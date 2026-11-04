@@ -1,0 +1,4 @@
+/target/
+*.desk-switch.toml
+/identity
+/peer
