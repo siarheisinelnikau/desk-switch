@@ -2,16 +2,16 @@ use anyhow::{Context, Result, bail, ensure};
 use std::net::SocketAddr;
 
 mod config;
+#[cfg(any(windows, test))]
+mod controller;
 mod edge;
 #[cfg(any(windows, test))]
 mod gate;
+#[cfg(any(windows, target_os = "linux"))]
+mod platform;
 mod transport;
 mod video;
 mod wire;
-#[cfg(any(windows, test))]
-mod controller;
-#[cfg(any(windows, target_os = "linux"))]
-mod platform;
 
 const USAGE: &str = "Desk Switch\n\
     init                 Create this computer's identity and print its public key\n\
@@ -37,8 +37,14 @@ fn run() -> Result<()> {
         [] | ["help" | "--help" | "-h"] => println!("{USAGE}"),
         ["--version" | "-V"] => println!("Desk Switch {}", env!("CARGO_PKG_VERSION")),
         ["state-dir"] => println!("{}", config::state_dir()?.display()),
-        ["init"] => println!("{}", config::hex(&config::create_identity(&config::state_dir()?)?.public)),
-        ["public-key"] => println!("{}", config::hex(&config::load_identity(&config::state_dir()?)?.public)),
+        ["init"] => println!(
+            "{}",
+            config::hex(&config::create_identity(&config::state_dir()?)?.public)
+        ),
+        ["public-key"] => println!(
+            "{}",
+            config::hex(&config::load_identity(&config::state_dir()?)?.public)
+        ),
         ["pair", key] => {
             config::pair(&config::state_dir()?, key)?;
             println!("Peer pinned.");
@@ -53,20 +59,37 @@ fn run() -> Result<()> {
         ["portal-check", "--consent"] => {
             let settings = config::Settings::load(&config::state_dir()?)?;
             runtime()?.block_on(async {
-                platform::portal::Portal::open(settings.edge).await?.close().await;
+                platform::portal::Portal::open(settings.edge)
+                    .await?
+                    .close()
+                    .await;
                 Ok::<_, anyhow::Error>(())
             })?;
         }
         ["run", address] => {
-            let address: SocketAddr = address.parse().context("use a numeric IP:PORT or [IPv6]:PORT")?;
+            let address: SocketAddr = address
+                .parse()
+                .context("use a numeric IP:PORT or [IPv6]:PORT")?;
             ensure!(address.port() != 0, "port must be nonzero");
             #[cfg(windows)]
-            ensure!(!address.ip().is_unspecified(), "use the Ubuntu computer's LAN IP address");
+            ensure!(
+                !address.ip().is_unspecified(),
+                "use the Ubuntu computer's LAN IP address"
+            );
             let dir = config::state_dir()?;
             let settings = config::Settings::load(&dir)?;
             let identity = config::load_identity(&dir)?;
             let peer = config::load_peer(&dir)?;
+            let lock = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .open(dir.join("run.lock"))?;
+            lock.try_lock()
+                .context("another Desk Switch process is using this state directory")?;
             platform::run(address, identity, peer, settings)?;
+            drop(lock);
         }
         _ => bail!("invalid command\n\n{USAGE}"),
     }
@@ -74,5 +97,7 @@ fn run() -> Result<()> {
 }
 
 fn runtime() -> Result<tokio::runtime::Runtime> {
-    Ok(tokio::runtime::Builder::new_current_thread().enable_all().build()?)
+    Ok(tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?)
 }
