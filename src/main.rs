@@ -3,6 +3,8 @@ use std::net::SocketAddr;
 
 mod config;
 mod edge;
+#[cfg(any(windows, test))]
+mod gate;
 mod transport;
 mod video;
 mod wire;
