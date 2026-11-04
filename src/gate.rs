@@ -19,7 +19,11 @@ pub struct Gate {
 
 impl Gate {
     pub fn new() -> Self {
-        Self { state: AtomicU64::new(0), deadline: AtomicU64::new(0), origin: Instant::now() }
+        Self {
+            state: AtomicU64::new(0),
+            deadline: AtomicU64::new(0),
+            origin: Instant::now(),
+        }
     }
 
     fn now(&self) -> u64 {
@@ -28,7 +32,8 @@ impl Gate {
 
     pub fn renew(&self, token: u64) {
         if self.current().0 == token {
-            self.deadline.store(self.now() + LEASE.as_millis() as u64, SeqCst);
+            self.deadline
+                .store(self.now() + LEASE.as_millis() as u64, SeqCst);
         }
     }
 
@@ -53,18 +58,26 @@ impl Gate {
         if route != Route::Local {
             return None;
         }
-        self.deadline.store(self.now() + LEASE.as_millis() as u64, SeqCst);
-        self.set(token, Route::Local, token + 1, Route::Hold).then_some(token + 1)
+        self.deadline
+            .store(self.now() + LEASE.as_millis() as u64, SeqCst);
+        self.set(token, Route::Local, token + 1, Route::Hold)
+            .then_some(token + 1)
     }
 
     fn set(&self, from_token: u64, from: Route, to_token: u64, to: Route) -> bool {
-        self.state.compare_exchange(
-            (from_token << 2) | from as u64, (to_token << 2) | to as u64, SeqCst, SeqCst
-        ).is_ok()
+        self.state
+            .compare_exchange(
+                (from_token << 2) | from as u64,
+                (to_token << 2) | to as u64,
+                SeqCst,
+                SeqCst,
+            )
+            .is_ok()
     }
 
     pub fn hold(&self, token: u64) -> bool {
-        self.current() == (token, Route::Remote) && self.set(token, Route::Remote, token, Route::Hold)
+        self.current() == (token, Route::Remote)
+            && self.set(token, Route::Remote, token, Route::Hold)
     }
 
     pub fn forward(&self, token: u64) -> bool {
@@ -97,6 +110,17 @@ mod tests {
         let token = gate.begin().unwrap();
         gate.emergency();
         gate.renew(token);
+        assert!(!gate.forward(token));
+        assert!(gate.current().1 == Route::Local);
+    }
+
+    #[test]
+    fn emergency_restores_local_input_during_return() {
+        let gate = Gate::new();
+        let token = gate.begin().unwrap();
+        assert!(gate.forward(token));
+        assert!(gate.hold(token));
+        gate.emergency();
         assert!(!gate.forward(token));
         assert!(gate.current().1 == Route::Local);
     }

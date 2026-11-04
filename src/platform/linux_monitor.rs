@@ -1,9 +1,12 @@
-use crate::{config::hex, video::{Monitor, input_codes}};
+use crate::{
+    config::hex,
+    video::{Monitor, input_codes},
+};
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use sha2::{Digest, Sha256};
 use std::{
-    fs, io::Read,
-    path::Path,
+    fs,
+    io::Read,
     process::{Command, Stdio},
     thread,
     time::{Duration, Instant},
@@ -20,14 +23,21 @@ fn displays() -> Result<Vec<Display>> {
     for entry in fs::read_dir("/sys/class/drm").context("reading Linux DRM connectors")? {
         let entry = entry?;
         let path = entry.path();
-        let Ok(edid) = fs::read(path.join("edid")) else { continue };
+        let Ok(edid) = fs::read(path.join("edid")) else {
+            continue;
+        };
         if edid.len() < 128 || !edid.starts_with(&[0, 255, 255, 255, 255, 255, 255, 0]) {
             continue;
         }
         let connector = entry.file_name().to_string_lossy().into_owned();
         let id = format!("{connector}:{}", hex(&Sha256::digest(&edid)));
-        let bus = fs::canonicalize(path.join("ddc")).ok()
-            .and_then(|path| path.file_name()?.to_str()?.strip_prefix("i2c-")?.parse().ok());
+        let bus = fs::canonicalize(path.join("ddc")).ok().and_then(|path| {
+            path.file_name()?
+                .to_str()?
+                .strip_prefix("i2c-")?
+                .parse()
+                .ok()
+        });
         displays.push(Display { id, connector, bus });
     }
     displays.sort_by(|a, b| a.connector.cmp(&b.connector));
@@ -36,18 +46,37 @@ fn displays() -> Result<Vec<Display>> {
 
 fn selected_bus(displays: &[Display], id: &str) -> Result<u32> {
     let mut matches = displays.iter().filter(|display| display.id == id);
-    let display = matches.next().context("configured monitor identity is unavailable; run probe on its active input")?;
-    ensure!(matches.next().is_none(), "configured monitor identity is ambiguous");
-    let bus = display.bus.context("this connector exposes no DRM DDC/I²C adapter")?;
-    ensure!(displays.iter().filter(|display| display.bus == Some(bus)).count() == 1,
-        "multiple physical displays share the selected DDC bus");
+    let display = matches
+        .next()
+        .context("configured monitor identity is unavailable; run probe on its active input")?;
+    ensure!(
+        matches.next().is_none(),
+        "configured monitor identity is ambiguous"
+    );
+    let bus = display
+        .bus
+        .context("this connector exposes no DRM DDC/I²C adapter")?;
+    ensure!(
+        displays
+            .iter()
+            .filter(|display| display.bus == Some(bus))
+            .count()
+            == 1,
+        "multiple physical displays share the selected DDC bus"
+    );
     Ok(bus)
 }
 
 fn ddcutil(bus: u32, args: &[&str]) -> Result<String> {
-    let mut child = Command::new("ddcutil").arg("--bus").arg(bus.to_string())
-        .args(args).env("LC_ALL", "C").stdin(Stdio::null())
-        .stdout(Stdio::piped()).stderr(Stdio::piped()).spawn()
+    let mut child = Command::new("ddcutil")
+        .arg("--bus")
+        .arg(bus.to_string())
+        .args(args)
+        .env("LC_ALL", "C")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
         .context("starting ddcutil; install it and check your I²C device access")?;
     // Drain both pipes while the process runs, with fixed memory and a bounded child lifetime.
     let stdout = child.stdout.take().unwrap();
@@ -75,10 +104,24 @@ fn ddcutil(bus: u32, args: &[&str]) -> Result<String> {
             }
         }
     };
-    let output = String::from_utf8_lossy(&stdout.join().map_err(|_| anyhow!("ddcutil stdout reader failed"))??).into_owned();
-    let error = String::from_utf8_lossy(&stderr.join().map_err(|_| anyhow!("ddcutil stderr reader failed"))??).into_owned();
-    ensure!(status.success(), "DDC/CI VCP 0x60 unavailable on /dev/i2c-{bus}: {} {}",
-        output.trim(), error.trim());
+    let output = String::from_utf8_lossy(
+        &stdout
+            .join()
+            .map_err(|_| anyhow!("ddcutil stdout reader failed"))??,
+    )
+    .into_owned();
+    let error = String::from_utf8_lossy(
+        &stderr
+            .join()
+            .map_err(|_| anyhow!("ddcutil stderr reader failed"))??,
+    )
+    .into_owned();
+    ensure!(
+        status.success(),
+        "DDC/CI VCP 0x60 unavailable on /dev/i2c-{bus}: {} {}",
+        output.trim(),
+        error.trim()
+    );
     Ok(output)
 }
 
@@ -86,7 +129,10 @@ fn parse_input(output: &str) -> Result<u16> {
     for line in output.lines() {
         let parts = line.split_whitespace().collect::<Vec<_>>();
         let hex = |value: &str| -> Result<u16> {
-            Ok(u16::from_str_radix(value.strip_prefix('x').context("missing VCP hex prefix")?, 16)?)
+            Ok(u16::from_str_radix(
+                value.strip_prefix('x').context("missing VCP hex prefix")?,
+                16,
+            )?)
         };
         match parts.as_slice() {
             ["VCP", "60", "SNC", value] => return hex(value),
@@ -95,7 +141,10 @@ fn parse_input(output: &str) -> Result<u16> {
             _ => {}
         }
     }
-    bail!("ddcutil did not report a readable VCP 0x60 input: {}", output.trim())
+    bail!(
+        "ddcutil did not report a readable VCP 0x60 input: {}",
+        output.trim()
+    )
 }
 
 fn read_input(bus: u32) -> Result<u16> {
@@ -111,14 +160,20 @@ impl Monitor for Ddc {
 
     fn write(&mut self, input: u16) -> Result<()> {
         let bus = selected_bus(&displays()?, &self.0)?;
-        ddcutil(bus, &["--noverify", "setvcp", "60", &format!("0x{input:04x}")])?;
+        ddcutil(
+            bus,
+            &["--noverify", "setvcp", "60", &format!("0x{input:04x}")],
+        )?;
         Ok(())
     }
 }
 
 pub fn probe(only: Option<&str>) -> Result<()> {
     let displays = displays()?;
-    ensure!(!displays.is_empty(), "no Linux DRM connectors expose a monitor EDID");
+    ensure!(
+        !displays.is_empty(),
+        "no Linux DRM connectors expose a monitor EDID"
+    );
     if let Some(id) = only {
         probe_one(&displays, id)
     } else {
@@ -136,23 +191,34 @@ fn probe_one(displays: &[Display], id: &str) -> Result<()> {
     let bus = selected_bus(displays, id)?;
     println!("  Current VCP 0x60: {:#06x}", read_input(bus)?);
     let codes = ddcutil(bus, &["capabilities"]).map(|caps| {
-        let raw = caps.lines().any(|line| line.trim_start().starts_with("vcp("));
+        let raw = caps
+            .lines()
+            .any(|line| line.trim_start().starts_with("vcp("));
         if raw {
             input_codes(&caps)
         } else {
             // Some ddcutil versions print human-readable capabilities instead of the raw string.
-            let mut lines = caps.lines().skip_while(|line| !line.contains("Feature: 60"));
+            let mut lines = caps
+                .lines()
+                .skip_while(|line| !line.contains("Feature: 60"));
             lines.next();
-            lines.take_while(|line| !line.contains("Feature:")).filter_map(|line| {
-                let (value, _) = line.trim().split_once(':')?;
-                if value.len() != 2 { return None; }
-                u16::from_str_radix(value, 16).ok()
-            }).collect()
+            lines
+                .take_while(|line| !line.contains("Feature:"))
+                .filter_map(|line| {
+                    let (value, _) = line.trim().split_once(':')?;
+                    if value.len() != 2 {
+                        return None;
+                    }
+                    u16::from_str_radix(value, 16).ok()
+                })
+                .collect()
         }
     });
     match codes {
         Ok(codes) if !codes.is_empty() => println!("  Advertised inputs: {codes:#06x?}"),
-        _ => println!("  Monitor did not advertise an input list; read each active input during setup."),
+        _ => println!(
+            "  Monitor did not advertise an input list; read each active input during setup."
+        ),
     }
     Ok(())
 }
@@ -164,8 +230,16 @@ mod tests {
     #[test]
     fn fixture_selects_the_matching_connector_and_refuses_a_shared_bus() {
         let mut fixture = vec![
-            Display { id: "private".into(), connector: "card0-DP-1".into(), bus: Some(2) },
-            Display { id: "shared".into(), connector: "card0-HDMI-A-1".into(), bus: Some(5) },
+            Display {
+                id: "private".into(),
+                connector: "card0-DP-1".into(),
+                bus: Some(2),
+            },
+            Display {
+                id: "shared".into(),
+                connector: "card0-HDMI-A-1".into(),
+                bus: Some(5),
+            },
         ];
         assert_eq!(selected_bus(&fixture, "shared").unwrap(), 5);
         assert!(selected_bus(&fixture, "missing").is_err());
