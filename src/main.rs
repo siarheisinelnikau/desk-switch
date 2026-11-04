@@ -1,6 +1,7 @@
 use anyhow::{Context, Result, bail, ensure};
 use std::net::SocketAddr;
 
+mod audio;
 mod config;
 #[cfg(any(windows, test))]
 mod controller;
@@ -21,7 +22,8 @@ const USAGE: &str = "Desk Switch\n\
     probe [MONITOR_ID]   Read DDC/CI VCP 0x60 and enumerate advertised inputs\n\
     portal-check         Ubuntu only; query Wayland portal capabilities\n\
     portal-check --consent  Ubuntu only; open EIS and list edge regions, without injecting input\n\
-    run IP:PORT          Ubuntu listens on this address; Windows connects to it";
+    run IP:PORT          Ubuntu listens on this address; Windows connects to it\n\
+    audio help           Opt in to an independent Ubuntu-to-Windows audio stream";
 
 fn main() {
     if let Err(error) = run() {
@@ -66,34 +68,32 @@ fn run() -> Result<()> {
                 Ok::<_, anyhow::Error>(())
             })?;
         }
+        ["audio", args @ ..] => audio::run(args)?,
         ["run", address] => {
-            let address: SocketAddr = address
-                .parse()
-                .context("use a numeric IP:PORT or [IPv6]:PORT")?;
-            ensure!(address.port() != 0, "port must be nonzero");
-            #[cfg(windows)]
-            ensure!(
-                !address.ip().is_unspecified(),
-                "use the Ubuntu computer's LAN IP address"
-            );
+            let address = parse_address(address)?;
             let dir = config::state_dir()?;
             let settings = config::Settings::load(&dir)?;
             let identity = config::load_identity(&dir)?;
             let peer = config::load_peer(&dir)?;
-            let lock = std::fs::OpenOptions::new()
-                .read(true)
-                .write(true)
-                .create(true)
-                .truncate(false)
-                .open(dir.join("run.lock"))?;
-            lock.try_lock()
-                .context("another Desk Switch process is using this state directory")?;
+            let _lock = config::lock(&dir, "run.lock")?;
             platform::run(address, identity, peer, settings)?;
-            drop(lock);
         }
         _ => bail!("invalid command\n\n{USAGE}"),
     }
     Ok(())
+}
+
+fn parse_address(address: &str) -> Result<SocketAddr> {
+    let address: SocketAddr = address
+        .parse()
+        .context("use a numeric IP:PORT or [IPv6]:PORT")?;
+    ensure!(address.port() != 0, "port must be nonzero");
+    #[cfg(windows)]
+    ensure!(
+        !address.ip().is_unspecified(),
+        "use the Ubuntu computer's LAN IP address"
+    );
+    Ok(address)
 }
 
 fn runtime() -> Result<tokio::runtime::Runtime> {

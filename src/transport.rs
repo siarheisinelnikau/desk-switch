@@ -4,7 +4,7 @@ use crate::{
 };
 use anyhow::{Context, Result, ensure};
 use bincode::Options;
-use snow::{Builder, HandshakeState, TransportState};
+use snow::{Builder, TransportState};
 use std::{
     sync::{Arc, Mutex},
     time::Duration,
@@ -43,6 +43,46 @@ async fn write_record(stream: &mut (impl AsyncWrite + Unpin), record: &[u8]) -> 
     Ok(())
 }
 
+pub async fn authenticate(
+    stream: &mut TcpStream,
+    ours: &Identity,
+    peer: &Key,
+    initiator: bool,
+    prologue: &[u8],
+) -> Result<TransportState> {
+    stream.set_nodelay(true)?;
+    let builder = Builder::new(NOISE.parse()?)
+        .prologue(prologue)?
+        .local_private_key(&ours.private)?
+        .remote_public_key(peer)?;
+    let mut noise = if initiator {
+        builder.build_initiator()?
+    } else {
+        builder.build_responder()?
+    };
+
+    timeout(Duration::from_secs(2), async {
+        let mut record = [0; MAX_RECORD];
+        for send in [initiator, !initiator] {
+            if send {
+                let len = noise.write_message(&[], &mut record)?;
+                write_record(stream, &record[..len]).await?;
+            } else {
+                let len = read_record(stream, &mut record).await?;
+                let mut payload = [0; MAX_RECORD];
+                ensure!(
+                    noise.read_message(&record[..len], &mut payload)? == 0,
+                    "invalid handshake payload"
+                );
+            }
+        }
+        Ok(noise.into_transport_mode()?)
+    })
+    .await
+    .context("peer authentication timed out")?
+    .context("peer authentication failed")
+}
+
 pub struct Pipe {
     state: Arc<Mutex<TransportState>>,
     writer: OwnedWriteHalf,
@@ -58,55 +98,26 @@ fn codec() -> impl Options {
 
 impl Pipe {
     pub async fn connect(
-        stream: TcpStream,
+        mut stream: TcpStream,
         ours: &Identity,
         peer: &Key,
         initiator: bool,
     ) -> Result<Self> {
-        stream.set_nodelay(true)?;
-        let builder = Builder::new(NOISE.parse()?)
-            .prologue(b"Desk Switch protocol 1")?
-            .local_private_key(&ours.private)?
-            .remote_public_key(peer)?;
-        let noise = if initiator {
-            builder.build_initiator()?
-        } else {
-            builder.build_responder()?
-        };
-        timeout(
-            Duration::from_secs(2),
-            Self::handshake(stream, noise, initiator),
-        )
-        .await
-        .context("peer authentication timed out")?
-        .context("peer authentication failed")
-    }
-
-    async fn handshake(
-        mut stream: TcpStream,
-        mut noise: HandshakeState,
-        initiator: bool,
-    ) -> Result<Self> {
-        let mut record = [0; MAX_RECORD];
-        for send in [initiator, !initiator] {
-            if send {
-                let len = noise.write_message(&[], &mut record)?;
-                write_record(&mut stream, &record[..len]).await?;
-            } else {
-                let len = read_record(&mut stream, &mut record).await?;
-                let mut payload = [0; MAX_RECORD];
-                ensure!(
-                    noise.read_message(&record[..len], &mut payload)? == 0,
-                    "invalid handshake payload"
-                );
-            }
-        }
-
-        let state = Arc::new(Mutex::new(noise.into_transport_mode()?));
+        let state = Arc::new(Mutex::new(
+            authenticate(
+                &mut stream,
+                ours,
+                peer,
+                initiator,
+                b"Desk Switch protocol 1",
+            )
+            .await?,
+        ));
         let (mut stream, writer) = stream.into_split();
         let reader_state = Arc::clone(&state);
         let (send, messages) = mpsc::channel(64);
         let reader = tokio::spawn(async move {
+            let mut record = [0; MAX_RECORD];
             loop {
                 let result = async {
                     let length = read_record(&mut stream, &mut record).await?;
