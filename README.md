@@ -54,6 +54,34 @@ On Ubuntu, `desk-switch portal-check` queries capabilities without requesting co
 
 Only the configured screen edge transfers between PCs. Dragging or holding a key prevents edge entry. Edge-originated transfers place the cursor just inside the destination edge at the matching proportional position. Leaving through the configured Ubuntu return edge reverses that transfer. The `input` mode makes no DDC calls and works without a `[monitor]` section. F12 while using input-only mode upgrades to a full transfer to Ubuntu if video is configured. F12-initiated transfers use relative motion and return with F12 or F11.
 
+## Optional audio from Ubuntu
+
+Keep your headphones connected to Windows. Windows plays the Ubuntu stream on the same output as local apps through shared-mode WASAPI. The audio feature starts off. Running Desk Switch for input and video does not start it.
+
+1. Reuse the peer keys already pinned on both PCs. In a separate terminal in the Ubuntu desktop session, run `./desk-switch audio sources` to list playback sinks. Then explicitly enable the sender.
+
+   ```sh
+   ./desk-switch audio serve 192.168.1.20:45877
+   # To select a particular sink monitor
+   ./desk-switch audio serve 192.168.1.20:45877 --source 'SINK_NAME'
+   ```
+
+2. On Windows, use `.\desk-switch.exe audio outputs` to list active outputs and their endpoint IDs. Start the receiver in a separate terminal. With no `--output`, it uses the default Windows playback device.
+
+   ```powershell
+   .\desk-switch.exe audio play 192.168.1.20:45877 --volume 50
+   # To select a particular playback device
+   .\desk-switch.exe audio play 192.168.1.20:45877 --output 'ENDPOINT_ID' --volume 50
+   ```
+
+Use a different TCP port from input and video. If you use a firewall, allow the audio port on Ubuntu from the Windows PC. The sender opens capture only after the paired Windows receiver requests audio. The stream runs independently of F11, F12, and edge switching.
+
+In the Windows audio terminal, enter `volume 0` through `volume 100`, `mute`, or `unmute` to adjust only Ubuntu audio. `status` shows the connection and volume. `off` closes the stream and releases the output, and `on` starts a fresh connection. `quit` or Ctrl+C exits. Ctrl+C in the Ubuntu audio terminal disables the sender. Volume and mute settings last for that receiver process. You can pass `--mute` on startup.
+
+Ubuntu audio needs `pipewire-bin` (`pw-dump` and `pw-record`) and a running PipeWire session with WirePlumber linking policy. It captures the monitor of the selected playback sink. Choose a sink that stays present during video switching. If your HDMI audio sink disappears when the monitor changes input, use a persistent output and route your Ubuntu apps to it. Ubuntu may also play the audio on that sink. The sender does not change system audio routing.
+
+The LAN stream is one-way, 48 kHz stereo PCM, approximately 1.54 Mbit/s before framing. Audio uses its own authenticated connection and small buffers. On a stalled or disconnected link the receiver discards queued audio and reconnects while enabled. Local Windows playback stays on the normal shared output. [WirePlumber linking policy](https://pipewire.pages.freedesktop.org/wireplumber/policies/linking.html) · [WASAPI shared streams](https://learn.microsoft.com/en-us/windows/win32/coreaudio/rendering-a-stream)
+
 ## Compatibility and recovery
 
 - Full switching needs readable and writable VCP `0x60` from both PCs while each PC is displaying on the shared monitor. Some monitors block DDC from inactive inputs, so the source PC writes and the destination PC reads back the selected input. Firmware that reports a stale or incorrect value can still prevent a reliable handoff. Verify both directions with the actual hardware.
@@ -62,7 +90,7 @@ Only the configured screen edge transfers between PCs. Dragging or holding a key
 
 ## Verify
 
-`cargo fmt --all --check`, `cargo clippy --locked --all-targets -- -D warnings`, and `cargo test --locked`. Tests use in-memory devices and loopback TCP. On hardware, first read `0x60` on both active inputs. Then check F12 in both directions with the second monitor visible, F11 and network-loss recovery with a held key, and each edge mode in both directions with your actual layout and scaling.
+`cargo fmt --all --check`, `cargo clippy --locked --all-targets -- -D warnings`, and `cargo test --locked`. Tests use in-memory devices, synthetic PCM, and loopback TCP. They cover audio off, reconnect, loss, stale frames, mute, and audio during a control round trip. On hardware, first read `0x60` on both active inputs. Then check F12 in both directions with the second monitor visible, F11 and network-loss recovery with a held key, and each edge mode in both directions with your actual layout and scaling.
 
 [ddcutil troubleshooting](https://www.ddcutil.com/faq/), [setvcp](https://www.ddcutil.com/command_setvcp/), [Win32 SetVCPFeature](https://learn.microsoft.com/en-us/windows/win32/api/lowlevelmonitorconfigurationapi/nf-lowlevelmonitorconfigurationapi-setvcpfeature), [Wayland RemoteDesktop portal](https://flatpak.github.io/xdg-desktop-portal/docs/doc-org.freedesktop.portal.RemoteDesktop.html).
 

@@ -54,6 +54,19 @@ pub fn state_dir() -> Result<PathBuf> {
         .join("desk-switch"))
 }
 
+pub fn lock(dir: &Path, name: &str) -> Result<fs::File> {
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(dir.join(name))?;
+    file.try_lock().with_context(|| {
+        format!("another Desk Switch process holds {name} in this state directory")
+    })?;
+    Ok(file)
+}
+
 fn create_private(path: &Path, contents: &str) -> Result<()> {
     let directory = path.parent().context("state path has no parent")?;
     let mut builder = fs::DirBuilder::new();
