@@ -1,3 +1,4 @@
+use crate::video::Inputs;
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -15,6 +16,7 @@ pub enum Input {
 }
 
 impl Input {
+    #[cfg(target_os = "linux")]
     pub fn valid(self) -> bool {
         match self {
             Self::Key { code, .. } => (1..=248).contains(&code),
@@ -29,14 +31,24 @@ impl Input {
 pub enum Message {
     Ping(u64),
     Pong(u64),
-    Prepare { id: u64, mode: Mode, edge: Option<u16> },
+    Prepare {
+        id: u64,
+        inputs: Option<Inputs>,
+        edge: Option<u16>,
+    },
     Ready(u64),
     Verify(u64),
-    Observed { id: u64, input: u16 },
+    Observed {
+        id: u64,
+        input: u16,
+    },
     Activate(u64),
     Active(u64),
     Event(Input),
-    ExitEdge { id: u64, position: u16 },
+    ExitEdge {
+        id: u64,
+        position: u16,
+    },
     Return(u64),
     Returning(u64),
     Returned(u64),

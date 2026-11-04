@@ -20,9 +20,13 @@ use tokio::{
 const MAX_RECORD: usize = 128;
 const IO_TIMEOUT: Duration = Duration::from_millis(500);
 pub const LEASE: Duration = Duration::from_millis(1750);
+#[cfg(windows)]
 pub const PING_PERIOD: Duration = Duration::from_millis(250);
 
-async fn read_record(stream: &mut (impl AsyncRead + Unpin), record: &mut [u8; MAX_RECORD]) -> Result<usize> {
+async fn read_record(
+    stream: &mut (impl AsyncRead + Unpin),
+    record: &mut [u8; MAX_RECORD],
+) -> Result<usize> {
     let length = usize::from(stream.read_u8().await?);
     ensure!((1..=MAX_RECORD).contains(&length), "invalid record length");
     stream.read_exact(&mut record[..length]).await?;
@@ -30,7 +34,10 @@ async fn read_record(stream: &mut (impl AsyncRead + Unpin), record: &mut [u8; MA
 }
 
 async fn write_record(stream: &mut (impl AsyncWrite + Unpin), record: &[u8]) -> Result<()> {
-    ensure!((1..=MAX_RECORD).contains(&record.len()), "invalid outgoing record length");
+    ensure!(
+        (1..=MAX_RECORD).contains(&record.len()),
+        "invalid outgoing record length"
+    );
     stream.write_u8(record.len() as u8).await?;
     stream.write_all(record).await?;
     Ok(())
@@ -44,23 +51,42 @@ pub struct Pipe {
 }
 
 fn codec() -> impl Options {
-    bincode::DefaultOptions::new().with_limit(MAX_RECORD as u64).reject_trailing_bytes()
+    bincode::DefaultOptions::new()
+        .with_limit(MAX_RECORD as u64)
+        .reject_trailing_bytes()
 }
 
 impl Pipe {
-    pub async fn connect(stream: TcpStream, ours: &Identity, peer: &Key, initiator: bool) -> Result<Self> {
+    pub async fn connect(
+        stream: TcpStream,
+        ours: &Identity,
+        peer: &Key,
+        initiator: bool,
+    ) -> Result<Self> {
         stream.set_nodelay(true)?;
         let builder = Builder::new(NOISE.parse()?)
             .prologue(b"Desk Switch protocol 1")?
             .local_private_key(&ours.private)?
             .remote_public_key(peer)?;
-        let noise = if initiator { builder.build_initiator()? } else { builder.build_responder()? };
-        timeout(Duration::from_secs(2), Self::handshake(stream, noise, initiator)).await
-            .context("peer authentication timed out")?
-            .context("peer authentication failed")
+        let noise = if initiator {
+            builder.build_initiator()?
+        } else {
+            builder.build_responder()?
+        };
+        timeout(
+            Duration::from_secs(2),
+            Self::handshake(stream, noise, initiator),
+        )
+        .await
+        .context("peer authentication timed out")?
+        .context("peer authentication failed")
     }
 
-    async fn handshake(mut stream: TcpStream, mut noise: HandshakeState, initiator: bool) -> Result<Self> {
+    async fn handshake(
+        mut stream: TcpStream,
+        mut noise: HandshakeState,
+        initiator: bool,
+    ) -> Result<Self> {
         let mut record = [0; MAX_RECORD];
         for send in [initiator, !initiator] {
             if send {
@@ -69,7 +95,10 @@ impl Pipe {
             } else {
                 let len = read_record(&mut stream, &mut record).await?;
                 let mut payload = [0; MAX_RECORD];
-                ensure!(noise.read_message(&record[..len], &mut payload)? == 0, "invalid handshake payload");
+                ensure!(
+                    noise.read_message(&record[..len], &mut payload)? == 0,
+                    "invalid handshake payload"
+                );
             }
         }
 
@@ -82,23 +111,37 @@ impl Pipe {
                 let result = async {
                     let length = read_record(&mut stream, &mut record).await?;
                     let mut plain = [0; MAX_RECORD];
-                    let length = reader_state.lock().unwrap().read_message(&record[..length], &mut plain)?;
+                    let length = reader_state
+                        .lock()
+                        .unwrap()
+                        .read_message(&record[..length], &mut plain)?;
                     Ok(codec().deserialize::<Message>(&plain[..length])?)
-                }.await;
+                }
+                .await;
                 let stop = result.is_err();
                 if send.send(result).await.is_err() || stop {
                     break;
                 }
             }
         });
-        Ok(Self { state, writer, messages, reader })
+        Ok(Self {
+            state,
+            writer,
+            messages,
+            reader,
+        })
     }
 
     pub async fn send(&mut self, message: Message) -> Result<()> {
         let plain = codec().serialize(&message)?;
         let mut record = [0; MAX_RECORD];
-        let len = self.state.lock().unwrap().write_message(&plain, &mut record)?;
-        timeout(IO_TIMEOUT, write_record(&mut self.writer, &record[..len])).await
+        let len = self
+            .state
+            .lock()
+            .unwrap()
+            .write_message(&plain, &mut record)?;
+        timeout(IO_TIMEOUT, write_record(&mut self.writer, &record[..len]))
+            .await
             .context("peer write timed out")??;
         Ok(())
     }
@@ -116,8 +159,13 @@ mod tests {
     use tokio::net::TcpListener;
 
     fn identity() -> Identity {
-        let pair = Builder::new(NOISE.parse().unwrap()).generate_keypair().unwrap();
-        Identity { private: pair.private.try_into().unwrap(), public: pair.public.try_into().unwrap() }
+        let pair = Builder::new(NOISE.parse().unwrap())
+            .generate_keypair()
+            .unwrap();
+        Identity {
+            private: pair.private.try_into().unwrap(),
+            public: pair.public.try_into().unwrap(),
+        }
     }
 
     #[tokio::test]
@@ -128,17 +176,49 @@ mod tests {
         let ubuntu = identity();
         let outsider = identity();
         let client = async {
-            let bad = Pipe::connect(TcpStream::connect(address).await.unwrap(), &outsider, &ubuntu.public, true).await;
+            let bad = Pipe::connect(
+                TcpStream::connect(address).await.unwrap(),
+                &outsider,
+                &ubuntu.public,
+                true,
+            )
+            .await;
             assert!(bad.is_err());
-            let mut pipe = Pipe::connect(TcpStream::connect(address).await.unwrap(), &windows, &ubuntu.public, true).await.unwrap();
+            let mut pipe = Pipe::connect(
+                TcpStream::connect(address).await.unwrap(),
+                &windows,
+                &ubuntu.public,
+                true,
+            )
+            .await
+            .unwrap();
             pipe.send(Message::Ping(42)).await.unwrap();
-            assert_eq!(pipe.messages.recv().await.unwrap().unwrap(), Message::Pong(42));
+            assert_eq!(
+                pipe.messages.recv().await.unwrap().unwrap(),
+                Message::Pong(42)
+            );
         };
         let server = async {
-            let bad = Pipe::connect(listener.accept().await.unwrap().0, &ubuntu, &windows.public, false).await;
+            let bad = Pipe::connect(
+                listener.accept().await.unwrap().0,
+                &ubuntu,
+                &windows.public,
+                false,
+            )
+            .await;
             assert!(bad.is_err());
-            let mut pipe = Pipe::connect(listener.accept().await.unwrap().0, &ubuntu, &windows.public, false).await.unwrap();
-            assert_eq!(pipe.messages.recv().await.unwrap().unwrap(), Message::Ping(42));
+            let mut pipe = Pipe::connect(
+                listener.accept().await.unwrap().0,
+                &ubuntu,
+                &windows.public,
+                false,
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                pipe.messages.recv().await.unwrap().unwrap(),
+                Message::Ping(42)
+            );
             pipe.send(Message::Pong(42)).await.unwrap();
         };
         tokio::join!(client, server);

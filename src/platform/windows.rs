@@ -14,7 +14,10 @@ use tokio::{
     sync::{mpsc, oneshot},
     time::{Instant, MissedTickBehavior, interval, sleep, timeout},
 };
-use windows_sys::Win32::{System::Threading::GetCurrentThreadId, UI::WindowsAndMessaging::{PostThreadMessageW, WM_QUIT}};
+use windows_sys::Win32::{
+    System::Threading::GetCurrentThreadId,
+    UI::WindowsAndMessaging::{PostThreadMessageW, WM_QUIT},
+};
 
 const SWITCH_TIMEOUT: Duration = Duration::from_secs(15);
 
@@ -31,16 +34,31 @@ pub fn run(
     let hooks = Hooks::install(Arc::clone(&gate), edge.clone(), control_tx, input_tx)?;
     let hook_thread = unsafe { GetCurrentThreadId() };
     let runtime = crate::runtime()?;
-    let thread = std::thread::Builder::new().name("Desk Switch coordinator".into()).spawn(move || {
-        let result = runtime.block_on(connect(address, identity, peer, Coordinator {
-            gate, edge, video, controls, events,
-        }));
-        unsafe { PostThreadMessageW(hook_thread, WM_QUIT, 0, 0); }
-        result
-    })?;
+    let thread = std::thread::Builder::new()
+        .name("Desk Switch coordinator".into())
+        .spawn(move || {
+            let result = runtime.block_on(connect(
+                address,
+                identity,
+                peer,
+                Coordinator {
+                    gate,
+                    edge,
+                    video,
+                    controls,
+                    events,
+                },
+            ));
+            unsafe {
+                PostThreadMessageW(hook_thread, WM_QUIT, 0, 0);
+            }
+            result
+        })?;
     println!("F12 switches the shared monitor and input. F11 immediately restores Windows input.");
     hooks.run()?;
-    thread.join().map_err(|_| anyhow::anyhow!("Windows coordinator stopped unexpectedly"))?
+    thread
+        .join()
+        .map_err(|_| anyhow::anyhow!("Windows coordinator stopped unexpectedly"))?
 }
 
 struct Coordinator {
@@ -51,7 +69,12 @@ struct Coordinator {
     events: mpsc::Receiver<(u64, Input)>,
 }
 
-async fn connect(address: SocketAddr, identity: Identity, peer: Key, mut io: Coordinator) -> Result<()> {
+async fn connect(
+    address: SocketAddr,
+    identity: Identity,
+    peer: Key,
+    mut io: Coordinator,
+) -> Result<()> {
     let shutdown = tokio::signal::ctrl_c();
     tokio::pin!(shutdown);
     loop {
@@ -85,7 +108,9 @@ async fn connect(address: SocketAddr, identity: Identity, peer: Key, mut io: Coo
                         eprintln!("Windows-side video recovery could not be verified: {error:#}");
                     }
                 }
-                if result.is_none() { break; }
+                if result.is_none() {
+                    break;
+                }
             }
             Err(error) => {
                 io.gate.emergency();
@@ -112,7 +137,12 @@ struct Handoff {
 impl Handoff {
     fn new(inputs: Option<Inputs>) -> Self {
         Self {
-            logic: Controller::new(inputs), token: None, deadline: None, id: 0, job: None, next_job: None,
+            logic: Controller::new(inputs),
+            token: None,
+            deadline: None,
+            id: 0,
+            job: None,
+            next_job: None,
         }
     }
 
@@ -120,7 +150,11 @@ impl Handoff {
         self.token = Some(token);
         self.deadline = Some(Instant::now() + SWITCH_TIMEOUT);
         self.id += 1;
-        self.logic.start(Transfer { id: self.id, mode, edge })
+        self.logic.start(Transfer {
+            id: self.id,
+            mode,
+            edge,
+        })
     }
 
     fn returning(&mut self, exit: Option<u16>, hotkey: bool) -> Result<Effect> {
@@ -138,9 +172,15 @@ impl Handoff {
         let mut lease = Instant::now() + LEASE;
         loop {
             ensure!(Instant::now() < lease, "Ubuntu heartbeat timed out");
-            ensure!(self.deadline.is_none_or(|time| Instant::now() < time), "switch confirmation timed out");
+            ensure!(
+                self.deadline.is_none_or(|time| Instant::now() < time),
+                "switch confirmation timed out"
+            );
             if let Some(token) = self.token {
-                ensure!(io.gate.current().0 == token, "emergency key, input overflow or local lease expired");
+                ensure!(
+                    io.gate.current().0 == token,
+                    "emergency key, input overflow or local lease expired"
+                );
             }
             let effect = tokio::select! {
                 _ = ping.tick() => {
@@ -204,11 +244,15 @@ impl Handoff {
     }
 
     fn poll_job(&mut self, io: &Coordinator) -> Result<Option<Effect>> {
-        if let Some((when, job)) = self.next_job && Instant::now() >= when {
+        if let Some((when, job)) = self.next_job
+            && Instant::now() >= when
+        {
             self.next_job = None;
             self.submit(io, job)?;
         }
-        let Some((job, pending)) = &mut self.job else { return Ok(None) };
+        let Some((job, pending)) = &mut self.job else {
+            return Ok(None);
+        };
         let result = match pending.try_recv() {
             Ok(result) => result,
             Err(oneshot::error::TryRecvError::Empty) => return Ok(None),
@@ -237,7 +281,10 @@ impl Handoff {
     }
 
     fn submit(&mut self, io: &Coordinator, job: Job) -> Result<()> {
-        let (_, worker) = io.video.as_ref().context("configure the shared monitor before switching video")?;
+        let (_, worker) = io
+            .video
+            .as_ref()
+            .context("configure the shared monitor before switching video")?;
         self.job = Some((job, worker.submit(job)?));
         Ok(())
     }
@@ -249,9 +296,13 @@ impl Handoff {
             Effect::Send(message) => {
                 pipe.send(message).await?;
                 if matches!(message, Message::Returned(_)) {
-                    let Effect::Local { position, upgrade } = self.logic.finished() else { unreachable!() };
+                    let Effect::Local { position, upgrade } = self.logic.finished() else {
+                        unreachable!()
+                    };
                     if upgrade {
-                        let Effect::Send(prepare) = self.start(token, Mode::Video, None)? else { unreachable!() };
+                        let Effect::Send(prepare) = self.start(token, Mode::Video, None)? else {
+                            unreachable!()
+                        };
                         pipe.send(prepare).await?;
                     } else {
                         if let (Some(position), Some(edge)) = (position, &io.edge)
@@ -272,7 +323,10 @@ impl Handoff {
             Effect::Ddc(job) => self.submit(io, job)?,
             Effect::Forward => {
                 win_input::center()?;
-                ensure!(io.gate.forward(token), "Windows route was revoked before activation");
+                ensure!(
+                    io.gate.forward(token),
+                    "Windows route was revoked before activation"
+                );
                 self.deadline = None;
                 println!("Input active on Ubuntu.");
             }

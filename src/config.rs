@@ -27,10 +27,12 @@ pub fn hex(bytes: &[u8]) -> String {
 
 fn key(value: &str) -> Result<Key> {
     let bytes = value.as_bytes();
-    ensure!(bytes.len() == 64 && bytes.iter().all(u8::is_ascii_hexdigit),
-        "expected a 64-character public or private key");
+    ensure!(
+        bytes.len() == 64 && bytes.iter().all(u8::is_ascii_hexdigit),
+        "expected a 64-character public or private key"
+    );
     let mut result = [0; 32];
-    for (byte, encoded) in result.iter_mut().zip(bytes.chunks_exact(2)) {
+    for (byte, encoded) in result.iter_mut().zip(bytes.as_chunks::<2>().0) {
         *byte = u8::from_str_radix(std::str::from_utf8(encoded)?, 16)?;
     }
     ensure!(result != [0; 32], "invalid all-zero key");
@@ -44,9 +46,12 @@ pub fn state_dir() -> Result<PathBuf> {
     #[cfg(windows)]
     let base = std::env::var_os("LOCALAPPDATA").map(PathBuf::from);
     #[cfg(not(windows))]
-    let base = std::env::var_os("XDG_CONFIG_HOME").map(PathBuf::from)
+    let base = std::env::var_os("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".config")));
-    Ok(base.context("set DESK_SWITCH_STATE to a private directory")?.join("desk-switch"))
+    Ok(base
+        .context("set DESK_SWITCH_STATE to a private directory")?
+        .join("desk-switch"))
 }
 
 fn create_private(path: &Path, contents: &str) -> Result<()> {
@@ -66,8 +71,13 @@ fn create_private(path: &Path, contents: &str) -> Result<()> {
         use std::os::unix::fs::OpenOptionsExt;
         options.mode(0o600);
     }
-    let mut file = options.open(path).with_context(|| format!("creating {}", path.display()))?;
-    if let Err(error) = file.write_all(contents.as_bytes()).and_then(|()| file.sync_all()) {
+    let mut file = options
+        .open(path)
+        .with_context(|| format!("creating {}", path.display()))?;
+    if let Err(error) = file
+        .write_all(contents.as_bytes())
+        .and_then(|()| file.sync_all())
+    {
         drop(file);
         let _ = fs::remove_file(path);
         return Err(error.into());
@@ -77,7 +87,10 @@ fn create_private(path: &Path, contents: &str) -> Result<()> {
 
 pub fn create_identity(dir: &Path) -> Result<Identity> {
     let pair = Builder::new(NOISE.parse()?).generate_keypair()?;
-    create_private(&dir.join("identity"), &format!("{}\n{}\n", hex(&pair.private), hex(&pair.public)))?;
+    create_private(
+        &dir.join("identity"),
+        &format!("{}\n{}\n", hex(&pair.private), hex(&pair.public)),
+    )?;
     load_identity(dir)
 }
 
@@ -93,16 +106,23 @@ pub fn load_identity(dir: &Path) -> Result<Identity> {
 pub fn pair(dir: &Path, remote: &str) -> Result<()> {
     let identity = load_identity(dir)?;
     let remote = key(remote)?;
-    ensure!(remote != identity.public, "enter the other computer's public key");
+    ensure!(
+        remote != identity.public,
+        "enter the other computer's public key"
+    );
     match create_private(&dir.join("peer"), &hex(&remote)) {
         Ok(()) => Ok(()),
         Err(_) if load_peer(dir).ok() == Some(remote) => Ok(()),
-        Err(error) => Err(error.context("a peer is pinned until you explicitly remove the peer file")),
+        Err(error) => {
+            Err(error.context("a peer is pinned until you explicitly remove the peer file"))
+        }
     }
 }
 
 pub fn load_peer(dir: &Path) -> Result<Key> {
-    key(fs::read_to_string(dir.join("peer")).context("pin the other computer with pair")?.trim())
+    key(fs::read_to_string(dir.join("peer"))
+        .context("pin the other computer with pair")?
+        .trim())
 }
 
 #[derive(Default, Deserialize)]
@@ -149,12 +169,23 @@ impl Settings {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => FileSettings::default(),
             Err(error) => return Err(error.into()),
         };
-        let monitor = config.monitor.map(|m| {
-            ensure!(!m.id.trim().is_empty(), "monitor id is empty");
-            ensure!(m.windows != m.ubuntu && m.windows != 0 && m.ubuntu != 0,
-                "configure distinct nonzero Windows and Ubuntu VCP 0x60 input values");
-            Ok::<_, anyhow::Error>((m.id, Inputs { windows: m.windows, ubuntu: m.ubuntu }))
-        }).transpose()?;
+        let monitor = config
+            .monitor
+            .map(|m| {
+                ensure!(!m.id.trim().is_empty(), "monitor id is empty");
+                ensure!(
+                    m.windows != m.ubuntu && m.windows != 0 && m.ubuntu != 0,
+                    "configure distinct nonzero Windows and Ubuntu VCP 0x60 input values"
+                );
+                Ok::<_, anyhow::Error>((
+                    m.id,
+                    Inputs {
+                        windows: m.windows,
+                        ubuntu: m.ubuntu,
+                    },
+                ))
+            })
+            .transpose()?;
         let edge = match config.edge {
             None => None,
             Some(edge) if edge.mode == "off" => None,
@@ -169,7 +200,9 @@ impl Settings {
                 }
                 Some(Edge {
                     mode,
-                    screen: edge.screen.ok_or_else(|| anyhow!("edge screen is required"))?,
+                    screen: edge
+                        .screen
+                        .ok_or_else(|| anyhow!("edge screen is required"))?,
                     side: Side::parse(&edge.side.context("edge side is required")?)?,
                 })
             }
