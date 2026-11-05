@@ -143,14 +143,23 @@ pub fn load_peer(dir: &Path) -> Result<Key> {
 struct FileSettings {
     monitor: Option<MonitorSettings>,
     edge: Option<EdgeSettings>,
+    capture: Option<CaptureSettings>,
 }
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct MonitorSettings {
     id: String,
-    windows: u16,
-    ubuntu: u16,
+    #[serde(alias = "windows")]
+    host: u16,
+    #[serde(alias = "ubuntu")]
+    peer: u16,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CaptureSettings {
+    devices: Vec<PathBuf>,
 }
 
 #[derive(Deserialize)]
@@ -171,6 +180,8 @@ pub struct Edge {
 pub struct Settings {
     pub monitor: Option<(String, Inputs)>,
     pub edge: Option<Edge>,
+    #[cfg(target_os = "linux")]
+    pub capture_devices: Vec<PathBuf>,
 }
 
 impl Settings {
@@ -187,14 +198,14 @@ impl Settings {
             .map(|m| {
                 ensure!(!m.id.trim().is_empty(), "monitor id is empty");
                 ensure!(
-                    m.windows != m.ubuntu && m.windows != 0 && m.ubuntu != 0,
-                    "configure distinct nonzero Windows and Ubuntu VCP 0x60 input values"
+                    m.host != m.peer && m.host != 0 && m.peer != 0,
+                    "configure distinct nonzero host and peer VCP 0x60 input values"
                 );
                 Ok::<_, anyhow::Error>((
                     m.id,
                     Inputs {
-                        windows: m.windows,
-                        ubuntu: m.ubuntu,
+                        host: m.host,
+                        peer: m.peer,
                     },
                 ))
             })
@@ -220,6 +231,69 @@ impl Settings {
                 })
             }
         };
-        Ok(Self { monitor, edge })
+        let capture_devices = config
+            .capture
+            .map(|capture| capture.devices)
+            .unwrap_or_default();
+        ensure!(
+            capture_devices.len() <= 16,
+            "at most 16 capture devices may be selected"
+        );
+        Ok(Self {
+            monitor,
+            edge,
+            #[cfg(target_os = "linux")]
+            capture_devices,
+        })
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Role {
+    Host,
+    Receiver,
+}
+
+impl Role {
+    pub fn parse(value: &str) -> Result<Self> {
+        match value {
+            "host" => Ok(Self::Host),
+            "receiver" => Ok(Self::Receiver),
+            _ => bail!("role must be host (keyboard/mouse attached here) or receiver"),
+        }
+    }
+
+    pub fn default_for_platform() -> Self {
+        if cfg!(windows) {
+            Self::Host
+        } else {
+            Self::Receiver
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn monitor_mapping_accepts_role_names_and_existing_configurations() {
+        let legacy: FileSettings =
+            toml::from_str("[monitor]\nid='shared'\nwindows=17\nubuntu=15").unwrap();
+        let roles: FileSettings =
+            toml::from_str("[monitor]\nid='shared'\nhost=17\npeer=15").unwrap();
+        let (legacy, roles) = (legacy.monitor.unwrap(), roles.monitor.unwrap());
+        assert_eq!((legacy.host, legacy.peer), (roles.host, roles.peer));
+        assert!(
+            toml::from_str::<FileSettings>("[monitor]\nid='shared'\nhost=17\nwindows=18\npeer=15")
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn either_role_is_explicitly_selectable() {
+        assert_eq!(Role::parse("host").unwrap(), Role::Host);
+        assert_eq!(Role::parse("receiver").unwrap(), Role::Receiver);
+        assert!(Role::parse("windows").is_err());
     }
 }

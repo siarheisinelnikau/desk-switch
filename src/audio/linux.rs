@@ -1,17 +1,8 @@
-use super::{
-    link::{CHANNELS, Link, RATE},
-    stream,
-};
-use crate::config::{Identity, Key};
+use super::link::{CHANNELS, RATE};
 use anyhow::{Context, Result, ensure};
 use serde_json::Value;
-use std::{net::SocketAddr, process::Stdio, time::Duration};
-use tokio::{
-    io::AsyncReadExt,
-    net::{TcpListener, TcpStream},
-    process::Command,
-    time::timeout,
-};
+use std::{process::Stdio, time::Duration};
+use tokio::{io::AsyncReadExt, process::Command, time::timeout};
 
 const GRAPH_LIMIT: u64 = 8 * 1024 * 1024;
 const CAPTURE_PROPERTIES: &str = r#"{ "application.name": "Desk Switch", "node.name": "desk-switch-capture", "media.name": "Desk Switch system audio", "stream.capture.sink": true, "node.dont-reconnect": true, "node.dont-move": true, "node.dont-fallback": true }"#;
@@ -124,88 +115,74 @@ pub async fn list() -> Result<()> {
     Ok(())
 }
 
-pub async fn serve(
-    address: SocketAddr,
-    identity: Identity,
-    peer: Key,
-    source: Option<&str>,
-) -> Result<()> {
-    let listener = TcpListener::bind(address)
-        .await
-        .context("binding the Ubuntu audio port")?;
-    println!("Ubuntu audio enabled on {address}. Waiting for the paired Windows receiver.");
-    let shutdown = tokio::signal::ctrl_c();
-    tokio::pin!(shutdown);
-    loop {
-        let socket = tokio::select! {
-            result = &mut shutdown => { result?; break; }
-            accepted = listener.accept() => accepted?.0,
-        };
-        tokio::select! {
-            result = &mut shutdown => { result?; break; }
-            result = session(socket, &identity, &peer, source) => {
-                if let Err(error) = result {
-                    eprintln!("Ubuntu audio idle. {error:#}");
-                }
-            }
-        }
-    }
-    println!("Ubuntu audio off.");
-    Ok(())
+pub struct Capture {
+    child: tokio::process::Child,
+    samples: tokio::process::ChildStdout,
 }
 
-async fn session(
-    socket: TcpStream,
-    identity: &Identity,
-    peer: &Key,
-    source: Option<&str>,
-) -> Result<()> {
-    let mut link = Link::open(socket, identity, peer, false).await?;
-    stream::request_start(&mut link).await?;
+impl Capture {
+    pub async fn open(source: Option<&str>) -> Result<Self> {
+        let graph = Graph::read().await?;
+        let sink = graph.select(source)?;
+        let mut child = Command::new("pw-record")
+            .args([
+                "--raw",
+                "--format=s16",
+                "--channel-map=stereo",
+                "--latency=10ms",
+                "--properties",
+                CAPTURE_PROPERTIES,
+            ])
+            .arg("--rate")
+            .arg(RATE.to_string())
+            .arg("--channels")
+            .arg(CHANNELS.to_string())
+            .arg("--target")
+            .arg(sink.serial.to_string())
+            .arg("-")
+            .kill_on_drop(true)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .spawn()
+            .context("starting pw-record; install pipewire-bin")?;
+        println!(
+            "Capturing the playback monitor of {} ({}).",
+            sink.description, sink.name
+        );
+        let samples = child
+            .stdout
+            .take()
+            .context("pw-record stdout unavailable")?;
+        Ok(Self { child, samples })
+    }
 
-    let mut incoming = stream::SILENCE;
-    let graph = tokio::select! {
-        biased;
-        packet = link.receive(&mut incoming) => {
-            packet?;
-            anyhow::bail!("unexpected packet while selecting a playback sink");
-        }
-        result = Graph::read() => result?,
-    };
-    let sink = graph.select(source)?;
-    let mut capture = Command::new("pw-record")
-        .args([
-            "--raw",
-            "--format=s16",
-            "--channel-map=stereo",
-            "--latency=10ms",
-            "--properties",
-            CAPTURE_PROPERTIES,
-        ])
-        .arg("--rate")
-        .arg(RATE.to_string())
-        .arg("--channels")
-        .arg(CHANNELS.to_string())
-        .arg("--target")
-        .arg(sink.serial.to_string())
-        .arg("-")
+    pub async fn stop(&mut self) -> Result<()> {
+        self.child.kill().await.context("stopping PipeWire capture")
+    }
+}
+
+impl tokio::io::AsyncRead for Capture {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buffer: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.samples).poll_read(cx, buffer)
+    }
+}
+
+pub(super) async fn playback(output: Option<&str>) -> Result<tokio::process::Child> {
+    let graph = Graph::read().await?;
+    let sink = graph.select(output)?;
+    Command::new("pw-play")
+        .args(["--raw", "--format=s16", "--channel-map=stereo", "--latency=10ms",
+            "--properties", r#"{ "application.name": "Desk Switch", "media.name": "Desk Switch remote audio", "node.dont-reconnect": true, "node.dont-move": true, "node.dont-fallback": true }"#])
+        .arg("--rate").arg(RATE.to_string())
+        .arg("--channels").arg(CHANNELS.to_string())
+        .arg("--target").arg(sink.serial.to_string()).arg("-")
         .kill_on_drop(true)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .spawn()
-        .context("starting pw-record; install pipewire-bin")?;
-    println!(
-        "Capturing the playback monitor of {} ({}).",
-        sink.description, sink.name
-    );
-    let mut samples = capture
-        .stdout
-        .take()
-        .context("pw-record stdout unavailable")?;
-    let result = stream::transmit(&mut link, &mut samples).await;
-    drop(samples);
-    capture.kill().await.context("stopping PipeWire capture")?;
-    result
+        .stdin(Stdio::piped()).spawn()
+        .context("starting pw-play; install pipewire-bin")
 }
 
 #[cfg(test)]

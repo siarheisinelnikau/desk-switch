@@ -16,7 +16,6 @@ pub enum Input {
 }
 
 impl Input {
-    #[cfg(target_os = "linux")]
     pub fn valid(self) -> bool {
         match self {
             Self::Key { code, .. } => (1..=248).contains(&code),
