@@ -278,10 +278,10 @@ impl Portal {
             let config = self
                 .edge
                 .as_ref()
-                .context("configure the Ubuntu return edge")?;
+                .context("configure the Wayland return edge")?;
             ensure!(
                 config.mode == mode,
-                "edge modes differ between Windows and Ubuntu"
+                "edge modes differ between host and receiver"
             );
             if require_region {
                 self.find_screen(&config.screen)?;
@@ -371,6 +371,10 @@ impl Portal {
     }
 
     pub fn event(&mut self, event: Input) -> Result<Option<u16>> {
+        self.local_event(event, true)
+    }
+
+    pub fn local_event(&mut self, event: Input, detect_edge: bool) -> Result<Option<u16>> {
         ensure!(
             event.valid() && !self.started.is_empty(),
             "invalid or inactive input event"
@@ -428,7 +432,8 @@ impl Portal {
                         .context("Wayland edge layout changed during the transfer")?;
                     let (dx, dy) = (f64::from(dx) / current.scale, f64::from(dy) / current.scale);
                     let edge = self.edge.as_ref().unwrap();
-                    if current.id == edge.screen
+                    if detect_edge
+                        && current.id == edge.screen
                         && self.keys.is_empty()
                         && self.buttons.is_empty()
                         && let Some(position) = edge.side.crossing(current.rect, x, y, dx, dy)
@@ -452,6 +457,35 @@ impl Portal {
         }
         self.connection.flush()?;
         Ok(None)
+    }
+
+    pub fn start_local(&mut self) -> Result<()> {
+        if let Some(edge) = &self.edge {
+            let mode = edge.mode;
+            self.start(Some(u16::MAX / 2), mode)?;
+            let screen = self.find_screen(&self.edge.as_ref().unwrap().screen)?;
+            let x = screen.rect.x + screen.rect.width / 2.0;
+            let y = screen.rect.y + screen.rect.height / 2.0;
+            self.absolute(&screen, x, y)?;
+            self.cursor = Some((x, y));
+            self.connection.flush()?;
+        } else {
+            self.start(None, Mode::Input)?;
+        }
+        Ok(())
+    }
+
+    pub fn enter_local(&mut self, position: u16) -> Result<()> {
+        let edge = self
+            .edge
+            .as_ref()
+            .context("the local return edge is disabled")?;
+        let screen = self.find_screen(&edge.screen)?;
+        let (x, y) = edge.side.entry(screen.rect, position);
+        self.absolute(&screen, x, y)?;
+        self.cursor = Some((x, y));
+        self.connection.flush()?;
+        Ok(())
     }
 
     pub fn release(&mut self) -> Result<()> {
@@ -482,5 +516,32 @@ impl Portal {
 
     pub async fn close(self) {
         let _ = timeout(Duration::from_secs(1), self.session.close()).await;
+    }
+}
+
+impl super::receiver::Sink for Portal {
+    async fn poll(&mut self) -> Result<()> {
+        let event = self
+            .stream
+            .next()
+            .await
+            .context("EIS device stream closed")??;
+        self.handle(event)
+    }
+
+    fn prepare(&self, edge: Option<u16>, mode: Mode) -> Result<()> {
+        self.can_start(edge, mode, mode == Mode::Input)
+    }
+
+    fn activate(&mut self, edge: Option<u16>, mode: Mode) -> Result<()> {
+        self.start(edge, mode)
+    }
+
+    fn event(&mut self, event: Input) -> Result<Option<u16>> {
+        self.event(event)
+    }
+
+    fn release(&mut self) -> Result<()> {
+        self.release()
     }
 }

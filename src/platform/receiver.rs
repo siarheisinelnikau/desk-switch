@@ -1,4 +1,3 @@
-use super::portal::Portal;
 use crate::{
     config::{Identity, Key},
     transport::{LEASE, Pipe},
@@ -6,7 +5,6 @@ use crate::{
     wire::{Input, Message, Mode},
 };
 use anyhow::{Context, Result, bail, ensure};
-use futures_util::StreamExt;
 use std::{net::SocketAddr, time::Duration};
 use tokio::{
     net::TcpListener,
@@ -35,39 +33,12 @@ struct Transfer {
 
 const SWITCH_TIMEOUT: Duration = Duration::from_secs(15);
 
-trait Sink {
+pub trait Sink {
     async fn poll(&mut self) -> Result<()>;
     fn prepare(&self, edge: Option<u16>, mode: Mode) -> Result<()>;
     fn activate(&mut self, edge: Option<u16>, mode: Mode) -> Result<()>;
     fn event(&mut self, event: Input) -> Result<Option<u16>>;
     fn release(&mut self) -> Result<()>;
-}
-
-impl Sink for Portal {
-    async fn poll(&mut self) -> Result<()> {
-        let event = self
-            .stream
-            .next()
-            .await
-            .context("EIS device stream closed")??;
-        self.handle(event)
-    }
-
-    fn prepare(&self, edge: Option<u16>, mode: Mode) -> Result<()> {
-        self.can_start(edge, mode, mode == Mode::Input)
-    }
-
-    fn activate(&mut self, edge: Option<u16>, mode: Mode) -> Result<()> {
-        self.start(edge, mode)
-    }
-
-    fn event(&mut self, event: Input) -> Result<Option<u16>> {
-        self.event(event)
-    }
-
-    fn release(&mut self) -> Result<()> {
-        self.release()
-    }
 }
 
 async fn disconnect(
@@ -79,7 +50,7 @@ async fn disconnect(
     if transfer.is_some_and(|active| active.mode == Mode::Video)
         && let Some((inputs, worker)) = video
     {
-        eprintln!("Attempting to restore the shared monitor to Windows.");
+        eprintln!("Attempting to restore the shared monitor to host.");
         if let Err(error) = worker.recover(*inputs).await {
             eprintln!("Automatic video recovery could not be verified: {error:#}");
         }
@@ -91,23 +62,20 @@ pub async fn run(
     address: SocketAddr,
     identity: Identity,
     peer: Key,
-    mut portal: Portal,
+    sink: &mut impl Sink,
     video: Option<(Inputs, VideoWorker)>,
 ) -> Result<()> {
     let listener = TcpListener::bind(address)
         .await
-        .context("binding Ubuntu listen address")?;
-    println!("Listening for the pinned Windows peer on {address}.");
+        .context("binding receiver listen address")?;
+    println!("Listening for the pinned host peer on {address}.");
     let shutdown = tokio::signal::ctrl_c();
     tokio::pin!(shutdown);
     loop {
         let (stream, _) = tokio::select! {
             result = &mut shutdown => { result?; break; }
-            event = portal.poll() => {
-                if let Err(error) = event {
-                    portal.close().await;
-                    return Err(error);
-                }
+            event = sink.poll() => {
+                event?;
                 continue;
             }
             result = listener.accept() => result?,
@@ -119,7 +87,7 @@ pub async fn run(
                 continue;
             }
         };
-        println!("Windows peer authenticated.");
+        println!("host peer authenticated.");
         let mut transfer = None;
         let mut last_id = 0;
         let result = tokio::select! {
@@ -127,21 +95,19 @@ pub async fn run(
                 result?;
                 None
             }
-            result = session(&mut pipe, &mut portal, video.as_ref(), &mut transfer, &mut last_id) => Some(result),
+            result = session(&mut pipe, sink, video.as_ref(), &mut transfer, &mut last_id) => Some(result),
         };
         drop(pipe);
         if let Some(Err(error)) = &result {
             eprintln!("Session ended: {error:#}");
         }
-        if let Err(error) = disconnect(&mut portal, transfer, video.as_ref()).await {
-            portal.close().await;
-            return Err(error.context("Wayland input was closed after a release error"));
+        if let Err(error) = disconnect(sink, transfer, video.as_ref()).await {
+            return Err(error.context("input adapter failed to release its held keys/buttons"));
         }
         if result.is_none() {
             break;
         }
     }
-    portal.close().await;
     Ok(())
 }
 
@@ -159,12 +125,12 @@ async fn session(
     tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
     loop {
         let now = Instant::now();
-        ensure!(now < lease, "Windows heartbeat timed out");
+        ensure!(now < lease, "host heartbeat timed out");
         ensure!(
             transfer
                 .as_ref()
                 .is_none_or(|active| active.stage == Stage::Active || now < active.deadline),
-            "Windows did not complete the switch before the deadline"
+            "host did not complete the switch before the deadline"
         );
         tokio::select! {
             _ = tick.tick() => {
@@ -176,18 +142,18 @@ async fn session(
                             match active.stage {
                                 Stage::Reading => {
                                     let (inputs, _) = video.unwrap();
-                                    if matches!(result, Ok(VideoResult::Read(input)) if input == inputs.ubuntu) {
+                                    if matches!(result, Ok(VideoResult::Read(input)) if input == inputs.peer) {
                                         active.stage = Stage::Verified;
-                                        pipe.send(Message::Observed { id: active.id, input: inputs.ubuntu }).await?;
+                                        pipe.send(Message::Observed { id: active.id, input: inputs.peer }).await?;
                                     } else {
                                         if let Err(error) = result {
-                                            eprintln!("Waiting for Ubuntu-side DDC read: {error:#}");
+                                            eprintln!("Waiting for receiver-side DDC read: {error:#}");
                                         }
                                         next_read = Instant::now() + Duration::from_millis(300);
                                     }
                                 }
                                 Stage::Returning => {
-                                    result.context("Ubuntu could not select the Windows monitor input")?;
+                                    result.context("receiver could not select the host monitor input")?;
                                     active.stage = Stage::Returned;
                                     pipe.send(Message::Returning(active.id)).await?;
                                 }
@@ -195,7 +161,7 @@ async fn session(
                             }
                         }
                         Err(oneshot::error::TryRecvError::Empty) => {}
-                        Err(oneshot::error::TryRecvError::Closed) => bail!("Ubuntu DDC worker stopped"),
+                        Err(oneshot::error::TryRecvError::Closed) => bail!("receiver DDC worker stopped"),
                     }
                 }
                 if active.stage == Stage::Reading && job.is_none() && Instant::now() >= next_read {
@@ -204,7 +170,7 @@ async fn session(
             }
             result = sink.poll() => result?,
             message = pipe.messages.recv() => {
-                let message = message.context("Windows disconnected")??;
+                let message = message.context("host disconnected")??;
                 if let Message::Ping(nonce) = message {
                     lease = Instant::now() + LEASE;
                     pipe.send(Message::Pong(nonce)).await?;
@@ -220,7 +186,7 @@ async fn session(
                         continue;
                     }
                     if inputs.is_some() && inputs != video.map(|(local, _)| *local) {
-                        eprintln!("Transfer rejected: the configured Windows/Ubuntu input values differ between peers.");
+                        eprintln!("Transfer rejected: the configured host/receiver input values differ between peers.");
                         pipe.send(Message::Rejected(id)).await?;
                         continue;
                     }
@@ -240,7 +206,7 @@ async fn session(
                         sink.activate(active.edge, active.mode)?;
                         active.stage = Stage::Active;
                         pipe.send(Message::Active(id)).await?;
-                        println!("Input active on Ubuntu ({:?}).", active.mode);
+                        println!("Input active on receiver ({:?}).", active.mode);
                     }
                     Message::Event(input) if active.stage == Stage::Active => {
                         if let Some(position) = sink.event(input)? {
@@ -256,7 +222,7 @@ async fn session(
                         if active.mode == Mode::Video {
                             let (inputs, worker) = video.unwrap();
                             active.stage = Stage::Returning;
-                            job = Some(worker.submit(Job::Select { from: inputs.ubuntu, to: inputs.windows })?);
+                            job = Some(worker.submit(Job::Select { from: inputs.peer, to: inputs.host })?);
                         } else {
                             active.stage = Stage::Returned;
                             pipe.send(Message::Returning(id)).await?;
@@ -264,7 +230,7 @@ async fn session(
                     }
                     Message::Returned(id) if active.id == id && active.stage == Stage::Returned => {
                         *transfer = None;
-                        println!("Input returned to Windows.");
+                        println!("Input returned to host.");
                     }
                     _ => bail!("unexpected, stale or out-of-phase command"),
                 }
@@ -284,10 +250,7 @@ mod tests {
     };
     use tokio::net::TcpStream;
 
-    const INPUTS: Inputs = Inputs {
-        windows: 17,
-        ubuntu: 15,
-    };
+    const INPUTS: Inputs = Inputs { host: 17, peer: 15 };
     const KEY: Input = Input::Key {
         code: 30,
         down: true,
@@ -366,7 +329,7 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let monitor = Arc::new(FixtureMonitor::default());
-        monitor.input.store(INPUTS.windows, SeqCst);
+        monitor.input.store(INPUTS.host, SeqCst);
         let worker = (INPUTS, VideoWorker::start(Arc::clone(&monitor)).unwrap());
         let client = async {
             let stream = TcpStream::connect(address).await.unwrap();
@@ -391,13 +354,13 @@ mod tests {
             );
             if mode == Mode::Video {
                 // The fixture supplies the outcome of the source-side DDC write.
-                monitor.input.store(INPUTS.ubuntu, SeqCst);
+                monitor.input.store(INPUTS.peer, SeqCst);
                 pipe.send(Message::Verify(1)).await.unwrap();
                 assert_eq!(
                     pipe.messages.recv().await.unwrap().unwrap(),
                     Message::Observed {
                         id: 1,
-                        input: INPUTS.ubuntu
+                        input: INPUTS.peer
                     }
                 );
             }
@@ -441,7 +404,7 @@ mod tests {
         })
         .await
         .unwrap();
-        assert_eq!(monitor.input.load(SeqCst), INPUTS.windows);
+        assert_eq!(monitor.input.load(SeqCst), INPUTS.host);
         if mode == Mode::Input {
             assert_eq!(monitor.calls.load(SeqCst), 0);
         } else {
