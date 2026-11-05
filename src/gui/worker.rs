@@ -25,6 +25,8 @@ pub struct Worker {
     pub logs: VecDeque<String>,
     pub input_status: Option<InputStatus>,
     pub audio_playing: bool,
+    pub peer_version: Option<String>,
+    pub version_error: Option<String>,
     pub stopping: bool,
     pub exit_ok: Option<bool>,
     pub data: Option<serde_json::Value>,
@@ -96,6 +98,8 @@ impl Worker {
             logs: VecDeque::new(),
             input_status: None,
             audio_playing: false,
+            peer_version: None,
+            version_error: None,
             stopping: false,
             exit_ok: None,
             data: None,
@@ -153,6 +157,26 @@ impl Worker {
             && let Ok(event) = serde_json::from_str::<Event>(json)
         {
             match event {
+                Event::PeerVersion {
+                    app,
+                    protocol,
+                    compatible,
+                } => {
+                    self.peer_version = app.clone();
+                    self.version_error = if compatible {
+                        None
+                    } else {
+                        Some(format!(
+                            "Версии не совпадают: этот ПК {} (протокол {}), другой ПК {} (протокол {}). Обновите оба ПК.",
+                            crate::compatibility::VERSION,
+                            crate::compatibility::PROTOCOL,
+                            app.as_deref().unwrap_or("старый клиент"),
+                            protocol
+                                .map(|p| p.to_string())
+                                .unwrap_or_else(|| "неизвестен".into())
+                        ))
+                    };
+                }
                 Event::Input(status) => self.input_status = Some(status),
                 Event::Audio { playing, .. } => self.audio_playing = playing && self.running(),
             }

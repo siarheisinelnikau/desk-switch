@@ -17,7 +17,36 @@ Launch the binary without arguments, or run `desk-switch gui`, to open the nativ
 
 The tray provides Open, Switch, Emergency return, Audio on/off, and Quit. On Windows, click the icon to open its menu. On Ubuntu, the panel must support StatusNotifierItem/AppIndicator, as Ubuntu's AppIndicator GNOME extension does. Closing the window hides it while a usable tray is present; without one it exits cooperatively. If the tray disappears, the window reopens. **Завершить** / tray Quit stops the managed services and their normal recovery paths before exiting. A lost GUI command pipe also requests service shutdown.
 
-`desk-switch gui --tray` starts hidden only when the tray is available. Launching the GUI starts no input or audio service automatically. Pairing and settings are local; `desktop.toml` stores window preferences beside the existing `settings.toml`. Update both PCs together to use requests from the receiver's tray. Physical video switching still needs two cables into the shared monitor and DDC/CI support; screen pixels are not sent over the network.
+`desk-switch gui --tray` starts hidden only when the tray is available. Pairing and settings are local; `desktop.toml` stores window preferences beside the existing `settings.toml`. Physical video switching still needs two cables into the shared monitor and DDC/CI support; screen pixels are not sent over the network.
+
+## Autostart and matching versions
+
+From 0.2.0, the first successful GUI launch registers autostart for the current user by default. Ubuntu uses an XDG autostart entry; Windows uses the current user's Run key. It launches into the tray and retains the selected profile. Moving the executable requires opening it once from its new location to refresh the entry. **Запуск и обновления** lets you disable autostart.
+
+![Startup and update settings in an isolated test profile](docs/startup-updates.png)
+
+**Подключать настроенную пару при запуске** defaults to enabled. No input service starts until both keys exist. Save valid role, address, monitor/edge and Ubuntu capture settings before the next launch. Portal consent and input-device permissions still apply. The audio start setting follows the last explicit audio on/off choice; audio starts disabled until enabled once, and its saved volume/mute are retained. Quit stops services and preserves startup preferences.
+
+Both encrypted input and audio handshakes exchange the exact application version and wire protocol before creating a usable connection. Different patch versions are rejected, as are different protocols and legacy clients that send no version. Both current clients report their local and remote versions; the GUI shows the mismatch and checks for an update. The protocol number is 2 in release 0.2.0. The first upgrade from 0.1.0 requires replacing the binary on **both** PCs manually because 0.1.0 has no updater.
+
+## Automatic updates
+
+Automatic checks/downloads default to enabled, at launch and every six hours. The channel is the latest signed `update.json` in [the project's GitHub Releases](https://github.com/siarheisinelnikau/desk-switch/releases). A missing release is shown as unpublished. Updates install at the next application launch, before automatic input/audio startup; the settings page also provides **Обновить и перезапустить**. A completed download can install immediately if no service is running. Signing keys, pinned peers, role settings, volume and autostart choices remain in the existing profile.
+
+Only stable, newer versions with a valid Ed25519 signature are accepted. One manifest must contain both Windows x86-64 and Ubuntu x86-64 assets of the same release. HTTPS, bounded sizes, SHA-256 and the embedded binary version/protocol are checked before installation. The update helper waits for this profile's GUI/input/audio locks, verifies the staged file again, and replaces the executable with a previous-version backup. An immediate startup failure restores the previous binary; an error marker prevents an automatic retry loop. Installation requires a user-writable application directory and does not elevate privileges.
+
+The publisher's public key is committed in `release/update-public-key.hex`; the local private key is in the ignored `.release-private/update-signing-key.pem`. Back up that private key and configure its PEM contents as the GitHub Actions secret `DESK_SWITCH_UPDATE_SIGNING_KEY` before publishing. The release workflow builds/tests both OS targets, validates their embedded version/protocol against the Cargo version and tag, signs a common manifest, uploads a draft with both assets, then publishes it. Existing version tags/releases must not be reused.
+
+To prepare a reviewable local release without publishing:
+
+~~~sh
+python3 tools/prepare_release.py --tag v0.2.0 \
+  --linux target/release/desk-switch \
+  --windows target/x86_64-pc-windows-gnu/release/desk-switch.exe \
+  --out dist/v0.2.0
+~~~
+
+`--build-info` prints the embedded build version/protocol. Automatic updates do not coordinate a simultaneous restart of both PCs: while one is on a newer version, the connection stays rejected until the other catches up. Neither peer can supply an arbitrary update URL or executable to the other.
 
 ## Build
 
@@ -156,7 +185,7 @@ cargo test --locked
 
 Tests use synthetic devices, PCM and loopback TCP. On each real pair validate full switching with the second monitor visible, F11/link loss with held keys/buttons, edges/scaling, and simultaneous local/remote audio on the selected headphones. Ubuntu host device access and portal consent also need validation on the target PC.
 
-Desktop validation uses an isolated Xvfb display and private D-Bus StatusNotifier watcher to check settings persistence, key creation/pinning, the menu, hidden-window command handling, show/hide/quit, and watcher loss/reappearance. Managed sender shutdown is checked through both a stop command and pipe EOF without opening an audio device. The Windows desktop/tray code is cross-compiled; interactive Windows and real monitor validation must be done on the target PCs.
+Desktop validation uses an isolated Xvfb display and private D-Bus StatusNotifier watcher to check settings persistence, key creation/pinning, autostart in a private XDG directory, the menu, hidden-window command handling, show/hide/quit, and watcher loss/reappearance. Test profiles disable automatic connection/audio/update checks. Managed sender shutdown is checked through both a stop command and pipe EOF without opening an audio device. Updater installation, immediate-failure rollback and tampered-payload rejection use signed synthetic executables in temporary directories. Windows desktop/tray/autostart/updater code is cross-compiled; interactive Windows and real monitor validation must be done on the target PCs.
 
 [ddcutil troubleshooting](https://www.ddcutil.com/faq/), [setvcp](https://www.ddcutil.com/command_setvcp/), [Win32 SetVCPFeature](https://learn.microsoft.com/en-us/windows/win32/api/lowlevelmonitorconfigurationapi/nf-lowlevelmonitorconfigurationapi-setvcpfeature), [RemoteDesktop portal](https://flatpak.github.io/xdg-desktop-portal/docs/doc-org.freedesktop.portal.RemoteDesktop.html).
 
