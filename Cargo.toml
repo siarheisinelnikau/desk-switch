@@ -2,12 +2,14 @@
 name = "desk-switch"
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.93"
+rust-version = "1.99"
 license = "MIT"
 description = "Switch a shared monitor, input and audio between Windows and Ubuntu PCs"
 
 [dependencies]
 anyhow = "1.0"
+eframe = { version = "0.35", default-features = false, features = ["default_fonts", "glow", "x11", "wayland"] }
+serde_json = "1.0"
 bincode = "1.3"
 serde = { version = "1.0", features = ["derive"] }
 snow = { version = "0.10", default-features = false, features = ["use-blake2", "use-chacha20poly1305", "use-curve25519", "use-getrandom"] }
@@ -21,10 +23,11 @@ futures-util = "0.3"
 evdev = { version = "0.13", features = ["tokio"] }
 reis = { version = "0.7", features = ["tokio"] }
 rustix = { version = "1.1", features = ["time"] }
-serde_json = "1.0"
+ksni = { version = "0.3.6", features = ["blocking"] }
 tokio = { version = "1.48", features = ["process"] }
 
 [target.'cfg(windows)'.dependencies]
+tray-icon = { version = "0.25", default-features = false }
 wasapi = "0.26"
 windows = { version = "0.62", features = ["Win32_Media_Audio"] }
 windows-sys = { version = "0.61", features = [
@@ -33,6 +36,7 @@ windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
     "Win32_Graphics_Gdi",
     "Win32_System_LibraryLoader",
+    "Win32_System_Console",
     "Win32_System_Registry",
     "Win32_System_Threading",
     "Win32_UI_HiDpi",

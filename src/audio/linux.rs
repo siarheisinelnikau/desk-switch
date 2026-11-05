@@ -101,16 +101,28 @@ impl Graph {
     }
 }
 
-pub async fn list() -> Result<()> {
+pub async fn devices() -> Result<Vec<super::AudioDevice>> {
     let graph = Graph::read().await?;
     ensure!(!graph.sinks.is_empty(), "no PipeWire playback sinks found");
-    for sink in &graph.sinks {
-        let default = if graph.default.as_ref() == Some(&sink.name) {
-            " [default]"
-        } else {
-            ""
-        };
-        println!("{}{}\n  {}", sink.description, default, sink.name);
+    Ok(graph
+        .sinks
+        .iter()
+        .map(|sink| super::AudioDevice {
+            id: sink.name.clone(),
+            name: sink.description.clone(),
+            default: graph.default.as_ref() == Some(&sink.name),
+        })
+        .collect())
+}
+
+pub async fn list() -> Result<()> {
+    for device in devices().await? {
+        println!(
+            "{}{}\n  {}",
+            device.name,
+            if device.default { " [default]" } else { "" },
+            device.id
+        );
     }
     Ok(())
 }

@@ -7,7 +7,7 @@ mod linux_monitor;
 pub mod portal;
 mod receiver;
 #[cfg(target_os = "linux")]
-pub use linux_monitor::probe;
+pub use linux_monitor::{discover, probe};
 
 #[cfg(windows)]
 mod win_input;
@@ -18,7 +18,7 @@ mod win_receive;
 #[cfg(windows)]
 mod windows;
 #[cfg(windows)]
-pub use win_monitor::probe;
+pub use win_monitor::{discover, probe};
 
 use crate::{
     config::{Identity, Key, Role, Settings},
@@ -73,4 +73,14 @@ pub fn run(
             }
         }),
     }
+}
+
+#[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
+pub struct MonitorInfo {
+    pub id: String,
+    pub name: String,
+    pub screen: String,
+    pub current: Option<u16>,
+    pub inputs: Vec<u16>,
+    pub error: Option<String>,
 }

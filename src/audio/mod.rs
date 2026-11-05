@@ -28,12 +28,16 @@ pub fn run(args: &[&str]) -> Result<()> {
     match args {
         [] | ["--help" | "-h" | "help"] => println!("{USAGE}"),
         ["sources"] => list()?,
+        ["sources" | "outputs", "--json"] => {
+            println!("@desk-switch-data {}", serde_json::to_string(&devices()?)?);
+        }
         ["serve", address] | ["serve", address, "--source", _] => {
             let address = crate::parse_address(address)?;
             let dir = config::state_dir()?;
             let identity = config::load_identity(&dir)?;
             let peer = config::load_peer(&dir)?;
             let _lock = config::lock(&dir, "audio.lock")?;
+            crate::lifecycle::install();
             crate::runtime()?.block_on(sender::serve(
                 address,
                 identity,
@@ -98,4 +102,18 @@ fn list() -> Result<()> {
     return output::list();
     #[cfg(target_os = "linux")]
     crate::runtime()?.block_on(linux::list())
+}
+
+#[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
+pub struct AudioDevice {
+    pub id: String,
+    pub name: String,
+    pub default: bool,
+}
+
+pub fn devices() -> Result<Vec<AudioDevice>> {
+    #[cfg(windows)]
+    return output::devices();
+    #[cfg(target_os = "linux")]
+    crate::runtime()?.block_on(linux::devices())
 }

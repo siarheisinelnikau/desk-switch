@@ -67,13 +67,19 @@ pub struct Portal {
 
 impl Portal {
     pub async fn open(edge: Option<Edge>) -> Result<Self> {
-        let portal = check().await?;
+        let portal = tokio::select! {
+            result = check() => result?,
+            result = crate::lifecycle::shutdown() => {
+                result?;
+                bail!("Wayland setup stopped");
+            }
+        };
         let session = timeout(
             Duration::from_secs(8),
             portal.create_session(CreateSessionOptions::default()),
         )
         .await??;
-        let result = timeout(Duration::from_secs(120), async {
+        let setup = timeout(Duration::from_secs(120), async {
             portal
                 .select_devices(
                     &session,
@@ -103,8 +109,15 @@ impl Portal {
                     .handshake_tokio("Desk Switch", ei::handshake::ContextType::Sender)
                     .await?,
             )
-        })
-        .await;
+        });
+        let result = tokio::select! {
+            result = setup => result,
+            result = crate::lifecycle::shutdown() => {
+                let _ = timeout(Duration::from_secs(1), session.close()).await;
+                result?;
+                bail!("Wayland setup stopped");
+            }
+        };
         let (connection, stream) = match result {
             Ok(Ok(ready)) => ready,
             failed => {
@@ -457,6 +470,10 @@ impl Portal {
         }
         self.connection.flush()?;
         Ok(None)
+    }
+
+    pub fn screen_ids(&self) -> Vec<String> {
+        self.screens().into_iter().map(|screen| screen.id).collect()
     }
 
     pub fn start_local(&mut self) -> Result<()> {

@@ -19,7 +19,7 @@ pub async fn serve(
         .await
         .context("binding the audio sender port")?;
     println!("System audio enabled on {address}. Waiting for the paired receiver.");
-    let shutdown = tokio::signal::ctrl_c();
+    let shutdown = crate::lifecycle::shutdown();
     tokio::pin!(shutdown);
     loop {
         let socket = tokio::select! {
@@ -32,6 +32,10 @@ pub async fn serve(
                 if let Err(error) = result { eprintln!("System audio idle. {error:#}"); }
             }
         }
+        crate::lifecycle::report(crate::lifecycle::Event::Audio {
+            playing: false,
+            message: "waiting for the paired receiver".into(),
+        });
     }
     println!("System audio off.");
     Ok(())
@@ -54,6 +58,10 @@ async fn session(
         }
         result = Capture::open(source) => result?,
     };
+    crate::lifecycle::report(crate::lifecycle::Event::Audio {
+        playing: true,
+        message: "transmitting the selected system mix".into(),
+    });
     let result = stream::transmit(&mut link, &mut capture).await;
     capture.stop().await?;
     result
