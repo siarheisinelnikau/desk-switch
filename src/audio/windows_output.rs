@@ -34,7 +34,7 @@ impl Drop for Com {
     }
 }
 
-pub fn list() -> Result<()> {
+pub fn devices() -> Result<Vec<super::AudioDevice>> {
     let _com = Com::open()?;
     let enumerator = DeviceEnumerator::new()?;
     let default = enumerator
@@ -46,15 +46,27 @@ pub fn list() -> Result<()> {
         devices.get_nbr_devices()? > 0,
         "no active Windows playback outputs"
     );
+    let mut result = Vec::new();
     for device in &devices {
         let device = device?;
         let id = device.get_id()?;
-        let marker = if default.as_ref() == Some(&id) {
-            " [default]"
-        } else {
-            ""
-        };
-        println!("{}{}\n  {}", device.get_friendlyname()?, marker, id);
+        result.push(super::AudioDevice {
+            default: default.as_ref() == Some(&id),
+            id,
+            name: device.get_friendlyname()?,
+        });
+    }
+    Ok(result)
+}
+
+pub fn list() -> Result<()> {
+    for device in devices()? {
+        println!(
+            "{}{}\n  {}",
+            device.name,
+            if device.default { " [default]" } else { "" },
+            device.id
+        );
     }
     Ok(())
 }

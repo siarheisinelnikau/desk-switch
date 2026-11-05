@@ -22,6 +22,7 @@ pub enum Control {
 }
 
 pub trait Cursor {
+    async fn request_toggle(&self) -> Result<()>;
     async fn center(&self) -> Result<()>;
     async fn enter(&self, edge: &Edge, position: u16) -> Result<()>;
     async fn resume(&self) -> Result<()> {
@@ -44,7 +45,7 @@ pub async fn connect<C: Cursor>(
     peer: Key,
     mut io: Coordinator<C>,
 ) -> Result<()> {
-    let shutdown = tokio::signal::ctrl_c();
+    let shutdown = crate::lifecycle::shutdown();
     tokio::pin!(shutdown);
     loop {
         let connection = tokio::select! {
@@ -56,13 +57,19 @@ pub async fn connect<C: Cursor>(
         };
         match connection {
             Ok(mut pipe) => {
-                println!("peer peer authenticated.");
+                println!("peer authenticated.");
+                crate::lifecycle::report(crate::lifecycle::Event::Input(
+                    crate::lifecycle::InputStatus::Here,
+                ));
                 let mut handoff = Handoff::new(io.video.as_ref().map(|(inputs, _)| *inputs));
                 let result = tokio::select! {
                     result = &mut shutdown => { result?; None }
                     result = handoff.run(&mut pipe, &mut io) => Some(result),
                 };
                 io.gate.emergency();
+                crate::lifecycle::report(crate::lifecycle::Event::Input(
+                    crate::lifecycle::InputStatus::Recovering,
+                ));
                 drop(pipe);
                 // A timeout may leave a Win32 DDC call in flight. Never race a new transfer
                 // with the old job or its recovery. The hook remains local while we wait.
@@ -83,6 +90,9 @@ pub async fn connect<C: Cursor>(
             }
             Err(error) => {
                 io.gate.emergency();
+                crate::lifecycle::report(crate::lifecycle::Event::Input(
+                    crate::lifecycle::InputStatus::Waiting,
+                ));
                 eprintln!("Waiting for peer: {error:#}");
             }
         }
@@ -136,6 +146,10 @@ impl Handoff {
         let mut ping = interval(PING_PERIOD);
         tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
         ping.set_missed_tick_behavior(MissedTickBehavior::Skip);
+        crate::lifecycle::report(crate::lifecycle::Event::Input(
+            crate::lifecycle::InputStatus::Here,
+        ));
+        let mut commands = crate::lifecycle::commands();
         let mut last_ping = 0;
         let mut last_pong = 0;
         let mut lease = Instant::now() + LEASE;
@@ -152,6 +166,14 @@ impl Handoff {
                 );
             }
             let effect = tokio::select! {
+                command = commands.recv() => {
+                    match command {
+                        Ok(crate::lifecycle::Command::Switch) => io.cursor.request_toggle().await?,
+                        Ok(crate::lifecycle::Command::Emergency) => io.gate.emergency(),
+                        Err(_) => {}
+                    }
+                    continue;
+                }
                 _ = ping.tick() => {
                     last_ping += 1;
                     pipe.send(Message::Ping(last_ping)).await?;
@@ -181,6 +203,10 @@ impl Handoff {
                 message = pipe.messages.recv() => {
                     let message = message.context("peer disconnected")??;
                     match message {
+                        Message::SwitchRequested => {
+                            io.cursor.request_toggle().await?;
+                            continue;
+                        }
                         Message::Pong(nonce) => {
                             ensure!(nonce > last_pong && nonce <= last_ping, "invalid heartbeat reply");
                             last_pong = nonce;
@@ -287,6 +313,9 @@ impl Handoff {
                         io.gate.local(token);
                         self.token = None;
                         self.deadline = None;
+                        crate::lifecycle::report(crate::lifecycle::Event::Input(
+                            crate::lifecycle::InputStatus::Here,
+                        ));
                         println!("Input returned to host.");
                     }
                 }
@@ -302,10 +331,173 @@ impl Handoff {
                     "host route was revoked before activation"
                 );
                 self.deadline = None;
+                crate::lifecycle::report(crate::lifecycle::Event::Input(
+                    crate::lifecycle::InputStatus::Peer,
+                ));
                 println!("Input active on peer.");
             }
             Effect::Local { .. } => bail!("unexpected local routing effect"),
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{config::NOISE, video::Monitor};
+    use std::sync::atomic::{AtomicU16, AtomicUsize, Ordering::SeqCst};
+    use tokio::net::TcpListener;
+
+    struct FixtureCursor {
+        gate: Arc<Gate>,
+        controls: mpsc::Sender<Control>,
+        toggles: Arc<AtomicUsize>,
+    }
+
+    impl Cursor for FixtureCursor {
+        async fn request_toggle(&self) -> Result<()> {
+            self.toggles.fetch_add(1, SeqCst);
+            let (token, route) = self.gate.current();
+            let token = match route {
+                Route::Local => self.gate.begin(),
+                Route::Remote if self.gate.hold(token) => Some(token),
+                _ => None,
+            };
+            if let Some(token) = token {
+                self.controls.send(Control::Toggle(token)).await?;
+            }
+            Ok(())
+        }
+        async fn center(&self) -> Result<()> {
+            Ok(())
+        }
+        async fn enter(&self, _: &Edge, _: u16) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    struct FixtureMonitor(Arc<AtomicU16>);
+    impl Monitor for FixtureMonitor {
+        fn read(&mut self) -> Result<u16> {
+            Ok(self.0.load(SeqCst))
+        }
+        fn write(&mut self, input: u16) -> Result<()> {
+            self.0.store(input, SeqCst);
+            Ok(())
+        }
+    }
+
+    fn identity() -> Identity {
+        let pair = snow::Builder::new(NOISE.parse().unwrap())
+            .generate_keypair()
+            .unwrap();
+        Identity {
+            private: pair.private.try_into().unwrap(),
+            public: pair.public.try_into().unwrap(),
+        }
+    }
+
+    async fn next(pipe: &mut Pipe) -> Message {
+        loop {
+            let message = pipe.messages.recv().await.unwrap().unwrap();
+            if let Message::Ping(nonce) = message {
+                pipe.send(Message::Pong(nonce)).await.unwrap();
+            } else {
+                return message;
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn authenticated_tray_request_switches_video_and_input_in_both_directions() {
+        let host = identity();
+        let peer = identity();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let gate = Arc::new(Gate::new());
+        let input = Arc::new(AtomicU16::new(17));
+        let toggles = Arc::new(AtomicUsize::new(0));
+        let (control_send, controls) = mpsc::channel(8);
+        let (_event_send, events) = mpsc::channel(8);
+        let inputs = Inputs { host: 17, peer: 15 };
+        let mut io = Coordinator {
+            gate: Arc::clone(&gate),
+            edge: None,
+            video: Some((
+                inputs,
+                VideoWorker::start(FixtureMonitor(Arc::clone(&input))).unwrap(),
+            )),
+            controls,
+            events,
+            cursor: FixtureCursor {
+                gate: Arc::clone(&gate),
+                controls: control_send,
+                toggles: Arc::clone(&toggles),
+            },
+        };
+        let source = async {
+            let stream = TcpStream::connect(address).await.unwrap();
+            let mut pipe = Pipe::connect(stream, &host, &peer.public, true)
+                .await
+                .unwrap();
+            assert!(
+                Handoff::new(Some(inputs))
+                    .run(&mut pipe, &mut io)
+                    .await
+                    .is_err()
+            );
+        };
+        let destination = async {
+            let mut pipe = Pipe::connect(
+                listener.accept().await.unwrap().0,
+                &peer,
+                &host.public,
+                false,
+            )
+            .await
+            .unwrap();
+            pipe.send(Message::SwitchRequested).await.unwrap();
+            assert_eq!(
+                next(&mut pipe).await,
+                Message::Prepare {
+                    id: 1,
+                    inputs: Some(inputs),
+                    edge: None
+                }
+            );
+            assert_eq!(input.load(SeqCst), inputs.host);
+            pipe.send(Message::Ready(1)).await.unwrap();
+            assert_eq!(next(&mut pipe).await, Message::Verify(1));
+            assert_eq!(input.load(SeqCst), inputs.peer);
+            assert!(gate.current().1 == Route::Hold);
+            pipe.send(Message::Observed {
+                id: 1,
+                input: inputs.peer,
+            })
+            .await
+            .unwrap();
+            assert_eq!(next(&mut pipe).await, Message::Activate(1));
+            pipe.send(Message::Active(1)).await.unwrap();
+            while gate.current().1 != Route::Remote {
+                sleep(Duration::from_millis(1)).await;
+            }
+            pipe.send(Message::SwitchRequested).await.unwrap();
+            assert_eq!(next(&mut pipe).await, Message::Return(1));
+            input.store(inputs.host, SeqCst);
+            pipe.send(Message::Returning(1)).await.unwrap();
+            assert_eq!(next(&mut pipe).await, Message::Returned(1));
+            while gate.current().1 != Route::Local {
+                sleep(Duration::from_millis(1)).await;
+            }
+        };
+        timeout(Duration::from_secs(4), async {
+            tokio::join!(source, destination);
+        })
+        .await
+        .unwrap();
+        assert_eq!(input.load(SeqCst), inputs.host);
+        assert!(gate.current().1 == Route::Local);
+        assert_eq!(toggles.load(SeqCst), 2);
     }
 }

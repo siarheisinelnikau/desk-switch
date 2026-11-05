@@ -190,7 +190,18 @@ fn probe_one(displays: &[Display], id: &str) -> Result<()> {
     println!("Monitor ID: {id}");
     let bus = selected_bus(displays, id)?;
     println!("  Current VCP 0x60: {:#06x}", read_input(bus)?);
-    let codes = ddcutil(bus, &["capabilities"]).map(|caps| {
+    let codes = advertised_inputs(bus);
+    match codes {
+        Ok(codes) if !codes.is_empty() => println!("  Advertised inputs: {codes:#06x?}"),
+        _ => println!(
+            "  Monitor did not advertise an input list; read each active input during setup."
+        ),
+    }
+    Ok(())
+}
+
+fn advertised_inputs(bus: u32) -> Result<Vec<u16>> {
+    ddcutil(bus, &["capabilities"]).map(|caps| {
         let raw = caps
             .lines()
             .any(|line| line.trim_start().starts_with("vcp("));
@@ -213,14 +224,30 @@ fn probe_one(displays: &[Display], id: &str) -> Result<()> {
                 })
                 .collect()
         }
-    });
-    match codes {
-        Ok(codes) if !codes.is_empty() => println!("  Advertised inputs: {codes:#06x?}"),
-        _ => println!(
-            "  Monitor did not advertise an input list; read each active input during setup."
-        ),
-    }
-    Ok(())
+    })
+}
+
+pub fn discover() -> Result<Vec<super::MonitorInfo>> {
+    let displays = displays()?;
+    Ok(displays
+        .iter()
+        .map(|display| {
+            let read = selected_bus(&displays, &display.id)
+                .and_then(|bus| Ok((read_input(bus)?, advertised_inputs(bus).unwrap_or_default())));
+            let (current, inputs, error) = match read {
+                Ok((value, inputs)) => (Some(value), inputs, None),
+                Err(error) => (None, Vec::new(), Some(format!("{error:#}"))),
+            };
+            super::MonitorInfo {
+                id: display.id.clone(),
+                name: display.connector.clone(),
+                screen: display.connector.clone(),
+                current,
+                inputs,
+                error,
+            }
+        })
+        .collect())
 }
 
 #[cfg(test)]

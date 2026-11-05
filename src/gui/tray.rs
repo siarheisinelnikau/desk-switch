@@ -1,0 +1,258 @@
+use super::Action;
+use anyhow::Result;
+use eframe::egui;
+use std::sync::mpsc::Sender;
+
+pub fn icon_rgba(size: usize) -> Vec<u8> {
+    let mut rgba = vec![0; size * size * 4];
+    for y in 0..size {
+        for x in 0..size {
+            let fx = x as f32 / size as f32;
+            let fy = y as f32 / size as f32;
+            let background = (0.08..0.92).contains(&fx) && (0.08..0.92).contains(&fy);
+            let first = (0.19..0.57).contains(&fx) && (0.24..0.58).contains(&fy);
+            let second = (0.45..0.82).contains(&fx) && (0.43..0.76).contains(&fy);
+            let inner_first = (0.23..0.53).contains(&fx) && (0.28..0.53).contains(&fy);
+            let inner_second = (0.49..0.78).contains(&fx) && (0.47..0.71).contains(&fy);
+            let color = if (first && !inner_first) || (second && !inner_second) {
+                [255, 255, 255, 255]
+            } else if background {
+                [82, 99, 224, 255]
+            } else {
+                [0, 0, 0, 0]
+            };
+            rgba[(y * size + x) * 4..][..4].copy_from_slice(&color);
+        }
+    }
+    rgba
+}
+
+fn dispatch(sender: &Sender<Action>, ctx: &egui::Context, action: Action) {
+    if action == Action::Show {
+        ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+        ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+        ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+    }
+    let _ = sender.send(action);
+    ctx.request_repaint();
+}
+
+#[cfg(target_os = "linux")]
+mod native {
+    use super::*;
+    use ksni::blocking::TrayMethods;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    };
+
+    pub struct Item {
+        sender: Sender<Action>,
+        ctx: egui::Context,
+        connected: bool,
+        emergency: bool,
+        sound: bool,
+        available: Arc<AtomicBool>,
+    }
+
+    impl ksni::Tray for Item {
+        fn id(&self) -> String {
+            "desk-switch".into()
+        }
+        fn title(&self) -> String {
+            "Desk Switch".into()
+        }
+        fn activate(&mut self, _: i32, _: i32) {
+            dispatch(&self.sender, &self.ctx, Action::Show);
+        }
+        fn icon_pixmap(&self) -> Vec<ksni::Icon> {
+            let mut pixels = icon_rgba(32);
+            for pixel in pixels.as_chunks_mut::<4>().0 {
+                pixel.rotate_right(1);
+            }
+            vec![ksni::Icon {
+                width: 32,
+                height: 32,
+                data: pixels,
+            }]
+        }
+        fn tool_tip(&self) -> ksni::ToolTip {
+            ksni::ToolTip {
+                title: "Desk Switch".into(),
+                description: if self.connected {
+                    "Пара подключена"
+                } else {
+                    "Настройка рабочего места"
+                }
+                .into(),
+                ..Default::default()
+            }
+        }
+        fn watcher_online(&self) {
+            self.available.store(true, Ordering::Relaxed);
+        }
+        fn watcher_offline(&self, _: ksni::OfflineReason) -> bool {
+            self.available.store(false, Ordering::Relaxed);
+            self.ctx.request_repaint();
+            true
+        }
+        fn menu(&self) -> Vec<ksni::MenuItem<Self>> {
+            use ksni::menu::{MenuItem, StandardItem};
+            let item = |label: &str, action, enabled| {
+                StandardItem {
+                    label: label.into(),
+                    enabled,
+                    activate: Box::new(move |this: &mut Self| {
+                        dispatch(&this.sender, &this.ctx, action)
+                    }),
+                    ..Default::default()
+                }
+                .into()
+            };
+            vec![
+                item("Открыть Desk Switch", Action::Show, true),
+                MenuItem::Separator,
+                item("Переключить на другой ПК", Action::Switch, self.connected),
+                item("Аварийный возврат", Action::Emergency, self.emergency),
+                MenuItem::Separator,
+                item(
+                    if self.sound {
+                        "Выключить аудиоподключение"
+                    } else {
+                        "Включить аудиоподключение"
+                    },
+                    Action::Sound,
+                    true,
+                ),
+                MenuItem::Separator,
+                item("Завершить Desk Switch", Action::Quit, true),
+            ]
+        }
+    }
+
+    pub struct Tray {
+        handle: ksni::blocking::Handle<Item>,
+        available: Arc<AtomicBool>,
+    }
+
+    impl Tray {
+        pub fn new(sender: Sender<Action>, ctx: egui::Context) -> Result<Self> {
+            let available = Arc::new(AtomicBool::new(true));
+            let handle = Item {
+                sender,
+                ctx,
+                connected: false,
+                emergency: false,
+                sound: false,
+                available: Arc::clone(&available),
+            }
+            .assume_sni_available(true)
+            .spawn()?;
+            Ok(Self { handle, available })
+        }
+        pub fn available(&self) -> bool {
+            self.available.load(Ordering::Relaxed) && !self.handle.is_closed()
+        }
+        pub fn update(&mut self, connected: bool, emergency: bool, sound: bool) {
+            self.handle.update(|item| {
+                item.connected = connected;
+                item.emergency = emergency;
+                item.sound = sound;
+            });
+        }
+    }
+
+    impl Drop for Tray {
+        fn drop(&mut self) {
+            self.handle.shutdown();
+        }
+    }
+}
+
+#[cfg(windows)]
+mod native {
+    use super::*;
+    use tray_icon::{
+        Icon, MouseButton, TrayIcon, TrayIconBuilder, TrayIconEvent,
+        menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem},
+    };
+
+    pub struct Tray {
+        _icon: TrayIcon,
+        switch: MenuItem,
+        emergency: MenuItem,
+        sound: MenuItem,
+    }
+
+    impl Tray {
+        pub fn new(sender: Sender<Action>, ctx: egui::Context) -> Result<Self> {
+            let menu = Menu::new();
+            let show = MenuItem::with_id("show", "Открыть Desk Switch", true, None);
+            let switch = MenuItem::with_id("switch", "Переключить на другой ПК", false, None);
+            let emergency = MenuItem::with_id("emergency", "Аварийный возврат", false, None);
+            let sound = MenuItem::with_id("sound", "Включить аудиоподключение", true, None);
+            let quit = MenuItem::with_id("quit", "Завершить Desk Switch", true, None);
+            menu.append_items(&[
+                &show,
+                &PredefinedMenuItem::separator(),
+                &switch,
+                &emergency,
+                &PredefinedMenuItem::separator(),
+                &sound,
+                &PredefinedMenuItem::separator(),
+                &quit,
+            ])?;
+            let menu_sender = sender.clone();
+            let menu_ctx = ctx.clone();
+            MenuEvent::set_event_handler(Some(move |event: MenuEvent| {
+                let action = match event.id.0.as_str() {
+                    "show" => Action::Show,
+                    "switch" => Action::Switch,
+                    "emergency" => Action::Emergency,
+                    "sound" => Action::Sound,
+                    "quit" => Action::Quit,
+                    _ => return,
+                };
+                dispatch(&menu_sender, &menu_ctx, action);
+            }));
+            TrayIconEvent::set_event_handler(Some(move |event| {
+                if matches!(
+                    event,
+                    TrayIconEvent::DoubleClick {
+                        button: MouseButton::Left,
+                        ..
+                    }
+                ) {
+                    dispatch(&sender, &ctx, Action::Show);
+                }
+            }));
+            let icon = Icon::from_rgba(icon_rgba(32), 32, 32)?;
+            let icon = TrayIconBuilder::new()
+                .with_menu(Box::new(menu))
+                .with_menu_on_left_click(true)
+                .with_tooltip("Desk Switch")
+                .with_icon(icon)
+                .build()?;
+            Ok(Self {
+                _icon: icon,
+                switch,
+                emergency,
+                sound,
+            })
+        }
+        pub fn available(&self) -> bool {
+            true
+        }
+        pub fn update(&mut self, connected: bool, emergency: bool, sound: bool) {
+            self.switch.set_enabled(connected);
+            self.emergency.set_enabled(emergency);
+            self.sound.set_text(if sound {
+                "Выключить аудиоподключение"
+            } else {
+                "Включить аудиоподключение"
+            });
+        }
+    }
+}
+
+pub use native::Tray;
