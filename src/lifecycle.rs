@@ -21,8 +21,16 @@ pub enum InputStatus {
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub enum Event {
+    PeerVersion {
+        app: Option<String>,
+        protocol: Option<u16>,
+        compatible: bool,
+    },
     Input(InputStatus),
-    Audio { playing: bool, message: String },
+    Audio {
+        playing: bool,
+        message: String,
+    },
 }
 
 struct Controls {
