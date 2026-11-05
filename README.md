@@ -4,6 +4,21 @@ Share one keyboard and mouse, switch one selected monitor's HDMI/DP input, and l
 
 **F12** switches video and input in both directions. **F11** immediately restores host input and attempts to restore host video. A selected screen edge can transfer input alone or input with video. Audio has separate on/off and volume controls and continues across input and monitor switches.
 
+## Desktop window and tray
+
+Launch the binary without arguments, or run `desk-switch gui`, to open the native Rust desktop window. It includes pairing, input roles and addresses, monitor/input selection, edge settings, audio device and volume controls, and recent service logs. The interface is in Russian. The existing CLI commands remain available.
+
+![Desk Switch desktop window](docs/desktop.png)
+
+1. Open **Компьютеры** on both PCs. Create their keys, copy each public key to the other PC, and pin both. Choose the PC with the physical keyboard/mouse as the host and the other as the receiver. Enter the receiver's LAN address on both.
+2. Open **Монитор и ввод**, enable switching, and click **Найти мониторы** on each PC. Select the shared physical monitor's local ID and fill in the two verified input codes as described below. Ubuntu hosts also need explicit keyboard/mouse paths under **Компьютеры**.
+3. Click **Подключить пару** on the receiver first, then on the host. Approve Ubuntu portal access when requested. Once authenticated, use **Переключить на другой ПК** in the window or tray menu. Clicking it again returns the monitor and input. **Аварийный возврат** restores control to the keyboard host.
+4. Configure audio separately under **Звук**: enable transmission on one PC and reception on the headphone PC. The tray's audio item starts/stops that PC's configured audio role. Volume and mute affect only the received stream.
+
+The tray provides Open, Switch, Emergency return, Audio on/off, and Quit. On Windows, click the icon to open its menu. On Ubuntu, the panel must support StatusNotifierItem/AppIndicator, as Ubuntu's AppIndicator GNOME extension does. Closing the window hides it while a usable tray is present; without one it exits cooperatively. If the tray disappears, the window reopens. **Завершить** / tray Quit stops the managed services and their normal recovery paths before exiting. A lost GUI command pipe also requests service shutdown.
+
+`desk-switch gui --tray` starts hidden only when the tray is available. Launching the GUI starts no input or audio service automatically. Pairing and settings are local; `desktop.toml` stores window preferences beside the existing `settings.toml`. Update both PCs together to use requests from the receiver's tray. Physical video switching still needs two cables into the shared monitor and DDC/CI support; screen pixels are not sent over the network.
+
 ## Build
 
 Install [rustup](https://rustup.rs/) and run the following on each PC.
@@ -16,7 +31,7 @@ Rust and dependencies are pinned. The binaries are target/release/desk-switch.ex
 
 Windows needs Windows 10/11. Native MSVC builds need Visual Studio Build Tools with the C++ workload. For a static MSVC CRT set the RUSTFLAGS environment variable to -C target-feature=+crt-static before building.
 
-Ubuntu needs build-essential to build. Run as your logged-in desktop user. Input uses the user session D-Bus, xdg-desktop-portal and a backend with RemoteDesktop v2 and EIS, such as compatible GNOME/Mutter with xdg-desktop-portal-gnome. Audio needs pipewire-bin and WirePlumber policy.
+Ubuntu needs build-essential to build, plus the usual X11/Wayland, xkbcommon and OpenGL/EGL desktop runtime libraries for the window. The GUI supports X11 and Wayland; Ubuntu input sharing requires Wayland. Run as your logged-in desktop user. Input uses the user session D-Bus, xdg-desktop-portal and a backend with RemoteDesktop v2 and EIS, such as compatible GNOME/Mutter with xdg-desktop-portal-gnome. Audio needs pipewire-bin and WirePlumber policy.
 
 Video switching on Ubuntu additionally needs ddcutil, i2c-dev and access to the selected /dev/i2c-* device. Use your distribution's package and device permission rules.
 
@@ -140,6 +155,8 @@ cargo test --locked
 ~~~
 
 Tests use synthetic devices, PCM and loopback TCP. On each real pair validate full switching with the second monitor visible, F11/link loss with held keys/buttons, edges/scaling, and simultaneous local/remote audio on the selected headphones. Ubuntu host device access and portal consent also need validation on the target PC.
+
+Desktop validation uses an isolated Xvfb display and private D-Bus StatusNotifier watcher to check settings persistence, key creation/pinning, the menu, hidden-window command handling, show/hide/quit, and watcher loss/reappearance. Managed sender shutdown is checked through both a stop command and pipe EOF without opening an audio device. The Windows desktop/tray code is cross-compiled; interactive Windows and real monitor validation must be done on the target PCs.
 
 [ddcutil troubleshooting](https://www.ddcutil.com/faq/), [setvcp](https://www.ddcutil.com/command_setvcp/), [Win32 SetVCPFeature](https://learn.microsoft.com/en-us/windows/win32/api/lowlevelmonitorconfigurationapi/nf-lowlevelmonitorconfigurationapi-setvcpfeature), [RemoteDesktop portal](https://flatpak.github.io/xdg-desktop-portal/docs/doc-org.freedesktop.portal.RemoteDesktop.html).
 

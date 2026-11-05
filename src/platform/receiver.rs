@@ -69,7 +69,10 @@ pub async fn run(
         .await
         .context("binding receiver listen address")?;
     println!("Listening for the pinned host peer on {address}.");
-    let shutdown = tokio::signal::ctrl_c();
+    crate::lifecycle::report(crate::lifecycle::Event::Input(
+        crate::lifecycle::InputStatus::Waiting,
+    ));
+    let shutdown = crate::lifecycle::shutdown();
     tokio::pin!(shutdown);
     loop {
         let (stream, _) = tokio::select! {
@@ -88,6 +91,9 @@ pub async fn run(
             }
         };
         println!("host peer authenticated.");
+        crate::lifecycle::report(crate::lifecycle::Event::Input(
+            crate::lifecycle::InputStatus::Peer,
+        ));
         let mut transfer = None;
         let mut last_id = 0;
         let result = tokio::select! {
@@ -107,6 +113,9 @@ pub async fn run(
         if result.is_none() {
             break;
         }
+        crate::lifecycle::report(crate::lifecycle::Event::Input(
+            crate::lifecycle::InputStatus::Waiting,
+        ));
     }
     Ok(())
 }
@@ -118,6 +127,7 @@ async fn session(
     transfer: &mut Option<Transfer>,
     last_id: &mut u64,
 ) -> Result<()> {
+    let mut commands = crate::lifecycle::commands();
     let mut lease = Instant::now() + LEASE;
     let mut next_read = Instant::now();
     let mut job: Option<oneshot::Receiver<Result<VideoResult>>> = None;
@@ -133,6 +143,11 @@ async fn session(
             "host did not complete the switch before the deadline"
         );
         tokio::select! {
+            command = commands.recv() => match command {
+                Ok(crate::lifecycle::Command::Switch) => pipe.send(Message::SwitchRequested).await?,
+                Ok(crate::lifecycle::Command::Emergency) => bail!("local emergency recovery requested"),
+                Err(_) => {}
+            },
             _ = tick.tick() => {
                 let Some(active) = transfer.as_mut() else { continue };
                 if let Some(pending) = &mut job {
@@ -206,6 +221,7 @@ async fn session(
                         sink.activate(active.edge, active.mode)?;
                         active.stage = Stage::Active;
                         pipe.send(Message::Active(id)).await?;
+                        crate::lifecycle::report(crate::lifecycle::Event::Input(crate::lifecycle::InputStatus::Here));
                         println!("Input active on receiver ({:?}).", active.mode);
                     }
                     Message::Event(input) if active.stage == Stage::Active => {
@@ -230,6 +246,7 @@ async fn session(
                     }
                     Message::Returned(id) if active.id == id && active.stage == Stage::Returned => {
                         *transfer = None;
+                        crate::lifecycle::report(crate::lifecycle::Event::Input(crate::lifecycle::InputStatus::Peer));
                         println!("Input returned to host.");
                     }
                     _ => bail!("unexpected, stale or out-of-phase command"),

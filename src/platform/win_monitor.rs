@@ -313,6 +313,16 @@ pub fn probe(only: Option<&str>) -> Result<()> {
 fn probe_physical(monitor: &Physical) -> Result<()> {
     let handle = monitor.0.hPhysicalMonitor;
     println!("  Current VCP 0x60: {:#06x}", read(handle)?);
+    let codes = advertised_inputs(handle);
+    if codes.is_empty() {
+        println!("  Monitor did not advertise an input list; read each active input during setup.");
+    } else {
+        println!("  Advertised inputs: {codes:#06x?}");
+    }
+    Ok(())
+}
+
+fn advertised_inputs(handle: HANDLE) -> Vec<u16> {
     let mut length = 0;
     let mut codes = Vec::new();
     if unsafe { GetCapabilitiesStringLength(handle, &mut length) } != 0
@@ -326,10 +336,43 @@ fn probe_physical(monitor: &Physical) -> Result<()> {
             codes = input_codes(&capabilities.to_string_lossy());
         }
     }
-    if codes.is_empty() {
-        println!("  Monitor did not advertise an input list; read each active input during setup.");
-    } else {
-        println!("  Advertised inputs: {codes:#06x?}");
-    }
-    Ok(())
+    codes
+}
+
+pub fn discover() -> Result<Vec<super::MonitorInfo>> {
+    Ok(screens()?
+        .iter()
+        .map(|screen| {
+            let identity = identity(screen);
+            let (id, name) = match identity {
+                Ok(found) => found,
+                Err(error) => {
+                    return super::MonitorInfo {
+                        id: String::new(),
+                        name: screen.name.clone(),
+                        screen: screen.name.clone(),
+                        current: None,
+                        inputs: Vec::new(),
+                        error: Some(format!("{error:#}")),
+                    };
+                }
+            };
+            let result = physical(screen).and_then(|physical| {
+                let handle = physical.0.hPhysicalMonitor;
+                Ok((read(handle)?, advertised_inputs(handle)))
+            });
+            let (current, inputs, error) = match result {
+                Ok((current, inputs)) => (Some(current), inputs, None),
+                Err(error) => (None, Vec::new(), Some(format!("{error:#}"))),
+            };
+            super::MonitorInfo {
+                id,
+                name,
+                screen: screen.name.clone(),
+                current,
+                inputs,
+                error,
+            }
+        })
+        .collect())
 }
