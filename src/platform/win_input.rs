@@ -96,6 +96,18 @@ impl HookData {
             })
     }
 
+    fn toggle(&self) {
+        let (token, route) = self.gate.current();
+        let switching = match route {
+            Route::Local if self.idle() => self.gate.begin(),
+            Route::Remote if self.gate.hold(token) => Some(token),
+            _ => None,
+        };
+        if let Some(token) = switching {
+            self.control(token, Control::Toggle(token));
+        }
+    }
+
     fn keyboard(&mut self, data: &KBDLLHOOKSTRUCT) -> bool {
         if data.flags & LLKHF_INJECTED != 0 {
             return false;
@@ -110,15 +122,7 @@ impl HookData {
         }
         if data.vkCode == u32::from(VK_F12) {
             if down && !self.toggle_down {
-                let (token, route) = self.gate.current();
-                let switching = match route {
-                    Route::Local if self.idle() => self.gate.begin(),
-                    Route::Remote if self.gate.hold(token) => Some(token),
-                    _ => None,
-                };
-                if let Some(token) = switching {
-                    self.control(token, Control::Toggle(token));
-                }
+                self.toggle();
             }
             self.toggle_down = down;
             return true;
@@ -317,6 +321,13 @@ impl Hooks {
                     return Err(io::Error::last_os_error())
                         .context("Windows input message loop failed");
                 }
+                _ if msg.message == REQUEST_TOGGLE => {
+                    DATA.with(|state| {
+                        if let Some(state) = state.borrow().as_ref() {
+                            state.toggle();
+                        }
+                    });
+                }
                 _ => unsafe {
                     TranslateMessage(&msg);
                     DispatchMessageW(&msg);
@@ -372,3 +383,5 @@ fn move_cursor(x: f64, y: f64) -> Result<()> {
     }
     Ok(())
 }
+
+pub const REQUEST_TOGGLE: u32 = WM_APP + 20;

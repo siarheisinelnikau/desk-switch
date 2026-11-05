@@ -52,4 +52,5 @@ pub enum Message {
     Returning(u64),
     Returned(u64),
     Rejected(u64),
+    SwitchRequested,
 }

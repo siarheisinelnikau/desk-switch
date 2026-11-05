@@ -1,6 +1,6 @@
 use crate::{edge::Side, video::Inputs, wire::Mode};
 use anyhow::{Context, Result, anyhow, bail, ensure};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use snow::Builder;
 use std::{
     fmt::Write as _,
@@ -138,36 +138,36 @@ pub fn load_peer(dir: &Path) -> Result<Key> {
         .trim())
 }
 
-#[derive(Default, Deserialize)]
+#[derive(Clone, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
-struct FileSettings {
-    monitor: Option<MonitorSettings>,
-    edge: Option<EdgeSettings>,
-    capture: Option<CaptureSettings>,
+pub struct FileSettings {
+    pub monitor: Option<MonitorSettings>,
+    pub edge: Option<EdgeSettings>,
+    pub capture: Option<CaptureSettings>,
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
-struct MonitorSettings {
-    id: String,
+pub struct MonitorSettings {
+    pub id: String,
     #[serde(alias = "windows")]
-    host: u16,
+    pub host: u16,
     #[serde(alias = "ubuntu")]
-    peer: u16,
+    pub peer: u16,
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
-struct CaptureSettings {
-    devices: Vec<PathBuf>,
+pub struct CaptureSettings {
+    pub devices: Vec<PathBuf>,
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
-struct EdgeSettings {
-    mode: String,
-    screen: Option<String>,
-    side: Option<String>,
+pub struct EdgeSettings {
+    pub mode: String,
+    pub screen: Option<String>,
+    pub side: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -184,15 +184,61 @@ pub struct Settings {
     pub capture_devices: Vec<PathBuf>,
 }
 
+pub fn read_settings(dir: &Path) -> Result<FileSettings> {
+    let path = dir.join("settings.toml");
+    match fs::read_to_string(&path) {
+        Ok(data) => toml::from_str(&data).with_context(|| format!("parsing {}", path.display())),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(FileSettings::default()),
+        Err(error) => Err(error.into()),
+    }
+}
+
+pub fn write_atomic(path: &Path, contents: &str) -> Result<()> {
+    let directory = path.parent().context("settings path has no directory")?;
+    let mut builder = fs::DirBuilder::new();
+    builder.recursive(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(0o700);
+    }
+    builder.create(directory)?;
+    let temp = path.with_extension(format!("{}.tmp", std::process::id()));
+    let result = (|| {
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = options.open(&temp)?;
+        file.write_all(contents.as_bytes())?;
+        file.sync_all()?;
+        drop(file);
+        fs::rename(&temp, path)?;
+        Ok::<_, anyhow::Error>(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temp);
+    }
+    result
+}
+
+pub fn save_settings(dir: &Path, document: &FileSettings) -> Result<()> {
+    Settings::from_document(document.clone())?;
+    write_atomic(
+        &dir.join("settings.toml"),
+        &toml::to_string_pretty(document)?,
+    )
+}
+
 impl Settings {
     pub fn load(dir: &Path) -> Result<Self> {
-        let path = dir.join("settings.toml");
-        let config = match fs::read_to_string(&path) {
-            Ok(data) => toml::from_str::<FileSettings>(&data)
-                .with_context(|| format!("parsing {}", path.display()))?,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => FileSettings::default(),
-            Err(error) => return Err(error.into()),
-        };
+        Self::from_document(read_settings(dir)?)
+    }
+
+    fn from_document(config: FileSettings) -> Result<Self> {
         let monitor = config
             .monitor
             .map(|m| {

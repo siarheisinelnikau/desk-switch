@@ -28,6 +28,10 @@ impl Player {
     fn status(&self, text: String) {
         let mut status = self.status.lock().unwrap();
         if *status != text {
+            crate::lifecycle::report(crate::lifecycle::Event::Audio {
+                playing: text.starts_with("playing on "),
+                message: text.clone(),
+            });
             println!("Remote audio: {text}");
             *status = text;
         }
@@ -111,7 +115,11 @@ pub async fn play(
         tokio::select! {
             result = &mut shutdown => break result,
             command = commands.recv(), if read_commands => {
-                let Some(command) = command else { read_commands = false; continue };
+                let Some(command) = command else {
+                    if crate::lifecycle::managed() { break Ok(()); }
+                    read_commands = false;
+                    continue;
+                };
                 match command.split_whitespace().collect::<Vec<_>>().as_slice() {
                     ["on"] if task.is_none() => {
                         player.status(format!("connecting to {address}"));

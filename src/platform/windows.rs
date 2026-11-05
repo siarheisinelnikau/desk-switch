@@ -12,9 +12,16 @@ use windows_sys::Win32::{
     UI::WindowsAndMessaging::{PostThreadMessageW, WM_QUIT},
 };
 
-struct WindowsCursor;
+struct WindowsCursor(u32);
 
 impl super::host::Cursor for WindowsCursor {
+    async fn request_toggle(&self) -> Result<()> {
+        anyhow::ensure!(
+            unsafe { PostThreadMessageW(self.0, win_input::REQUEST_TOGGLE, 0, 0) } != 0,
+            "Windows input thread is unavailable"
+        );
+        Ok(())
+    }
     async fn center(&self) -> Result<()> {
         win_input::center()
     }
@@ -49,7 +56,7 @@ pub fn run(
                     video,
                     controls,
                     events,
-                    cursor: WindowsCursor,
+                    cursor: WindowsCursor(hook_thread),
                 },
             ));
             unsafe {

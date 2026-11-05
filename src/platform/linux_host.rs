@@ -23,6 +23,7 @@ use std::{
 use tokio::sync::{mpsc, oneshot};
 
 enum CursorAction {
+    Toggle,
     Suspend,
     Resume(Option<u16>),
 }
@@ -46,6 +47,9 @@ impl PortalCursor {
 }
 
 impl host::Cursor for PortalCursor {
+    async fn request_toggle(&self) -> Result<()> {
+        self.command(CursorAction::Toggle).await
+    }
     async fn resume(&self) -> Result<()> {
         self.command(CursorAction::Resume(None)).await
     }
@@ -125,6 +129,16 @@ impl Routing {
         }
     }
 
+    fn toggle(&self) -> Option<Control> {
+        let (token, route) = self.gate.current();
+        let token = match route {
+            Route::Local if self.owners.is_empty() => self.gate.begin(),
+            Route::Remote if self.gate.hold(token) => Some(token),
+            _ => None,
+        };
+        token.map(Control::Toggle)
+    }
+
     fn key(
         &mut self,
         device: usize,
@@ -148,13 +162,7 @@ impl Routing {
                 self.cooldown = Instant::now() + Duration::from_millis(500);
                 return (None, None);
             }
-            let (token, route) = self.gate.current();
-            let token = match route {
-                Route::Local if self.owners.is_empty() => self.gate.begin(),
-                Route::Remote if self.gate.hold(token) => Some(token),
-                _ => None,
-            };
-            return (token.map(Control::Toggle), None);
+            return (self.toggle(), None);
         }
         let input = if (272..=276).contains(&code) {
             Input::Button { code, down }
@@ -347,6 +355,18 @@ async fn capture(
             command = cursor.recv() => {
                 let command = command.context("host coordinator stopped")?;
                 match command.action {
+                    CursorAction::Toggle => {
+                        if let Some(control) = routing.toggle()
+                            && controls.try_send(control).is_err()
+                        {
+                            gate.emergency();
+                        }
+                        if gate.current().1 != Route::Local && local_active {
+                            portal.release()?;
+                            local_active = false;
+                        }
+                        let _ = command.reply.send(Ok(()));
+                    }
                     CursorAction::Suspend => {
                         if local_active {
                             portal.release()?;
