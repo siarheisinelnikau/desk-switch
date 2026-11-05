@@ -49,6 +49,25 @@ pub async fn authenticate(
     initiator: bool,
     prologue: &[u8],
 ) -> Result<TransportState> {
+    authenticate_versioned(
+        stream,
+        ours,
+        peer,
+        initiator,
+        prologue,
+        &crate::compatibility::Version::current(),
+    )
+    .await
+}
+
+async fn authenticate_versioned(
+    stream: &mut TcpStream,
+    ours: &Identity,
+    peer: &Key,
+    initiator: bool,
+    prologue: &[u8],
+    version: &crate::compatibility::Version,
+) -> Result<TransportState> {
     stream.set_nodelay(true)?;
     let builder = Builder::new(NOISE.parse()?)
         .prologue(prologue)?
@@ -62,20 +81,29 @@ pub async fn authenticate(
 
     timeout(Duration::from_secs(2), async {
         let mut record = [0; MAX_RECORD];
+        let hello = version.encode()?;
+        let mut peer_version = None;
         for send in [initiator, !initiator] {
             if send {
-                let len = noise.write_message(&[], &mut record)?;
+                let len = noise.write_message(&hello, &mut record)?;
                 write_record(stream, &record[..len]).await?;
             } else {
                 let len = read_record(stream, &mut record).await?;
                 let mut payload = [0; MAX_RECORD];
-                ensure!(
-                    noise.read_message(&record[..len], &mut payload)? == 0,
-                    "invalid handshake payload"
-                );
+                let len = noise.read_message(&record[..len], &mut payload)?;
+                peer_version = crate::compatibility::Version::decode(&payload[..len]).ok();
             }
         }
-        Ok(noise.into_transport_mode()?)
+        // The responder sends its authenticated version even when rejecting the peer,
+        // so both PCs can explain a mismatch before any input/audio starts.
+        let compatible = version.require(peer_version.as_ref());
+        crate::lifecycle::report(crate::lifecycle::Event::PeerVersion {
+            app: peer_version.as_ref().map(|v| v.app.clone()),
+            protocol: peer_version.as_ref().map(|v| v.protocol),
+            compatible: compatible.is_ok(),
+        });
+        compatible?;
+        Ok::<_, anyhow::Error>(noise.into_transport_mode()?)
     })
     .await
     .context("peer authentication timed out")?
@@ -230,6 +258,112 @@ mod tests {
                 Message::Ping(42)
             );
             pipe.send(Message::Pong(42)).await.unwrap();
+        };
+        tokio::join!(client, server);
+    }
+
+    #[tokio::test]
+    async fn both_channels_reject_app_or_protocol_mismatch_on_both_pcs() {
+        use crate::compatibility::{Mismatch, PROTOCOL, Version};
+        for prologue in [
+            b"Desk Switch protocol 1".as_slice(),
+            b"Desk Switch audio 1".as_slice(),
+        ] {
+            for remote in [
+                Version {
+                    app: "0.2.1".into(),
+                    protocol: PROTOCOL,
+                },
+                Version {
+                    protocol: PROTOCOL + 1,
+                    ..Version::current()
+                },
+            ] {
+                let host = identity();
+                let peer = identity();
+                let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let address = listener.local_addr().unwrap();
+                let local = Version::current();
+                let client = async {
+                    let mut stream = TcpStream::connect(address).await.unwrap();
+                    let error = authenticate_versioned(
+                        &mut stream,
+                        &host,
+                        &peer.public,
+                        true,
+                        prologue,
+                        &local,
+                    )
+                    .await
+                    .err()
+                    .unwrap();
+                    let mismatch = error.downcast_ref::<Mismatch>().unwrap();
+                    assert_eq!(mismatch.peer.as_ref(), Some(&remote));
+                };
+                let server = async {
+                    let mut stream = listener.accept().await.unwrap().0;
+                    let error = authenticate_versioned(
+                        &mut stream,
+                        &peer,
+                        &host.public,
+                        false,
+                        prologue,
+                        &remote,
+                    )
+                    .await
+                    .err()
+                    .unwrap();
+                    let mismatch = error.downcast_ref::<Mismatch>().unwrap();
+                    assert_eq!(mismatch.peer.as_ref(), Some(&local));
+                };
+                tokio::join!(client, server);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn legacy_authenticated_peer_is_rejected_before_a_transport_is_created() {
+        let host = identity();
+        let peer = identity();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let client = async {
+            let mut stream = TcpStream::connect(address).await.unwrap();
+            let mut noise = Builder::new(NOISE.parse().unwrap())
+                .prologue(b"Desk Switch protocol 1")
+                .unwrap()
+                .local_private_key(&host.private)
+                .unwrap()
+                .remote_public_key(&peer.public)
+                .unwrap()
+                .build_initiator()
+                .unwrap();
+            let mut record = [0; MAX_RECORD];
+            let len = noise.write_message(&[], &mut record).unwrap();
+            write_record(&mut stream, &record[..len]).await.unwrap();
+            let len = read_record(&mut stream, &mut record).await.unwrap();
+            let mut plain = [0; MAX_RECORD];
+            assert!(noise.read_message(&record[..len], &mut plain).unwrap() > 0);
+        };
+        let server = async {
+            let mut stream = listener.accept().await.unwrap().0;
+            let error = authenticate(
+                &mut stream,
+                &peer,
+                &host.public,
+                false,
+                b"Desk Switch protocol 1",
+            )
+            .await
+            .err()
+            .unwrap();
+            assert!(
+                error
+                    .downcast_ref::<crate::compatibility::Mismatch>()
+                    .unwrap()
+                    .peer
+                    .is_none()
+            );
         };
         tokio::join!(client, server);
     }

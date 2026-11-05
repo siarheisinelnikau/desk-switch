@@ -166,6 +166,7 @@ impl Desktop {
                     (Page::Devices, "Компьютеры"),
                     (Page::Monitor, "Монитор и ввод"),
                     (Page::Sound, "Звук"),
+                    (Page::Application, "Запуск и обновления"),
                     (Page::Diagnostics, "Диагностика"),
                 ] {
                     let selected = self.page == page;
@@ -238,6 +239,7 @@ impl Desktop {
                             Page::Devices => self.computers(ui),
                             Page::Monitor => self.monitor(ui),
                             Page::Sound => self.sound(ui),
+                            Page::Application => self.application(ui),
                             Page::Diagnostics => self.diagnostics(ui),
                         }
                         if let Some((message, error)) = self.notice.clone() {
@@ -847,5 +849,103 @@ impl Desktop {
                     });
             });
         }
+    }
+
+    fn application(&mut self, ui: &mut egui::Ui) {
+        title(
+            ui,
+            "Запуск и обновления",
+            "Автозапуск, единая версия на обоих ПК и подписанные обновления.",
+        );
+        card(ui, |ui| {
+            subheading(ui, "При входе в систему");
+            ui.checkbox(
+                &mut self.prefs.autostart,
+                "Запускать Desk Switch в трее при входе в систему",
+            );
+            ui.checkbox(
+                &mut self.prefs.auto_connect,
+                "Подключать настроенную пару при запуске приложения",
+            );
+            ui.checkbox(
+                &mut self.prefs.auto_audio,
+                "Включать настроенное аудиоподключение при запуске",
+            );
+            note(
+                ui,
+                "Подключение начинается после сопряжения и настройки. На Ubuntu может потребоваться системное подтверждение доступа.",
+            );
+            if primary(ui, "Сохранить настройки запуска").clicked() {
+                self.save_application();
+            }
+        });
+        card(ui, |ui| {
+            subheading(ui, "Версии двух компьютеров");
+            ui.label(format!(
+                "Этот компьютер: {} · протокол {}",
+                crate::compatibility::VERSION,
+                crate::compatibility::PROTOCOL
+            ));
+            let peer = [&self.input, &self.audio]
+                .into_iter()
+                .flatten()
+                .find_map(|worker| worker.peer_version.as_deref());
+            ui.label(format!(
+                "Другой компьютер: {}",
+                peer.unwrap_or("версия появится после подключения")
+            ));
+            if let Some(error) = &self.last_version_error {
+                ui.colored_label(Color32::from_rgb(162, 69, 53), error);
+            }
+            note(
+                ui,
+                "Приложения сверяют точную версию и протокол. При несовпадении ввод и звук не передаются.",
+            );
+        });
+        card(ui, |ui| {
+            subheading(ui, "Обновления");
+            if ui
+                .checkbox(
+                    &mut self.prefs.auto_update,
+                    "Проверять и скачивать обновления автоматически",
+                )
+                .changed()
+            {
+                let result = self.prefs.save(&self.dir);
+                self.message(result, "Настройка обновлений сохранена.");
+            }
+            note(
+                ui,
+                "Проверяем при запуске и каждые 6 часов. Устанавливаем при следующем запуске, до подключения ввода.",
+            );
+            ui.label(&self.update_status);
+            ui.horizontal(|ui| {
+                if ui
+                    .add_enabled(
+                        self.update_job.is_none(),
+                        egui::Button::new("Проверить обновления"),
+                    )
+                    .clicked()
+                {
+                    self.check_updates(ui.ctx());
+                }
+                if ui
+                    .add_enabled(
+                        self.update_ready,
+                        egui::Button::new("Обновить и перезапустить"),
+                    )
+                    .clicked()
+                {
+                    self.install_update(ui.ctx());
+                }
+                if self.update_job.is_some() {
+                    ui.spinner();
+                }
+            });
+            note(
+                ui,
+                "Обновления подписаны ключом проекта. Релиз содержит сборки Windows и Ubuntu одной версии.",
+            );
+        });
     }
 }
