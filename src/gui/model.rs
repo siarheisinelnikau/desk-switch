@@ -6,6 +6,10 @@ use std::path::{Path, PathBuf};
 #[derive(Clone, Deserialize, Serialize)]
 #[serde(default)]
 pub struct Preferences {
+    pub autostart: bool,
+    pub auto_connect: bool,
+    pub auto_audio: bool,
+    pub auto_update: bool,
     pub role: String,
     pub address: String,
     pub audio_mode: String,
@@ -19,6 +23,10 @@ pub struct Preferences {
 impl Default for Preferences {
     fn default() -> Self {
         Self {
+            autostart: true,
+            auto_connect: true,
+            auto_audio: false,
+            auto_update: true,
             role: if cfg!(windows) { "host" } else { "receiver" }.into(),
             address: "192.168.1.20:45876".into(),
             audio_mode: "receive".into(),
@@ -202,6 +210,17 @@ pub fn input_code(value: &str) -> Result<u16> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn older_preferences_enable_login_and_updates_but_do_not_start_audio() {
+        let prefs: Preferences =
+            toml::from_str("role='receiver'\naddress='192.168.1.20:45876'\nvolume=25\nmuted=true")
+                .unwrap();
+        assert!(prefs.autostart && prefs.auto_connect && prefs.auto_update);
+        assert!(!prefs.auto_audio);
+        assert_eq!(prefs.volume, 25);
+        assert!(prefs.muted);
+    }
 
     #[test]
     fn launch_arguments_preserve_literal_device_names_and_role() {

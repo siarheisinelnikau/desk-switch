@@ -2,3 +2,6 @@
 *.desk-switch.toml
 /identity
 /peer
+/.release-private/
+/dist/
+__pycache__/

@@ -4,6 +4,8 @@ use anyhow::{Context, Result, bail, ensure};
 use std::net::SocketAddr;
 
 mod audio;
+mod autostart;
+mod compatibility;
 mod config;
 mod controller;
 mod edge;
@@ -15,6 +17,7 @@ mod lifecycle;
 #[cfg(any(windows, target_os = "linux"))]
 mod platform;
 mod transport;
+mod updater;
 mod video;
 mod wire;
 
@@ -33,7 +36,9 @@ const USAGE: &str = "Desk Switch\n\
 fn main() {
     #[cfg(windows)]
     if std::env::args().len() > 1
-        && !std::env::args().nth(1).is_some_and(|arg| arg == "gui")
+        && !std::env::args()
+            .nth(1)
+            .is_some_and(|arg| arg == "gui" || arg == "internal-update-apply")
         && !lifecycle::managed()
     {
         // Keep explicit CLI commands usable from a terminal without a console on GUI launch.
@@ -53,8 +58,16 @@ fn run() -> Result<()> {
     match args.as_slice() {
         [] | ["gui"] => gui::run(false)?,
         ["gui", "--tray"] => gui::run(true)?,
+        ["gui", "--tray", "--state-dir", path] => {
+            gui::run_at(true, std::path::PathBuf::from(path))?
+        }
         ["help" | "--help" | "-h"] => println!("{USAGE}"),
-        ["--version" | "-V"] => println!("Desk Switch {}", env!("CARGO_PKG_VERSION")),
+        ["--build-info"] => println!("{}", compatibility::BUILD_INFO),
+        ["--version" | "-V"] => println!(
+            "Desk Switch {} (protocol {})",
+            compatibility::VERSION,
+            compatibility::PROTOCOL
+        ),
         ["state-dir"] => println!("{}", config::state_dir()?.display()),
         ["init"] => println!(
             "{}",
@@ -94,6 +107,7 @@ fn run() -> Result<()> {
             })?;
         }
         ["audio", args @ ..] => audio::run(args)?,
+        ["internal-update-apply", dir] => updater::apply(std::path::Path::new(dir))?,
         ["run", address] | ["run", "--role", _, address] => {
             let role = args
                 .get(2)

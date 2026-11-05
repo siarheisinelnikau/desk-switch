@@ -29,6 +29,7 @@ enum Page {
     Devices,
     Monitor,
     Sound,
+    Application,
     Diagnostics,
 }
 
@@ -65,10 +66,21 @@ pub struct Desktop {
     quitting: bool,
     last_switch: Option<Instant>,
     dirty: bool,
+    startup_pending: bool,
+    startup_valid: bool,
+    update_job: Option<crate::updater::Job>,
+    update_status: String,
+    update_ready: bool,
+    last_update_check: Option<Instant>,
+    last_version_error: Option<String>,
 }
 
 pub fn run(start_hidden: bool) -> Result<()> {
-    let dir = config::state_dir()?;
+    run_at(start_hidden, config::state_dir()?)
+}
+
+pub fn run_at(start_hidden: bool, dir: PathBuf) -> Result<()> {
+    anyhow::ensure!(dir.is_absolute(), "путь профиля должен быть абсолютным");
     let mut builder = std::fs::DirBuilder::new();
     builder.recursive(true);
     #[cfg(unix)]
@@ -125,6 +137,7 @@ impl Desktop {
             .map(|key| config::hex(&key))
             .unwrap_or_default();
         let (send, actions) = mpsc::channel();
+        let startup_valid = prefs_error.is_none() && settings_error.is_none();
         let (tray, tray_error) = match tray::Tray::new(send, ctx) {
             Ok(tray) => (Some(tray), None),
             Err(error) => (None, Some(format!("{error:#}"))),
@@ -154,6 +167,13 @@ impl Desktop {
             quitting: false,
             last_switch: None,
             dirty: false,
+            startup_pending: true,
+            startup_valid,
+            update_job: None,
+            update_status: "Проверка ещё не выполнялась.".into(),
+            update_ready: false,
+            last_update_check: None,
+            last_version_error: None,
         }
     }
 
@@ -205,6 +225,10 @@ impl Desktop {
 
     fn toggle_audio(&mut self) {
         if self.audio_running() {
+            self.prefs.auto_audio = false;
+            if let Err(error) = self.prefs.save(&self.dir) {
+                self.notice = Some((error.to_string(), true));
+            }
             self.audio.as_mut().unwrap().stop();
             return;
         }
@@ -219,6 +243,8 @@ impl Desktop {
                 Kind::AudioReceive
             };
             self.audio = Some(Worker::start(kind, &args, &self.dir)?);
+            self.prefs.auto_audio = true;
+            self.prefs.save(&self.dir)?;
             Ok(())
         })();
         self.message(result, "Аудиослужба запускается.");
@@ -320,6 +346,10 @@ impl Desktop {
     }
 
     fn tick(&mut self, ctx: &egui::Context) {
+        if self.startup_pending {
+            self.startup_pending = false;
+            self.startup(ctx);
+        }
         for _ in 0..32 {
             let Ok(action) = self.actions.try_recv() else {
                 break;
@@ -339,6 +369,61 @@ impl Desktop {
                     true,
                 ));
             }
+        }
+        let version_error = [&self.input, &self.audio]
+            .into_iter()
+            .flatten()
+            .find_map(|worker| worker.version_error.clone());
+        if let Some(error) = &version_error
+            && self.last_version_error.as_ref() != Some(error)
+        {
+            self.notice = Some((error.clone(), true));
+            self.action(Action::Show, ctx);
+            if self.prefs.auto_update
+                && self
+                    .last_update_check
+                    .is_none_or(|time| time.elapsed() > Duration::from_secs(60))
+            {
+                self.check_updates(ctx);
+            }
+        }
+        self.last_version_error = version_error;
+        if let Some(result) = self.update_job.as_ref().and_then(crate::updater::Job::poll) {
+            self.update_job = None;
+            match result {
+                Ok(crate::updater::Outcome::Current) => {
+                    self.update_status = "Установлена актуальная версия.".into()
+                }
+                Ok(crate::updater::Outcome::Unpublished) => {
+                    self.update_status = "Канал настроен. Релизы ещё не опубликованы.".into()
+                }
+                Ok(crate::updater::Outcome::Ready(version)) => {
+                    self.update_ready = true;
+                    self.update_status = format!(
+                        "Версия {version} проверена и скачана. Установится при следующем запуске."
+                    );
+                    if self.prefs.auto_update
+                        && !self.input_running()
+                        && !self.audio_running()
+                        && !self.quitting
+                        && !self.dir.join("updates/last-error.txt").exists()
+                    {
+                        self.install_update(ctx);
+                    }
+                }
+                Err(error) => {
+                    self.update_status = format!("Не удалось проверить обновления: {error:#}")
+                }
+            }
+        }
+        if self.prefs.auto_update
+            && !self.quitting
+            && self.update_job.is_none()
+            && self
+                .last_update_check
+                .is_some_and(|time| time.elapsed() > Duration::from_secs(6 * 60 * 60))
+        {
+            self.check_updates(ctx);
         }
         if let Some((_, query)) = &mut self.query {
             query.poll();
@@ -408,6 +493,9 @@ impl Desktop {
         let Some(worker) = &self.input else {
             return ("Не подключено", false);
         };
+        if worker.version_error.is_some() {
+            return ("Версии не совпадают", false);
+        }
         if worker.stopping && worker.running() {
             return ("Отключение…", false);
         }
@@ -419,6 +507,74 @@ impl Desktop {
             Some(InputStatus::Peer) => ("Управление на другом ПК", true),
             Some(InputStatus::Recovering) => ("Возврат управления…", false),
             _ => ("Ожидание второго ПК", false),
+        }
+    }
+
+    fn startup(&mut self, ctx: &egui::Context) {
+        if !self.startup_valid {
+            return;
+        }
+        let result = std::env::current_exe()
+            .map_err(anyhow::Error::from)
+            .and_then(|exe| crate::autostart::sync(self.prefs.autostart, &exe, &self.dir));
+        if let Err(error) = result {
+            self.notice = Some((format!("{error:#}"), true));
+        }
+        let failed_update = std::fs::read_to_string(self.dir.join("updates/last-error.txt")).ok();
+        if let Some(error) = &failed_update {
+            self.notice = Some((format!("Обновление не установлено: {error}"), true));
+        }
+        if self.prefs.auto_update && failed_update.is_none() {
+            if crate::updater::staged(&self.dir).is_ok() {
+                self.update_ready = true;
+                self.install_update(ctx);
+                if self.quitting {
+                    return;
+                }
+            }
+            self.check_updates(ctx);
+        }
+        let paired = !self.public_key.is_empty() && !self.peer_key.is_empty();
+        if paired && self.prefs.auto_connect {
+            self.toggle_input();
+        }
+        if paired && self.prefs.auto_audio {
+            self.toggle_audio();
+        }
+    }
+
+    fn save_application(&mut self) {
+        let result = (|| {
+            self.prefs.save(&self.dir)?;
+            crate::autostart::sync(self.prefs.autostart, &std::env::current_exe()?, &self.dir)
+        })();
+        self.message(result, "Настройки запуска сохранены.");
+    }
+
+    fn check_updates(&mut self, ctx: &egui::Context) {
+        if self.update_job.is_some() || self.quitting {
+            return;
+        }
+        let result = std::env::current_exe()
+            .map_err(anyhow::Error::from)
+            .and_then(|exe| crate::updater::Job::start(self.dir.clone(), exe, ctx.clone()));
+        self.last_update_check = Some(Instant::now());
+        match result {
+            Ok(job) => {
+                self.update_job = Some(job);
+                self.update_status = "Проверяем и скачиваем подписанное обновление…".into();
+            }
+            Err(error) => self.update_status = error.to_string(),
+        }
+    }
+
+    fn install_update(&mut self, ctx: &egui::Context) {
+        match crate::updater::launch_apply(&self.dir) {
+            Ok(()) => {
+                let _ = std::fs::remove_file(self.dir.join("updates/last-error.txt"));
+                self.action(Action::Quit, ctx);
+            }
+            Err(error) => self.notice = Some((format!("{error:#}"), true)),
         }
     }
 }
