@@ -1,45 +1,47 @@
 mod link;
 #[cfg(target_os = "linux")]
 mod linux;
-#[cfg(any(windows, test))]
+#[cfg(windows)]
+#[path = "windows_output.rs"]
+mod output;
+#[cfg(target_os = "linux")]
+#[path = "linux_output.rs"]
+mod output;
+mod player;
 mod playout;
+mod sender;
 mod stream;
 #[cfg(windows)]
-mod windows;
+mod windows_capture;
 
 use crate::config;
-#[cfg(windows)]
 use anyhow::ensure;
 use anyhow::{Result, bail};
 
 const USAGE: &str = "Desk Switch audio is off until explicitly started.\n\
-    Ubuntu   audio sources\n\
-    Ubuntu   audio serve IP:PORT [--source PIPEWIRE_SINK]\n\
-    Windows  audio outputs\n\
-    Windows  audio play IP:PORT [--output ENDPOINT_ID] [--volume 0-100] [--mute]";
+             audio sources\n\
+             audio serve IP:PORT [--source PLAYBACK_SOURCE]\n\
+             audio outputs\n\
+             audio play IP:PORT [--output PLAYBACK_OUTPUT] [--volume 0-100] [--mute]";
 
 pub fn run(args: &[&str]) -> Result<()> {
     match args {
         [] | ["--help" | "-h" | "help"] => println!("{USAGE}"),
-        #[cfg(target_os = "linux")]
-        ["sources"] => crate::runtime()?.block_on(linux::list())?,
-        #[cfg(target_os = "linux")]
+        ["sources"] => list()?,
         ["serve", address] | ["serve", address, "--source", _] => {
             let address = crate::parse_address(address)?;
             let dir = config::state_dir()?;
             let identity = config::load_identity(&dir)?;
             let peer = config::load_peer(&dir)?;
             let _lock = config::lock(&dir, "audio.lock")?;
-            crate::runtime()?.block_on(linux::serve(
+            crate::runtime()?.block_on(sender::serve(
                 address,
                 identity,
                 peer,
                 args.get(3).copied(),
             ))?;
         }
-        #[cfg(windows)]
-        ["outputs"] => windows::list()?,
-        #[cfg(windows)]
+        ["outputs"] => list()?,
         ["play", address, options @ ..] => {
             let address = crate::parse_address(address)?;
             let mut output = None;
@@ -65,18 +67,21 @@ pub fn run(args: &[&str]) -> Result<()> {
                     _ => bail!("invalid audio option '{option}'\n{USAGE}"),
                 }
             }
+            ensure!(
+                !address.ip().is_unspecified(),
+                "audio player must connect to the sender's LAN IP"
+            );
             let dir = config::state_dir()?;
             let identity = config::load_identity(&dir)?;
             let peer = config::load_peer(&dir)?;
             let _lock = config::lock(&dir, "audio.lock")?;
-            crate::runtime()?.block_on(windows::play(address, identity, peer, output, mix))?;
+            crate::runtime()?.block_on(player::play(address, identity, peer, output, mix))?;
         }
         _ => bail!("invalid audio command for this platform\n{USAGE}"),
     }
     Ok(())
 }
 
-#[cfg(windows)]
 fn volume(value: &str) -> Result<u8> {
     value
         .parse()
@@ -87,3 +92,10 @@ fn volume(value: &str) -> Result<u8> {
 
 #[cfg(test)]
 mod tests;
+
+fn list() -> Result<()> {
+    #[cfg(windows)]
+    return output::list();
+    #[cfg(target_os = "linux")]
+    crate::runtime()?.block_on(linux::list())
+}

@@ -58,7 +58,7 @@ impl Controller {
             bail!("already switching");
         }
         if transfer.mode == Mode::Video && self.inputs.is_none() {
-            bail!("shared monitor and its Windows/Ubuntu VCP 0x60 inputs must be configured");
+            bail!("shared monitor and its host/receiver VCP 0x60 inputs must be configured");
         }
         self.phase = Phase::Preparing;
         self.transfer = Some(transfer);
@@ -81,7 +81,7 @@ impl Controller {
         let transfer = self
             .transfer
             .filter(|_| self.is_remote())
-            .ok_or_else(|| anyhow::anyhow!("no active Ubuntu transfer"))?;
+            .ok_or_else(|| anyhow::anyhow!("no active receiver transfer"))?;
         if exit.is_some() && transfer.edge.is_none() {
             bail!("exit edge was never armed");
         }
@@ -103,8 +103,8 @@ impl Controller {
                         .expect("video transfers require configured inputs");
                     self.phase = Phase::Writing;
                     Ok(Effect::Ddc(Job::Select {
-                        from: inputs.windows,
-                        to: inputs.ubuntu,
+                        from: inputs.host,
+                        to: inputs.peer,
                     }))
                 } else {
                     self.phase = Phase::Activating;
@@ -112,8 +112,8 @@ impl Controller {
                 }
             }
             (Phase::Verifying, Message::Observed { id: reply, input }) if reply == id => {
-                if self.inputs.map(|inputs| inputs.ubuntu) != Some(input) {
-                    bail!("Ubuntu did not observe its configured monitor input");
+                if self.inputs.map(|inputs| inputs.peer) != Some(input) {
+                    bail!("receiver did not observe its configured monitor input");
                 }
                 self.phase = Phase::Activating;
                 Ok(Effect::Send(Message::Activate(id)))
@@ -132,7 +132,7 @@ impl Controller {
             }
             (_, Message::Rejected(reply)) if reply == id => {
                 bail!(
-                    "Ubuntu rejected the transfer; check its portal, edge, and monitor diagnostics"
+                    "receiver rejected the transfer; check its portal, edge, and monitor diagnostics"
                 )
             }
             _ => bail!("unexpected or stale switch reply: {message:?}"),
@@ -153,7 +153,7 @@ impl Controller {
             .transfer
             .filter(|_| self.phase == Phase::Checking)
             .ok_or_else(|| anyhow::anyhow!("unexpected DDC read result"))?;
-        if self.inputs.map(|inputs| inputs.windows) == observed {
+        if self.inputs.map(|inputs| inputs.host) == observed {
             Ok(Effect::Send(Message::Returned(transfer.id)))
         } else {
             Ok(Effect::Ddc(Job::Read))
@@ -190,10 +190,7 @@ impl Controller {
 mod tests {
     use super::*;
 
-    const INPUTS: Inputs = Inputs {
-        windows: 17,
-        ubuntu: 15,
-    };
+    const INPUTS: Inputs = Inputs { host: 17, peer: 15 };
 
     fn setup(mode: Mode) -> Controller {
         let mut controller = Controller::new(Some(INPUTS));
@@ -257,7 +254,7 @@ mod tests {
     }
 
     #[test]
-    fn video_return_requires_a_fresh_windows_read() {
+    fn video_return_requires_a_fresh_host_read() {
         let mut controller = setup(Mode::Video);
         assert_eq!(controller.id(), Some(3));
         controller.message(Message::Ready(3)).unwrap();

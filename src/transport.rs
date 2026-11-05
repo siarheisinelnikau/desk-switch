@@ -20,7 +20,6 @@ use tokio::{
 const MAX_RECORD: usize = 128;
 const IO_TIMEOUT: Duration = Duration::from_millis(500);
 pub const LEASE: Duration = Duration::from_millis(1750);
-#[cfg(windows)]
 pub const PING_PERIOD: Duration = Duration::from_millis(250);
 
 async fn read_record(

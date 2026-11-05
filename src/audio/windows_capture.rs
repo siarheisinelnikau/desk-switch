@@ -1,0 +1,222 @@
+use super::{
+    link::{BLOCK_ALIGN, CHANNELS, FRAME_BYTES, Pcm, RATE},
+    output::{Com, output_device},
+};
+use anyhow::{Context, Result, ensure};
+use std::{
+    collections::VecDeque,
+    io,
+    pin::Pin,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    task::{Context as TaskContext, Poll},
+    thread::{self, JoinHandle},
+    time::{Duration, Instant},
+};
+use tokio::{
+    io::{AsyncRead, ReadBuf},
+    sync::{mpsc, oneshot},
+};
+use wasapi::{Direction, SampleType, StreamMode, WaveFormat};
+use windows::Win32::Media::Audio::{
+    AUDCLNT_BUFFERFLAGS_DATA_DISCONTINUITY, AUDCLNT_BUFFERFLAGS_SILENT, IAudioCaptureClient,
+};
+
+struct TimedPcm {
+    pcm: Pcm,
+    time: Instant,
+}
+
+pub struct Capture {
+    stop: Arc<AtomicBool>,
+    thread: Option<JoinHandle<()>>,
+    receive: mpsc::Receiver<TimedPcm>,
+    current: Option<TimedPcm>,
+    offset: usize,
+}
+
+impl Capture {
+    pub async fn open(source: Option<&str>) -> Result<Self> {
+        let stop = Arc::new(AtomicBool::new(false));
+        let worker_stop = Arc::clone(&stop);
+        let (send, receive) = mpsc::channel(4);
+        let (ready_send, ready) = oneshot::channel();
+        let source = source.map(str::to_owned);
+        let thread = thread::Builder::new()
+            .name("Desk Switch loopback".into())
+            .spawn(move || {
+                let mut ready_send = Some(ready_send);
+                let result = (|| {
+                    let _com = Com::open()?;
+                    let device = output_device(source.as_deref())?;
+                    let label = device.get_friendlyname()?;
+                    let mut audio = device.get_iaudioclient()?;
+                    let format =
+                        WaveFormat::new(16, 16, &SampleType::Int, RATE as usize, CHANNELS, None);
+                    audio
+                        .initialize_client(
+                            &format,
+                            &Direction::Capture,
+                            &StreamMode::PollingShared {
+                                autoconvert: true,
+                                buffer_duration_hns: 200_000,
+                            },
+                        )
+                        .context("initializing shared WASAPI loopback capture at 48 kHz stereo")?;
+                    let capture: IAudioCaptureClient =
+                        unsafe { audio.as_iaudioclient().GetService()? };
+                    audio.start_stream()?;
+                    println!("Capturing the system mix of {label}.");
+                    if ready_send.take().unwrap().send(Ok(())).is_err() {
+                        audio.stop_stream()?;
+                        return Ok(());
+                    }
+                    let result = record(&capture, &worker_stop, &send);
+                    let _ = audio.stop_stream();
+                    let _ = audio.reset_stream();
+                    result
+                })();
+                if let Err(error) = result {
+                    if let Some(ready) = ready_send {
+                        let _ = ready.send(Err(error));
+                    } else {
+                        eprintln!("WASAPI loopback stopped: {error:#}");
+                    }
+                }
+            })?;
+        let result = Self {
+            stop,
+            thread: Some(thread),
+            receive,
+            current: None,
+            offset: 0,
+        };
+        ready
+            .await
+            .context("WASAPI loopback worker stopped during setup")??;
+        Ok(result)
+    }
+
+    pub async fn stop(&mut self) -> Result<()> {
+        self.close();
+        Ok(())
+    }
+
+    fn close(&mut self) {
+        self.stop.store(true, Ordering::Release);
+        if let Some(thread) = self.thread.take() {
+            thread.thread().unpark();
+            let _ = thread.join();
+        }
+        self.current = None;
+        self.receive.close();
+    }
+}
+
+fn record(
+    capture: &IAudioCaptureClient,
+    stop: &AtomicBool,
+    send: &mpsc::Sender<TimedPcm>,
+) -> Result<()> {
+    let mut pending = VecDeque::with_capacity(FRAME_BYTES * 4);
+    let period = Duration::from_millis(10);
+    let mut next = Instant::now() + period;
+    while !stop.load(Ordering::Acquire) {
+        while unsafe { capture.GetNextPacketSize()? } != 0 {
+            let mut pointer = std::ptr::null_mut();
+            let mut frames = 0;
+            let mut flags = 0;
+            unsafe {
+                capture.GetBuffer(&mut pointer, &mut frames, &mut flags, None, None)?;
+            }
+            let bytes = frames as usize * BLOCK_ALIGN;
+            let read = (|| {
+                ensure!(
+                    bytes <= RATE as usize / 5 * BLOCK_ALIGN,
+                    "WASAPI loopback packet exceeds its buffer bound"
+                );
+                if flags & AUDCLNT_BUFFERFLAGS_DATA_DISCONTINUITY.0 as u32 != 0 {
+                    pending.clear();
+                }
+                if flags & AUDCLNT_BUFFERFLAGS_SILENT.0 as u32 != 0 {
+                    pending.extend(std::iter::repeat_n(0, bytes));
+                } else {
+                    ensure!(
+                        bytes == 0 || !pointer.is_null(),
+                        "WASAPI returned a null audio buffer"
+                    );
+                    if bytes != 0 {
+                        pending.extend(unsafe { std::slice::from_raw_parts(pointer, bytes) });
+                    }
+                }
+                Ok::<_, anyhow::Error>(())
+            })();
+            unsafe {
+                capture.ReleaseBuffer(frames)?;
+            }
+            read?;
+            while pending.len() > FRAME_BYTES * 4 {
+                pending.drain(..FRAME_BYTES.min(pending.len()));
+            }
+        }
+        let now = Instant::now();
+        if now >= next {
+            let mut pcm = [0; FRAME_BYTES];
+            let available = pcm.len().min(pending.len());
+            for sample in &mut pcm[..available] {
+                *sample = pending.pop_front().unwrap();
+            }
+            match send.try_send(TimedPcm { pcm, time: now }) {
+                Ok(()) | Err(mpsc::error::TrySendError::Full(_)) => {}
+                Err(mpsc::error::TrySendError::Closed(_)) => return Ok(()),
+            }
+            next = now + period;
+        }
+        thread::park_timeout(Duration::from_millis(3));
+    }
+    Ok(())
+}
+
+impl AsyncRead for Capture {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut TaskContext<'_>,
+        output: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        loop {
+            if let Some(current) = &self.current {
+                if current.time.elapsed() >= Duration::from_millis(60) {
+                    self.current = None;
+                    self.offset = 0;
+                    continue;
+                }
+                let count = output.remaining().min(FRAME_BYTES - self.offset);
+                output.put_slice(&current.pcm[self.offset..self.offset + count]);
+                self.offset += count;
+                if self.offset == FRAME_BYTES {
+                    self.current = None;
+                    self.offset = 0;
+                }
+                return Poll::Ready(Ok(()));
+            }
+            match self.receive.poll_recv(cx) {
+                Poll::Ready(Some(pcm)) => self.current = Some(pcm),
+                Poll::Ready(None) => {
+                    return Poll::Ready(Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "WASAPI loopback ended",
+                    )));
+                }
+                Poll::Pending => return Poll::Pending,
+            }
+        }
+    }
+}
+
+impl Drop for Capture {
+    fn drop(&mut self) {
+        self.close();
+    }
+}

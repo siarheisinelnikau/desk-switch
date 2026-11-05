@@ -4,20 +4,16 @@ use std::{collections::VecDeque, time::Duration};
 use tokio::time::{Instant, timeout};
 
 const WINDOW: usize = 4;
-#[cfg(any(windows, test))]
 const FRESHNESS: Duration = Duration::from_millis(160);
-#[cfg(any(target_os = "linux", test))]
 const WARMUP: Duration = Duration::from_secs(3);
-#[cfg(any(windows, test))]
 const READY_TIMEOUT: Duration = Duration::from_secs(7);
 pub const SILENCE: Pcm = [0; FRAME_BYTES];
 
-#[cfg(any(target_os = "linux", test))]
 pub async fn request_start(link: &mut Link) -> Result<()> {
     let mut incoming = SILENCE;
     let packet = timeout(WARMUP, link.receive(&mut incoming))
         .await
-        .context("Windows did not request audio")??;
+        .context("receiver did not request audio")??;
     ensure!(
         packet == Packet::Start,
         "audio must start with an explicit request"
@@ -25,7 +21,6 @@ pub async fn request_start(link: &mut Link) -> Result<()> {
     Ok(())
 }
 
-#[cfg(any(target_os = "linux", test))]
 pub async fn transmit(
     link: &mut Link,
     source: &mut (impl tokio::io::AsyncRead + Unpin),
@@ -74,13 +69,11 @@ pub async fn transmit(
     }
 }
 
-#[cfg(any(target_os = "linux", test))]
 struct CaptureFrame {
     pcm: Pcm,
     filled: usize,
 }
 
-#[cfg(any(target_os = "linux", test))]
 impl CaptureFrame {
     async fn read(&mut self, source: &mut (impl tokio::io::AsyncRead + Unpin)) -> Result<()> {
         use tokio::io::AsyncReadExt;
@@ -94,7 +87,6 @@ impl CaptureFrame {
     }
 }
 
-#[cfg(any(windows, test))]
 pub async fn receive(
     link: &mut Link,
     queue: &std::sync::Mutex<super::playout::Playout>,
@@ -108,10 +100,10 @@ pub async fn receive(
     let mut pcm = SILENCE;
     let packet = timeout(READY_TIMEOUT, link.receive(&mut pcm))
         .await
-        .context("the Ubuntu audio source did not become ready")??;
+        .context("the sender audio source did not become ready")??;
     ensure!(
         packet == Packet::Ready,
-        "Ubuntu did not confirm audio readiness"
+        "sender did not confirm audio readiness"
     );
     let mut requests = VecDeque::with_capacity(WINDOW);
     for ticket in 0..WINDOW as u64 {

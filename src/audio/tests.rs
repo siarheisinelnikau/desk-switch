@@ -295,10 +295,7 @@ async fn audio_stays_continuous_through_a_video_and_input_round_trip() {
     );
     let (mut client, mut server) = (client.unwrap(), server.unwrap());
     let control = async {
-        let inputs = Inputs {
-            windows: 17,
-            ubuntu: 15,
-        };
+        let inputs = Inputs { host: 17, peer: 15 };
         let mut controller = Controller::new(Some(inputs));
         let Effect::Send(prepare) = controller
             .start(Transfer {
