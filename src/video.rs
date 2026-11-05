@@ -7,8 +7,8 @@ pub const SETTLE: Duration = Duration::from_millis(600);
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct Inputs {
-    pub windows: u16,
-    pub ubuntu: u16,
+    pub host: u16,
+    pub peer: u16,
 }
 
 pub trait Monitor: Send + 'static {
@@ -42,9 +42,9 @@ fn execute(monitor: &mut impl Monitor, job: Job) -> Result<VideoResult> {
         }
         Job::Recover(inputs) => {
             let actual = monitor.read()?;
-            if actual == inputs.ubuntu {
-                monitor.write(inputs.windows)?;
-            } else if actual != inputs.windows {
+            if actual == inputs.peer {
+                monitor.write(inputs.host)?;
+            } else if actual != inputs.host {
                 bail!("recovery saw an unconfigured VCP 0x60 value {actual:#06x}");
             }
             Ok(VideoResult::Written)
