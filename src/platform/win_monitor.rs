@@ -354,6 +354,7 @@ pub fn discover() -> Result<Vec<super::MonitorInfo>> {
                         current: None,
                         inputs: Vec::new(),
                         error: Some(format!("{error:#}")),
+                        fingerprint: String::new(),
                     };
                 }
             };
@@ -372,7 +373,59 @@ pub fn discover() -> Result<Vec<super::MonitorInfo>> {
                 current,
                 inputs,
                 error,
+                fingerprint: String::new(),
             }
         })
         .collect())
+}
+
+pub fn list_displays() -> Result<Vec<super::MonitorInfo>> {
+    Ok(screens()?
+        .into_iter()
+        .filter_map(|screen| {
+            let (id, name) = identity(&screen).ok()?;
+            let mut fingerprint = String::new();
+            for index in 0..64 {
+                let mut device = DISPLAY_DEVICEW {
+                    cb: size_of::<DISPLAY_DEVICEW>() as u32,
+                    ..Default::default()
+                };
+                if unsafe {
+                    EnumDisplayDevicesW(
+                        screen.gdi.as_ptr(),
+                        index,
+                        &mut device,
+                        EDD_GET_DEVICE_INTERFACE_NAME,
+                    )
+                } == 0
+                {
+                    break;
+                }
+                if device.StateFlags & DISPLAY_DEVICE_ACTIVE != 0 {
+                    if let Ok(data) = edid(&device.DeviceID) {
+                        fingerprint = crate::workspace::hardware::display_key(&data);
+                    }
+                    break;
+                }
+            }
+            Some(super::MonitorInfo {
+                id,
+                name,
+                screen: screen.name,
+                current: None,
+                inputs: Vec::new(),
+                error: None,
+                fingerprint,
+            })
+        })
+        .collect())
+}
+
+pub fn read_monitor(id: &str) -> Result<super::MonitorInfo> {
+    let mut display = list_displays()?
+        .into_iter()
+        .find(|d| d.id == id)
+        .context("Выбранный монитор отключён")?;
+    display.current = Some(read(select(id)?.0.hPhysicalMonitor)?);
+    Ok(display)
 }

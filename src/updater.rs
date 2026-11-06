@@ -13,7 +13,9 @@ use std::{
 };
 
 pub const CHANNEL: &str =
-    "https://github.com/siarheisinelnikau/desk-switch/releases/latest/download/update.json";
+    "https://api.github.com/repos/siarheisinelnikau/desk-switch/releases/latest";
+const SIGNED_START: &str = "<!-- desk-switch-update:start -->";
+const SIGNED_END: &str = "<!-- desk-switch-update:end -->";
 const PUBLIC_KEY: &str = include_str!("../release/update-public-key.hex");
 const MAX_MANIFEST: u64 = 64 * 1024;
 const MAX_BINARY: u64 = 128 * 1024 * 1024;
@@ -89,7 +91,9 @@ fn verified(envelope: &Envelope, public_key: &str) -> Result<Release> {
         "only stable numbered releases can be installed automatically"
     );
     ensure!(
-        release.targets.contains_key(WINDOWS) && release.targets.contains_key(LINUX),
+        release.targets.contains_key(WINDOWS)
+            && (release.targets.contains_key(LINUX)
+                || release.targets.contains_key("linux-x86_64-deb")),
         "релиз должен содержать обе сборки, Windows и Ubuntu"
     );
     for artifact in release.targets.values() {
@@ -131,6 +135,54 @@ fn client() -> Result<reqwest::blocking::Client> {
         .user_agent(format!("Desk-Switch/{}", crate::compatibility::VERSION))
         .redirect(reqwest::redirect::Policy::limited(5))
         .build()?)
+}
+
+fn release_envelope(bytes: &[u8]) -> Result<Envelope> {
+    let release: serde_json::Value = serde_json::from_slice(bytes)?;
+    ensure!(
+        release["draft"] == false && release["prerelease"] == false,
+        "only published stable releases are accepted"
+    );
+    let body = release["body"]
+        .as_str()
+        .context("release has no signed update information")?;
+    let (_, signed) = body
+        .split_once(SIGNED_START)
+        .context("signed update information is missing")?;
+    let (signed, rest) = signed
+        .split_once(SIGNED_END)
+        .context("signed update information is incomplete")?;
+    ensure!(
+        !rest.contains(SIGNED_START) && signed.len() <= MAX_MANIFEST as usize,
+        "invalid signed update information"
+    );
+    let envelope: Envelope = serde_json::from_str(signed.trim())?;
+    let payload: Release = serde_json::from_str(&envelope.payload)?;
+    ensure!(
+        release["tag_name"].as_str() == Some(format!("v{}", payload.version).as_str()),
+        "release tag does not match signed version"
+    );
+    Ok(envelope)
+}
+
+fn fetch_envelope() -> Result<Option<Envelope>> {
+    let response = client()?
+        .get(https(CHANNEL)?)
+        .timeout(Duration::from_secs(15))
+        .send()?;
+    if response.status() == reqwest::StatusCode::NOT_FOUND {
+        return Ok(None);
+    }
+    let mut bytes = Vec::new();
+    response
+        .error_for_status()?
+        .take(MAX_MANIFEST * 4 + 1)
+        .read_to_end(&mut bytes)?;
+    ensure!(
+        bytes.len() <= MAX_MANIFEST as usize * 4,
+        "release information is too large"
+    );
+    Ok(Some(release_envelope(&bytes)?))
 }
 
 fn sibling(executable: &Path, suffix: &str) -> Result<PathBuf> {
@@ -210,30 +262,19 @@ fn binary_version(path: &Path, release: &Release) -> Result<()> {
 
 pub fn check_and_stage(dir: &Path, executable: &Path) -> Result<Outcome> {
     let http = client()?;
-    let response = http
-        .get(https(CHANNEL)?)
-        .timeout(Duration::from_secs(12))
-        .send()?;
-    if response.status() == reqwest::StatusCode::NOT_FOUND {
+    let Some(envelope) = fetch_envelope()? else {
         return Ok(Outcome::Unpublished);
-    }
-    let mut bytes = Vec::new();
-    response
-        .error_for_status()?
-        .take(MAX_MANIFEST + 1)
-        .read_to_end(&mut bytes)?;
-    ensure!(
-        bytes.len() <= MAX_MANIFEST as usize,
-        "update manifest is too large"
-    );
-    let envelope: Envelope = serde_json::from_slice(&bytes)?;
+    };
     let release = verified(&envelope, PUBLIC_KEY)?;
     if semver::Version::parse(&release.version)?
         <= semver::Version::parse(crate::compatibility::VERSION)?
     {
         return Ok(Outcome::Current);
     }
-    let artifact = &release.targets[target()?];
+    let artifact = release
+        .targets
+        .get(target()?)
+        .context("Install the latest .deb from GitHub once to enable package updates")?;
     let _lock = binary_lock(executable)?;
     let payload = sibling(executable, ".desk-switch-next")?;
     // An existing ticket is reused only after signature and payload verification.
@@ -380,18 +421,7 @@ fn shared_download(dir: &Path, ctx: &eframe::egui::Context) -> Result<Outcome> {
     };
     // The shared library checks HTTPS, package/PE metadata and hashes. Bind its
     // selected asset to our pinned Ed25519 key before allowing any download.
-    let mut data = Vec::new();
-    client()?
-        .get(https(CHANNEL)?)
-        .send()?
-        .error_for_status()?
-        .take(MAX_MANIFEST + 1)
-        .read_to_end(&mut data)?;
-    ensure!(
-        data.len() <= MAX_MANIFEST as usize,
-        "update manifest is too large"
-    );
-    let envelope: Envelope = serde_json::from_slice(&data)?;
+    let envelope = fetch_envelope()?.context("signed release is unavailable")?;
     let signed = verified(&envelope, PUBLIC_KEY)?;
     let key = if cfg!(windows) {
         WINDOWS
@@ -682,6 +712,27 @@ mod tests {
         artifact.size = 9;
         assert!(checksum(&path, &artifact).is_err());
         fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn signed_release_body_needs_no_metadata_download_and_rejects_wrong_tag_or_prerelease() {
+        let (envelope, key) = fixture();
+        let body = format!(
+            "Release notes\n{SIGNED_START}\n{}\n{SIGNED_END}",
+            serde_json::to_string(&envelope).unwrap()
+        );
+        let mut api =
+            serde_json::json!({"tag_name":"v0.3.0","draft":false,"prerelease":false,"body":body});
+        let parsed = release_envelope(&serde_json::to_vec(&api).unwrap()).unwrap();
+        assert_eq!(verified(&parsed, &key).unwrap().version, "0.3.0");
+        api["tag_name"] = "v9.9.9".into();
+        assert!(release_envelope(&serde_json::to_vec(&api).unwrap()).is_err());
+        api["tag_name"] = "v0.3.0".into();
+        api["prerelease"] = true.into();
+        assert!(release_envelope(&serde_json::to_vec(&api).unwrap()).is_err());
+        api["prerelease"] = false.into();
+        api["body"] = "Unsigned description".into();
+        assert!(release_envelope(&serde_json::to_vec(&api).unwrap()).is_err());
     }
 
     #[test]

@@ -1,4 +1,4 @@
-use super::{Action, Desktop, Page, QueryKind, config};
+use super::{Action, Desktop, Page};
 use eframe::egui::{self, Align, Color32, FontId, RichText, Stroke, Vec2};
 
 const NAVY: Color32 = Color32::from_rgb(26, 34, 57);
@@ -147,16 +147,6 @@ fn primary(ui: &mut egui::Ui, text: &str) -> egui::Response {
     )
 }
 
-fn field(ui: &mut egui::Ui, label: &str, value: &mut String, hint: &str) -> bool {
-    ui.label(crate::i18n::ui_text(label));
-    ui.add(
-        egui::TextEdit::singleline(value)
-            .hint_text(crate::i18n::ui_text(hint))
-            .desired_width(f32::INFINITY),
-    )
-    .changed()
-}
-
 fn choice(ui: &mut egui::Ui, id: &str, value: &mut String, options: &[(&str, &str)]) -> bool {
     let before = value.clone();
     let caption = options
@@ -191,6 +181,7 @@ fn badge(ui: &mut egui::Ui, label: &str, active: bool) {
         .corner_radius(20)
         .inner_margin(egui::Margin::symmetric(12, 6))
         .show(ui, |ui| {
+            ui.spacing_mut().interact_size.y = 16.0;
             ui.horizontal(|ui| {
                 let (rect, _) = ui.allocate_exact_size(Vec2::splat(7.0), egui::Sense::hover());
                 ui.painter().circle_filled(rect.center(), 3.5, color);
@@ -203,54 +194,86 @@ fn badge(ui: &mut egui::Ui, label: &str, active: bool) {
         });
 }
 
+fn keyboard(painter: &egui::Painter, center: egui::Pos2, color: Color32) {
+    let rect = egui::Rect::from_center_size(center, Vec2::new(36.0, 22.0));
+    painter.rect_stroke(rect, 4, Stroke::new(1.5, color), egui::StrokeKind::Inside);
+    for y in 0..2 {
+        for x in 0..5 {
+            let p = rect.left_top() + Vec2::new(6.0 + x as f32 * 5.8, 5.5 + y as f32 * 5.0);
+            painter.rect_filled(
+                egui::Rect::from_center_size(p, Vec2::new(2.6, 2.0)),
+                0,
+                color,
+            );
+        }
+    }
+    painter.line_segment(
+        [center + Vec2::new(-8.0, 6.0), center + Vec2::new(8.0, 6.0)],
+        Stroke::new(1.5, color),
+    );
+}
+fn mouse(painter: &egui::Painter, center: egui::Pos2, color: Color32) {
+    let rect = egui::Rect::from_center_size(center, Vec2::new(17.0, 25.0));
+    painter.rect_stroke(rect, 8, Stroke::new(1.5, color), egui::StrokeKind::Inside);
+    painter.line_segment(
+        [center - Vec2::new(0.0, 10.0), center - Vec2::new(0.0, 2.0)],
+        Stroke::new(1.5, color),
+    );
+    painter.line_segment(
+        [center - Vec2::new(6.0, 2.0), center + Vec2::new(6.0, -2.0)],
+        Stroke::new(1.0, color),
+    );
+}
+fn headphones(painter: &egui::Painter, center: egui::Pos2, color: Color32) {
+    let points = (0..=18)
+        .map(|i| {
+            let angle = std::f32::consts::PI * (i as f32 / 18.0);
+            center + Vec2::new(-angle.cos() * 12.0, -angle.sin() * 12.0)
+        })
+        .collect::<Vec<_>>();
+    painter.add(egui::Shape::line(points, Stroke::new(2.0, color)));
+    for offset in [-11.0, 11.0] {
+        painter.rect_filled(
+            egui::Rect::from_center_size(center + Vec2::new(offset, 4.0), Vec2::new(5.0, 12.0)),
+            2,
+            color,
+        );
+    }
+}
+
 impl Desktop {
     pub(super) fn render(&mut self, root: &mut egui::Ui) {
         let ctx = root.ctx().clone();
         egui::Panel::left("navigation")
-            .exact_size(200.0)
+            .exact_size(180.0)
             .resizable(false)
-            .frame(egui::Frame::new().fill(NAVY).inner_margin(20))
+            .frame(egui::Frame::new().fill(NAVY).inner_margin(18))
             .show(root, |ui| {
-                ui.add_space(8.0);
-                ui.horizontal(|ui| {
-                    let (rect, _) = ui.allocate_exact_size(Vec2::splat(28.0), egui::Sense::hover());
-                    let painter = ui.painter();
-                    painter.rect_filled(rect, 7, ACCENT);
-                    painter.rect_stroke(
-                        rect.shrink(7.0),
-                        2,
-                        Stroke::new(1.5, Color32::WHITE),
-                        egui::StrokeKind::Inside,
-                    );
-                    ui.label(crate::i18n::ui_text(
-                        RichText::new(crate::i18n::tr("Desk Switch"))
-                            .color(Color32::WHITE)
-                            .size(19.0)
-                            .strong(),
-                    ));
-                });
-                ui.add_space(4.0);
-                ui.label(crate::i18n::ui_text(
+                ui.add_space(12.0);
+                ui.label(
+                    RichText::new("Desk Switch")
+                        .size(22.0)
+                        .strong()
+                        .color(Color32::WHITE),
+                );
+                ui.label(
                     RichText::new(crate::i18n::tr("ДВА ПК. ОДНО МЕСТО."))
-                        .color(Color32::from_rgb(143, 154, 183))
-                        .size(10.0),
-                ));
-                ui.add_space(38.0);
+                        .size(10.0)
+                        .color(Color32::from_rgb(150, 160, 184)),
+                );
+                ui.add_space(36.0);
                 for (page, label) in [
-                    (Page::Overview, "Обзор"),
-                    (Page::Devices, "Компьютеры"),
-                    (Page::Monitor, "Монитор и ввод"),
-                    (Page::Sound, "Звук"),
-                    (Page::Application, "Запуск и обновления"),
+                    (Page::Overview, "Рабочее место"),
+                    (Page::Application, "Настройки"),
                     (Page::Diagnostics, "Диагностика"),
                 ] {
                     let selected = self.page == page;
-                    let button = egui::Button::new(crate::i18n::ui_text(
-                        RichText::new(crate::i18n::tr(label)).color(if selected {
+                    let button = egui::Button::new(RichText::new(crate::i18n::tr(label)).color(
+                        if selected {
                             Color32::WHITE
                         } else {
                             Color32::from_rgb(170, 181, 207)
-                        }),
+                        },
                     ))
                     .fill(if selected {
                         Color32::from_rgb(52, 65, 103)
@@ -264,44 +287,27 @@ impl Desktop {
                     }
                 }
                 ui.with_layout(egui::Layout::bottom_up(Align::LEFT), |ui| {
+                    if ui.button(crate::i18n::tr("Закрыть приложение")).clicked() {
+                        self.action(Action::Quit, &ctx);
+                    }
                     if ui
-                        .add(
-                            egui::Button::new(crate::i18n::ui_text(
-                                RichText::new(crate::i18n::tr("Завершить"))
-                                    .color(Color32::from_rgb(170, 181, 207)),
-                            ))
-                            .fill(Color32::TRANSPARENT)
-                            .stroke(Stroke::NONE),
+                        .add_enabled(
+                            self.tray.as_ref().is_some_and(super::tray::Tray::available),
+                            egui::Button::new(crate::i18n::tr("Свернуть в трей")),
                         )
                         .clicked()
                     {
-                        self.action(Action::Quit, &ctx);
+                        self.action(Action::Hide, &ctx);
                     }
-                    ui.label(crate::i18n::ui_text(
-                        RichText::new(crate::i18n::tr(
-                            if self.tray.as_ref().is_some_and(super::tray::Tray::available) {
-                                "Работает в системном трее"
-                            } else {
-                                "Окно управления открыто"
-                            },
-                        ))
-                        .size(11.0)
-                        .color(Color32::from_rgb(143, 154, 183)),
-                    ));
-                    ui.add_space(8.0);
-                    ui.label(crate::i18n::ui_text(
-                        RichText::new(crate::i18n::tr(format!(
-                            "v{} · Rust",
-                            env!("CARGO_PKG_VERSION")
-                        )))
-                        .size(11.0)
-                        .color(Color32::from_rgb(105, 119, 151)),
-                    ));
+                    ui.label(
+                        RichText::new(format!("v{}", env!("CARGO_PKG_VERSION")))
+                            .size(11.0)
+                            .color(Color32::from_rgb(143, 154, 183)),
+                    );
                 });
             });
-
         egui::CentralPanel::default()
-            .frame(egui::Frame::new().fill(palette(root).bg).inner_margin(28))
+            .frame(egui::Frame::new().fill(palette(root).bg).inner_margin(26))
             .show(root, |ui| {
                 egui::ScrollArea::vertical()
                     .auto_shrink([false, false])
@@ -317,35 +323,25 @@ impl Desktop {
                         }
                         match self.page {
                             Page::Overview => self.overview(ui),
-                            Page::Devices => self.computers(ui),
-                            Page::Monitor => self.monitor(ui),
-                            Page::Sound => self.sound(ui),
                             Page::Application => self.application(ui),
                             Page::Diagnostics => self.diagnostics(ui),
                         }
                         if let Some((message, error)) = self.notice.clone() {
-                            ui.add_space(12.0);
-                            egui::Frame::new()
-                                .fill(if error {
-                                    Color32::from_rgb(255, 239, 235)
-                                } else {
-                                    Color32::from_rgb(232, 239, 255)
-                                })
-                                .corner_radius(8)
-                                .inner_margin(12)
-                                .show(ui, |ui| {
-                                    ui.horizontal_wrapped(|ui| {
-                                        ui.label(crate::i18n::ui_text(
-                                            RichText::new(crate::i18n::tr(message)).color(
-                                                if error { palette(ui).error } else { ACCENT },
-                                            ),
-                                        ));
-                                        if ui.small_button(crate::i18n::ui_text("Скрыть")).clicked()
-                                        {
-                                            self.notice = None;
-                                        }
-                                    });
+                            ui.add_space(10.0);
+                            card(ui, |ui| {
+                                ui.horizontal_wrapped(|ui| {
+                                    ui.label(RichText::new(crate::i18n::tr(message)).color(
+                                        if error {
+                                            palette(ui).error
+                                        } else {
+                                            palette(ui).ink
+                                        },
+                                    ));
+                                    if ui.small_button(crate::i18n::tr("Скрыть")).clicked() {
+                                        self.notice = None;
+                                    }
                                 });
+                            });
                         }
                     });
             });
@@ -354,633 +350,477 @@ impl Desktop {
     fn overview(&mut self, ui: &mut egui::Ui) {
         title(
             ui,
-            "Ваше рабочее место",
-            "Монитор, клавиатура и мышь — между двумя компьютерами.",
+            "Два компьютера. Всё вместе.",
+            "Свяжите ПК один раз. Устройства и настройки согласуются автоматически.",
         );
-        let (status, connected) = self.input_label();
         card(ui, |ui| {
             ui.horizontal(|ui| {
-                subheading(ui, "Управление компьютерами");
+                let changed = ui
+                    .checkbox(
+                        &mut self.prefs.discovery,
+                        RichText::new(crate::i18n::tr("Доступен в сети")).strong(),
+                    )
+                    .changed();
+                if changed {
+                    self.discovery_error = None;
+                    self.availability_changed(ui.ctx());
+                }
                 ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
-                    badge(ui, status, connected)
+                    badge(
+                        ui,
+                        if self.pair.synced {
+                            "Пара подключена"
+                        } else if self.pair.remote.is_some() {
+                            "Синхронизация…"
+                        } else if self.prefs.discovery {
+                            "Ищем компьютеры…"
+                        } else {
+                            "Не в сети"
+                        },
+                        self.pair.synced,
+                    );
                 });
             });
+            if !self.pair.synced {
+                note(
+                    ui,
+                    "Включите на обоих ПК: приложение одновременно показывает этот ПК и ищет другие.",
+                );
+            }
+        });
+        ui.add_space(6.0);
+        if let Some(request) = self.pair.request.clone() {
+            card(ui, |ui| {
+                subheading(
+                    ui,
+                    &format!(
+                        "{} {}",
+                        request.name,
+                        crate::i18n::tr("хочет связать компьютеры")
+                    ),
+                );
+                note(ui, &format!("Код подтверждения: {}", request.code));
+                ui.horizontal(|ui| {
+                    if primary(ui, "Принять").clicked() {
+                        self.approve_pair(true);
+                    }
+                    if ui.button(crate::i18n::tr("Отклонить")).clicked() {
+                        self.approve_pair(false);
+                    }
+                });
+            });
+        } else if let Some(request) = &self.pair.outgoing {
+            card(ui, |ui| {
+                subheading(ui, "Подтвердите связь на другом ПК");
+                ui.label(crate::i18n::tr(format!(
+                    "Код подтверждения: {}",
+                    request.code
+                )));
+                ui.spinner();
+            });
+        }
+        card(ui, |ui| {
             self.diagram(ui);
             ui.horizontal(|ui| {
-                ui.add_enabled_ui(self.connected() && self.form.monitor_enabled, |ui| {
-                    if primary(ui, "Переключить на другой ПК").clicked() {
+                ui.add_enabled_ui(self.connected() && self.pair.synced, |ui| {
+                    if primary(ui, "Передать клавиатуру и мышь").clicked() {
                         self.switch();
                     }
                 });
-                ui.label(crate::i18n::ui_text(
-                    RichText::new(crate::i18n::tr("F12"))
-                        .monospace()
-                        .color(palette(ui).muted),
-                ));
-                ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
-                    if ui
-                        .button(crate::i18n::ui_text(if self.input_running() {
-                            "Отключить пару"
-                        } else if self.public_key.is_empty() || self.peer_key.is_empty() {
-                            "Настроить пару"
-                        } else {
-                            "Подключить пару"
-                        }))
-                        .clicked()
+                note(ui, "F12 — переключить · F11 — вернуть");
+            });
+            if let Some(plan) = &self.pair.plan
+                && plan.input_source.is_none()
+                && self.pair.synced
+            {
+                note(
+                    ui,
+                    if self.pair.hardware.input()
+                        && self
+                            .pair
+                            .remote
+                            .as_ref()
+                            .is_some_and(|r| r.hardware.input())
                     {
-                        if !self.input_running()
-                            && (self.public_key.is_empty() || self.peer_key.is_empty())
-                        {
-                            self.page = Page::Devices;
-                        } else {
-                            self.toggle_input();
-                        }
+                        "Клавиатура и мышь есть на обоих ПК — каждый управляет собой. Источник можно выбрать ниже."
+                    } else {
+                        "Подключите клавиатуру и мышь к одному из ПК. Проверяем устройства каждые 3 секунды."
+                    },
+                );
+            }
+            if self.pair.input_failed
+                || self.pair.audio_failed
+                || self
+                    .pair
+                    .remote
+                    .as_ref()
+                    .is_some_and(|r| r.input_error.is_some() || r.audio_error.is_some())
+            {
+                ui.separator();
+                note(
+                    ui,
+                    "Устройство не удалось запустить. Подтвердите системный доступ на нужном ПК; подробности — в диагностике.",
+                );
+                if ui
+                    .button(crate::i18n::tr("Повторить подключение устройств"))
+                    .clicked()
+                {
+                    self.retry_devices();
+                }
+            }
+        });
+        ui.add_space(6.0);
+        if self.pair.remote.is_some() {
+            self.routing(ui);
+        } else {
+            card(ui, |ui| {
+                subheading(ui, "Компьютеры рядом");
+                if !self.prefs.discovery {
+                    note(
+                        ui,
+                        "Включите доступность в сети на обоих ПК, затем нажмите «Связать».",
+                    );
+                } else if self.discovered.is_empty() {
+                    note(
+                        ui,
+                        "Ищем компьютеры… На втором ПК тоже включите доступность в сети.",
+                    );
+                }
+                if let Some(error) = &self.discovery_error {
+                    ui.colored_label(palette(ui).error, crate::i18n::tr(error));
+                    if ui.button(crate::i18n::tr("Повторить поиск")).clicked() {
+                        self.discovery_error = None;
+                        self.stop_pair();
+                        self.availability_changed(ui.ctx());
                     }
+                }
+                let peers = self.discovered.values().cloned().collect::<Vec<_>>();
+                for peer in peers {
+                    ui.separator();
+                    ui.horizontal(|ui| {
+                        ui.vertical(|ui| {
+                            ui.label(RichText::new(&peer.name).strong());
+                            if peer.compatible() {
+                                note(ui, "Готов к подключению");
+                            } else {
+                                ui.colored_label(
+                                    palette(ui).error,
+                                    crate::i18n::tr(
+                                        "Несовместимая версия — обновите этот или другой ПК",
+                                    ),
+                                );
+                            }
+                            note(
+                                ui,
+                                &format!("Версия {} · протокол {}", peer.version, peer.protocol),
+                            );
+                        });
+                        ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
+                            let already = self.peer_key.is_empty()
+                                || peer.public_key.as_ref() == Some(&self.peer_key);
+                            ui.add_enabled_ui(
+                                peer.compatible() && !self.pair.busy && already,
+                                |ui| {
+                                    if primary(ui, "Связать").clicked() {
+                                        self.link_peer(&peer);
+                                    }
+                                },
+                            );
+                        });
+                    });
+                }
+                if !self.pair.status.is_empty() {
+                    ui.label(crate::i18n::tr(&self.pair.status));
+                }
+                if !self.peer_key.is_empty() {
+                    note(
+                        ui,
+                        &format!("Связанный ПК: {}", self.prefs.workspace.peer_name),
+                    );
+                    if ui.small_button(crate::i18n::tr("Разорвать пару")).clicked() {
+                        self.forget_pair();
+                    }
+                }
+                note(
+                    ui,
+                    "Запрос → «Принять» на другом ПК → готово. Ключами приложение обменивается само.",
+                );
+            });
+        }
+        ui.add_space(6.0);
+        self.local_monitor(ui);
+    }
+
+    fn routing(&mut self, ui: &mut egui::Ui) {
+        use crate::workspace::Selection;
+        let remote = self.pair.remote.as_ref().unwrap().clone();
+        let local = self.local_node();
+        let before = self.prefs.workspace.shared.clone();
+        card(ui, |ui| {
+            subheading(ui, "Общие настройки пары");
+            note(
+                ui,
+                "Меняйте на любом ПК — второй получит настройки автоматически.",
+            );
+            let shared = &mut self.prefs.workspace.shared;
+            for (label, id, value) in [
+                ("Клавиатура и мышь", "input-owner", &mut shared.input),
+                ("Где слушать оба ПК", "audio-owner", &mut shared.audio),
+            ] {
+                ui.horizontal(|ui| {
+                    ui.label(crate::i18n::tr(label));
+                    let caption = match value {
+                        Selection::Auto => crate::i18n::tr("Автоматически"),
+                        Selection::Computer(key) => {
+                            if key == &local.key {
+                                local.name.clone()
+                            } else {
+                                remote.name.clone()
+                            }
+                        }
+                    };
+                    egui::ComboBox::from_id_salt(id)
+                        .width(260.0)
+                        .selected_text(caption)
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(
+                                value,
+                                Selection::Auto,
+                                crate::i18n::tr("Автоматически"),
+                            );
+                            ui.selectable_value(
+                                value,
+                                Selection::Computer(local.key.clone()),
+                                &local.name,
+                            );
+                            ui.selectable_value(
+                                value,
+                                Selection::Computer(remote.key.clone()),
+                                &remote.name,
+                            );
+                        });
                 });
+            }
+            ui.horizontal(|ui| {
+                ui.checkbox(&mut shared.audio_enabled, crate::i18n::tr("Звук двух ПК"));
+                ui.add(egui::Slider::new(&mut shared.volume, 0..=100).suffix(" %"));
+                ui.checkbox(&mut shared.muted, crate::i18n::tr("Без звука"));
             });
             note(
                 ui,
-                "Меняется вход выбранного монитора и направление клавиатуры и мыши.",
+                "Громкость меняет только звук другого ПК. Собственный звук остаётся как в системе.",
             );
-        });
-        ui.add_space(6.0);
-        ui.columns(2, |columns| {
-            card(&mut columns[0], |ui| {
-                subheading(ui, "Общий монитор");
-                ui.label(crate::i18n::ui_text(if self.form.monitor_enabled {
-                    "Выбран один физический монитор"
-                } else {
-                    "Настройте входы двух ПК"
-                }));
-                note(ui, "DDC/CI · HDMI / DisplayPort");
+            ui.horizontal(|ui| {
+                ui.checkbox(
+                    &mut shared.edge,
+                    crate::i18n::tr("Переход мышью через край экрана"),
+                );
                 if ui
-                    .button(crate::i18n::ui_text("Настроить монитор"))
+                    .small_button(crate::i18n::tr("Поменять ПК местами"))
                     .clicked()
                 {
-                    self.page = Page::Monitor;
+                    shared.purple_on_left = !shared.purple_on_left;
                 }
             });
-            card(&mut columns[1], |ui| {
-                subheading(ui, "Звук второго ПК");
-                ui.label(crate::i18n::ui_text(if self.audio_running() {
-                    "Аудиослужба включена"
-                } else {
-                    "Выключен"
-                }));
-                note(ui, "Работает независимо от переключения");
-                if ui.button(crate::i18n::ui_text("Настроить звук")).clicked() {
-                    self.page = Page::Sound;
-                }
-            });
-        });
-        ui.add_space(6.0);
-        ui.horizontal(|ui| {
-            if ui
-                .add_enabled(
-                    self.input_running(),
-                    egui::Button::new(crate::i18n::ui_text("Аварийный возврат · F11")),
-                )
-                .clicked()
-            {
-                self.action(Action::Emergency, ui.ctx());
+            if ui.small_button(crate::i18n::tr("Разорвать пару")).clicked() {
+                self.forget_pair();
             }
-            note(ui, "Вернуть управление на ПК с физической клавиатурой.");
         });
-        if self.public_key.is_empty() || self.peer_key.is_empty() {
-            ui.add_space(8.0);
-            ui.horizontal_wrapped(|ui| {
-                note(
-                    ui,
-                    "Первый запуск? Сначала свяжите два компьютера по публичным ключам.",
-                );
-                if ui.link("Открыть настройку пары").clicked() {
-                    self.page = Page::Devices;
+        if self.prefs.workspace.shared != before {
+            self.shared_changed();
+        }
+    }
+
+    fn local_monitor(&mut self, ui: &mut egui::Ui) {
+        let mut changed = false;
+        card(ui, |ui| {
+            egui::CollapsingHeader::new(crate::i18n::tr("Монитор этого ПК")).show(ui,|ui| {
+                note(ui,"Каждый ПК запоминает только своё текущее подключение. Вход второго ПК придёт по сети.");
+                let old_id=self.prefs.workspace.monitor.id.clone();
+                let selected=self.monitors.iter().find(|m|m.id==old_id).map(|m|m.name.as_str()).unwrap_or("Монитор пока не найден");
+                egui::ComboBox::from_id_salt("own-monitor").width(ui.available_width()).selected_text(crate::i18n::tr(selected)).show_ui(ui,|ui| {
+                    for monitor in &self.monitors {
+                        if ui.selectable_value(&mut self.prefs.workspace.monitor.id,monitor.id.clone(),&monitor.name).changed(){
+                            self.prefs.workspace.monitor.name=monitor.name.clone();self.prefs.workspace.monitor.fingerprint=monitor.fingerprint.clone();
+                        }
+                    }
+                });
+                changed|=ui.checkbox(&mut self.prefs.workspace.monitor.enabled,crate::i18n::tr("Это общий монитор — переключать вместе с управлением")).changed();
+                if old_id!=self.prefs.workspace.monitor.id {self.prefs.workspace.monitor.input=None;changed=true;}
+                if self.prefs.workspace.monitor.enabled {
+                    if self.query.is_some(){ui.spinner();}
+                    else if self.prefs.workspace.monitor.input.is_some(){note(ui,"Текущее подключение этого ПК запомнено.");}
+                    else {note(ui,"Не удалось прочитать текущее подключение. Включите DDC/CI в меню монитора.");}
+                    if ui.small_button(crate::i18n::tr("Запомнить текущее подключение заново")).clicked(){changed=true;}
+                    if self.pair.remote.is_some() && self.pair.plan.as_ref().is_some_and(|p|p.monitor.is_none()) {
+                        note(ui,"Для переключения выберите этот же общий монитор на втором ПК. Оба текущих входа должны быть разными.");
+                    }
                 }
+                note(ui,"Чтение подключения не переключает монитор. Без настройки обоих ПК передаются только клавиатура и мышь.");
             });
+        });
+        if changed {
+            self.remember_monitor();
         }
     }
 
     fn diagram(&self, ui: &mut egui::Ui) {
         let (rect, _) =
-            ui.allocate_exact_size(Vec2::new(ui.available_width(), 205.0), egui::Sense::hover());
+            ui.allocate_exact_size(Vec2::new(ui.available_width(), 225.0), egui::Sense::hover());
         let painter = ui.painter();
-        let here_active = self.connected()
-            && self
-                .input
-                .as_ref()
-                .is_some_and(|w| w.input_status == Some(super::InputStatus::Here));
-        let other_active = self.connected() && !here_active;
-        let left = egui::pos2(rect.left() + rect.width() * 0.24, rect.top() + 77.0);
+        let colors = palette(ui);
+        let local = self.local_node();
+        let remote = self.pair.remote.as_ref();
+        let plan = self.pair.plan.as_ref();
+        let synced = self.pair.synced;
+        let purple = Color32::from_rgb(167, 139, 250);
+        let green = Color32::from_rgb(66, 211, 157);
+        let muted = colors.muted.gamma_multiply(0.5);
+        let mut nodes = vec![(&local, true, muted)];
+        if let Some(remote) = remote {
+            nodes.push((remote, false, muted));
+        }
+        if let Some(plan) = plan {
+            nodes.sort_by_key(|(node, _, _)| (node.key != plan.purple) == plan.purple_on_left);
+            for (node, _, color) in &mut nodes {
+                *color = if synced {
+                    if node.key == plan.purple {
+                        purple
+                    } else {
+                        green
+                    }
+                } else {
+                    muted
+                };
+            }
+        }
+        let source = plan.and_then(|p| p.input_source.as_ref());
+        let source_node = nodes
+            .iter()
+            .find(|(n, _, _)| Some(&n.key) == source)
+            .map(|(n, _, c)| (*n, *c));
+        let active = source_node.and_then(|(node, _)| match node.input {
+            Some(super::InputStatus::Here) => Some(node.key.as_str()),
+            Some(super::InputStatus::Peer) => nodes
+                .iter()
+                .find(|(other, _, _)| other.key != node.key)
+                .map(|(n, _, _)| n.key.as_str()),
+            _ => None,
+        });
+        let left = egui::pos2(rect.left() + rect.width() * 0.24, rect.top() + 80.0);
         let right = egui::pos2(rect.left() + rect.width() * 0.76, left.y);
-        let screen_size = Vec2::new((rect.width() * 0.26).min(180.0), 99.0);
-        let link_color = if self.connected() {
-            ACCENT
-        } else {
-            palette(ui).line
-        };
-        painter.line_segment([left, right], Stroke::new(2.0, link_color));
-        painter.circle_filled(rect.center() - Vec2::new(0.0, 25.5), 17.0, Color32::WHITE);
+        painter.line_segment(
+            [left, right],
+            Stroke::new(1.5, if synced { ACCENT } else { colors.line }),
+        );
+        let middle = egui::pos2(rect.center().x, left.y);
+        painter.circle_filled(middle, 21.0, colors.card);
         painter.text(
-            rect.center() - Vec2::new(0.0, 25.5),
+            middle,
             egui::Align2::CENTER_CENTER,
-            crate::i18n::tr("↔"),
-            FontId::proportional(23.0),
-            link_color,
+            "↔",
+            FontId::proportional(25.0),
+            if synced { colors.ink } else { muted },
         );
-        for (center, active, label, detail) in [
-            (
-                left,
-                here_active,
-                "Этот компьютер",
-                if self.prefs.role == "host" {
-                    "Клавиатура и мышь здесь"
-                } else {
-                    "Принимает управление"
-                },
-            ),
-            (
-                right,
-                other_active,
-                "Другой компьютер",
-                if self.peer_key.is_empty() {
-                    "Ожидает сопряжения"
-                } else {
-                    "Ключ сохранён"
-                },
-            ),
-        ] {
-            let screen = egui::Rect::from_center_size(center, screen_size);
-            painter.rect_filled(
-                screen.expand(5.0),
-                10,
-                if active {
-                    palette(ui).selection
-                } else {
-                    palette(ui).bg
-                },
-            );
-            painter.rect_stroke(
-                screen,
-                7,
-                Stroke::new(
-                    2.0,
-                    if active {
-                        ACCENT
-                    } else {
-                        Color32::from_rgb(175, 186, 205)
-                    },
-                ),
-                egui::StrokeKind::Inside,
-            );
-            painter.rect_filled(
-                screen.shrink(8.0),
-                3,
-                if active {
-                    palette(ui).selection
-                } else {
-                    palette(ui).card
-                },
-            );
-            painter.line_segment(
-                [
-                    egui::pos2(center.x, screen.bottom()),
-                    egui::pos2(center.x, screen.bottom() + 13.0),
-                ],
-                Stroke::new(2.0, palette(ui).muted),
-            );
-            painter.line_segment(
-                [
-                    egui::pos2(center.x - 21.0, screen.bottom() + 14.0),
-                    egui::pos2(center.x + 21.0, screen.bottom() + 14.0),
-                ],
-                Stroke::new(2.0, palette(ui).muted),
-            );
-            painter.text(
+        for index in 0..2 {
+            let center = if index == 0 { left } else { right };
+            let entry = nodes.get(index);
+            let node = entry.map(|(n, _, _)| *n);
+            let own = entry.is_some_and(|(_, own, _)| *own);
+            let color = entry.map(|(_, _, color)| *color).unwrap_or(muted);
+            let screen = egui::Rect::from_center_size(
                 center,
+                Vec2::new((rect.width() * 0.32).min(216.0), 98.0),
+            );
+            painter.rect_filled(screen.expand(7.0), 12, color.gamma_multiply(0.06));
+            painter.rect_filled(screen, 8, colors.bg);
+            painter.rect_stroke(screen, 8, Stroke::new(2.0, color), egui::StrokeKind::Inside);
+            painter.rect_filled(
+                egui::Rect::from_center_size(center + Vec2::new(0.0, 55.0), Vec2::new(4.0, 14.0)),
+                1,
+                color,
+            );
+            painter.rect_filled(
+                egui::Rect::from_center_size(center + Vec2::new(0.0, 64.0), Vec2::new(44.0, 3.0)),
+                2,
+                color,
+            );
+            let name = node
+                .map(|n| n.name.chars().take(25).collect::<String>())
+                .unwrap_or_else(|| crate::i18n::tr("Другой компьютер"));
+            painter.text(
+                center - Vec2::new(0.0, 10.0),
                 egui::Align2::CENTER_CENTER,
-                crate::i18n::tr(if active {
-                    "Управление здесь"
+                name,
+                FontId::proportional(16.0),
+                colors.ink,
+            );
+            painter.text(
+                center + Vec2::new(0.0, 16.0),
+                egui::Align2::CENTER_CENTER,
+                crate::i18n::tr(if own {
+                    "Этот компьютер"
+                } else if synced {
+                    "Другой компьютер"
                 } else {
-                    "ПК"
+                    "Ожидает подключения"
                 }),
-                FontId::proportional(13.0),
-                if active { ACCENT } else { palette(ui).muted },
+                FontId::proportional(11.0),
+                color,
             );
-            painter.text(
-                egui::pos2(center.x, rect.bottom() - 47.0),
-                egui::Align2::CENTER_CENTER,
-                crate::i18n::tr(label),
-                FontId::proportional(15.0),
-                palette(ui).ink,
-            );
-            painter.text(
-                egui::pos2(center.x, rect.bottom() - 25.0),
-                egui::Align2::CENTER_CENTER,
-                crate::i18n::tr(detail),
-                FontId::proportional(12.0),
-                palette(ui).muted,
-            );
-        }
-    }
-
-    fn computers(&mut self, ui: &mut egui::Ui) {
-        title(
-            ui,
-            "Два доверенных компьютера",
-            "Один раз обменяйтесь публичными ключами напрямую между ПК.",
-        );
-        card(ui, |ui| {
-            subheading(ui, "Поиск в локальной сети");
-            if ui
-                .checkbox(
-                    &mut self.prefs.discovery,
-                    crate::i18n::ui_text("Находить другие ПК и быть видимым в локальной сети"),
-                )
-                .changed()
-            {
-                self.restart_discovery();
-                self.sync_discovery(ui.ctx());
-                if let Err(error) = self.prefs.save(&self.dir) {
-                    self.notice = Some((error.to_string(), true));
-                }
-            }
-            note(
-                ui,
-                "Включите опцию на обоих ПК. Поиск помогает выбрать адреса; ключи для сопряжения по-прежнему передаются вручную.",
-            );
-            if self.prefs.discovery {
-                if let Some(error) = &self.discovery_error {
-                    ui.colored_label(palette(ui).error, crate::i18n::ui_text(error));
-                } else if self.discovered.is_empty() {
-                    note(ui, "Ищем компьютеры… IP также можно ввести вручную.");
-                }
-                let peers = self.discovered.values().cloned().collect::<Vec<_>>();
-                for peer in peers {
-                    ui.separator();
-                    ui.label(crate::i18n::ui_text(RichText::new(&peer.name).strong()));
-                    ui.label(crate::i18n::ui_text(format!(
-                        "Версия {} · протокол {}",
-                        peer.version, peer.protocol
-                    )));
-                    ui.label(crate::i18n::ui_text(if peer.role == "host" {
-                        "Роль: передаёт ввод"
-                    } else {
-                        "Роль: принимает ввод"
-                    }));
-                    note(
-                        ui,
-                        &peer
-                            .addresses
-                            .iter()
-                            .map(ToString::to_string)
-                            .collect::<Vec<_>>()
-                            .join(", "),
-                    );
-                    if !peer.compatible() {
-                        note(ui, "Версии не совпадают. Обновите оба компьютера.");
-                    }
-                    for address in &peer.addresses {
-                        if ui
-                            .add_enabled(
-                                peer.compatible() && !self.input_running() && !self.audio_running(),
-                                egui::Button::new(format!(
-                                    "{} · {address}",
-                                    crate::i18n::tr("Использовать адреса этого ПК")
-                                )),
-                            )
-                            .clicked()
-                        {
-                            self.use_discovered(&peer, *address);
-                        }
-                    }
-                }
-            }
-        });
-        card(ui, |ui| {
-            subheading(ui, "1. Ключ этого компьютера");
-            if self.public_key.is_empty() {
-                note(
-                    ui,
-                    "Создаётся локально. Приватная часть остаётся на этом компьютере.",
-                );
-                if primary(ui, "Создать ключ").clicked() {
-                    let result = config::create_identity(&self.dir).map(|identity| {
-                        self.public_key = config::hex(&identity.public);
-                    });
-                    self.message(result, "Ключ создан. Передайте публичную часть другому ПК.");
-                }
+            let icon_y = rect.top() + 177.0;
+            let input_color = if !synced {
+                muted
+            } else if source.is_none() {
+                color
+            } else if node.is_some_and(|n| Some(n.key.as_str()) == active) {
+                source_node.map(|(_, c)| c).unwrap_or(muted)
             } else {
-                ui.label(crate::i18n::ui_text(
-                    RichText::new(&self.public_key).monospace().size(12.0),
-                ));
-                if ui
-                    .button(crate::i18n::ui_text("Копировать публичный ключ"))
-                    .clicked()
-                {
-                    ui.ctx().copy_text(self.public_key.clone());
-                }
-            }
-        });
-        card(ui, |ui| {
-            subheading(ui, "2. Ключ другого компьютера");
-            if self.peer_key.is_empty() {
-                ui.add(
-                    egui::TextEdit::multiline(&mut self.pair_entry)
-                        .desired_rows(2)
-                        .desired_width(f32::INFINITY)
-                        .hint_text(crate::i18n::ui_text(
-                            "64 символа публичного ключа другого ПК",
-                        )),
-                );
-                if ui
-                    .add_enabled(
-                        !self.public_key.is_empty(),
-                        egui::Button::new(crate::i18n::ui_text("Связать компьютеры")),
-                    )
-                    .clicked()
-                {
-                    let result = config::pair(&self.dir, self.pair_entry.trim()).and_then(|()| {
-                        self.peer_key = config::hex(&config::load_peer(&self.dir)?);
-                        self.pair_entry.clear();
-                        Ok(())
-                    });
-                    self.message(
-                        result,
-                        "Ключ другого компьютера закреплён. Выполните сопряжение и на нём.",
-                    );
-                }
-            } else {
-                badge(ui, "Ключ другого ПК закреплён", true);
-                ui.label(crate::i18n::ui_text(
-                    RichText::new(&self.peer_key).monospace().size(12.0),
-                ));
-            }
-        });
-        card(ui, |ui| {
-            subheading(ui, "3. Роль и подключение");
-            ui.add_enabled_ui(!self.input_running(), |ui| {
-                ui.label(crate::i18n::ui_text("К этому компьютеру подключена физическая клавиатура и мышь?"));
-                if choice(ui, "role", &mut self.prefs.role, &[
-                    ("host", "Да — передавать управление"), ("receiver", "Нет — принимать управление"),
-                ]) {
-                    self.dirty = true;
-                    if let Some((peer,address)) = self.selected_peer.clone() { self.use_discovered(&peer,address); }
-                }
-                let receiver = self.prefs.role == "receiver";
-                if field(ui, if receiver { "Локальный адрес для приёма ввода" } else { "Адрес принимающего ПК" }, &mut self.prefs.address, "192.168.1.20:45876") { self.dirty = true; self.selected_peer = None; }
-                note(ui, "Числовой IP и порт. Сначала запустите принимающий ПК, затем ПК с клавиатурой.");
-                #[cfg(target_os = "linux")]
-                if !receiver {
-                    ui.separator();
-                    ui.label(crate::i18n::ui_text("Клавиатура и относительная мышь · пути /dev/input/by-id/"));
-                    self.dirty |= ui.add(egui::TextEdit::multiline(&mut self.form.capture_devices)
-                        .desired_width(f32::INFINITY).desired_rows(3).hint_text(crate::i18n::ui_text("Один event-путь устройства на строку"))).changed();
-                    note(ui, "Нужен доступ к выбранным устройствам и согласие в системном диалоге Wayland.");
-                }
-            });
-            self.save_button(ui);
-        });
-    }
-
-    fn monitor(&mut self, ui: &mut egui::Ui) {
-        title(
-            ui,
-            "Монитор и ввод",
-            "Переключайте один общий экран. Остальные мониторы сохраняют свои входы.",
-        );
-        card(ui, |ui| {
-            ui.horizontal(|ui| {
-                subheading(ui, "Общий физический монитор");
-                ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
-                    if ui
-                        .add_enabled(
-                            self.query.is_none(),
-                            egui::Button::new(crate::i18n::ui_text("Найти мониторы")),
-                        )
-                        .clicked()
-                    {
-                        self.scan(QueryKind::Monitors);
-                    }
-                    if self.query.is_some() {
-                        ui.spinner();
-                    }
-                });
-            });
-            ui.add_enabled_ui(!self.input_running(), |ui| {
-                self.dirty |= ui.checkbox(&mut self.form.monitor_enabled, crate::i18n::ui_text("Переключать вход монитора вместе с управлением")).changed();
-                ui.add_enabled_ui(self.form.monitor_enabled, |ui| {
-                    let selected = self.monitors.iter().find(|monitor| monitor.id == self.form.monitor_id)
-                        .map(|monitor| monitor.name.as_str()).unwrap_or("Выберите монитор из списка");
-                    egui::ComboBox::from_id_salt("monitor").width(ui.available_width()).selected_text(crate::i18n::ui_text(selected)).show_ui(ui, |ui| {
-                        for monitor in &self.monitors {
-                            self.dirty |= ui.selectable_value(&mut self.form.monitor_id, monitor.id.clone(), crate::i18n::ui_text(&monitor.name)).changed();
-                        }
-                    });
-                    self.dirty |= field(ui, "Локальный ID выбранного монитора", &mut self.form.monitor_id, "Заполняется при выборе из списка");
-                    if let Some(monitor) = self.monitors.iter().find(|monitor| monitor.id == self.form.monitor_id) {
-                        if let Some(current) = monitor.current { note(ui, &format!("Текущий вход: {current:02X} (VCP 60)")); }
-                        if !monitor.inputs.is_empty() {
-                            note(ui, &format!("Доступные коды: {}", monitor.inputs.iter().map(|code| format!("{code:02X}")).collect::<Vec<_>>().join(", ")));
-                        }
-                        if let Some(error) = &monitor.error { ui.colored_label(palette(ui).error, crate::i18n::ui_text(error)); }
-                    }
-                    ui.columns(2, |columns| {
-                        self.dirty |= field(&mut columns[0], "Вход ПК с клавиатурой · hex", &mut self.form.host_code, "Код из проверки монитора");
-                        self.dirty |= field(&mut columns[1], "Вход второго ПК · hex", &mut self.form.peer_code, "Код из проверки монитора");
-                    });
-                    note(ui, "Включите DDC/CI в меню монитора. По очереди выберите вход каждого ПК вручную и запишите его текущий код. Укажите те же два кода на обоих ПК.");
-                });
-            });
-        });
-        card(ui, |ui| {
-            subheading(ui, "Переход через край экрана");
-            ui.add_enabled_ui(!self.input_running(), |ui| {
-                self.dirty |= choice(
-                    ui,
-                    "edge_mode",
-                    &mut self.form.edge_mode,
-                    &[
-                        ("off", "Выключен"),
-                        ("input", "Только клавиатура и мышь"),
-                        ("video", "Монитор, клавиатура и мышь"),
-                    ],
-                );
-                ui.add_enabled_ui(self.form.edge_mode != "off", |ui| {
-                    self.dirty |= field(
-                        ui,
-                        "Экран для перехода",
-                        &mut self.form.edge_screen,
-                        if cfg!(windows) {
-                            r"\\.\DISPLAY2"
-                        } else {
-                            "ID области EIS"
-                        },
-                    );
-                    #[cfg(target_os = "linux")]
-                    {
-                        if ui
-                            .add_enabled(
-                                self.query.is_none(),
-                                egui::Button::new(crate::i18n::ui_text(
-                                    "Запросить области Wayland…",
-                                )),
-                            )
-                            .clicked()
-                        {
-                            self.scan(QueryKind::Wayland);
-                        }
-                        note(
-                            ui,
-                            "Откроется системный диалог доступа. Проверка не отправляет ввод.",
-                        );
-                        for id in &self.wayland_screens {
-                            if ui
-                                .selectable_label(
-                                    self.form.edge_screen == *id,
-                                    crate::i18n::ui_text(id),
-                                )
-                                .clicked()
-                            {
-                                self.form.edge_screen = id.clone();
-                                self.dirty = true;
-                            }
-                        }
-                    }
-                    #[cfg(windows)]
-                    for monitor in &self.monitors {
-                        if ui
-                            .selectable_label(
-                                self.form.edge_screen == monitor.screen,
-                                crate::i18n::ui_text(&monitor.screen),
-                            )
-                            .clicked()
-                        {
-                            self.form.edge_screen = monitor.screen.clone();
-                            self.dirty = true;
-                        }
-                    }
-                    self.dirty |= choice(
-                        ui,
-                        "edge_side",
-                        &mut self.form.edge_side,
-                        &[
-                            ("left", "Левый край"),
-                            ("right", "Правый край"),
-                            ("top", "Верхний край"),
-                            ("bottom", "Нижний край"),
-                        ],
-                    );
-                });
-            });
-            self.save_button(ui);
-        });
-    }
-
-    fn sound(&mut self, ui: &mut egui::Ui) {
-        title(
-            ui,
-            "Звук второго компьютера",
-            "Слушайте удалённый и местный звук в одних наушниках.",
-        );
-        card(ui, |ui| {
-            ui.horizontal(|ui| {
-                subheading(ui, "Независимое аудиоподключение");
-                ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
-                    let playing = self.audio.as_ref().is_some_and(|w| w.audio_playing);
-                    badge(
-                        ui,
-                        if playing {
-                            if self.prefs.audio_mode == "send" {
-                                "Передаётся"
-                            } else {
-                                "Воспроизводится"
-                            }
-                        } else if self.audio_running() {
-                            "Ожидание соединения"
-                        } else {
-                            "Выключен"
-                        },
-                        playing,
-                    );
-                });
-            });
-            ui.add_enabled_ui(!self.audio_running(), |ui| {
-                ui.label(crate::i18n::ui_text("Роль этого компьютера для звука"));
-                if choice(ui, "audio_mode", &mut self.prefs.audio_mode, &[
-                    ("receive", "Принимать звук — наушники здесь"), ("send", "Передавать системный звук"),
-                ]) {
-                    self.dirty = true;
-                    if let Some((peer,address)) = self.selected_peer.clone() { self.use_discovered(&peer,address); }
-                }
-                let receive = self.prefs.audio_mode == "receive";
-                if field(ui, if receive { "Адрес передающего звук ПК" } else { "Локальный адрес аудиосервера" }, &mut self.prefs.audio_address, "192.168.1.20:45877") { self.dirty = true; self.selected_peer = None; }
-                ui.label(crate::i18n::ui_text(if receive { "Устройство воспроизведения" } else { "Системный микс выбранного устройства" }));
-                let selected = if receive { &mut self.prefs.audio_output } else { &mut self.prefs.audio_source };
-                let caption = self.devices.iter().find(|device| device.id == *selected).map(|d| d.name.as_str())
-                    .unwrap_or(if selected.is_empty() { "По умолчанию" } else { selected.as_str() });
-                egui::ComboBox::from_id_salt("audio_device").width(ui.available_width()).selected_text(crate::i18n::ui_text(caption)).show_ui(ui, |ui| {
-                    self.dirty |= ui.selectable_value(selected, String::new(), crate::i18n::ui_text("По умолчанию")).changed();
-                    for device in &self.devices {
-                        self.dirty |= ui.selectable_value(selected, device.id.clone(), crate::i18n::ui_text(format!("{}{}", device.name, if device.default { crate::i18n::tr(" · по умолчанию") } else { String::new() }))).changed();
-                    }
-                });
-                if ui.add_enabled(self.query.is_none(), egui::Button::new(crate::i18n::ui_text("Обновить аудиоустройства"))).clicked() { self.scan(QueryKind::Audio); }
-                note(ui, "Сначала включите передачу звука на другом ПК. Для аудио используйте отдельный порт.");
-            });
-            ui.separator();
-            if self.prefs.audio_mode == "receive" {
-                ui.label(crate::i18n::ui_text("Громкость только удалённого звука"));
-                ui.horizontal(|ui| {
-                    let changed = ui
-                        .add(egui::Slider::new(&mut self.prefs.volume, 0..=100).suffix(" %"))
-                        .changed();
-                    let mute_changed = ui
-                        .checkbox(&mut self.prefs.muted, crate::i18n::ui_text("Без звука"))
-                        .changed();
-                    if changed || mute_changed {
-                        self.sound_mix();
-                    }
-                });
-            }
-            if primary(
-                ui,
-                if self.audio_running() {
-                    "Выключить аудиоподключение"
+                muted
+            };
+            let hardware = node.map(|n| &n.hardware);
+            keyboard(
+                painter,
+                egui::pos2(center.x - 39.0, icon_y),
+                if source.is_some() || hardware.is_some_and(|h| h.keyboard) {
+                    input_color
                 } else {
-                    "Включить аудиоподключение"
+                    muted
                 },
-            )
-            .clicked()
-            {
-                self.toggle_audio();
-            }
-            note(
-                ui,
-                "Звук продолжает работать при переключении монитора. Выберите выход, который не исчезает при смене HDMI/DP.",
             );
-        });
-    }
-
-    fn save_button(&mut self, ui: &mut egui::Ui) {
-        ui.add_space(6.0);
-        ui.add_enabled_ui(!self.input_running(), |ui| {
-            if primary(ui, "Сохранить настройки").clicked() {
-                let result = self.save();
-                self.message(result, "Настройки сохранены.");
-            }
-            if self.dirty {
-                note(
-                    ui,
-                    "Есть изменения. При подключении настройки сохранятся автоматически.",
-                );
-            }
-        });
-        if self.input_running() {
-            note(
-                ui,
-                "Отключите пару, чтобы изменить настройки ввода и монитора.",
+            mouse(
+                painter,
+                egui::pos2(center.x + 4.0, icon_y),
+                if source.is_some() || hardware.is_some_and(|h| h.mouse) {
+                    input_color
+                } else {
+                    muted
+                },
             );
+            let audio = synced
+                && plan
+                    .is_some_and(|p| node.is_some_and(|n| p.audio_output.as_ref() == Some(&n.key)));
+            headphones(
+                painter,
+                egui::pos2(center.x + 47.0, icon_y),
+                if audio { color } else { muted },
+            );
+            if audio && nodes.iter().all(|(n, _, _)| n.audio_playing) {
+                painter.circle_filled(egui::pos2(center.x + 41.0, icon_y + 24.0), 3.5, purple);
+                painter.circle_filled(egui::pos2(center.x + 52.0, icon_y + 24.0), 3.5, green);
+            }
         }
+        painter.text(
+            egui::pos2(rect.center().x, rect.top() + 12.0),
+            egui::Align2::CENTER_CENTER,
+            crate::i18n::tr(if synced {
+                "Цвет устройства показывает, с какого оно ПК"
+            } else {
+                "До подключения и синхронизации всё серое"
+            }),
+            FontId::proportional(11.0),
+            colors.muted,
+        );
     }
 
     fn diagnostics(&mut self, ui: &mut egui::Ui) {
@@ -1041,7 +881,7 @@ impl Desktop {
     fn application(&mut self, ui: &mut egui::Ui) {
         title(
             ui,
-            "Запуск и обновления",
+            "Настройки",
             "Автозапуск, единая версия на обоих ПК и подписанные обновления.",
         );
         let appearance = (self.prefs.theme.clone(), self.prefs.language.clone());
@@ -1075,25 +915,24 @@ impl Desktop {
         }
         card(ui, |ui| {
             subheading(ui, "При входе в систему");
-            ui.checkbox(
-                &mut self.prefs.autostart,
-                crate::i18n::ui_text("Запускать Desk Switch в трее при входе в систему"),
-            );
-            ui.checkbox(
-                &mut self.prefs.auto_connect,
-                crate::i18n::ui_text("Подключать настроенную пару при запуске приложения"),
-            );
-            ui.checkbox(
-                &mut self.prefs.auto_audio,
-                crate::i18n::ui_text("Включать настроенное аудиоподключение при запуске"),
-            );
+            let changed = ui
+                .checkbox(
+                    &mut self.prefs.autostart,
+                    crate::i18n::tr("Запускать Desk Switch в трее при входе в систему"),
+                )
+                .changed()
+                | ui.checkbox(
+                    &mut self.prefs.auto_connect,
+                    crate::i18n::tr("Подключать настроенную пару при запуске приложения"),
+                )
+                .changed();
+            if changed {
+                self.save_application();
+            }
             note(
                 ui,
                 "Подключение начинается после сопряжения и настройки. На Ubuntu может потребоваться системное подтверждение доступа.",
             );
-            if primary(ui, "Сохранить настройки запуска").clicked() {
-                self.save_application();
-            }
         });
         card(ui, |ui| {
             subheading(ui, "Версии двух компьютеров");
@@ -1102,10 +941,17 @@ impl Desktop {
                 crate::compatibility::VERSION,
                 crate::compatibility::PROTOCOL
             )));
-            let peer = [&self.input, &self.audio]
-                .into_iter()
-                .flatten()
-                .find_map(|worker| worker.peer_version.as_deref());
+            let peer = self
+                .pair
+                .remote
+                .as_ref()
+                .map(|_| crate::compatibility::VERSION)
+                .or_else(|| {
+                    [&self.input, &self.audio]
+                        .into_iter()
+                        .flatten()
+                        .find_map(|worker| worker.peer_version.as_deref())
+                });
             ui.label(crate::i18n::ui_text(format!(
                 "Другой компьютер: {}",
                 peer.map(str::to_owned)

@@ -41,7 +41,8 @@ jobs:
           python3 tools/package_deb.py --binary target/release/desk-switch --out dist
           python3 tools/verify_deb.py dist/desk-switch-linux-x86_64.deb
           sudo apt-get --simulate install ./dist/desk-switch-linux-x86_64.deb
-      - uses: actions/upload-artifact@v4
+      - if: matrix.platform == 'windows'
+        uses: actions/upload-artifact@v4
         with:
           name: desk-switch-${{ matrix.platform }}
           path: target/release/${{ matrix.binary }}
@@ -79,7 +80,7 @@ jobs:
           else:
               assert json.loads(Path('release/publish-request.json').read_text())['tag'] == tag
           Path('dist').mkdir()
-          for source, name in [('desk-switch','desk-switch-linux-x86_64'), ('desk-switch.exe','desk-switch-windows-x86_64.exe'), ('desk-switch-linux-x86_64.deb','desk-switch-linux-x86_64.deb')]:
+          for source, name in [('desk-switch.exe','desk-switch-windows-x86_64.exe'), ('desk-switch-linux-x86_64.deb','desk-switch-linux-x86_64.deb')]:
               shutil.copy2(Path('artifacts')/source, Path('dist')/name)
           subprocess.run(['gh','release','create',tag,*map(str,Path('dist').iterdir()),'--target',os.environ['GITHUB_SHA'],'--prerelease','--title',f'Desk Switch {tag}','--notes-file',f'release/notes/{version}.md'],check=True)
           PY
