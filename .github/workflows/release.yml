@@ -2,7 +2,10 @@ name: Release
 
 on:
   push:
+    branches: [main]
+    paths: [release/publish-request.json]
     tags: ["v*"]
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -25,15 +28,27 @@ jobs:
       RUSTFLAGS: ${{ matrix.rustflags }}
     steps:
       - uses: actions/checkout@v4
-      - run: rustup show active-toolchain
       - run: cargo fmt --all --check
       - run: cargo clippy --locked --all-targets -- -D warnings
       - run: cargo test --locked
       - run: cargo build --locked --release
+      - if: matrix.platform == 'linux'
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y dpkg-dev desktop-file-utils
+          python3 tools/package_deb.py --binary target/release/desk-switch --out dist
+          python3 tools/verify_deb.py dist/desk-switch-linux-x86_64.deb
+          sudo apt-get --simulate install ./dist/desk-switch-linux-x86_64.deb
       - uses: actions/upload-artifact@v4
         with:
           name: desk-switch-${{ matrix.platform }}
           path: target/release/${{ matrix.binary }}
+          if-no-files-found: error
+      - if: matrix.platform == 'linux'
+        uses: actions/upload-artifact@v4
+        with:
+          name: desk-switch-debian
+          path: dist/desk-switch-linux-x86_64.deb
           if-no-files-found: error
 
   publish:
@@ -48,31 +63,21 @@ jobs:
           pattern: desk-switch-*
           path: artifacts
           merge-multiple: true
-      - name: Prepare the private signing key
-        env:
-          UPDATE_SIGNING_KEY: ${{ secrets.DESK_SWITCH_UPDATE_SIGNING_KEY }}
-        run: |
-          python3 - <<'PY'
-          import os
-          from pathlib import Path
-          key = os.environ.get("UPDATE_SIGNING_KEY", "")
-          if not key:
-              raise SystemExit("Set the DESK_SWITCH_UPDATE_SIGNING_KEY repository secret first")
-          path = Path(os.environ["RUNNER_TEMP"]) / "update-signing-key.pem"
-          path.write_text(key)
-          path.chmod(0o600)
-          PY
-      - name: Sign one manifest for both platforms
-        run: >-
-          python3 tools/prepare_release.py --tag "$GITHUB_REF_NAME"
-          --linux artifacts/desk-switch --windows artifacts/desk-switch.exe
-          --key "$RUNNER_TEMP/update-signing-key.pem" --out dist
-      - name: Publish complete release
+      - name: Publish tested installers for signing
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release create "$GITHUB_REF_NAME" dist/* --verify-tag --draft --title "Desk Switch $GITHUB_REF_NAME" --generate-notes
-          gh release edit "$GITHUB_REF_NAME" --draft=false
-      - name: Remove private signing material
-        if: always()
-        run: rm -f "$RUNNER_TEMP/update-signing-key.pem"
+          python3 - <<'PY'
+          import json, os, shutil, subprocess, tomllib
+          from pathlib import Path
+          version = tomllib.loads(Path('Cargo.toml').read_text())['package']['version']
+          tag = f'v{version}'
+          if os.environ['GITHUB_REF_TYPE'] == 'tag':
+              assert os.environ['GITHUB_REF_NAME'] == tag
+          else:
+              assert json.loads(Path('release/publish-request.json').read_text())['tag'] == tag
+          Path('dist').mkdir()
+          for source, name in [('desk-switch','desk-switch-linux-x86_64'), ('desk-switch.exe','desk-switch-windows-x86_64.exe'), ('desk-switch-linux-x86_64.deb','desk-switch-linux-x86_64.deb')]:
+              shutil.copy2(Path('artifacts')/source, Path('dist')/name)
+          subprocess.run(['gh','release','create',tag,*map(str,Path('dist').iterdir()),'--target',os.environ['GITHUB_SHA'],'--prerelease','--title',f'Desk Switch {tag}','--notes-file',f'release/notes/{version}.md'],check=True)
+          PY

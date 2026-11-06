@@ -102,7 +102,7 @@ mod tests {
         assert!(
             current
                 .require(Some(&Version {
-                    app: "0.2.1".into(),
+                    app: format!("{VERSION}-different"),
                     ..current.clone()
                 }))
                 .is_err()
