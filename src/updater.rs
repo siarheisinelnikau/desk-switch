@@ -51,11 +51,11 @@ struct Pending {
     payload: PathBuf,
 }
 
-#[derive(Debug)]
 pub enum Outcome {
     Current,
     Unpublished,
     Ready(String),
+    Prepared(String, rust_auto_updator::Prepared),
 }
 
 fn hex<const N: usize>(value: &str) -> Result<[u8; N]> {
@@ -305,13 +305,179 @@ impl Job {
         std::thread::Builder::new()
             .name("Desk Switch updates".into())
             .spawn(move || {
-                let result = check_and_stage(&dir, &executable);
+                let result = if shared_managed(&executable) {
+                    shared_download(&dir, &ctx)
+                } else {
+                    check_and_stage(&dir, &executable)
+                };
                 let _ = send.send(result);
                 ctx.request_repaint();
             })?;
         Ok(Self { result })
     }
     pub fn poll(&self) -> Option<Result<Outcome>> {
+        self.result.try_recv().ok()
+    }
+}
+
+pub fn shared_managed(executable: &Path) -> bool {
+    cfg!(windows) || executable == Path::new("/usr/lib/desk-switch/desk-switch")
+}
+
+pub fn shared_config(dir: &Path) -> Result<rust_auto_updator::Config> {
+    let config = if cfg!(windows) {
+        rust_auto_updator::Config::new(
+            "siarheisinelnikau",
+            "desk-switch",
+            crate::compatibility::VERSION,
+            "desk-switch",
+        )
+    } else {
+        rust_auto_updator::Config::debian(
+            "siarheisinelnikau",
+            "desk-switch",
+            crate::compatibility::VERSION,
+            "desk-switch",
+        )
+    };
+    let mut config = config.map_err(anyhow::Error::msg)?;
+    config.allow_asset_digest = true;
+    config.legacy_executable_names = vec![
+        if cfg!(windows) {
+            "desk-switch-windows-x86_64.exe"
+        } else {
+            "desk-switch-linux-x86_64.deb"
+        }
+        .into(),
+    ];
+    config.max_executable_size = MAX_BINARY;
+    config.install.stage_prefix = ".desk-switch-shared-update-".into();
+    config.install.helper_name = if cfg!(windows) {
+        "desk-switch-update.exe"
+    } else {
+        "desk-switch-update"
+    }
+    .into();
+    config.install.restart_args = vec![
+        "gui".into(),
+        "--state-dir".into(),
+        dir.to_string_lossy().into_owned(),
+    ];
+    config.install.rollback_args = config.install.restart_args.clone();
+    #[cfg(windows)]
+    {
+        config.expected_subsystem = Some(2);
+        config.install.startup_health_timeout = Some(Duration::from_secs(30));
+    }
+    config.validate().map_err(anyhow::Error::msg)?;
+    Ok(config)
+}
+
+fn shared_download(dir: &Path, ctx: &eframe::egui::Context) -> Result<Outcome> {
+    let config = shared_config(dir)?;
+    let Some(latest) = rust_auto_updator::check_latest(&config).map_err(anyhow::Error::msg)? else {
+        return Ok(Outcome::Current);
+    };
+    // The shared library checks HTTPS, package/PE metadata and hashes. Bind its
+    // selected asset to our pinned Ed25519 key before allowing any download.
+    let mut data = Vec::new();
+    client()?
+        .get(https(CHANNEL)?)
+        .send()?
+        .error_for_status()?
+        .take(MAX_MANIFEST + 1)
+        .read_to_end(&mut data)?;
+    ensure!(
+        data.len() <= MAX_MANIFEST as usize,
+        "update manifest is too large"
+    );
+    let envelope: Envelope = serde_json::from_slice(&data)?;
+    let signed = verified(&envelope, PUBLIC_KEY)?;
+    let key = if cfg!(windows) {
+        WINDOWS
+    } else {
+        "linux-x86_64-deb"
+    };
+    verify_shared_asset(&signed, &latest, key)?;
+    let prepared =
+        rust_auto_updator::prepare_download(&latest, &config, |_, _| ctx.request_repaint())
+            .map_err(anyhow::Error::msg)?;
+    Ok(Outcome::Prepared(signed.version, prepared))
+}
+
+fn verify_shared_asset(
+    signed: &Release,
+    latest: &rust_auto_updator::Release,
+    key: &str,
+) -> Result<()> {
+    let artifact = signed
+        .targets
+        .get(key)
+        .context("signed installer is missing from this release")?;
+    ensure!(
+        signed.version == latest.version.to_string()
+            && artifact.url == latest.executable_url()
+            && artifact.size == latest.executable_size()
+            && Some(artifact.sha256.as_str()) == latest.sha256_digest(),
+        "installer does not match the signed release"
+    );
+    Ok(())
+}
+
+static CLEANUP: std::sync::Mutex<Option<PathBuf>> = std::sync::Mutex::new(None);
+
+pub fn shared_cli(args: &mut Vec<String>) -> Result<bool> {
+    if args.first().is_some_and(|arg| arg == "--apply-update") {
+        rust_auto_updator::apply_update(&shared_config(&crate::config::state_dir()?)?)
+            .map_err(anyhow::Error::msg)?;
+        return Ok(true);
+    }
+    if args.first().is_some_and(|arg| arg == "gui")
+        && args.len() >= 3
+        && args
+            .get(args.len() - 2)
+            .is_some_and(|arg| arg == "--cleanup-update")
+    {
+        let index = args.len() - 2;
+        let path = PathBuf::from(args.get(index + 1).context("missing cleanup directory")?);
+        args.drain(index..=index + 1);
+        *CLEANUP.lock().unwrap() = Some(path);
+    }
+    Ok(false)
+}
+
+pub fn acknowledge_shared_start(dir: &Path) {
+    if let Some(path) = CLEANUP.lock().unwrap().take()
+        && let Ok(config) = shared_config(dir)
+    {
+        rust_auto_updator::cleanup_after_update(path, config.install);
+    }
+}
+
+pub struct InstallJob {
+    result: Receiver<(rust_auto_updator::Prepared, Result<(), String>)>,
+}
+
+impl InstallJob {
+    pub fn start(
+        mut prepared: rust_auto_updator::Prepared,
+        dir: &Path,
+        ctx: eframe::egui::Context,
+    ) -> Result<Self> {
+        prepared
+            .set_restart_args(shared_config(dir)?.install.restart_args)
+            .map_err(anyhow::Error::msg)?;
+        let (send, result) = mpsc::channel();
+        std::thread::Builder::new()
+            .name("Desk Switch install".into())
+            .spawn(move || {
+                let installed = rust_auto_updator::handoff(&mut prepared);
+                let _ = send.send((prepared, installed));
+                ctx.request_repaint();
+            })?;
+        Ok(Self { result })
+    }
+    pub fn poll(&self) -> Option<(rust_auto_updator::Prepared, Result<(), String>)> {
         self.result.try_recv().ok()
     }
 }
@@ -528,5 +694,50 @@ mod tests {
         release.version = "0.3.1".into();
         assert!(binary_version(&path, &release).is_err());
         fs::remove_file(path).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod shared_tests {
+    use super::*;
+    #[test]
+    fn library_download_must_match_the_pinned_signed_artifact() {
+        let config = shared_config(Path::new("/tmp/desk-switch-shared-fixture")).unwrap();
+        let filename = if cfg!(windows) {
+            "desk-switch-windows-x86_64.exe"
+        } else {
+            "desk-switch-linux-x86_64.deb"
+        };
+        let key = if cfg!(windows) {
+            WINDOWS
+        } else {
+            "linux-x86_64-deb"
+        };
+        let url = format!(
+            "https://github.com/siarheisinelnikau/desk-switch/releases/download/v99.0.0/{filename}"
+        );
+        let hash = "11".repeat(32);
+        let json = serde_json::json!({"tag_name":"v99.0.0","html_url":"https://github.com/siarheisinelnikau/desk-switch/releases/tag/v99.0.0","draft":false,"prerelease":false,"assets":[{"name":filename,"browser_download_url":url,"size":1024,"digest":format!("sha256:{hash}")}]}).to_string();
+        let latest = rust_auto_updator::parse_release(&json, &config)
+            .unwrap()
+            .unwrap();
+        let mut signed = Release {
+            version: "99.0.0".into(),
+            protocol: 2,
+            targets: BTreeMap::from([(
+                key.into(),
+                Artifact {
+                    url,
+                    sha256: hash,
+                    size: 1024,
+                },
+            )]),
+        };
+        verify_shared_asset(&signed, &latest, key).unwrap();
+        signed.targets.get_mut(key).unwrap().sha256 = "22".repeat(32);
+        assert!(verify_shared_asset(&signed, &latest, key).is_err());
+        signed.targets.get_mut(key).unwrap().sha256 = "11".repeat(32);
+        signed.version = "98.0.0".into();
+        assert!(verify_shared_asset(&signed, &latest, key).is_err());
     }
 }

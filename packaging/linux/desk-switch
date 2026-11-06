@@ -1,62 +1,10 @@
-#!/usr/bin/python3
-"""Start a user-writable application copy so signed updates never need sudo."""
-import fcntl
-import json
-import os
-from pathlib import Path
-import re
-import shutil
-import sys
-import tempfile
-
-
-def version(path):
-    for stamp in re.findall(rb'DESK-SWITCH-BUILD:(\{[^}]{1,127}\})', path.read_bytes()):
-        try:
-            value = json.loads(stamp)["app"]
-            if re.fullmatch(r"\d+\.\d+\.\d+", value):
-                return tuple(map(int, value.split(".")))
-        except (ValueError, KeyError):
-            pass
-    raise ValueError(f"No application version in {path}")
-
-
-def main():
-    if os.geteuid() == 0:
-        raise RuntimeError("Run Desk Switch as your desktop user, without sudo")
-    launcher = Path(__file__).resolve()
-    bundled = launcher.parent.parent / "lib/desk-switch/desk-switch"
-    base = Path(os.environ.get("XDG_DATA_HOME", ""))
-    if not base.is_absolute():
-        base = Path.home() / ".local/share"
-    directory = base / "desk-switch/application"
-    directory.mkdir(mode=0o700, parents=True, exist_ok=True)
-    executable = directory / "desk-switch"
-    # Use the same lock as the Rust updater, including during package upgrades.
-    with (directory / "desk-switch.desk-switch-update.lock").open("a+b") as lock:
-        fcntl.flock(lock, fcntl.LOCK_EX)
-        try:
-            current = version(executable)
-        except (OSError, ValueError):
-            current = (0, 0, 0)
-        if current < version(bundled) or not os.access(executable, os.X_OK):
-            descriptor, temporary = tempfile.mkstemp(prefix=".install-", dir=directory)
-            try:
-                with os.fdopen(descriptor, "wb") as destination, bundled.open("rb") as source:
-                    shutil.copyfileobj(source, destination)
-                    os.fchmod(destination.fileno(), 0o700)
-                    destination.flush()
-                    os.fsync(destination.fileno())
-                os.replace(temporary, executable)
-            finally:
-                Path(temporary).unlink(missing_ok=True)
-    os.environ["DESK_SWITCH_PACKAGED_LAUNCHER"] = str(launcher)
-    os.execv(executable, [str(executable), *sys.argv[1:]])
-
-
-if __name__ == "__main__":
-    try:
-        main()
-    except (OSError, RuntimeError, ValueError) as error:
-        print(f"Desk Switch: {error}", file=sys.stderr)
-        sys.exit(1)
+#!/bin/sh
+set -eu
+if [ "$(id -u)" -eq 0 ]; then
+    echo 'Run Desk Switch as your desktop user, without sudo' >&2
+    exit 1
+fi
+launcher=$(readlink -f -- "$0")
+application=$(dirname -- "$(dirname -- "$launcher")")/lib/desk-switch/desk-switch
+export DESK_SWITCH_PACKAGED_LAUNCHER="$launcher"
+exec "$application" "$@"
