@@ -62,6 +62,7 @@ impl Service {
         )
         .and_then(|socket| {
             socket.set_only_v6(false)?;
+            socket.set_reuse_address(true)?;
             socket.bind(&SocketAddr::from(([0, 0, 0, 0, 0, 0, 0, 0], port)).into())?;
             Ok(socket)
         })
@@ -71,6 +72,7 @@ impl Service {
                 socket2::Type::STREAM,
                 Some(socket2::Protocol::TCP),
             )?;
+            socket.set_reuse_address(true)?;
             socket.bind(&SocketAddr::from(([0, 0, 0, 0], port)).into())?;
             Ok::<_, std::io::Error>(socket)
         })
@@ -138,6 +140,9 @@ impl Service {
         let _ = self.commands.try_send(Command::Approve(key.into(), accept));
     }
     pub fn disconnect(&self) {
+        // Stop is observed during dialing, callback arbitration and consent too.
+        // A queued connection command alone can arrive before a session exists.
+        self.stop.send_replace(true);
         let _ = self.commands.try_send(Command::Disconnect);
     }
     pub fn forget(&self) -> Result<()> {
@@ -659,6 +664,20 @@ mod tests {
                 );
             }
         }
+        fn restart(&mut self) {
+            let node = self.service.state.borrow().clone();
+            let identity = config::load_identity(&self.dir).unwrap();
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            self.address = listener.local_addr().unwrap();
+            self.service = Service::spawn(
+                self.dir.clone(),
+                node,
+                listener,
+                identity,
+                eframe::egui::Context::default(),
+            )
+            .unwrap();
+        }
     }
     impl Drop for Fixture {
         fn drop(&mut self) {
@@ -669,7 +688,7 @@ mod tests {
 
     #[test]
     fn a_link_click_and_remote_approval_pin_both_keys_and_reconnect_without_approval() {
-        let a = Fixture::new("approve-a");
+        let mut a = Fixture::new("approve-a");
         let b = Fixture::new("approve-b");
         a.service.dial(vec![b.address], b.key.clone()).unwrap();
         let Event::Request(request) = b.wait(|e| matches!(e, Event::Request(_))) else {
@@ -696,8 +715,8 @@ mod tests {
             super::super::Selection::Computer(a.key.clone())
         );
         a.service.disconnect();
-        a.wait(|e| matches!(e, Event::Closed(_)));
         b.wait(|e| matches!(e, Event::Closed(_)));
+        a.restart();
         a.service.dial(vec![b.address], b.key.clone()).unwrap();
         a.wait(|e| {
             assert!(!matches!(e, Event::Request(_)));
