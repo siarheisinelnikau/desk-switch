@@ -3,7 +3,6 @@ use mdns_sd::{ResolvedService, ScopedIp, ServiceDaemon, ServiceEvent, ServiceInf
 use std::{
     net::{SocketAddr, SocketAddrV6},
     sync::mpsc::{self, Receiver},
-    time::{SystemTime, UNIX_EPOCH},
 };
 
 const SERVICE: &str = "_desk-switch._tcp.local.";
@@ -14,14 +13,16 @@ pub struct Peer {
     pub name: String,
     pub version: String,
     pub protocol: u16,
-    pub role: String,
     pub addresses: Vec<SocketAddr>,
-    pub audio_port: u16,
+    pub public_key: Option<String>,
+    pub control_port: Option<u16>,
 }
 impl Peer {
     pub fn compatible(&self) -> bool {
         self.version == crate::compatibility::VERSION
             && self.protocol == crate::compatibility::PROTOCOL
+            && self.public_key.is_some()
+            && self.control_port.is_some()
     }
 }
 
@@ -40,37 +41,48 @@ pub struct Discovery {
 impl Discovery {
     pub fn start(
         name: &str,
-        role: &str,
-        port: u16,
-        audio_port: u16,
+        public_key: &str,
+        control_port: u16,
         ctx: eframe::egui::Context,
     ) -> Result<Self> {
-        ensure!(port != 0 && audio_port != 0, "invalid discovery ports");
+        ensure!(
+            control_port != 0 && public_key.len() == 64,
+            "invalid discovery endpoint"
+        );
         let daemon = ServiceDaemon::new()?;
-        let stamp = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
-        let id = format!("ds-{}-{stamp:x}", std::process::id());
+        let id = format!("ds-{}", &public_key[..24]);
         let hostname = format!("{id}.local.");
         let name = clean(name, 64);
         let properties = [
             ("app", "desk-switch".to_owned()),
             ("name", name),
-            ("role", role.to_owned()),
+            ("role", "receiver".to_owned()),
             ("version", crate::compatibility::VERSION.to_owned()),
             ("protocol", crate::compatibility::PROTOCOL.to_string()),
-            ("audio-port", audio_port.to_string()),
+            ("audio-port", crate::workspace::AUDIO_PORT.to_string()),
+            ("control-port", control_port.to_string()),
+            ("key", public_key.to_owned()),
         ];
         let properties = properties
             .into_iter()
             .map(|(key, value)| (key.to_owned(), value))
             .collect::<std::collections::HashMap<_, _>>();
-        let service =
-            ServiceInfo::new(SERVICE, &id, &hostname, "", port, properties)?.enable_addr_auto();
+        let service = ServiceInfo::new(
+            SERVICE,
+            &id,
+            &hostname,
+            "",
+            crate::workspace::INPUT_PORT,
+            properties,
+        )?
+        .enable_addr_auto();
         let fullname = service.get_fullname().to_owned();
         daemon.register(service)?;
         let incoming = daemon.browse(SERVICE)?;
         let monitor = daemon.monitor()?;
         let (send, events) = mpsc::sync_channel(64);
         let own = fullname.clone();
+        let own_key = public_key.to_owned();
         std::thread::Builder::new()
             .name("Desk Switch discovery".into())
             .spawn(move || {
@@ -85,7 +97,8 @@ impl Discovery {
                         .wait();
                     let update = match event {
                         Incoming::Browse(Ok(ServiceEvent::ServiceResolved(info)))
-                            if info.get_fullname() != own =>
+                            if info.get_fullname() != own
+                                && info.get_property_val_str("key") != Some(own_key.as_str()) =>
                         {
                             parse(&info).map(Event::Found)
                         }
@@ -151,59 +164,19 @@ fn clean(value: &str, limit: usize) -> String {
         .collect()
 }
 
-pub fn selected_addresses(
-    role: &str,
-    audio_mode: &str,
-    port: u16,
-    audio_port: u16,
-    peer: &Peer,
-    address: SocketAddr,
-) -> (SocketAddr, SocketAddr) {
-    let unspecified = if address.is_ipv4() {
-        std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED)
-    } else {
-        std::net::IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED)
-    };
-    let control = if role == "host" {
-        address
-    } else {
-        SocketAddr::new(
-            unspecified,
-            if peer.role == "host" {
-                address.port()
-            } else {
-                port
-            },
-        )
-    };
-    let audio = if audio_mode == "receive" {
-        let mut target = address;
-        target.set_port(peer.audio_port);
-        target
-    } else {
-        SocketAddr::new(unspecified, audio_port)
-    };
-    (control, audio)
-}
-
 fn parse(info: &ResolvedService) -> Option<Peer> {
     if info.get_property_val_str("app")? != "desk-switch" || info.get_port() == 0 {
         return None;
     }
     let version = info.get_property_val_str("version")?;
-    if version.len() > 48 || semver::Version::parse(version).is_err() {
-        return None;
-    }
-    let role = info.get_property_val_str("role")?;
-    if !["host", "receiver"].contains(&role) {
+    if version.is_empty()
+        || version.len() > 48
+        || !version.is_ascii()
+        || version.bytes().any(|b| b.is_ascii_control())
+    {
         return None;
     }
     let protocol = info.get_property_val_str("protocol")?.parse().ok()?;
-    let audio_port = info
-        .get_property_val_str("audio-port")?
-        .parse()
-        .ok()
-        .filter(|port| *port != 0)?;
     let mut addresses = info
         .get_addresses()
         .iter()
@@ -234,9 +207,19 @@ fn parse(info: &ResolvedService) -> Option<Peer> {
         name: clean(info.get_property_val_str("name")?, 64),
         version: version.into(),
         protocol,
-        role: role.into(),
         addresses,
-        audio_port,
+        public_key: info
+            .get_property_val_str("key")
+            .filter(|key| {
+                key.len() == 64
+                    && key.bytes().all(|b| b.is_ascii_hexdigit())
+                    && *key != "0".repeat(64)
+            })
+            .map(str::to_ascii_lowercase),
+        control_port: info
+            .get_property_val_str("control-port")
+            .and_then(|s| s.parse().ok())
+            .filter(|p| *p != 0),
     })
 }
 
@@ -249,7 +232,12 @@ mod tests {
             ("app", "desk-switch"),
             ("name", "Fixture PC"),
             ("version", crate::compatibility::VERSION),
-            ("protocol", "2"),
+            ("protocol", "3"),
+            (
+                "key",
+                "1111111111111111111111111111111111111111111111111111111111111111",
+            ),
+            ("control-port", "45878"),
             ("role", "receiver"),
             ("audio-port", "45877"),
         ];
@@ -285,26 +273,28 @@ mod tests {
     }
 
     #[test]
-    fn choosing_an_endpoint_keeps_server_and_client_addresses_separate() {
-        let address = SocketAddr::V6(SocketAddrV6::new("fe80::5".parse().unwrap(), 47000, 0, 7));
-        assert_eq!(address.to_string().parse::<SocketAddr>().unwrap(), address);
-        let peer = Peer {
-            id: "fixture".into(),
-            name: "PC".into(),
-            version: crate::compatibility::VERSION.into(),
-            protocol: 2,
-            role: "host".into(),
-            addresses: vec![address],
-            audio_port: 47001,
-        };
-        let (control, audio) = selected_addresses("host", "receive", 45876, 45877, &peer, address);
-        assert_eq!(control, address);
-        assert_eq!(audio.port(), 47001);
-        assert_eq!(audio.ip(), address.ip());
-        let (control, audio) = selected_addresses("receiver", "send", 45876, 45877, &peer, address);
-        assert!(control.ip().is_unspecified());
-        assert_eq!(control.port(), 47000);
-        assert!(audio.ip().is_unspecified());
-        assert_eq!(audio.port(), 45877);
+    fn other_protocols_and_unknown_roles_remain_visible() {
+        for protocol in ["1", "3", "99"] {
+            let properties = [
+                ("app", "desk-switch"),
+                ("name", "Future PC"),
+                ("version", "99.1.0"),
+                ("protocol", protocol),
+                ("role", "future-role"),
+            ];
+            let record = ServiceInfo::new(
+                SERVICE,
+                "other",
+                "other.local.",
+                "192.168.1.7",
+                45876,
+                &properties[..],
+            )
+            .unwrap()
+            .as_resolved_service();
+            let peer = parse(&record).unwrap();
+            assert!(!peer.compatible());
+            assert_eq!(peer.protocol, protocol.parse::<u16>().unwrap());
+        }
     }
 }

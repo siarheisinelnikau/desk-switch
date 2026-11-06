@@ -21,13 +21,14 @@ pub struct Preferences {
     pub audio_output: String,
     pub volume: u8,
     pub muted: bool,
+    pub workspace: crate::workspace::Preferences,
 }
 
 impl Default for Preferences {
     fn default() -> Self {
         Self {
-            language: "ru".into(),
-            theme: "system".into(),
+            language: "en".into(),
+            theme: "dark".into(),
             discovery: false,
             autostart: true,
             auto_connect: true,
@@ -41,6 +42,7 @@ impl Default for Preferences {
             audio_output: String::new(),
             volume: 50,
             muted: false,
+            workspace: crate::workspace::Preferences::default(),
         }
     }
 }
@@ -49,9 +51,16 @@ impl Preferences {
     pub fn load(dir: &Path) -> Result<Self> {
         match std::fs::read_to_string(dir.join("desktop.toml")) {
             Ok(data) => {
-                let settings: Self = toml::from_str(&data)?;
+                let mut settings: Self = toml::from_str(&data)?;
+                if toml::from_str::<toml::Value>(&data)?
+                    .get("workspace")
+                    .is_none()
+                {
+                    settings.workspace.shared.volume = settings.volume;
+                    settings.workspace.shared.muted = settings.muted;
+                }
                 ensure!(
-                    settings.volume <= 100,
+                    settings.volume <= 100 && settings.workspace.shared.volume <= 100,
                     "audio volume must be between 0 and 100"
                 );
                 config::Role::parse(&settings.role)?;
@@ -218,17 +227,47 @@ mod tests {
     use super::*;
 
     #[test]
-    fn older_preferences_enable_login_and_updates_but_do_not_start_audio() {
+    fn older_preferences_deserialize_with_new_appearance_defaults() {
         let prefs: Preferences =
             toml::from_str("role='receiver'\naddress='192.168.1.20:45876'\nvolume=25\nmuted=true")
                 .unwrap();
         assert!(prefs.autostart && prefs.auto_connect && prefs.auto_update);
         assert!(!prefs.auto_audio);
         assert!(!prefs.discovery);
-        assert_eq!(prefs.theme, "system");
-        assert_eq!(prefs.language, "ru");
+        assert_eq!(prefs.theme, "dark");
+        assert_eq!(prefs.language, "en");
         assert_eq!(prefs.volume, 25);
         assert!(prefs.muted);
+    }
+
+    #[test]
+    fn loading_an_old_profile_preserves_language_theme_and_audio_mix() {
+        let dir = std::env::temp_dir().join(format!(
+            "desk-switch-prefs-migration-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("desktop.toml"),
+            "language='ru'\ntheme='light'\nvolume=25\nmuted=true",
+        )
+        .unwrap();
+        let prefs = Preferences::load(&dir).unwrap();
+        assert_eq!(
+            (prefs.language.as_str(), prefs.theme.as_str()),
+            ("ru", "light")
+        );
+        assert_eq!(prefs.workspace.shared.volume, 25);
+        assert!(prefs.workspace.shared.muted);
+        prefs.save(&dir).unwrap();
+        let saved = Preferences::load(&dir).unwrap();
+        assert_eq!(saved.workspace.shared.volume, 25);
+        std::fs::remove_dir_all(dir).unwrap();
+        let fresh = Preferences::default();
+        assert_eq!(
+            (fresh.language.as_str(), fresh.theme.as_str()),
+            ("en", "dark")
+        );
     }
 
     #[test]

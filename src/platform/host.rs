@@ -188,7 +188,7 @@ impl Handoff {
                     match control {
                         Control::Toggle(token) if io.gate.current() == (token, Route::Hold) => {
                             if self.logic.is_local() {
-                                self.start(token, Mode::Video, None)?
+                                self.start(token, if io.video.is_some() {Mode::Video} else {Mode::Input}, None)?
                             } else if self.logic.is_remote() {
                                 self.returning(None, true)?
                             } else { continue; }

@@ -22,6 +22,7 @@ mod transport;
 mod updater;
 mod video;
 mod wire;
+mod workspace;
 
 const USAGE: &str = "Desk Switch\n\
     gui [--tray]         Open the desktop window, optionally in the system tray\n\
@@ -70,6 +71,10 @@ fn run() -> Result<()> {
         ["gui", "--tray", "--state-dir", path] => {
             gui::run_at(true, std::path::PathBuf::from(path))?
         }
+        #[cfg(debug_assertions)]
+        ["gui-preview", case, "--state-dir", path] => {
+            gui::run_preview(case, std::path::PathBuf::from(path))?
+        }
         ["help" | "--help" | "-h"] => println!("{USAGE}"),
         ["--build-info"] => println!("{}", compatibility::BUILD_INFO),
         ["--version" | "-V"] => println!(
@@ -96,6 +101,10 @@ fn run() -> Result<()> {
             serde_json::to_string(&platform::discover()?)?
         ),
         ["probe", id] => platform::probe(Some(id))?,
+        ["monitor-read", id] => println!(
+            "@desk-switch-data {}",
+            serde_json::to_string(&platform::read_monitor(id)?)?
+        ),
         #[cfg(target_os = "linux")]
         ["portal-check"] => {
             runtime()?.block_on(platform::portal::check())?;

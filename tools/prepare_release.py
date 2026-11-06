@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build one signed update manifest covering both Windows and Ubuntu binaries."""
+"""Prepare the signed release metadata for exactly one .exe and one .deb."""
 import argparse
 import hashlib
 import json
@@ -38,10 +38,9 @@ def checked_binary(path: Path, platform: str, version: str, protocol: int) -> by
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--linux", required=True, type=Path)
     parser.add_argument("--windows", required=True, type=Path)
     parser.add_argument("--tag", required=True)
-    parser.add_argument("--deb", type=Path)
+    parser.add_argument("--deb", required=True, type=Path)
     parser.add_argument("--key", type=Path, default=ROOT/".release-private/update-signing-key.pem")
     parser.add_argument("--out", type=Path, default=ROOT/"dist")
     args = parser.parse_args()
@@ -54,25 +53,19 @@ def main():
     if public != bytes.fromhex("302a300506032b6570032100") + pinned:
         raise ValueError("The signing key does not match the public key pinned in the clients")
     targets = {}
-    artifacts = []
-    for platform, source, filename in [
-        ("linux-x86_64", args.linux, "desk-switch-linux-x86_64"),
-        ("windows-x86_64", args.windows, "desk-switch-windows-x86_64.exe"),
-    ]:
-        data = checked_binary(source, platform, version, protocol)
-        targets[platform] = {
-            "url": f"https://github.com/{REPOSITORY}/releases/download/{args.tag}/{filename}",
-            "sha256": hashlib.sha256(data).hexdigest(),
-            "size": len(data),
-        }
-        artifacts.append((source, filename))
-    if args.deb:
-        data = args.deb.read_bytes()
-        fields = subprocess.check_output(["dpkg-deb", "--field", str(args.deb), "Package", "Version", "Architecture"], text=True)
-        if fields.splitlines() != ["Package: desk-switch", f"Version: {version}", "Architecture: amd64"]:
-            raise ValueError("Debian installer metadata does not match the release")
-        targets["linux-x86_64-deb"] = {"url": f"https://github.com/{REPOSITORY}/releases/download/{args.tag}/desk-switch-linux-x86_64.deb", "sha256": hashlib.sha256(data).hexdigest(), "size": len(data)}
-        artifacts.append((args.deb, "desk-switch-linux-x86_64.deb"))
+    artifacts = [(args.windows,"desk-switch-windows-x86_64.exe"),(args.deb,"desk-switch-linux-x86_64.deb")]
+    checked_binary(args.windows,"windows-x86_64",version,protocol)
+    fields = subprocess.check_output(["dpkg-deb", "--field", str(args.deb), "Package", "Version", "Architecture"], text=True)
+    if fields.splitlines() != ["Package: desk-switch", f"Version: {version}", "Architecture: amd64"]:
+        raise ValueError("Debian installer metadata does not match the release")
+    with tempfile.TemporaryDirectory(prefix="desk-switch-verify-deb-") as directory:
+        subprocess.run(["dpkg-deb","--extract",str(args.deb),directory],check=True)
+        checked_binary(Path(directory)/"usr/lib/desk-switch/desk-switch","linux-x86_64",version,protocol)
+    for platform,(source,filename) in zip(["windows-x86_64","linux-x86_64-deb"],artifacts):
+        data=source.read_bytes()
+        if not 0 < len(data) <= 128*1024*1024:
+            raise ValueError("Invalid installer size")
+        targets[platform]={"url":f"https://github.com/{REPOSITORY}/releases/download/{args.tag}/{filename}","sha256":hashlib.sha256(data).hexdigest(),"size":len(data)}
     payload = json.dumps({"version": version, "protocol": protocol, "targets": targets}, sort_keys=True, separators=(",", ":"))
     with tempfile.TemporaryDirectory(prefix="desk-switch-sign-") as directory:
         message = Path(directory)/"payload.json"
@@ -82,7 +75,8 @@ def main():
         signed = signature.read_bytes()
     args.out.mkdir(parents=True, exist_ok=True)
     for source, filename in artifacts:
-        shutil.copy2(source, args.out/filename)
+        if source.resolve() != (args.out/filename).resolve():
+            shutil.copy2(source, args.out/filename)
     (args.out/"update.json").write_text(json.dumps({"payload": payload, "signature": signed.hex()}, indent=2)+"\n")
     print(f"Prepared signed {args.tag}, protocol {protocol}, both platforms, in {args.out}")
 

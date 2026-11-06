@@ -16,6 +16,7 @@ struct Display {
     id: String,
     connector: String,
     bus: Option<u32>,
+    fingerprint: String,
 }
 
 fn displays() -> Result<Vec<Display>> {
@@ -38,7 +39,12 @@ fn displays() -> Result<Vec<Display>> {
                 .parse()
                 .ok()
         });
-        displays.push(Display { id, connector, bus });
+        displays.push(Display {
+            id,
+            connector,
+            bus,
+            fingerprint: crate::workspace::hardware::display_key(&edid),
+        });
     }
     displays.sort_by(|a, b| a.connector.cmp(&b.connector));
     Ok(displays)
@@ -245,9 +251,43 @@ pub fn discover() -> Result<Vec<super::MonitorInfo>> {
                 current,
                 inputs,
                 error,
+                fingerprint: display.fingerprint.clone(),
             }
         })
         .collect())
+}
+
+pub fn list_displays() -> Result<Vec<super::MonitorInfo>> {
+    Ok(displays()?
+        .into_iter()
+        .map(|display| super::MonitorInfo {
+            id: display.id,
+            name: display.connector.clone(),
+            screen: display.connector,
+            current: None,
+            inputs: Vec::new(),
+            error: None,
+            fingerprint: display.fingerprint,
+        })
+        .collect())
+}
+
+pub fn read_monitor(id: &str) -> Result<super::MonitorInfo> {
+    let displays = displays()?;
+    let display = displays
+        .iter()
+        .find(|d| d.id == id)
+        .context("Выбранный монитор отключён")?;
+    let current = read_input(selected_bus(&displays, id)?)?;
+    Ok(super::MonitorInfo {
+        id: id.into(),
+        name: display.connector.clone(),
+        screen: display.connector.clone(),
+        current: Some(current),
+        inputs: Vec::new(),
+        error: None,
+        fingerprint: display.fingerprint.clone(),
+    })
 }
 
 #[cfg(test)]
@@ -261,11 +301,13 @@ mod tests {
                 id: "private".into(),
                 connector: "card0-DP-1".into(),
                 bus: Some(2),
+                fingerprint: String::new(),
             },
             Display {
                 id: "shared".into(),
                 connector: "card0-HDMI-A-1".into(),
                 bus: Some(5),
+                fingerprint: String::new(),
             },
         ];
         assert_eq!(selected_bus(&fixture, "shared").unwrap(), 5);
