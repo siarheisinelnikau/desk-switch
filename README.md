@@ -16,16 +16,21 @@ sudo apt install ./desk-switch-linux-x86_64.deb
 Open **Desk Switch** from the application menu, or run `desk-switch` without sudo.
 The installer includes the menu icon and declares desktop runtime dependencies.
 The separate file without `.deb` is a portable ELF executable, not an apt package.
-The Debian launcher keeps an updateable user copy under
-`$XDG_DATA_HOME/desk-switch/application` (normally `~/.local/share/desk-switch/application`).
-Signed updates need no sudo and are kept when opening an older package. Autostart
-uses `/usr/bin/desk-switch` with a TryExec guard; uninstalling the package disables
-that login entry while preserving pairing/settings. Package upgrades refresh older
-user copies on the next launch. Run portable binaries from a user-writable folder.
+From 0.3.0 the Debian launcher runs the package-owned executable. In-app installer
+updates use your shared `rust-auto-updator` library and Ubuntu's standard polkit
+password prompt after **Update and restart**. Autostart uses the installed launcher
+with a TryExec guard, so removing the package disables that login entry while
+preserving settings and pairing. Old 0.2.x per-user copies retain portable update
+compatibility; install the current `.deb` once to switch to package-managed updates.
+Portable Linux binaries must stay in a user-writable directory.
 
-Launch the binary without arguments, or run `desk-switch gui`, to open the native Rust desktop window. It includes pairing, input roles and addresses, monitor/input selection, edge settings, audio device and volume controls, and recent service logs. The interface is in Russian. The existing CLI commands remain available.
+Launch the binary without arguments, or run `desk-switch gui`, to open the native Rust desktop window. It includes pairing, input roles and addresses, monitor/input selection, edge settings, audio device and volume controls, and recent service logs. The interface and tray support Russian, English, German, French, Spanish and Italian. **Запуск и обновления / Startup and updates** contains the language selector and Light, Dark and System themes. Changes apply immediately and are saved automatically. The existing CLI commands remain available.
 
 ![Desk Switch desktop window](docs/desktop.png)
+
+![Light theme and language settings](docs/appearance-light.png)
+
+![Dark theme and language settings](docs/appearance-dark.png)
 
 1. Open **Компьютеры** on both PCs. Create their keys, copy each public key to the other PC, and pin both. Choose the PC with the physical keyboard/mouse as the host and the other as the receiver. Enter the receiver's LAN address on both.
 2. Open **Монитор и ввод**, enable switching, and click **Найти мониторы** on each PC. Select the shared physical monitor's local ID and fill in the two verified input codes as described below. Ubuntu hosts also need explicit keyboard/mouse paths under **Компьютеры**.
@@ -36,6 +41,23 @@ The tray provides Open, Switch, Emergency return, Audio on/off, and Quit. On Win
 
 `desk-switch gui --tray` starts hidden only when the tray is available. Pairing and settings are local; `desktop.toml` stores window preferences beside the existing `settings.toml`. Physical video switching still needs two cables into the shared monitor and DDC/CI support; screen pixels are not sent over the network.
 
+## Optional computer discovery
+
+Under **Компьютеры / Computers**, enable local network discovery on **both** PCs.
+It is off by default. The list shows names, roles, versions and IPv4/IPv6 addresses;
+choose the desired endpoint to fill the input and audio address fields. Receiver
+addresses bind locally; client addresses point to the other PC. Check the physical
+keyboard role and audio role, exchange public keys directly, then save/connect.
+Changing roles retains the selected endpoint; editing an address returns to manual
+configuration. Discovery never pins keys, connects or starts input/audio on its own.
+Different versions stay visible with an update hint and cannot be selected.
+
+Discovery uses `_desk-switch._tcp.local.` with mDNS (UDP 5353). Allow multicast on
+your trusted LAN if filtered. Networks that isolate clients or block multicast
+still support manual IP entry. Disabling discovery stops browsing/advertising.
+Only name, role, ports and app/protocol versions are announced; private keys and
+input/audio data are never part of discovery.
+
 ## Autostart and matching versions
 
 From 0.2.0, the first successful GUI launch registers autostart for the current user by default. Ubuntu uses an XDG autostart entry; Windows uses the current user's Run key. It launches into the tray and retains the selected profile. Moving the executable requires opening it once from its new location to refresh the entry. **Запуск и обновления** lets you disable autostart.
@@ -44,23 +66,44 @@ From 0.2.0, the first successful GUI launch registers autostart for the current 
 
 **Подключать настроенную пару при запуске** defaults to enabled. No input service starts until both keys exist. Save valid role, address, monitor/edge and Ubuntu capture settings before the next launch. Portal consent and input-device permissions still apply. The audio start setting follows the last explicit audio on/off choice; audio starts disabled until enabled once, and its saved volume/mute are retained. Quit stops services and preserves startup preferences.
 
-Both encrypted input and audio handshakes exchange the exact application version and wire protocol before creating a usable connection. Different patch versions are rejected, as are different protocols and legacy clients that send no version. Both current clients report their local and remote versions; the GUI shows the mismatch and checks for an update. The protocol number is 2 in release 0.2.0. The first upgrade from 0.1.0 requires replacing the binary on **both** PCs manually because 0.1.0 has no updater.
+Both encrypted input and audio handshakes exchange the exact application version and wire protocol before creating a usable connection. Different patch versions are rejected, as are different protocols and legacy clients that send no version. Both current clients report their local and remote versions; the GUI shows the mismatch and checks for an update. The protocol number remains 2 in release 0.3.0. The first upgrade from 0.1.0 requires replacing the binary on **both** PCs manually because 0.1.0 has no updater.
 
 ## Automatic updates
 
-Automatic checks/downloads default to enabled, at launch and every six hours. The channel is the latest signed `update.json` in [the project's GitHub Releases](https://github.com/siarheisinelnikau/desk-switch/releases). A missing release is shown as unpublished. Updates install at the next application launch, before automatic input/audio startup; the settings page also provides **Обновить и перезапустить**. A completed download can install immediately if no service is running. Signing keys, pinned peers, role settings, volume and autostart choices remain in the existing profile.
+Automatic checks/downloads default to enabled, at launch and every six hours.
+Windows and installed Debian packages use the core of your **rust-auto-updator
+0.4.1**, vendored with its MIT license and source hashes for reproducible standalone
+CI builds. The host keeps its existing egui renderer, tray, settings and lifecycle.
+Before the shared library downloads anything, its chosen repository/version/URL,
+size and SHA-256 must match `update.json` verified with the project's pinned
+Ed25519 key. The shared library also checks PE or Debian metadata and handles
+staging, installation and restart. The installer itself has a signed hash too.
 
-Only stable, newer versions with a valid Ed25519 signature are accepted. One manifest must contain both Windows x86-64 and Ubuntu x86-64 assets of the same release. HTTPS, bounded sizes, SHA-256 and the embedded binary version/protocol are checked before installation. The update helper waits for this profile's GUI/input/audio locks, verifies the staged file again, and replaces the executable with a previous-version backup. An immediate startup failure restores the previous binary; an error marker prevents an automatic retry loop. Installation requires a user-writable application directory and does not elevate privileges.
+Click **Обновить и перезапустить / Update and restart** to install. Settings are
+saved and managed input/audio services stop cooperatively before the installer.
+Ubuntu uses a system polkit password prompt on a worker thread; cancellation or
+failure keeps the window open and the verified download available for retry.
+Windows uses the library's portable replacement and first-frame health/rollback
+protocol. The application stays responsive during installation. Pairing keys,
+roles, volume and preferences remain in the profile. Restart resumes that profile.
 
-The publisher's public key is committed in `release/update-public-key.hex`; the local private key stays in the ignored `.release-private/update-signing-key.pem`. Back up that private key. The release workflow builds/tests both OS targets and the Debian installer on Ubuntu 24.04, then creates a prerelease. Download both executable assets, run `tools/prepare_release.py` locally, and commit the resulting signed `update.json` as `release/manifests/VERSION.json`. The promotion workflow verifies the signature, both public downloads and the installer's bundled binary before publishing the stable release. No private signing key is sent to GitHub. Existing version tags/releases must not be reused. Set `release/publish-request.json` to the new Cargo version's tag to request a build through the connector, or push that version tag normally.
+Portable Linux copies and existing 0.2.x update helpers retain the signed legacy
+path so installed older clients can upgrade. That path installs a newer raw binary
+at the next launch, with signature, bounds, size/SHA-256 and embedded version checks,
+plus the existing backup and immediate-startup rollback. It requires a user-writable
+application directory. Both encrypted input and audio always reject different app
+or protocol versions; update both PCs together.
+
+The publisher's public key is committed in `release/update-public-key.hex`; the local private key stays in the ignored `.release-private/update-signing-key.pem`. Back up that private key. The release workflow builds/tests both OS targets and the Debian installer on Ubuntu 24.04, then creates a prerelease. Download both executable assets and the `.deb`, run `tools/prepare_release.py` locally, and commit the resulting signed `update.json` as `release/manifests/VERSION.json`. The promotion workflow verifies the signature, both public downloads and the installer's bundled binary before publishing the stable release. No private signing key is sent to GitHub. Existing version tags/releases must not be reused. Set `release/publish-request.json` to the new Cargo version's tag to request a build through the connector, or push that version tag normally.
 
 To prepare a reviewable local release without publishing:
 
 ~~~sh
-python3 tools/prepare_release.py --tag v0.2.0 \
+python3 tools/prepare_release.py --tag v0.3.0 \
   --linux target/release/desk-switch \
   --windows target/x86_64-pc-windows-gnu/release/desk-switch.exe \
-  --out dist/v0.2.0
+  --deb dist/desk-switch-linux-x86_64.deb \
+  --out dist/v0.3.0
 ~~~
 
 `--build-info` prints the embedded build version/protocol. Automatic updates do not coordinate a simultaneous restart of both PCs: while one is on a newer version, the connection stays rejected until the other catches up. Neither peer can supply an arbitrary update URL or executable to the other.
@@ -77,7 +120,7 @@ Rust and dependencies are pinned. The binaries are target/release/desk-switch.ex
 
 Windows needs Windows 10/11. Native MSVC builds need Visual Studio Build Tools with the C++ workload. For a static MSVC CRT set the RUSTFLAGS environment variable to -C target-feature=+crt-static before building.
 
-Ubuntu needs build-essential to build, plus the usual X11/Wayland, xkbcommon and OpenGL/EGL desktop runtime libraries for the window. The GUI supports X11 and Wayland; Ubuntu input sharing requires Wayland. Run as your logged-in desktop user. Input uses the user session D-Bus, xdg-desktop-portal and a backend with RemoteDesktop v2 and EIS, such as compatible GNOME/Mutter with xdg-desktop-portal-gnome. Audio needs pipewire-bin and WirePlumber policy.
+Ubuntu needs build-essential, pkg-config and libssl-dev to build, plus the usual X11/Wayland, xkbcommon and OpenGL/EGL desktop runtime libraries for the window. The GUI supports X11 and Wayland; Ubuntu input sharing requires Wayland. Run as your logged-in desktop user. Input uses the user session D-Bus, xdg-desktop-portal and a backend with RemoteDesktop v2 and EIS, such as compatible GNOME/Mutter with xdg-desktop-portal-gnome. Audio needs pipewire-bin and WirePlumber policy.
 
 Video switching on Ubuntu additionally needs ddcutil, i2c-dev and access to the selected /dev/i2c-* device. Use your distribution's package and device permission rules.
 
@@ -207,3 +250,10 @@ Desktop validation uses an isolated Xvfb display and private D-Bus StatusNotifie
 [ddcutil troubleshooting](https://www.ddcutil.com/faq/), [setvcp](https://www.ddcutil.com/command_setvcp/), [Win32 SetVCPFeature](https://learn.microsoft.com/en-us/windows/win32/api/lowlevelmonitorconfigurationapi/nf-lowlevelmonitorconfigurationapi-setvcpfeature), [RemoteDesktop portal](https://flatpak.github.io/xdg-desktop-portal/docs/doc-org.freedesktop.portal.RemoteDesktop.html).
 
 MIT licensed.
+
+Appearance validation covers all six catalogs, placeholders, native tray labels and
+safe quit in a private Xvfb display and private D-Bus. Live theme/language changes
+are checked together with saved preferences and the tray's updated language.
+Discovery tests use synthetic mDNS records and endpoint selection without browsing
+the real LAN. The shared updater must match the signed artifact before download;
+package checks validate the real `.deb`, its root-owned layout and launcher.

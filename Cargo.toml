@@ -1,12 +1,15 @@
 [package]
 name = "desk-switch"
-version = "0.2.1"
+version = "0.3.0"
 edition = "2024"
 rust-version = "1.99"
 license = "MIT"
 description = "Switch a shared monitor, input and audio between Windows and Ubuntu PCs"
 
 [dependencies]
+rust-auto-updator = { path = "vendor/rust-auto-updator" }
+mdns-sd = "=0.21.4"
+flume = "0.12"
 anyhow = "1.0"
 eframe = { version = "0.35", default-features = false, features = ["default_fonts", "glow", "x11", "wayland"] }
 serde_json = "1.0"

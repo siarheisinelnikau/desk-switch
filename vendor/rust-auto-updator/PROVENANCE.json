@@ -1,0 +1,18 @@
+{
+  "source": "../rust-auto-updator/crates/rust-auto-updator",
+  "version": "0.4.1",
+  "adjustment": "Workspace-inherited package metadata resolved for standalone vendoring. Sources unchanged.",
+  "files": {
+    "src/config.rs": "d8f60cc28ad5ad9dfb8c45761ecfed72542b970dca54937deed952dad830f345",
+    "src/controller.rs": "1777a5cff8e892d3efe2a81f3bf6f10a11bdd719999b6365ce72e2a6c341acef",
+    "src/download.rs": "477ec14988917ef9bf44ad7b3ceef1b43ccffb4b32d79dec934603bf85394100",
+    "src/github.rs": "40eaa5a97493fb8755ad06ce76777d4a4200174ca4072fa8d56b1b8745b734ff",
+    "src/install.rs": "d4c1e01d9e69ca4147e97faf8bdb99bca3116188673bf9572de81b82168a15e2",
+    "src/lib.rs": "b17b3bcaabfac75a6dd9c59104b426be4c4424d8b45e55cc4385ea1ada8e8e1b",
+    "src/linux_install.rs": "a72aa0bebedfcba7664866f2edf26a0a0934db2c939b8d94c0e53feae8cf2b55",
+    "src/service.rs": "4bff7687748adf2d144cde7a7bf3b32f12142adc2791dafed5fb571f6b52202f",
+    "src/tests.rs": "fce509b2f7989be9a248afdcc57281e5bb7a6c7569d3df120fcdec375a40b39a",
+    "src/unsupported_install.rs": "3236f9c2be5a484935d9c1c5a771f7628e8bc54075d3db76e59125bc12928eda",
+    "src/verify.rs": "46f2d649628656c41e4d1e2c390f978effecd36acd498ea3b2318b29679cae24"
+  }
+}

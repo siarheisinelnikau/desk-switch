@@ -73,6 +73,14 @@ pub struct Desktop {
     update_ready: bool,
     last_update_check: Option<Instant>,
     last_version_error: Option<String>,
+    prepared_update: Option<rust_auto_updator::Prepared>,
+    install_job: Option<crate::updater::InstallJob>,
+    install_pending: bool,
+    presented: bool,
+    discovery: Option<crate::discovery::Discovery>,
+    discovered: std::collections::BTreeMap<String, crate::discovery::Peer>,
+    discovery_error: Option<String>,
+    selected_peer: Option<(crate::discovery::Peer, std::net::SocketAddr)>,
 }
 
 pub fn run(start_hidden: bool) -> Result<()> {
@@ -121,11 +129,12 @@ pub fn run_at(start_hidden: bool, dir: PathBuf) -> Result<()> {
 
 impl Desktop {
     fn new(ctx: egui::Context, dir: PathBuf, start_hidden: bool) -> Self {
-        view::style(&ctx);
         let (prefs, prefs_error) = match Preferences::load(&dir) {
             Ok(prefs) => (prefs, None),
             Err(error) => (Preferences::default(), Some(format!("{error:#}"))),
         };
+        crate::i18n::set_language(&prefs.language);
+        view::style(&ctx, &prefs.theme);
         let (document, settings_error) = match config::read_settings(&dir) {
             Ok(document) => (document, None),
             Err(error) => (config::FileSettings::default(), Some(format!("{error:#}"))),
@@ -174,6 +183,14 @@ impl Desktop {
             update_ready: false,
             last_update_check: None,
             last_version_error: None,
+            prepared_update: None,
+            install_job: None,
+            install_pending: false,
+            presented: false,
+            discovery: None,
+            discovered: std::collections::BTreeMap::new(),
+            discovery_error: None,
+            selected_peer: None,
         }
     }
 
@@ -191,6 +208,9 @@ impl Desktop {
         config::save_settings(&self.dir, &self.form.document()?)?;
         self.prefs.save(&self.dir)?;
         self.dirty = false;
+        if self.prefs.discovery {
+            self.restart_discovery();
+        }
         Ok(())
     }
 
@@ -297,6 +317,16 @@ impl Desktop {
                 }
             }
             Action::Quit => {
+                if self.install_job.is_some() || self.install_pending {
+                    self.notice = Some((
+                        "Устанавливаем обновление. На Ubuntu подтвердите системный запрос пароля."
+                            .into(),
+                        false,
+                    ));
+                    self.hidden = false;
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+                    return;
+                }
                 self.quitting = true;
                 if let Some(input) = &mut self.input {
                     input.stop();
@@ -305,6 +335,7 @@ impl Desktop {
                     audio.stop();
                 }
                 self.query.take();
+                self.discovery.take();
             }
         }
     }
@@ -346,9 +377,30 @@ impl Desktop {
     }
 
     fn tick(&mut self, ctx: &egui::Context) {
+        self.sync_discovery(ctx);
+        if self.presented {
+            crate::updater::acknowledge_shared_start(&self.dir);
+        }
         if self.startup_pending {
             self.startup_pending = false;
             self.startup(ctx);
+            self.sync_discovery(ctx);
+        }
+        if let Some(discovery) = &self.discovery {
+            for event in discovery.poll() {
+                match event {
+                    crate::discovery::Event::Found(peer)
+                        if self.discovered.len() < 32 || self.discovered.contains_key(&peer.id) =>
+                    {
+                        self.discovered.insert(peer.id.clone(), peer);
+                    }
+                    crate::discovery::Event::Removed(id) => {
+                        self.discovered.remove(&id);
+                    }
+                    crate::discovery::Event::Error(error) => self.discovery_error = Some(error),
+                    _ => {}
+                }
+            }
         }
         for _ in 0..32 {
             let Ok(action) = self.actions.try_recv() else {
@@ -411,8 +463,38 @@ impl Desktop {
                         self.install_update(ctx);
                     }
                 }
+                Ok(crate::updater::Outcome::Prepared(version, prepared)) => {
+                    self.prepared_update = Some(prepared);
+                    self.update_ready = true;
+                    self.update_status =
+                        format!("Версия {version} проверена. Нажмите «Обновить и перезапустить».");
+                }
                 Err(error) => {
                     self.update_status = format!("Не удалось проверить обновления: {error:#}")
+                }
+            }
+        }
+        if self.install_pending && !self.input_running() && !self.audio_running() {
+            self.install_pending = false;
+            if let Some(prepared) = self.prepared_update.take() {
+                match crate::updater::InstallJob::start(prepared, &self.dir, ctx.clone()) {
+                    Ok(job) => self.install_job = Some(job),
+                    Err(error) => self.update_status = error.to_string(),
+                }
+            }
+        }
+        if let Some((prepared, result)) = self
+            .install_job
+            .as_ref()
+            .and_then(crate::updater::InstallJob::poll)
+        {
+            self.install_job = None;
+            match result {
+                Ok(()) => self.action(Action::Quit, ctx),
+                Err(error) => {
+                    self.prepared_update = Some(prepared);
+                    self.update_ready = true;
+                    self.update_status = format!("Установка отменена или не удалась: {error}");
                 }
             }
         }
@@ -510,6 +592,93 @@ impl Desktop {
         }
     }
 
+    fn restart_discovery(&mut self) {
+        self.discovery.take();
+        self.discovered.clear();
+        self.discovery_error = None;
+    }
+
+    fn sync_discovery(&mut self, ctx: &egui::Context) {
+        if !self.prefs.discovery || self.quitting {
+            if self.discovery.is_some() {
+                self.restart_discovery();
+            }
+            return;
+        }
+        if self.discovery.is_some() || self.discovery_error.is_some() {
+            return;
+        }
+        let port = self
+            .prefs
+            .address
+            .parse::<std::net::SocketAddr>()
+            .map(|address| address.port())
+            .unwrap_or(45876);
+        let audio = self
+            .prefs
+            .audio_address
+            .parse::<std::net::SocketAddr>()
+            .map(|address| address.port())
+            .unwrap_or(45877);
+        match crate::discovery::Discovery::start(
+            &crate::discovery::computer_name(),
+            &self.prefs.role,
+            port,
+            audio,
+            ctx.clone(),
+        ) {
+            Ok(service) => self.discovery = Some(service),
+            Err(error) => self.discovery_error = Some(error.to_string()),
+        }
+    }
+
+    fn use_discovered(&mut self, peer: &crate::discovery::Peer, address: std::net::SocketAddr) {
+        let port = self
+            .prefs
+            .address
+            .parse::<std::net::SocketAddr>()
+            .map(|address| address.port())
+            .unwrap_or(45876);
+        let audio = self
+            .prefs
+            .audio_address
+            .parse::<std::net::SocketAddr>()
+            .map(|address| address.port())
+            .unwrap_or(45877);
+        let (control, sound) = crate::discovery::selected_addresses(
+            &self.prefs.role,
+            &self.prefs.audio_mode,
+            port,
+            audio,
+            peer,
+            address,
+        );
+        self.prefs.address = control.to_string();
+        self.prefs.audio_address = sound.to_string();
+        self.selected_peer = Some((peer.clone(), address));
+        self.dirty = true;
+        self.notice = Some((
+            "Адреса выбраны. Проверьте роли, обменяйтесь ключами и сохраните настройки.".into(),
+            false,
+        ));
+    }
+
+    fn appearance_changed(&mut self, ctx: &egui::Context) {
+        crate::i18n::set_language(&self.prefs.language);
+        view::style(ctx, &self.prefs.theme);
+        if let Some(tray) = &mut self.tray {
+            tray.update(
+                self.tray_snapshot.0,
+                self.tray_snapshot.1,
+                self.tray_snapshot.2,
+            );
+        }
+        if let Err(error) = self.prefs.save(&self.dir) {
+            self.notice = Some((error.to_string(), true));
+        }
+        ctx.request_repaint();
+    }
+
     fn startup(&mut self, ctx: &egui::Context) {
         if !self.startup_valid {
             return;
@@ -520,12 +689,20 @@ impl Desktop {
         if let Err(error) = result {
             self.notice = Some((format!("{error:#}"), true));
         }
-        let failed_update = std::fs::read_to_string(self.dir.join("updates/last-error.txt")).ok();
+        let managed =
+            std::env::current_exe().is_ok_and(|path| crate::updater::shared_managed(&path));
+        let failed_update = if managed {
+            None
+        } else {
+            std::fs::read_to_string(self.dir.join("updates/last-error.txt")).ok()
+        };
         if let Some(error) = &failed_update {
             self.notice = Some((format!("Обновление не установлено: {error}"), true));
         }
         if self.prefs.auto_update && failed_update.is_none() {
-            if crate::updater::staged(&self.dir).is_ok() {
+            if !std::env::current_exe().is_ok_and(|path| crate::updater::shared_managed(&path))
+                && crate::updater::staged(&self.dir).is_ok()
+            {
                 self.update_ready = true;
                 self.install_update(ctx);
                 if self.quitting {
@@ -552,7 +729,11 @@ impl Desktop {
     }
 
     fn check_updates(&mut self, ctx: &egui::Context) {
-        if self.update_job.is_some() || self.quitting {
+        if self.update_job.is_some()
+            || self.install_job.is_some()
+            || self.install_pending
+            || self.quitting
+        {
             return;
         }
         let result = std::env::current_exe()
@@ -569,6 +750,24 @@ impl Desktop {
     }
 
     fn install_update(&mut self, ctx: &egui::Context) {
+        if self.prepared_update.is_some() {
+            if let Err(error) = self.save() {
+                self.notice = Some((error.to_string(), true));
+                return;
+            }
+            if let Some(input) = &mut self.input {
+                input.stop();
+            }
+            if let Some(audio) = &mut self.audio {
+                audio.stop();
+            }
+            self.query.take();
+            self.install_pending = true;
+            self.update_ready = false;
+            self.update_status =
+                "Устанавливаем обновление. На Ubuntu подтвердите системный запрос пароля.".into();
+            return;
+        }
         match crate::updater::launch_apply(&self.dir) {
             Ok(()) => {
                 let _ = std::fs::remove_file(self.dir.join("updates/last-error.txt"));
@@ -586,5 +785,6 @@ impl eframe::App for Desktop {
 
     fn ui(&mut self, ui: &mut egui::Ui, _: &mut eframe::Frame) {
         self.render(ui);
+        self.presented = true;
     }
 }

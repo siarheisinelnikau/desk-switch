@@ -47,6 +47,7 @@ mod native {
     };
 
     pub struct Item {
+        language: String,
         sender: Sender<Action>,
         ctx: egui::Context,
         connected: bool,
@@ -79,12 +80,14 @@ mod native {
         fn tool_tip(&self) -> ksni::ToolTip {
             ksni::ToolTip {
                 title: "Desk Switch".into(),
-                description: if self.connected {
-                    "Пара подключена"
-                } else {
-                    "Настройка рабочего места"
-                }
-                .into(),
+                description: crate::i18n::tr_language(
+                    &self.language,
+                    if self.connected {
+                        "Пара подключена"
+                    } else {
+                        "Настройка рабочего места"
+                    },
+                ),
                 ..Default::default()
             }
         }
@@ -100,7 +103,7 @@ mod native {
             use ksni::menu::{MenuItem, StandardItem};
             let item = |label: &str, action, enabled| {
                 StandardItem {
-                    label: label.into(),
+                    label: crate::i18n::tr_language(&self.language, label),
                     enabled,
                     activate: Box::new(move |this: &mut Self| {
                         dispatch(&this.sender, &this.ctx, action)
@@ -139,6 +142,7 @@ mod native {
         pub fn new(sender: Sender<Action>, ctx: egui::Context) -> Result<Self> {
             let available = Arc::new(AtomicBool::new(true));
             let handle = Item {
+                language: crate::i18n::current_code().into(),
                 sender,
                 ctx,
                 connected: false,
@@ -155,6 +159,7 @@ mod native {
         }
         pub fn update(&mut self, connected: bool, emergency: bool, sound: bool) {
             self.handle.update(|item| {
+                item.language = crate::i18n::current_code().into();
                 item.connected = connected;
                 item.emergency = emergency;
                 item.sound = sound;
@@ -179,6 +184,8 @@ mod native {
 
     pub struct Tray {
         _icon: TrayIcon,
+        show: MenuItem,
+        quit: MenuItem,
         switch: MenuItem,
         emergency: MenuItem,
         sound: MenuItem,
@@ -187,11 +194,28 @@ mod native {
     impl Tray {
         pub fn new(sender: Sender<Action>, ctx: egui::Context) -> Result<Self> {
             let menu = Menu::new();
-            let show = MenuItem::with_id("show", "Открыть Desk Switch", true, None);
-            let switch = MenuItem::with_id("switch", "Переключить на другой ПК", false, None);
-            let emergency = MenuItem::with_id("emergency", "Аварийный возврат", false, None);
-            let sound = MenuItem::with_id("sound", "Включить аудиоподключение", true, None);
-            let quit = MenuItem::with_id("quit", "Завершить Desk Switch", true, None);
+            let show =
+                MenuItem::with_id("show", crate::i18n::tr("Открыть Desk Switch"), true, None);
+            let switch = MenuItem::with_id(
+                "switch",
+                crate::i18n::tr("Переключить на другой ПК"),
+                false,
+                None,
+            );
+            let emergency = MenuItem::with_id(
+                "emergency",
+                crate::i18n::tr("Аварийный возврат"),
+                false,
+                None,
+            );
+            let sound = MenuItem::with_id(
+                "sound",
+                crate::i18n::tr("Включить аудиоподключение"),
+                true,
+                None,
+            );
+            let quit =
+                MenuItem::with_id("quit", crate::i18n::tr("Завершить Desk Switch"), true, None);
             menu.append_items(&[
                 &show,
                 &PredefinedMenuItem::separator(),
@@ -235,6 +259,8 @@ mod native {
                 .build()?;
             Ok(Self {
                 _icon: icon,
+                show,
+                quit,
                 switch,
                 emergency,
                 sound,
@@ -244,13 +270,19 @@ mod native {
             true
         }
         pub fn update(&mut self, connected: bool, emergency: bool, sound: bool) {
+            self.show.set_text(crate::i18n::tr("Открыть Desk Switch"));
+            self.quit.set_text(crate::i18n::tr("Завершить Desk Switch"));
+            self.switch
+                .set_text(crate::i18n::tr("Переключить на другой ПК"));
+            self.emergency
+                .set_text(crate::i18n::tr("Аварийный возврат"));
             self.switch.set_enabled(connected);
             self.emergency.set_enabled(emergency);
-            self.sound.set_text(if sound {
+            self.sound.set_text(crate::i18n::tr(if sound {
                 "Выключить аудиоподключение"
             } else {
                 "Включить аудиоподключение"
-            });
+            }));
         }
     }
 }

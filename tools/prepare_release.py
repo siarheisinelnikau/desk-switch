@@ -41,6 +41,7 @@ def main():
     parser.add_argument("--linux", required=True, type=Path)
     parser.add_argument("--windows", required=True, type=Path)
     parser.add_argument("--tag", required=True)
+    parser.add_argument("--deb", type=Path)
     parser.add_argument("--key", type=Path, default=ROOT/".release-private/update-signing-key.pem")
     parser.add_argument("--out", type=Path, default=ROOT/"dist")
     args = parser.parse_args()
@@ -65,6 +66,13 @@ def main():
             "size": len(data),
         }
         artifacts.append((source, filename))
+    if args.deb:
+        data = args.deb.read_bytes()
+        fields = subprocess.check_output(["dpkg-deb", "--field", str(args.deb), "Package", "Version", "Architecture"], text=True)
+        if fields.splitlines() != ["Package: desk-switch", f"Version: {version}", "Architecture: amd64"]:
+            raise ValueError("Debian installer metadata does not match the release")
+        targets["linux-x86_64-deb"] = {"url": f"https://github.com/{REPOSITORY}/releases/download/{args.tag}/desk-switch-linux-x86_64.deb", "sha256": hashlib.sha256(data).hexdigest(), "size": len(data)}
+        artifacts.append((args.deb, "desk-switch-linux-x86_64.deb"))
     payload = json.dumps({"version": version, "protocol": protocol, "targets": targets}, sort_keys=True, separators=(",", ":"))
     with tempfile.TemporaryDirectory(prefix="desk-switch-sign-") as directory:
         message = Path(directory)/"payload.json"

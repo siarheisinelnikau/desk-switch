@@ -8,9 +8,11 @@ mod autostart;
 mod compatibility;
 mod config;
 mod controller;
+mod discovery;
 mod edge;
 mod gate;
 mod gui;
+mod i18n;
 #[cfg(any(windows, test))]
 mod keys;
 mod lifecycle;
@@ -36,9 +38,12 @@ const USAGE: &str = "Desk Switch\n\
 fn main() {
     #[cfg(windows)]
     if std::env::args().len() > 1
-        && !std::env::args()
-            .nth(1)
-            .is_some_and(|arg| arg == "gui" || arg == "internal-update-apply")
+        && !std::env::args().nth(1).is_some_and(|arg| {
+            matches!(
+                arg.as_str(),
+                "gui" | "internal-update-apply" | "--apply-update" | "--cleanup-update"
+            )
+        })
         && !lifecycle::managed()
     {
         // Keep explicit CLI commands usable from a terminal without a console on GUI launch.
@@ -53,11 +58,15 @@ fn main() {
 }
 
 fn run() -> Result<()> {
-    let args = std::env::args().skip(1).collect::<Vec<_>>();
+    let mut args = std::env::args().skip(1).collect::<Vec<_>>();
+    if updater::shared_cli(&mut args)? {
+        return Ok(());
+    }
     let args = args.iter().map(String::as_str).collect::<Vec<_>>();
     match args.as_slice() {
         [] | ["gui"] => gui::run(false)?,
         ["gui", "--tray"] => gui::run(true)?,
+        ["gui", "--state-dir", path] => gui::run_at(false, std::path::PathBuf::from(path))?,
         ["gui", "--tray", "--state-dir", path] => {
             gui::run_at(true, std::path::PathBuf::from(path))?
         }
