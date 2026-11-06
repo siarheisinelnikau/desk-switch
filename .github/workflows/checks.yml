@@ -9,7 +9,7 @@ jobs:
         os: [ubuntu-24.04, windows-2022]
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7.0.1
       - if: runner.os == 'Linux'
         run: |
           sudo apt-get update -qq
