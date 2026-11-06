@@ -21,6 +21,8 @@ pub struct Preferences {
     pub audio_output: String,
     pub volume: u8,
     pub muted: bool,
+    pub native_volume: u8,
+    pub native_muted: bool,
     pub workspace: crate::workspace::Preferences,
 }
 
@@ -42,6 +44,8 @@ impl Default for Preferences {
             audio_output: String::new(),
             volume: 50,
             muted: false,
+            native_volume: 100,
+            native_muted: false,
             workspace: crate::workspace::Preferences::default(),
         }
     }
@@ -60,7 +64,15 @@ impl Preferences {
                     settings.workspace.shared.muted = settings.muted;
                 }
                 ensure!(
-                    settings.volume <= 100 && settings.workspace.shared.volume <= 100,
+                    settings.volume <= 100
+                        && settings.native_volume <= 100
+                        && settings.workspace.shared.volume <= 100
+                        && settings
+                            .workspace
+                            .shared
+                            .audio_levels
+                            .values()
+                            .all(|v| v.volume <= 100),
                     "audio volume must be between 0 and 100"
                 );
                 config::Role::parse(&settings.role)?;
@@ -118,6 +130,10 @@ impl Preferences {
             if self.muted {
                 args.push("--mute".into());
             }
+            args.extend(["--native-volume".into(), self.native_volume.to_string()]);
+            if self.native_muted {
+                args.push("--native-mute".into());
+            }
             if !self.audio_output.trim().is_empty() {
                 args.extend(["--output".into(), self.audio_output.clone()]);
             }
@@ -135,6 +151,7 @@ pub struct Form {
     pub edge_screen: String,
     pub edge_side: String,
     pub capture_devices: String,
+    pub sharing: config::InputSharing,
 }
 
 impl Form {
@@ -167,14 +184,16 @@ impl Form {
                 .unwrap_or_else(|| "right".into()),
             capture_devices: settings
                 .capture
+                .as_ref()
                 .map(|c| {
                     c.devices
-                        .into_iter()
+                        .iter()
                         .map(|p| p.to_string_lossy().into_owned())
                         .collect::<Vec<_>>()
                         .join("\n")
                 })
                 .unwrap_or_default(),
+            sharing: settings.capture.map(|c| c.sharing).unwrap_or_default(),
         }
     }
 
@@ -200,7 +219,10 @@ impl Form {
             .filter(|line| !line.is_empty())
             .map(PathBuf::from)
             .collect::<Vec<_>>();
-        let capture = (!devices.is_empty()).then_some(CaptureSettings { devices });
+        let capture = Some(CaptureSettings {
+            devices,
+            sharing: self.sharing,
+        });
         Ok(FileSettings {
             monitor,
             edge,

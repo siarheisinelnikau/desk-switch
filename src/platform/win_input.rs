@@ -38,6 +38,7 @@ struct HookData {
     keys: [Option<Owner>; 256],
     buttons: [Option<Owner>; 5],
     edge: Option<Edge>,
+    sharing: crate::config::InputSharing,
     toggle_down: bool,
     emergency_down: bool,
 }
@@ -67,6 +68,15 @@ impl HookData {
             &mut self.keys[..]
         };
         let slot = &mut owners[index];
+        let route = if if button {
+            self.sharing.mouse
+        } else {
+            self.sharing.keyboard
+        } {
+            route
+        } else {
+            Route::Local
+        };
         let fallback = match route {
             Route::Local => Owner::Local,
             Route::Hold => Owner::Suppressed,
@@ -143,7 +153,7 @@ impl HookData {
     }
 
     fn mouse(&mut self, message: u32, data: &MSLLHOOKSTRUCT) -> bool {
-        if data.flags & LLMHF_INJECTED != 0 {
+        if data.flags & LLMHF_INJECTED != 0 || !self.sharing.mouse {
             return false;
         }
         let (token, route) = self.gate.current();
@@ -260,6 +270,7 @@ impl Hooks {
     pub fn install(
         gate: Arc<Gate>,
         mut edge: Option<Edge>,
+        sharing: crate::config::InputSharing,
         control: mpsc::Sender<Control>,
         input: mpsc::Sender<(u64, Input)>,
     ) -> Result<Self> {
@@ -314,6 +325,7 @@ impl Hooks {
                 keys: [None; 256],
                 buttons: [None; 5],
                 edge,
+                sharing,
                 toggle_down: false,
                 emergency_down: false,
             });
@@ -394,3 +406,68 @@ fn move_cursor(x: f64, y: f64) -> Result<()> {
 }
 
 pub const REQUEST_TOGGLE: u32 = WM_APP + 20;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn disabled_keyboard_passes_through_while_mouse_is_shared() {
+        let gate = Arc::new(Gate::new());
+        let token = gate.begin().unwrap();
+        assert!(gate.forward(token));
+        let (control, _) = mpsc::channel(8);
+        let (input, mut events) = mpsc::channel(8);
+        let mut hooks = HookData {
+            gate,
+            control,
+            input,
+            keys: [None; 256],
+            buttons: [None; 5],
+            edge: None,
+            sharing: crate::config::InputSharing {
+                keyboard: false,
+                mouse: true,
+            },
+            toggle_down: false,
+            emergency_down: false,
+        };
+        assert!(!hooks.physical(
+            30,
+            false,
+            true,
+            Some(Input::Key {
+                code: 30,
+                down: true
+            })
+        ));
+        assert!(events.try_recv().is_err());
+        assert!(hooks.physical(
+            0,
+            true,
+            true,
+            Some(Input::Button {
+                code: 272,
+                down: true
+            })
+        ));
+        assert!(matches!(
+            events.try_recv().unwrap(),
+            (
+                _,
+                Input::Button {
+                    code: 272,
+                    down: true
+                }
+            )
+        ));
+        assert!(!hooks.physical(
+            30,
+            false,
+            false,
+            Some(Input::Key {
+                code: 30,
+                down: false
+            })
+        ));
+    }
+}

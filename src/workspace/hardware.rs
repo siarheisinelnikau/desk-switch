@@ -139,6 +139,24 @@ fn bit(value: &str, code: usize) -> bool {
 }
 
 #[cfg(target_os = "linux")]
+pub fn absolute_pointer(has_axis: impl Fn(usize) -> bool) -> bool {
+    // ABS_VOLUME and other auxiliary HID axes do not make a relative mouse
+    // absolute. Only position axes identify a touchpad/tablet/touchscreen.
+    [0, 1, 53, 54].into_iter().any(has_axis)
+}
+
+#[cfg(target_os = "linux")]
+fn input_capabilities(key: &str, rel: &str, abs: &str) -> (bool, bool) {
+    if absolute_pointer(|code| bit(abs, code)) {
+        return (false, false);
+    }
+    (
+        [30, 57, 87, 88].into_iter().all(|code| bit(key, code)),
+        bit(key, 272) && bit(rel, 0) && bit(rel, 1),
+    )
+}
+
+#[cfg(target_os = "linux")]
 pub fn inputs() -> Result<(bool, bool, Vec<PathBuf>)> {
     let mut keyboard = false;
     let mut mouse = false;
@@ -165,14 +183,7 @@ pub fn inputs() -> Result<(bool, bool, Vec<PathBuf>)> {
         let key = std::fs::read_to_string(device.join("capabilities/key")).unwrap_or_default();
         let rel = std::fs::read_to_string(device.join("capabilities/rel")).unwrap_or_default();
         let abs = std::fs::read_to_string(device.join("capabilities/abs")).unwrap_or_default();
-        if abs
-            .split_whitespace()
-            .any(|s| u64::from_str_radix(s, 16).unwrap_or(0) != 0)
-        {
-            continue;
-        }
-        let k = bit(&key, 30) && bit(&key, 57) && bit(&key, 87) && bit(&key, 88);
-        let m = bit(&key, 272) && bit(&rel, 0) && bit(&rel, 1);
+        let (k, m) = input_capabilities(&key, &rel, &abs);
         keyboard |= k;
         mouse |= m;
         if (k || m) && paths.len() < 16 {
@@ -217,6 +228,31 @@ mod tests {
         assert!(!bit("1 0", 0));
         assert!(bit("3", 1));
         assert!(!bit("garbage", 30));
+    }
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn composite_relative_mouse_with_auxiliary_absolute_volume_is_supported() {
+        let key = "3f00733fff 0 0 483ffff17aff32d bfd4444600000000 ffff0001 130ff38b17d007 ffe77bfad9415fed fdbeffdf77cfffff fffffffffffffffe";
+        assert_eq!(input_capabilities(key, "1943", "100000000"), (true, true));
+        // Real pointer position axes must still never enter relative capture.
+        for abs in ["1", "2", "20000000000000", "40000000000000"] {
+            assert_eq!(input_capabilities(key, "1943", abs), (false, false));
+        }
+    }
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn receiver_interfaces_are_classified_separately_from_consumer_controls() {
+        let keyboard = "1000000000007 ff800000000007ff febeffdff3cfffff fffffffffffffffe";
+        assert_eq!(input_capabilities(keyboard, "0", "0"), (true, false));
+        assert_eq!(
+            input_capabilities("1f0000 0 0 0 0", "1943", "0"),
+            (false, true)
+        );
+        let consumer = "3f00733fff 0 0 483ffff17aff32d bfd4444600000000 1 130ff38b17d000 677bfad9415fed 19ed68000004400 10000002";
+        assert_eq!(
+            input_capabilities(consumer, "1040", "100000000"),
+            (false, false)
+        );
     }
     #[test]
     fn serial_identity_survives_port_specific_edid_changes() {

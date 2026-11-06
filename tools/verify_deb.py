@@ -4,6 +4,7 @@ import argparse
 import json
 import os
 from pathlib import Path
+import re
 import subprocess
 import tempfile
 import tomllib
@@ -16,6 +17,10 @@ def check(package):
     for field, expected in [("Package", "desk-switch"), ("Version", version), ("Architecture", "amd64")]:
         actual = subprocess.check_output(["dpkg-deb", "--field", str(package), field], text=True).strip()
         assert actual == expected, (field, actual)
+    dependencies = subprocess.check_output(["dpkg-deb", "--field", str(package), "Depends"], text=True)
+    for required in ["ddcutil", "pipewire-bin", "pipewire-pulse", "pulseaudio-utils"]:
+        assert any(re.fullmatch(r"\s*" + re.escape(required) + r"(?:\s*\([^)]*\))?\s*", dependency)
+                   for dependency in dependencies.split(",")), f"{required} must be a required runtime dependency"
     with tempfile.TemporaryDirectory(prefix="desk-switch-deb-check-") as temporary:
         work = Path(temporary)
         extracted = work / "installed"
@@ -32,7 +37,7 @@ def check(package):
         assert bundled.read_bytes() == original, "launcher must not mutate the package-owned executable"
         assert not (work / "user data/desk-switch/application/desk-switch").exists()
         assert (extracted / "usr/share/doc/desk-switch/rust-auto-updator-LICENSE").is_file()
-        print("PASS: Debian metadata, menu icon, launcher, package-owned binary and updater license")
+        print("PASS: Debian metadata, required monitor/audio utilities, menu icon, launcher, package-owned binary and updater license")
 
 
 if __name__ == "__main__":

@@ -40,6 +40,7 @@ enum Page {
 #[derive(Clone, Copy)]
 enum QueryKind {
     Monitors,
+    MonitorStatus,
 }
 
 pub struct Desktop {
@@ -226,7 +227,10 @@ impl Desktop {
         config::load_peer(&self.dir)
             .context("сначала выполните сопряжение с другим компьютером")?;
         let args = self.prefs.input_args()?;
-        self.input = Some(Worker::start(Kind::Input, &args, &self.dir)?);
+        self.pair.monitor_input = None;
+        let mut worker = Worker::start(Kind::Input, &args, &self.dir)?;
+        worker.monitoring = self.form.monitor_enabled;
+        self.input = Some(worker);
         Ok(())
     }
 
@@ -324,7 +328,7 @@ impl Desktop {
             return;
         }
         let args: Vec<String> = match kind {
-            QueryKind::Monitors => vec![
+            QueryKind::Monitors | QueryKind::MonitorStatus => vec![
                 "monitor-read".into(),
                 self.prefs.workspace.monitor.id.clone(),
             ],
@@ -354,10 +358,13 @@ impl Desktop {
             };
             self.action(action, ctx);
         }
-        for worker in [&mut self.input, &mut self.audio].into_iter().flatten() {
-            let was_running = worker.running();
-            worker.poll();
-            if was_running && !worker.running() && worker.exit_ok == Some(false) {
+        for (worker, failed) in [
+            (&mut self.input, &mut self.pair.input_failed),
+            (&mut self.audio, &mut self.pair.audio_failed),
+        ] {
+            let Some(worker) = worker else { continue };
+            if worker.poll() {
+                *failed = true;
                 self.notice = Some((
                     worker
                         .logs
@@ -476,14 +483,31 @@ impl Desktop {
                         let monitor: MonitorInfo = serde_json::from_value(value)?;
                         if monitor.id == self.prefs.workspace.monitor.id {
                             self.prefs.workspace.monitor.input = monitor.current;
+                            self.pair.monitor_input = monitor.current;
                             self.prefs.workspace.monitor.fingerprint = monitor.fingerprint;
                             self.prefs.save(&self.dir)?;
+                        }
+                    }
+                    QueryKind::MonitorStatus => {
+                        let monitor: MonitorInfo = serde_json::from_value(value)?;
+                        if monitor.id == self.prefs.workspace.monitor.id
+                            && monitor.fingerprint == self.prefs.workspace.monitor.fingerprint
+                        {
+                            self.pair.monitor_input = monitor.current;
+                        } else {
+                            self.pair.monitor_input = None;
                         }
                     }
                 }
                 Ok(())
             })();
-            self.message(result, "Список устройств обновлён.");
+            if matches!(kind, QueryKind::MonitorStatus) {
+                if result.is_err() {
+                    self.pair.monitor_input = None;
+                }
+            } else {
+                self.message(result, "Список устройств обновлён.");
+            }
         }
         let tray_available = self.tray.as_ref().is_some_and(tray::Tray::available);
         if self.hidden && !tray_available {

@@ -4,6 +4,7 @@ use anyhow::{Context, Result, bail};
 use std::{
     io::{self, BufRead},
     net::SocketAddr,
+    path::PathBuf,
     sync::{Arc, Mutex},
     thread,
     time::Duration,
@@ -85,6 +86,8 @@ pub async fn play(
     peer: Key,
     output: Option<String>,
     mix: Mix,
+    mut native_level: crate::workspace::AudioLevel,
+    dir: PathBuf,
 ) -> Result<()> {
     let player = Player {
         address,
@@ -105,15 +108,28 @@ pub async fn play(
                 }
             }
         })?;
-    println!("Audio commands: on, off, volume 0–100, mute, unmute, status, quit");
+    let mut native = super::mixer::NativeMixer::start(dir, native_level)?;
+    native.wait_ready().await?;
+    let mut native_done = false;
+    println!(
+        "Audio commands: on, off, volume 0–100, mute, unmute, native-volume 0–100, native-mute, native-unmute, status, quit"
+    );
     player.status(format!("connecting to {address}"));
     let mut task = Some(tokio::spawn(player.clone().reconnect()));
     let shutdown = tokio::signal::ctrl_c();
     tokio::pin!(shutdown);
     let mut read_commands = true;
-    let signal = loop {
+    let signal: Result<()> = loop {
         tokio::select! {
-            result = &mut shutdown => break result,
+            result = &mut shutdown => break result.map_err(Into::into),
+            result = &mut native.done => {
+                native_done = true;
+                break match result {
+                    Ok(Err(error)) => Err(error),
+                    Err(error) => Err(anyhow::anyhow!("native audio mixer stopped: {error}")),
+                    Ok(Ok(())) => Err(anyhow::anyhow!("native audio mixer stopped unexpectedly")),
+                };
+            }
             command = commands.recv(), if read_commands => {
                 let Some(command) = command else {
                     if crate::lifecycle::managed() { break Ok(()); }
@@ -122,12 +138,14 @@ pub async fn play(
                 };
                 match command.split_whitespace().collect::<Vec<_>>().as_slice() {
                     ["on"] if task.is_none() => {
+                        if let Err(error) = native.set(native_level) { break Err(error); }
                         player.status(format!("connecting to {address}"));
                         task = Some(tokio::spawn(player.clone().reconnect()));
                     }
                     ["on"] => println!("Remote audio is already enabled."),
                     ["off"] => {
                         stop(&mut task).await;
+                        if let Err(error) = native.set(crate::workspace::AudioLevel::default()) { break Err(error); }
                         player.status("off".into());
                     }
                     ["mute"] => {
@@ -145,6 +163,17 @@ pub async fn play(
                         }
                         Err(error) => eprintln!("{error}"),
                     },
+                    ["native-volume", value] => match super::volume(value) {
+                        Ok(volume) => {
+                            native_level.volume = volume;
+                            if task.is_some() && let Err(error) = native.set(native_level) { break Err(error); }
+                        }
+                        Err(error) => eprintln!("{error}"),
+                    },
+                    ["native-mute"] | ["native-unmute"] => {
+                        native_level.muted = command.trim() == "native-mute";
+                        if task.is_some() && let Err(error) = native.set(native_level) { break Err(error); }
+                    }
                     ["status"] => {
                         let mix = *player.mix.lock().unwrap();
                         println!("Remote audio: {} | {}%{}", player.status.lock().unwrap(), mix.volume,
@@ -158,8 +187,13 @@ pub async fn play(
         }
     };
     stop(&mut task).await;
+    let restored = if native_done {
+        Ok(())
+    } else {
+        native.stop().await
+    };
     player.status("off".into());
-    Ok(signal?)
+    signal.and(restored)
 }
 
 async fn stop(task: &mut Option<tokio::task::JoinHandle<()>>) {
