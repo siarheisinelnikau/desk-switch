@@ -30,11 +30,11 @@ def main():
         subprocess.run(["openssl", "pkeyutl", "-verify", "-rawin", "-pubin", "-keyform", "DER", "-inkey", str(work / "key.der"), "-sigfile", str(work / "signature"), "-in", str(work / "payload")], check=True)
         release = json.loads(envelope["payload"])
         assert release["version"] == version and release["protocol"] == protocol
-        targets = {"linux-x86_64": "desk-switch-linux-x86_64", "windows-x86_64": "desk-switch-windows-x86_64.exe"}
-        assert set(release["targets"]) == set(targets) | {"linux-x86_64-deb"}
-        info = json.loads(subprocess.check_output(["gh", "release", "view", tag, "--repo", REPOSITORY, "--json", "isPrerelease,assets"], text=True))
+        targets = {"windows-x86_64": "desk-switch-windows-x86_64.exe", "linux-x86_64-deb": "desk-switch-linux-x86_64.deb"}
+        assert set(release["targets"]) == set(targets)
+        info = json.loads(subprocess.check_output(["gh", "release", "view", tag, "--repo", REPOSITORY, "--json", "isPrerelease,assets,body"], text=True))
         assets = {asset["name"]: asset for asset in info["assets"]}
-        assert set(targets.values()) | {"desk-switch-linux-x86_64.deb"} <= set(assets)
+        assert set(assets) == set(targets.values()), "Only the .deb and .exe belong in this release"
         for platform, filename in targets.items():
             artifact = release["targets"][platform]
             assert artifact["url"] == f"https://github.com/{REPOSITORY}/releases/download/{tag}/{filename}"
@@ -44,29 +44,26 @@ def main():
                 data = response.read(artifact["size"] + 1)
             assert len(data) == artifact["size"] and hashlib.sha256(data).hexdigest() == artifact["sha256"]
             path.write_bytes(data)
-            checked_binary(path, platform, version, protocol)
-        # The installer must contain the exact Linux binary covered by the signature.
-        package = work / "package.deb"
-        with urllib.request.urlopen(f"https://github.com/{REPOSITORY}/releases/download/{tag}/desk-switch-linux-x86_64.deb", timeout=60) as response:
-            package.write_bytes(response.read(128 * 1024 * 1024 + 1))
-        assert package.stat().st_size <= 128 * 1024 * 1024
-        installer = release["targets"]["linux-x86_64-deb"]
-        assert installer["sha256"] == hashlib.sha256(package.read_bytes()).hexdigest()
-        assert installer["size"] == package.stat().st_size
-        subprocess.run(["dpkg-deb", "--extract", str(package), str(work / "installed")], check=True)
-        bundled = work / "installed/usr/lib/desk-switch/desk-switch"
-        assert hashlib.sha256(bundled.read_bytes()).hexdigest() == release["targets"]["linux-x86_64"]["sha256"]
-        assert subprocess.check_output(["dpkg-deb", "--field", str(package), "Version"], text=True).strip() == version
+            if platform == "windows-x86_64":
+                checked_binary(path, platform, version, protocol)
+            else:
+                subprocess.run(["dpkg-deb", "--extract", str(path), str(work / "installed")], check=True)
+                checked_binary(work / "installed/usr/lib/desk-switch/desk-switch", "linux-x86_64", version, protocol)
+                assert subprocess.check_output(["dpkg-deb", "--field", str(path), "Package"], text=True).strip() == "desk-switch"
+                assert subprocess.check_output(["dpkg-deb", "--field", str(path), "Version"], text=True).strip() == version
+                assert subprocess.check_output(["dpkg-deb", "--field", str(path), "Architecture"], text=True).strip() == "amd64"
         update = work / "update.json"
         update.write_bytes(manifest.read_bytes())
+        signed_block = "<!-- desk-switch-update:start -->\n" + update.read_text().strip() + "\n<!-- desk-switch-update:end -->"
         if not info["isPrerelease"]:
-            with urllib.request.urlopen(f"https://github.com/{REPOSITORY}/releases/download/{tag}/update.json", timeout=30) as response:
-                assert response.read(65537) == update.read_bytes()
-            print("Already published with this signed manifest")
+            assert signed_block in info["body"]
+            print("Already published with this signed metadata")
             return
-        subprocess.run(["gh", "release", "upload", tag, str(update), "--repo", REPOSITORY, "--clobber"], check=True)
-        subprocess.run(["gh", "release", "edit", tag, "--repo", REPOSITORY, "--prerelease=false", "--latest"], check=True)
-        print(f"Published signed stable {tag}, including the Debian installer")
+        notes = work / "notes.md"
+        notes.write_text((ROOT / f"release/notes/{version}.md").read_text().strip() + "\n\n" + signed_block + "\n")
+        subprocess.run(["gh", "release", "edit", tag, "--repo", REPOSITORY, "--notes-file", str(notes), "--prerelease=false", "--latest"], check=True)
+        print(f"Published signed stable {tag}: .deb + .exe only")
+
 
 
 if __name__ == "__main__":

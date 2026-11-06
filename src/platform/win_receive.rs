@@ -28,13 +28,22 @@ pub struct NativeSink {
 }
 
 impl NativeSink {
-    pub fn new(edge: Option<Edge>) -> Result<Self> {
+    pub fn new(mut edge: Option<Edge>) -> Result<Self> {
         let dpi =
             unsafe { SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) };
         ensure!(
             dpi != 0 || edge.is_none(),
             "cannot enable per-monitor DPI awareness for the return edge"
         );
+        if let Some(edge) = &mut edge
+            && edge.screen == "auto"
+        {
+            edge.screen = win_monitor::screens()?
+                .into_iter()
+                .next()
+                .context("No screen is available")?
+                .name;
+        }
         Ok(Self {
             active: false,
             edge,

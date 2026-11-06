@@ -62,9 +62,16 @@ impl host::Cursor for PortalCursor {
 }
 
 fn open_devices(paths: &[PathBuf]) -> Result<Vec<Device>> {
+    let automatic;
+    let paths = if paths.is_empty() {
+        automatic = crate::workspace::hardware::inputs()?.2;
+        &automatic[..]
+    } else {
+        paths
+    };
     ensure!(
         !paths.is_empty(),
-        "Ubuntu host needs [capture].devices with the keyboard and mouse event paths"
+        "Клавиатура и мышь не найдены. Подключите устройства к этому ПК."
     );
     ensure!(
         paths.len() <= 16,

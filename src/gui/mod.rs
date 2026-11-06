@@ -1,9 +1,15 @@
 mod model;
+#[cfg(debug_assertions)]
+mod preview;
+mod session;
 mod tray;
 mod view;
 mod worker;
+#[cfg(debug_assertions)]
+pub use preview::run as run_preview;
 
-use crate::{audio::AudioDevice, config, lifecycle::InputStatus, platform::MonitorInfo};
+use crate::lifecycle::InputStatus;
+use crate::{config, platform::MonitorInfo};
 use anyhow::{Context, Result};
 use eframe::egui;
 use model::{Form, Preferences};
@@ -21,14 +27,12 @@ pub enum Action {
     Emergency,
     Sound,
     Quit,
+    Hide,
 }
 
 #[derive(Clone, Copy, PartialEq)]
 enum Page {
     Overview,
-    Devices,
-    Monitor,
-    Sound,
     Application,
     Diagnostics,
 }
@@ -36,9 +40,6 @@ enum Page {
 #[derive(Clone, Copy)]
 enum QueryKind {
     Monitors,
-    Audio,
-    #[cfg(target_os = "linux")]
-    Wayland,
 }
 
 pub struct Desktop {
@@ -48,14 +49,10 @@ pub struct Desktop {
     page: Page,
     public_key: String,
     peer_key: String,
-    pair_entry: String,
     input: Option<Worker>,
     audio: Option<Worker>,
     query: Option<(QueryKind, Worker)>,
     monitors: Vec<MonitorInfo>,
-    devices: Vec<AudioDevice>,
-    #[cfg(target_os = "linux")]
-    wayland_screens: Vec<String>,
     notice: Option<(String, bool)>,
     tray: Option<tray::Tray>,
     tray_error: Option<String>,
@@ -65,7 +62,6 @@ pub struct Desktop {
     start_hidden: bool,
     quitting: bool,
     last_switch: Option<Instant>,
-    dirty: bool,
     startup_pending: bool,
     startup_valid: bool,
     update_job: Option<crate::updater::Job>,
@@ -80,7 +76,11 @@ pub struct Desktop {
     discovery: Option<crate::discovery::Discovery>,
     discovered: std::collections::BTreeMap<String, crate::discovery::Peer>,
     discovery_error: Option<String>,
-    selected_peer: Option<(crate::discovery::Peer, std::net::SocketAddr)>,
+    pair: session::Pair,
+    applied_mix: String,
+    quitting_since: Option<Instant>,
+    #[cfg(debug_assertions)]
+    preview: Option<crate::workspace::Node>,
 }
 
 pub fn run(start_hidden: bool) -> Result<()> {
@@ -158,14 +158,10 @@ impl Desktop {
             page: Page::Overview,
             public_key,
             peer_key,
-            pair_entry: String::new(),
             input: None,
             audio: None,
             query: None,
             monitors: Vec::new(),
-            devices: Vec::new(),
-            #[cfg(target_os = "linux")]
-            wayland_screens: Vec::new(),
             notice: prefs_error.or(settings_error).map(|error| (error, true)),
             tray,
             tray_error,
@@ -175,7 +171,6 @@ impl Desktop {
             start_hidden,
             quitting: false,
             last_switch: None,
-            dirty: false,
             startup_pending: true,
             startup_valid,
             update_job: None,
@@ -190,7 +185,11 @@ impl Desktop {
             discovery: None,
             discovered: std::collections::BTreeMap::new(),
             discovery_error: None,
-            selected_peer: None,
+            pair: session::Pair::default(),
+            applied_mix: String::new(),
+            quitting_since: None,
+            #[cfg(debug_assertions)]
+            preview: None,
         }
     }
 
@@ -201,16 +200,16 @@ impl Desktop {
         self.audio.as_ref().is_some_and(Worker::running)
     }
     fn connected(&self) -> bool {
+        #[cfg(debug_assertions)]
+        if let Some(node) = &self.preview {
+            return self.pair.synced && node.input.is_some();
+        }
         self.input.as_ref().is_some_and(Worker::connected)
     }
 
     fn save(&mut self) -> Result<()> {
         config::save_settings(&self.dir, &self.form.document()?)?;
         self.prefs.save(&self.dir)?;
-        self.dirty = false;
-        if self.prefs.discovery {
-            self.restart_discovery();
-        }
         Ok(())
     }
 
@@ -231,59 +230,33 @@ impl Desktop {
         Ok(())
     }
 
-    fn toggle_input(&mut self) {
-        if self.input_running() {
-            self.input.as_mut().unwrap().stop();
-        } else {
-            let result = self.start_input();
-            self.message(
-                result,
-                "Служба запускается. На Ubuntu подтвердите доступ в системном диалоге.",
-            );
-        }
-    }
-
     fn toggle_audio(&mut self) {
-        if self.audio_running() {
-            self.prefs.auto_audio = false;
-            if let Err(error) = self.prefs.save(&self.dir) {
-                self.notice = Some((error.to_string(), true));
-            }
-            self.audio.as_mut().unwrap().stop();
-            return;
-        }
-        let result = (|| {
-            self.prefs.save(&self.dir)?;
-            config::load_identity(&self.dir)?;
-            config::load_peer(&self.dir).context("сначала выполните сопряжение")?;
-            let args = self.prefs.audio_args()?;
-            let kind = if self.prefs.audio_mode == "send" {
-                Kind::AudioSend
-            } else {
-                Kind::AudioReceive
-            };
-            self.audio = Some(Worker::start(kind, &args, &self.dir)?);
-            self.prefs.auto_audio = true;
-            self.prefs.save(&self.dir)?;
-            Ok(())
-        })();
-        self.message(result, "Аудиослужба запускается.");
+        self.prefs.workspace.shared.audio_enabled = !self.prefs.workspace.shared.audio_enabled;
+        self.shared_changed();
     }
 
     fn switch(&mut self) {
+        #[cfg(debug_assertions)]
+        if let Some(local) = &mut self.preview {
+            local.input = Some(if local.input == Some(InputStatus::Here) {
+                InputStatus::Peer
+            } else {
+                InputStatus::Here
+            });
+            if let Some(remote) = &mut self.pair.remote {
+                remote.input = Some(if local.input == Some(InputStatus::Here) {
+                    InputStatus::Peer
+                } else {
+                    InputStatus::Here
+                });
+            }
+            return;
+        }
         if !self.connected()
             || self
                 .last_switch
                 .is_some_and(|time| time.elapsed() < Duration::from_millis(800))
         {
-            return;
-        }
-        if !self.form.monitor_enabled {
-            self.notice = Some((
-                "Выберите общий монитор и его входы в настройках.".into(),
-                true,
-            ));
-            self.page = Page::Monitor;
             return;
         }
         let result = self.input.as_mut().unwrap().command("switch");
@@ -309,11 +282,11 @@ impl Desktop {
                     self.message(result, "Запрошен аварийный возврат управления.");
                 }
             }
-            Action::Sound => {
-                let starting = !self.audio_running();
-                self.toggle_audio();
-                if starting && self.notice.as_ref().is_some_and(|(_, error)| *error) {
-                    self.action(Action::Show, ctx);
+            Action::Sound => self.toggle_audio(),
+            Action::Hide => {
+                if self.tray.as_ref().is_some_and(tray::Tray::available) {
+                    self.hidden = true;
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
                 }
             }
             Action::Quit => {
@@ -328,6 +301,8 @@ impl Desktop {
                     return;
                 }
                 self.quitting = true;
+                self.quitting_since.get_or_insert_with(Instant::now);
+                self.stop_pair();
                 if let Some(input) = &mut self.input {
                     input.stop();
                 }
@@ -341,66 +316,37 @@ impl Desktop {
     }
 
     fn scan(&mut self, kind: QueryKind) {
+        #[cfg(debug_assertions)]
+        if self.preview.is_some() {
+            return;
+        }
         if self.query.is_some() {
             return;
         }
         let args: Vec<String> = match kind {
-            QueryKind::Monitors => vec!["probe", "--json"],
-            QueryKind::Audio => vec!["audio", "outputs", "--json"],
-            #[cfg(target_os = "linux")]
-            QueryKind::Wayland => vec!["portal-check", "--consent", "--json"],
-        }
-        .into_iter()
-        .map(str::to_owned)
-        .collect();
+            QueryKind::Monitors => vec![
+                "monitor-read".into(),
+                self.prefs.workspace.monitor.id.clone(),
+            ],
+        };
         match Worker::start(Kind::Query, &args, &self.dir) {
             Ok(worker) => self.query = Some((kind, worker)),
             Err(error) => self.notice = Some((format!("{error:#}"), true)),
         }
     }
 
-    fn sound_mix(&mut self) {
-        if let Some(audio) = &mut self.audio
-            && audio.running()
-            && audio.kind == Kind::AudioReceive
-        {
-            let result = audio
-                .command(&format!("volume {}", self.prefs.volume))
-                .and_then(|()| audio.command(if self.prefs.muted { "mute" } else { "unmute" }));
-            if let Err(error) = result {
-                self.notice = Some((error.to_string(), true));
-            }
-        }
-        if let Err(error) = self.prefs.save(&self.dir) {
-            self.notice = Some((error.to_string(), true));
-        }
-    }
-
     fn tick(&mut self, ctx: &egui::Context) {
-        self.sync_discovery(ctx);
+        #[cfg(debug_assertions)]
+        if self.preview.is_some() {
+            self.preview_tick(ctx);
+            return;
+        }
         if self.presented {
             crate::updater::acknowledge_shared_start(&self.dir);
         }
         if self.startup_pending {
             self.startup_pending = false;
             self.startup(ctx);
-            self.sync_discovery(ctx);
-        }
-        if let Some(discovery) = &self.discovery {
-            for event in discovery.poll() {
-                match event {
-                    crate::discovery::Event::Found(peer)
-                        if self.discovered.len() < 32 || self.discovered.contains_key(&peer.id) =>
-                    {
-                        self.discovered.insert(peer.id.clone(), peer);
-                    }
-                    crate::discovery::Event::Removed(id) => {
-                        self.discovered.remove(&id);
-                    }
-                    crate::discovery::Event::Error(error) => self.discovery_error = Some(error),
-                    _ => {}
-                }
-            }
         }
         for _ in 0..32 {
             let Ok(action) = self.actions.try_recv() else {
@@ -422,6 +368,7 @@ impl Desktop {
                 ));
             }
         }
+        self.tick_pair(ctx);
         let version_error = [&self.input, &self.audio]
             .into_iter()
             .flatten()
@@ -525,10 +472,14 @@ impl Desktop {
                             "Устройства не ответили. Проверьте системные зависимости.".into()
                         }))?;
                 match kind {
-                    QueryKind::Monitors => self.monitors = serde_json::from_value(value)?,
-                    QueryKind::Audio => self.devices = serde_json::from_value(value)?,
-                    #[cfg(target_os = "linux")]
-                    QueryKind::Wayland => self.wayland_screens = serde_json::from_value(value)?,
+                    QueryKind::Monitors => {
+                        let monitor: MonitorInfo = serde_json::from_value(value)?;
+                        if monitor.id == self.prefs.workspace.monitor.id {
+                            self.prefs.workspace.monitor.input = monitor.current;
+                            self.prefs.workspace.monitor.fingerprint = monitor.fingerprint;
+                            self.prefs.save(&self.dir)?;
+                        }
+                    }
                 }
                 Ok(())
             })();
@@ -538,11 +489,7 @@ impl Desktop {
         if self.hidden && !tray_available {
             self.action(Action::Show, ctx);
         }
-        let snapshot = (
-            self.connected() && self.form.monitor_enabled,
-            self.input_running(),
-            self.audio_running(),
-        );
+        let snapshot = (self.connected(), self.input_running(), self.audio_running());
         if snapshot != self.tray_snapshot {
             if let Some(tray) = &mut self.tray {
                 tray.update(snapshot.0, snapshot.1, snapshot.2);
@@ -558,109 +505,20 @@ impl Desktop {
         }
         if ctx.input(|input| input.viewport().close_requested()) && !self.quitting {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
-            if tray_available {
-                self.hidden = true;
-                ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
-            } else {
-                self.action(Action::Quit, ctx);
+            self.action(Action::Quit, ctx);
+        }
+        if self
+            .quitting_since
+            .is_some_and(|time| time.elapsed() > Duration::from_secs(6))
+        {
+            for worker in [&mut self.input, &mut self.audio].into_iter().flatten() {
+                worker.force_stop();
             }
         }
         if self.quitting && !self.input_running() && !self.audio_running() {
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
         }
         ctx.request_repaint_after(Duration::from_millis(200));
-    }
-
-    fn input_label(&self) -> (&'static str, bool) {
-        let Some(worker) = &self.input else {
-            return ("Не подключено", false);
-        };
-        if worker.version_error.is_some() {
-            return ("Версии не совпадают", false);
-        }
-        if worker.stopping && worker.running() {
-            return ("Отключение…", false);
-        }
-        if !worker.running() {
-            return ("Остановлено", false);
-        }
-        match worker.input_status {
-            Some(InputStatus::Here) => ("Управление на этом ПК", true),
-            Some(InputStatus::Peer) => ("Управление на другом ПК", true),
-            Some(InputStatus::Recovering) => ("Возврат управления…", false),
-            _ => ("Ожидание второго ПК", false),
-        }
-    }
-
-    fn restart_discovery(&mut self) {
-        self.discovery.take();
-        self.discovered.clear();
-        self.discovery_error = None;
-    }
-
-    fn sync_discovery(&mut self, ctx: &egui::Context) {
-        if !self.prefs.discovery || self.quitting {
-            if self.discovery.is_some() {
-                self.restart_discovery();
-            }
-            return;
-        }
-        if self.discovery.is_some() || self.discovery_error.is_some() {
-            return;
-        }
-        let port = self
-            .prefs
-            .address
-            .parse::<std::net::SocketAddr>()
-            .map(|address| address.port())
-            .unwrap_or(45876);
-        let audio = self
-            .prefs
-            .audio_address
-            .parse::<std::net::SocketAddr>()
-            .map(|address| address.port())
-            .unwrap_or(45877);
-        match crate::discovery::Discovery::start(
-            &crate::discovery::computer_name(),
-            &self.prefs.role,
-            port,
-            audio,
-            ctx.clone(),
-        ) {
-            Ok(service) => self.discovery = Some(service),
-            Err(error) => self.discovery_error = Some(error.to_string()),
-        }
-    }
-
-    fn use_discovered(&mut self, peer: &crate::discovery::Peer, address: std::net::SocketAddr) {
-        let port = self
-            .prefs
-            .address
-            .parse::<std::net::SocketAddr>()
-            .map(|address| address.port())
-            .unwrap_or(45876);
-        let audio = self
-            .prefs
-            .audio_address
-            .parse::<std::net::SocketAddr>()
-            .map(|address| address.port())
-            .unwrap_or(45877);
-        let (control, sound) = crate::discovery::selected_addresses(
-            &self.prefs.role,
-            &self.prefs.audio_mode,
-            port,
-            audio,
-            peer,
-            address,
-        );
-        self.prefs.address = control.to_string();
-        self.prefs.audio_address = sound.to_string();
-        self.selected_peer = Some((peer.clone(), address));
-        self.dirty = true;
-        self.notice = Some((
-            "Адреса выбраны. Проверьте роли, обменяйтесь ключами и сохраните настройки.".into(),
-            false,
-        ));
     }
 
     fn appearance_changed(&mut self, ctx: &egui::Context) {
@@ -710,13 +568,6 @@ impl Desktop {
                 }
             }
             self.check_updates(ctx);
-        }
-        let paired = !self.public_key.is_empty() && !self.peer_key.is_empty();
-        if paired && self.prefs.auto_connect {
-            self.toggle_input();
-        }
-        if paired && self.prefs.auto_audio {
-            self.toggle_audio();
         }
     }
 

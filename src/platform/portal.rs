@@ -271,6 +271,18 @@ impl Portal {
     }
 
     fn find_screen(&self, id: &str) -> Result<Screen> {
+        if id == "auto" {
+            return self
+                .screens()
+                .into_iter()
+                .min_by(|a, b| {
+                    a.rect
+                        .x
+                        .total_cmp(&b.rect.x)
+                        .then(a.rect.y.total_cmp(&b.rect.y))
+                })
+                .context("Wayland не предоставил область экрана");
+        }
         let mut screens = self.screens().into_iter().filter(|screen| screen.id == id);
         let screen = screens
             .next()
@@ -446,7 +458,9 @@ impl Portal {
                     let (dx, dy) = (f64::from(dx) / current.scale, f64::from(dy) / current.scale);
                     let edge = self.edge.as_ref().unwrap();
                     if detect_edge
-                        && current.id == edge.screen
+                        && (current.id == edge.screen
+                            || (edge.screen == "auto"
+                                && current.id == self.find_screen("auto")?.id))
                         && self.keys.is_empty()
                         && self.buttons.is_empty()
                         && let Some(position) = edge.side.crossing(current.rect, x, y, dx, dy)
