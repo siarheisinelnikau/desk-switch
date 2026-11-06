@@ -1,0 +1,4 @@
+{
+  "payload": "{\"protocol\":4,\"targets\":{\"linux-x86_64-deb\":{\"sha256\":\"fa4fa0b4fc083c9d5972d71537b44a820c38efccc77eae8d1abe21e254ee1086\",\"size\":6545680,\"url\":\"https://github.com/siarheisinelnikau/desk-switch/releases/download/v0.4.2/desk-switch-linux-x86_64.deb\"},\"windows-x86_64\":{\"sha256\":\"ab9524b75ce0a619ac3420dabd668f406ddeb749c801fe41ddf6600a775c9c5b\",\"size\":15445504,\"url\":\"https://github.com/siarheisinelnikau/desk-switch/releases/download/v0.4.2/desk-switch-windows-x86_64.exe\"}},\"version\":\"0.4.2\"}",
+  "signature": "03e1b9a13f1a62eaf1c968c5306369b2ef3d62eacb9b6a639ef6f87b377ea5066d4a5c94690bddeff31b69eaaea9bbfeefb9865876854f26efd86df5c819020c"
+}
