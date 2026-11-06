@@ -314,6 +314,31 @@ enum Frame {
     Pinned,
     State(Box<Node>),
     Forget,
+    Forgotten,
+}
+
+fn remove_pin(dir: &std::path::Path) -> Result<()> {
+    match std::fs::remove_file(dir.join("peer")) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e.into()),
+    }
+}
+
+async fn send_frame(
+    writer: &mut tokio::net::tcp::WriteHalf<'_>,
+    noise: &mut TransportState,
+    frame: Frame,
+) -> Result<()> {
+    let bytes = serde_json::to_vec(&frame)?;
+    let mut encrypted = vec![0; LIMIT];
+    let len = noise.write_message(&bytes, &mut encrypted)?;
+    timeout(AUTH_TIMEOUT, async {
+        writer.write_u16(len as u16).await?;
+        writer.write_all(&encrypted[..len]).await
+    })
+    .await??;
+    Ok(())
 }
 impl Candidate {
     async fn send(&mut self, frame: Frame) -> Result<()> {
@@ -561,25 +586,31 @@ async fn session(
     // Keep a dedicated reader so a GUI publish/tick cannot cancel half a TCP frame.
     let (mut read, mut write) = peer.stream.split();
     let mut read_buffer = Vec::new();
+    let mut forgetting: Option<Instant> = None;
     loop {
         tokio::select! {
             command=commands.recv()=>match command {
                 Some(Command::Disconnect)|None=>return Ok(()),
                 Some(Command::Forget)=> {
-                    let bytes=serde_json::to_vec(&Frame::Forget)?;let mut encrypted=vec![0;LIMIT];let len=peer.noise.write_message(&bytes,&mut encrypted)?;
-                    timeout(AUTH_TIMEOUT,async {write.write_u16(len as u16).await?;write.write_all(&encrypted[..len]).await}).await??;
-                    std::fs::remove_file(dir.join("peer"))?;notify.send(Event::Forgotten);return Ok(());
+                    remove_pin(dir)?;
+                    if let Err(error)=send_frame(&mut write,&mut peer.noise,Frame::Forget).await {
+                        notify.send(Event::Forgotten);return Err(error);
+                    }
+                    forgetting=Some(Instant::now()+AUTH_TIMEOUT);
                 }
                 _=>{}
             },
             _=tick.tick()=> {
+                if let Some(deadline)=forgetting {
+                    if Instant::now()>=deadline {notify.send(Event::Forgotten);return Ok(());}
+                    continue;
+                }
                 ensure!(last_seen.elapsed()<Duration::from_secs(4),"Соединение с другим ПК потеряно");
                 let state=local.borrow().clone();
-                let bytes=serde_json::to_vec(&Frame::State(Box::new(state)))?;
-                let mut encrypted=vec![0;LIMIT]; let len=peer.noise.write_message(&bytes,&mut encrypted)?;
-                timeout(AUTH_TIMEOUT,async {write.write_u16(len as u16).await?;write.write_all(&encrypted[..len]).await}).await??;
+                send_frame(&mut write,&mut peer.noise,Frame::State(Box::new(state))).await?;
             }
             read=read.read_buf(&mut read_buffer)=> {
+                if forgetting.is_some() && !matches!(read,Ok(n) if n>0) {notify.send(Event::Forgotten);return Ok(());}
                 ensure!(read?>0,"Соединение с другим ПК закрыто");
                 ensure!(read_buffer.len()<=LIMIT*2,"pair receive buffer overflow");
                 while read_buffer.len()>=2 {
@@ -588,7 +619,12 @@ async fn session(
                     if read_buffer.len()<length+2 {break;}
                     let mut plain=vec![0;LIMIT]; let len=peer.noise.read_message(&read_buffer[2..length+2],&mut plain)?;
                     let frame=serde_json::from_slice::<Frame>(&plain[..len])?;
-                    if matches!(frame,Frame::Forget) {std::fs::remove_file(dir.join("peer"))?;notify.send(Event::Forgotten);return Ok(());}
+                    if matches!(frame,Frame::Forget) {
+                        remove_pin(dir)?;
+                        let result=send_frame(&mut write,&mut peer.noise,Frame::Forgotten).await;
+                        notify.send(Event::Forgotten);result?;return Ok(());
+                    }
+                    if matches!(frame,Frame::Forgotten) && forgetting.is_some() {notify.send(Event::Forgotten);return Ok(());}
                     let Frame::State(state)=frame else {bail!("unexpected pair command")};
                     state.validate(own,&key)?; last_seen=Instant::now();
                     ensure!(notify.send(Event::State(state)),"окно приложения закрыто");
@@ -648,6 +684,7 @@ mod tests {
                 address,
             }
         }
+        #[track_caller]
         fn wait(&self, accept: impl Fn(&Event) -> bool) -> Event {
             let deadline = std::time::Instant::now() + Duration::from_secs(6);
             let mut seen = Vec::new();
@@ -765,6 +802,17 @@ mod tests {
         b.wait(|e| matches!(e, Event::Connected { .. }));
         a.wait(|e| matches!(e, Event::State(_)));
         b.wait(|e| matches!(e, Event::State(_)));
+        a.service.forget().unwrap();
+        b.service.forget().unwrap();
+        a.wait(|e| matches!(e, Event::Forgotten));
+        b.wait(|e| matches!(e, Event::Forgotten));
+        assert!(!a.dir.join("peer").exists() && !b.dir.join("peer").exists());
+    }
+    #[test]
+    fn repeated_restart_and_pairing_keeps_the_same_trusted_identity() {
+        for _ in 0..30 {
+            a_link_click_and_remote_approval_pin_both_keys_and_reconnect_without_approval();
+        }
     }
     #[tokio::test]
     async fn initial_key_exchange_authenticates_and_uses_same_confirmation_code() {
