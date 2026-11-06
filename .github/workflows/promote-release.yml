@@ -1,0 +1,20 @@
+name: Publish signed release
+
+on:
+  push:
+    branches: [main]
+    paths: ["release/manifests/*.json"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Verify both binaries and Debian package, then publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 tools/promote_release.py
