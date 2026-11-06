@@ -28,14 +28,16 @@ jobs:
       RUSTFLAGS: ${{ matrix.rustflags }}
     steps:
       - uses: actions/checkout@v4
+      - if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y pkg-config libssl-dev dpkg-dev desktop-file-utils
       - run: cargo fmt --all --check
       - run: cargo clippy --locked --all-targets -- -D warnings
       - run: cargo test --locked
       - run: cargo build --locked --release
       - if: matrix.platform == 'linux'
         run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y dpkg-dev desktop-file-utils
           python3 tools/package_deb.py --binary target/release/desk-switch --out dist
           python3 tools/verify_deb.py dist/desk-switch-linux-x86_64.deb
           sudo apt-get --simulate install ./dist/desk-switch-linux-x86_64.deb

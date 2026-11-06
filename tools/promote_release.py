@@ -31,7 +31,7 @@ def main():
         release = json.loads(envelope["payload"])
         assert release["version"] == version and release["protocol"] == protocol
         targets = {"linux-x86_64": "desk-switch-linux-x86_64", "windows-x86_64": "desk-switch-windows-x86_64.exe"}
-        assert set(release["targets"]) == set(targets)
+        assert set(release["targets"]) == set(targets) | {"linux-x86_64-deb"}
         info = json.loads(subprocess.check_output(["gh", "release", "view", tag, "--repo", REPOSITORY, "--json", "isPrerelease,assets"], text=True))
         assets = {asset["name"]: asset for asset in info["assets"]}
         assert set(targets.values()) | {"desk-switch-linux-x86_64.deb"} <= set(assets)
@@ -50,10 +50,13 @@ def main():
         with urllib.request.urlopen(f"https://github.com/{REPOSITORY}/releases/download/{tag}/desk-switch-linux-x86_64.deb", timeout=60) as response:
             package.write_bytes(response.read(128 * 1024 * 1024 + 1))
         assert package.stat().st_size <= 128 * 1024 * 1024
+        installer = release["targets"]["linux-x86_64-deb"]
+        assert installer["sha256"] == hashlib.sha256(package.read_bytes()).hexdigest()
+        assert installer["size"] == package.stat().st_size
         subprocess.run(["dpkg-deb", "--extract", str(package), str(work / "installed")], check=True)
         bundled = work / "installed/usr/lib/desk-switch/desk-switch"
         assert hashlib.sha256(bundled.read_bytes()).hexdigest() == release["targets"]["linux-x86_64"]["sha256"]
-        assert subprocess.check_output(["dpkg-deb", "--field", str(package), "Version"], text=True).strip() == version + "-1"
+        assert subprocess.check_output(["dpkg-deb", "--field", str(package), "Version"], text=True).strip() == version
         update = work / "update.json"
         update.write_bytes(manifest.read_bytes())
         if not info["isPrerelease"]:

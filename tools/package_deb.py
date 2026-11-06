@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build an amd64 Debian package with desktop integration and signed self-updates."""
+"""Build an amd64 Debian package with desktop integration and package-managed signed updates."""
 import argparse
 import hashlib
 import math
@@ -36,6 +36,7 @@ def main():
             "usr/share/applications/com.deskswitch.Desktop.desktop": ROOT / "packaging/linux/com.deskswitch.Desktop.desktop",
             "usr/share/icons/hicolor/scalable/apps/com.deskswitch.Desktop.svg": ROOT / "packaging/linux/com.deskswitch.Desktop.svg",
             "usr/share/doc/desk-switch/copyright": ROOT / "LICENSE",
+            "usr/share/doc/desk-switch/rust-auto-updator-LICENSE": ROOT / "vendor/rust-auto-updator/LICENSE",
         }
         for name, source in files.items():
             target = stage / name
@@ -47,12 +48,12 @@ def main():
         (work / "debian/control").write_text("Source: desk-switch\n\nPackage: desk-switch\nArchitecture: amd64\nDescription: Share input and audio between PCs\n")
         shlibs = subprocess.check_output(["dpkg-shlibdeps", "-O", "-e", str(binary)], cwd=work, text=True)
         native = next(line.split("=", 1)[1] for line in shlibs.splitlines() if line.startswith("shlibs:Depends="))
-        dependencies = native + ", python3 (>= 3.11), libx11-6, libx11-xcb1, libxcursor1, libxrandr2, libxi6, libxinerama1, libxkbcommon0, libxkbcommon-x11-0, libwayland-client0, libegl1, libgl1"
+        dependencies = native + ", pkexec, ca-certificates, libx11-6, libx11-xcb1, libxcursor1, libxrandr2, libxi6, libxinerama1, libxkbcommon0, libxkbcommon-x11-0, libwayland-client0, libegl1, libgl1"
         control = stage / "DEBIAN"
         control.mkdir()
         size = math.ceil(sum(p.stat().st_size for p in stage.rglob("*") if p.is_file()) / 1024)
         (control / "control").write_text(
-            f"Package: desk-switch\nVersion: {version}-1\nArchitecture: amd64\n"
+            f"Package: desk-switch\nVersion: {version}\nArchitecture: amd64\n"
             "Maintainer: Desk Switch contributors <9218241+siarheisinelnikau@users.noreply.github.com>\n"
             "Section: utils\nPriority: optional\n"
             f"Installed-Size: {size}\nDepends: {dependencies}\n"
