@@ -6,6 +6,23 @@ Share one keyboard and mouse, switch one selected monitor's HDMI/DP input, and l
 
 ## Desktop window and tray
 
+Ubuntu 24.04/26.04 x86-64: download **desk-switch-linux-x86_64.deb** from
+[the latest release](https://github.com/siarheisinelnikau/desk-switch/releases/latest), then install:
+
+~~~sh
+sudo apt install ./desk-switch-linux-x86_64.deb
+~~~
+
+Open **Desk Switch** from the application menu, or run `desk-switch` without sudo.
+The installer includes the menu icon and declares desktop runtime dependencies.
+The separate file without `.deb` is a portable ELF executable, not an apt package.
+The Debian launcher keeps an updateable user copy under
+`$XDG_DATA_HOME/desk-switch/application` (normally `~/.local/share/desk-switch/application`).
+Signed updates need no sudo and are kept when opening an older package. Autostart
+uses `/usr/bin/desk-switch` with a TryExec guard; uninstalling the package disables
+that login entry while preserving pairing/settings. Package upgrades refresh older
+user copies on the next launch. Run portable binaries from a user-writable folder.
+
 Launch the binary without arguments, or run `desk-switch gui`, to open the native Rust desktop window. It includes pairing, input roles and addresses, monitor/input selection, edge settings, audio device and volume controls, and recent service logs. The interface is in Russian. The existing CLI commands remain available.
 
 ![Desk Switch desktop window](docs/desktop.png)
@@ -35,7 +52,7 @@ Automatic checks/downloads default to enabled, at launch and every six hours. Th
 
 Only stable, newer versions with a valid Ed25519 signature are accepted. One manifest must contain both Windows x86-64 and Ubuntu x86-64 assets of the same release. HTTPS, bounded sizes, SHA-256 and the embedded binary version/protocol are checked before installation. The update helper waits for this profile's GUI/input/audio locks, verifies the staged file again, and replaces the executable with a previous-version backup. An immediate startup failure restores the previous binary; an error marker prevents an automatic retry loop. Installation requires a user-writable application directory and does not elevate privileges.
 
-The publisher's public key is committed in `release/update-public-key.hex`; the local private key is in the ignored `.release-private/update-signing-key.pem`. Back up that private key and configure its PEM contents as the GitHub Actions secret `DESK_SWITCH_UPDATE_SIGNING_KEY` before publishing. The release workflow builds/tests both OS targets, validates their embedded version/protocol against the Cargo version and tag, signs a common manifest, uploads a draft with both assets, then publishes it. Existing version tags/releases must not be reused.
+The publisher's public key is committed in `release/update-public-key.hex`; the local private key stays in the ignored `.release-private/update-signing-key.pem`. Back up that private key. The release workflow builds/tests both OS targets and the Debian installer on Ubuntu 24.04, then creates a prerelease. Download both executable assets, run `tools/prepare_release.py` locally, and commit the resulting signed `update.json` as `release/manifests/VERSION.json`. The promotion workflow verifies the signature, both public downloads and the installer's bundled binary before publishing the stable release. No private signing key is sent to GitHub. Existing version tags/releases must not be reused. Set `release/publish-request.json` to the new Cargo version's tag to request a build through the connector, or push that version tag normally.
 
 To prepare a reviewable local release without publishing:
 

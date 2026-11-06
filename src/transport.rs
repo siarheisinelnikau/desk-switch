@@ -271,7 +271,7 @@ mod tests {
         ] {
             for remote in [
                 Version {
-                    app: "0.2.1".into(),
+                    app: format!("{}-different", crate::compatibility::VERSION),
                     protocol: PROTOCOL,
                 },
                 Version {

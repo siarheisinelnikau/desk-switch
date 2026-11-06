@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=Desk Switch
+Comment=Share keyboard, mouse and audio between PCs
+Comment[ru]=Общая мышь, клавиатура и звук для двух ПК
+Exec=desk-switch gui
+TryExec=desk-switch
+Icon=com.deskswitch.Desktop
+Terminal=false
+Categories=Utility;
+StartupWMClass=com.deskswitch.Desktop
+Keywords=keyboard;mouse;monitor;audio;
