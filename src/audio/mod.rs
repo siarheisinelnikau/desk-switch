@@ -1,6 +1,7 @@
 mod link;
 #[cfg(target_os = "linux")]
 mod linux;
+mod mixer;
 #[cfg(windows)]
 #[path = "windows_output.rs"]
 mod output;
@@ -16,13 +17,13 @@ mod windows_capture;
 
 use crate::config;
 use anyhow::ensure;
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 
 const USAGE: &str = "Desk Switch audio is off until explicitly started.\n\
              audio sources\n\
              audio serve IP:PORT [--source PLAYBACK_SOURCE]\n\
              audio outputs\n\
-             audio play IP:PORT [--output PLAYBACK_OUTPUT] [--volume 0-100] [--mute]";
+             audio play IP:PORT [--output PLAYBACK_OUTPUT] [--volume 0-100] [--mute] [--native-volume 0-100] [--native-mute]";
 
 pub fn run(args: &[&str]) -> Result<()> {
     match args {
@@ -37,13 +38,24 @@ pub fn run(args: &[&str]) -> Result<()> {
             let identity = config::load_identity(&dir)?;
             let peer = config::load_peer(&dir)?;
             let _lock = config::lock(&dir, "audio.lock")?;
+            mixer::restore_pending(&dir)?;
             crate::lifecycle::install();
-            crate::runtime()?.block_on(sender::serve(
-                address,
-                identity,
-                peer,
-                args.get(3).copied(),
-            ))?;
+            crate::runtime()?.block_on(async {
+                // A previous listening role may have left recovery entries for
+                // apps that were closed. Restore them if they reopen while sending.
+                let mut native = mixer::NativeMixer::start(dir.clone(), Default::default())?;
+                native.wait_ready().await?;
+                let mut native_done = false;
+                let result = tokio::select! {
+                    result = sender::serve(address, identity, peer, args.get(3).copied()) => result,
+                    result = &mut native.done => {
+                        native_done = true;
+                        result.context("native audio recovery stopped")?.and_then(|_| Err(anyhow::anyhow!("native audio recovery stopped unexpectedly")))
+                    }
+                };
+                let restored = if native_done { Ok(()) } else { native.stop().await };
+                result.and(restored)
+            })?;
         }
         ["outputs"] => list()?,
         ["play", address, options @ ..] => {
@@ -53,6 +65,7 @@ pub fn run(args: &[&str]) -> Result<()> {
                 volume: 100,
                 muted: false,
             };
+            let mut native = crate::workspace::AudioLevel::default();
             let mut options = options.iter().copied();
             while let Some(option) = options.next() {
                 match option {
@@ -68,6 +81,10 @@ pub fn run(args: &[&str]) -> Result<()> {
                     }
                     "--volume" => mix.volume = volume(options.next().unwrap_or_default())?,
                     "--mute" => mix.muted = true,
+                    "--native-volume" => {
+                        native.volume = volume(options.next().unwrap_or_default())?
+                    }
+                    "--native-mute" => native.muted = true,
                     _ => bail!("invalid audio option '{option}'\n{USAGE}"),
                 }
             }
@@ -79,7 +96,9 @@ pub fn run(args: &[&str]) -> Result<()> {
             let identity = config::load_identity(&dir)?;
             let peer = config::load_peer(&dir)?;
             let _lock = config::lock(&dir, "audio.lock")?;
-            crate::runtime()?.block_on(player::play(address, identity, peer, output, mix))?;
+            crate::runtime()?.block_on(player::play(
+                address, identity, peer, output, mix, native, dir,
+            ))?;
         }
         _ => bail!("invalid audio command for this platform\n{USAGE}"),
     }

@@ -241,6 +241,38 @@ fn headphones(painter: &egui::Painter, center: egui::Pos2, color: Color32) {
     }
 }
 
+fn monitor(painter: &egui::Painter, center: egui::Pos2, width: f32, color: Color32, bg: Color32) {
+    let screen = egui::Rect::from_center_size(center, Vec2::new(width, 98.0));
+    painter.rect_filled(screen.expand(7.0), 12, color.gamma_multiply(0.06));
+    painter.rect_filled(screen, 8, bg);
+    painter.rect_stroke(screen, 8, Stroke::new(2.0, color), egui::StrokeKind::Inside);
+    painter.rect_filled(
+        egui::Rect::from_center_size(center + Vec2::new(0.0, 55.0), Vec2::new(4.0, 14.0)),
+        1,
+        color,
+    );
+    painter.rect_filled(
+        egui::Rect::from_center_size(center + Vec2::new(0.0, 64.0), Vec2::new(44.0, 3.0)),
+        2,
+        color,
+    );
+}
+
+fn tower(painter: &egui::Painter, center: egui::Pos2, color: Color32, bg: Color32) {
+    let case = egui::Rect::from_center_size(center, Vec2::new(64.0, 94.0));
+    painter.rect_filled(case.expand(7.0), 12, color.gamma_multiply(0.06));
+    painter.rect_filled(case, 8, bg);
+    painter.rect_stroke(case, 8, Stroke::new(2.0, color), egui::StrokeKind::Inside);
+    painter.circle_stroke(center + Vec2::new(0.0, -23.0), 5.0, Stroke::new(1.5, color));
+    for y in [2.0, 10.0, 18.0] {
+        painter.line_segment(
+            [center + Vec2::new(-16.0, y), center + Vec2::new(16.0, y)],
+            Stroke::new(1.5, color),
+        );
+    }
+    painter.circle_filled(center + Vec2::new(0.0, 33.0), 2.0, color);
+}
+
 impl Desktop {
     pub(super) fn render(&mut self, root: &mut egui::Ui) {
         let ctx = root.ctx().clone();
@@ -435,7 +467,9 @@ impl Desktop {
             {
                 note(
                     ui,
-                    if self.pair.hardware.input()
+                    if !plan.keyboard_enabled || !plan.mouse_enabled {
+                        "Включите передачу нужных устройств или подключите их к принимающему ПК. Источник можно выбрать ниже."
+                    } else if self.pair.hardware.input()
                         && self
                             .pair
                             .remote
@@ -557,15 +591,45 @@ impl Desktop {
         let local = self.local_node();
         let before = self.prefs.workspace.shared.clone();
         card(ui, |ui| {
-            subheading(ui, "Общие настройки пары");
+            subheading(ui, "Общие устройства");
             note(
                 ui,
                 "Меняйте на любом ПК — второй получит настройки автоматически.",
             );
             let shared = &mut self.prefs.workspace.shared;
+            ui.horizontal(|ui| {
+                for (keyboard, enabled, label) in [
+                    (true, &mut shared.keyboard_enabled, "Клавиатура"),
+                    (false, &mut shared.mouse_enabled, "Мышь"),
+                ] {
+                    ui.add_enabled(crate::workspace::Plan::can_disable(&local, &remote, keyboard),
+                        egui::Checkbox::new(enabled, crate::i18n::tr(label)))
+                        .on_disabled_hover_text(crate::i18n::tr("Сначала верните управление: это единственное устройство ввода на принимающем ПК."));
+                }
+                let configured = crate::workspace::Plan::shared_monitor(&local,&remote)
+                    && local.monitor.input.zip(remote.monitor.input).is_some_and(|(a,b)| a != b);
+                let mut enabled = shared.monitor_enabled && configured;
+                if ui.add_enabled(configured && !crate::workspace::Plan::input_in_use(&local, &remote)
+                    && crate::workspace::Plan::can_disable(&local,&remote,true)
+                    && crate::workspace::Plan::can_disable(&local,&remote,false),
+                    egui::Checkbox::new(&mut enabled, crate::i18n::tr("Общий монитор")))
+                    .on_disabled_hover_text(crate::i18n::tr(if configured {
+                        "Сначала верните управление: это единственное устройство ввода на принимающем ПК."
+                    } else { "Настройте подключение монитора на каждом ПК ниже." })).changed() {
+                    shared.monitor_enabled = enabled;
+                }
+            });
+            if !crate::workspace::Plan::can_disable(&local, &remote, true)
+                || !crate::workspace::Plan::can_disable(&local, &remote, false)
+            {
+                note(
+                    ui,
+                    "Сначала верните управление: это единственное устройство ввода на принимающем ПК.",
+                );
+            }
             for (label, id, value) in [
                 ("Клавиатура и мышь", "input-owner", &mut shared.input),
-                ("Где слушать оба ПК", "audio-owner", &mut shared.audio),
+                ("Общая акустика", "audio-owner", &mut shared.audio),
             ] {
                 ui.horizontal(|ui| {
                     ui.label(crate::i18n::tr(label));
@@ -601,25 +665,85 @@ impl Desktop {
                         });
                 });
             }
-            ui.horizontal(|ui| {
-                ui.checkbox(&mut shared.audio_enabled, crate::i18n::tr("Звук двух ПК"));
-                ui.add(egui::Slider::new(&mut shared.volume, 0..=100).suffix(" %"));
-                ui.checkbox(&mut shared.muted, crate::i18n::tr("Без звука"));
+            ui.checkbox(
+                &mut shared.audio_enabled,
+                crate::i18n::tr("Использовать общую акустику"),
+            );
+            let output = self
+                .pair
+                .plan
+                .as_ref()
+                .and_then(|p| p.audio_output.as_deref())
+                .and_then(|key| [&local, &remote].into_iter().find(|n| n.key == key));
+            if let Some(output) = output {
+                note(ui, &format!("Выход: {}", output.hardware.audio_name));
+            }
+            ui.add_enabled_ui(shared.audio_enabled && output.is_some(), |ui| {
+                for (node, label) in [(&local, "Этот компьютер"), (&remote, "Другой компьютер")]
+                {
+                    let color = if !self.pair.synced {
+                        palette(ui).muted
+                    } else if self
+                        .pair
+                        .plan
+                        .as_ref()
+                        .is_some_and(|plan| plan.purple == node.key)
+                    {
+                        Color32::from_rgb(167, 139, 250)
+                    } else {
+                        Color32::from_rgb(66, 211, 157)
+                    };
+                    ui.colored_label(color, format!("{} · {}", crate::i18n::tr(label), node.name));
+                    let mut level = shared.audio_level(&node.key);
+                    let changed = ui
+                        .horizontal(|ui| {
+                            let volume = ui
+                                .add(egui::Slider::new(&mut level.volume, 0..=100).suffix(" %"))
+                                .changed();
+                            ui.checkbox(&mut level.muted, crate::i18n::tr("Без звука"))
+                                .changed()
+                                || volume
+                        })
+                        .inner;
+                    if changed {
+                        shared.audio_levels.insert(node.key.clone(), level);
+                    }
+                }
             });
             note(
                 ui,
-                "Громкость меняет только звук другого ПК. Собственный звук остаётся как в системе.",
+                "Каждый ползунок меняет звук своего ПК. Настройки одинаковы на обоих компьютерах и сохраняются при переносе наушников.",
             );
             ui.horizontal(|ui| {
-                ui.checkbox(
-                    &mut shared.edge,
-                    crate::i18n::tr("Переход мышью через край экрана"),
+                ui.add_enabled(
+                    shared.mouse_enabled,
+                    egui::Checkbox::new(
+                        &mut shared.edge,
+                        crate::i18n::tr("Переход мышью через край экрана"),
+                    ),
                 );
-                if ui
-                    .small_button(crate::i18n::tr("Поменять ПК местами"))
-                    .clicked()
-                {
-                    shared.purple_on_left = !shared.purple_on_left;
+                if shared.edge {
+                    let purple = local.key < remote.key;
+                    let mut local_left = purple == shared.purple_on_left;
+                    egui::ComboBox::from_id_salt("local-edge")
+                        .selected_text(crate::i18n::tr(if local_left {
+                            "Правый край"
+                        } else {
+                            "Левый край"
+                        }))
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(
+                                &mut local_left,
+                                false,
+                                crate::i18n::tr("Левый край"),
+                            );
+                            ui.selectable_value(
+                                &mut local_left,
+                                true,
+                                crate::i18n::tr("Правый край"),
+                            );
+                        });
+                    shared.purple_on_left = purple == local_left;
                 }
             });
             if ui.small_button(crate::i18n::tr("Разорвать пару")).clicked() {
@@ -634,7 +758,7 @@ impl Desktop {
     fn local_monitor(&mut self, ui: &mut egui::Ui) {
         let mut changed = false;
         card(ui, |ui| {
-            egui::CollapsingHeader::new(crate::i18n::tr("Монитор этого ПК")).show(ui,|ui| {
+            egui::CollapsingHeader::new(crate::i18n::tr("Общий монитор")).show(ui,|ui| {
                 note(ui,"Каждый ПК запоминает только своё текущее подключение. Вход второго ПК придёт по сети.");
                 let old_id=self.prefs.workspace.monitor.id.clone();
                 let selected=self.monitors.iter().find(|m|m.id==old_id).map(|m|m.name.as_str()).unwrap_or("Монитор пока не найден");
@@ -665,12 +789,19 @@ impl Desktop {
     }
 
     fn diagram(&self, ui: &mut egui::Ui) {
-        let (rect, _) =
-            ui.allocate_exact_size(Vec2::new(ui.available_width(), 225.0), egui::Sense::hover());
-        let painter = ui.painter();
-        let colors = palette(ui);
         let local = self.local_node();
         let remote = self.pair.remote.as_ref();
+        let shared_monitor =
+            remote.is_some_and(|r| crate::workspace::Plan::shared_monitor(&local, r));
+        let (rect, _) = ui.allocate_exact_size(
+            Vec2::new(
+                ui.available_width(),
+                if shared_monitor { 250.0 } else { 225.0 },
+            ),
+            egui::Sense::hover(),
+        );
+        let painter = ui.painter();
+        let colors = palette(ui);
         let plan = self.pair.plan.as_ref();
         let synced = self.pair.synced;
         let purple = Color32::from_rgb(167, 139, 250);
@@ -681,7 +812,6 @@ impl Desktop {
             nodes.push((remote, false, muted));
         }
         if let Some(plan) = plan {
-            nodes.sort_by_key(|(node, _, _)| (node.key != plan.purple) == plan.purple_on_left);
             for (node, _, color) in &mut nodes {
                 *color = if synced {
                     if node.key == plan.purple {
@@ -694,69 +824,117 @@ impl Desktop {
                 };
             }
         }
-        let source = plan.and_then(|p| p.input_source.as_ref());
-        let source_node = nodes
-            .iter()
-            .find(|(n, _, _)| Some(&n.key) == source)
-            .map(|(n, _, c)| (*n, *c));
-        let active = source_node.and_then(|(node, _)| match node.input {
-            Some(super::InputStatus::Here) => Some(node.key.as_str()),
-            Some(super::InputStatus::Peer) => nodes
+        let device_color = |key: Option<&str>| {
+            nodes
                 .iter()
-                .find(|(other, _, _)| other.key != node.key)
-                .map(|(n, _, _)| n.key.as_str()),
-            _ => None,
-        });
-        let left = egui::pos2(rect.left() + rect.width() * 0.24, rect.top() + 80.0);
-        let right = egui::pos2(rect.left() + rect.width() * 0.76, left.y);
-        painter.line_segment(
-            [left, right],
-            Stroke::new(1.5, if synced { ACCENT } else { colors.line }),
+                .find(|(node, _, _)| Some(node.key.as_str()) == key)
+                .map(|(_, _, color)| *color)
+                .unwrap_or(muted)
+        };
+        let side = if shared_monitor { 0.16 } else { 0.24 };
+        let left = egui::pos2(
+            rect.left() + rect.width() * side,
+            rect.top() + if shared_monitor { 90.0 } else { 80.0 },
         );
+        let right = egui::pos2(rect.right() - rect.width() * side, left.y);
         let middle = egui::pos2(rect.center().x, left.y);
-        painter.circle_filled(middle, 21.0, colors.card);
-        painter.text(
-            middle,
-            egui::Align2::CENTER_CENTER,
-            "↔",
-            FontId::proportional(25.0),
-            if synced { colors.ink } else { muted },
-        );
+        if shared_monitor {
+            let owner =
+                remote.and_then(|r| crate::workspace::Plan::monitor_owner(&local, r, synced));
+            for (index, center) in [left, right].into_iter().enumerate() {
+                let active = nodes
+                    .get(index)
+                    .is_some_and(|(n, _, _)| Some(n.key.as_str()) == owner);
+                painter.line_segment(
+                    [center, middle],
+                    Stroke::new(
+                        if active { 2.0 } else { 1.0 },
+                        if active {
+                            device_color(owner)
+                        } else {
+                            colors.line
+                        },
+                    ),
+                );
+            }
+            monitor(
+                painter,
+                middle,
+                (rect.width() * 0.29).min(208.0),
+                device_color(owner),
+                colors.bg,
+            );
+            painter.text(
+                middle - Vec2::new(0.0, 12.0),
+                egui::Align2::CENTER_CENTER,
+                crate::i18n::tr("Общий монитор"),
+                FontId::proportional(14.0),
+                colors.ink,
+            );
+            let caption = nodes
+                .iter()
+                .find(|(n, _, _)| Some(n.key.as_str()) == owner)
+                .map(|(n, _, _)| n.name.chars().take(22).collect::<String>())
+                .unwrap_or_else(|| crate::i18n::tr("Проверяем видеовход…"));
+            painter.text(
+                middle + Vec2::new(0.0, 14.0),
+                egui::Align2::CENTER_CENTER,
+                caption,
+                FontId::proportional(12.0),
+                if owner.is_some() {
+                    device_color(owner)
+                } else {
+                    colors.muted
+                },
+            );
+        } else {
+            painter.line_segment(
+                [left, right],
+                Stroke::new(1.5, if synced { ACCENT } else { colors.line }),
+            );
+            painter.circle_filled(middle, 21.0, colors.card);
+            painter.text(
+                middle,
+                egui::Align2::CENTER_CENTER,
+                "↔",
+                FontId::proportional(25.0),
+                if synced { colors.ink } else { muted },
+            );
+        }
         for index in 0..2 {
             let center = if index == 0 { left } else { right };
             let entry = nodes.get(index);
             let node = entry.map(|(n, _, _)| *n);
             let own = entry.is_some_and(|(_, own, _)| *own);
             let color = entry.map(|(_, _, color)| *color).unwrap_or(muted);
-            let screen = egui::Rect::from_center_size(
-                center,
-                Vec2::new((rect.width() * 0.32).min(216.0), 98.0),
-            );
-            painter.rect_filled(screen.expand(7.0), 12, color.gamma_multiply(0.06));
-            painter.rect_filled(screen, 8, colors.bg);
-            painter.rect_stroke(screen, 8, Stroke::new(2.0, color), egui::StrokeKind::Inside);
-            painter.rect_filled(
-                egui::Rect::from_center_size(center + Vec2::new(0.0, 55.0), Vec2::new(4.0, 14.0)),
-                1,
-                color,
-            );
-            painter.rect_filled(
-                egui::Rect::from_center_size(center + Vec2::new(0.0, 64.0), Vec2::new(44.0, 3.0)),
-                2,
-                color,
-            );
+            if shared_monitor {
+                tower(painter, center, color, colors.bg);
+            } else {
+                monitor(
+                    painter,
+                    center,
+                    (rect.width() * 0.32).min(216.0),
+                    color,
+                    colors.bg,
+                );
+            }
             let name = node
-                .map(|n| n.name.chars().take(25).collect::<String>())
+                .map(|n| {
+                    n.name
+                        .chars()
+                        .take(if shared_monitor { 22 } else { 25 })
+                        .collect::<String>()
+                })
                 .unwrap_or_else(|| crate::i18n::tr("Другой компьютер"));
             painter.text(
-                center - Vec2::new(0.0, 10.0),
+                center + Vec2::new(0.0, if shared_monitor { 65.0 } else { -10.0 }),
                 egui::Align2::CENTER_CENTER,
                 name,
-                FontId::proportional(16.0),
+                FontId::proportional(if shared_monitor { 14.0 } else { 16.0 }),
                 colors.ink,
             );
             painter.text(
-                center + Vec2::new(0.0, 16.0),
+                center + Vec2::new(0.0, if shared_monitor { 84.0 } else { 16.0 }),
                 egui::Align2::CENTER_CENTER,
                 crate::i18n::tr(if own {
                     "Этот компьютер"
@@ -768,34 +946,23 @@ impl Desktop {
                 FontId::proportional(11.0),
                 color,
             );
-            let icon_y = rect.top() + 177.0;
-            let input_color = if !synced {
-                muted
-            } else if source.is_none() {
-                color
-            } else if node.is_some_and(|n| Some(n.key.as_str()) == active) {
-                source_node.map(|(_, c)| c).unwrap_or(muted)
-            } else {
-                muted
-            };
-            let hardware = node.map(|n| &n.hardware);
+            let icon_y = rect.top() + if shared_monitor { 210.0 } else { 177.0 };
+            let devices = node
+                .zip(remote)
+                .zip(plan)
+                .map(|((node, remote), plan)| {
+                    plan.input_devices(node, if own { remote } else { &local }, synced)
+                })
+                .unwrap_or_default();
             keyboard(
                 painter,
                 egui::pos2(center.x - 39.0, icon_y),
-                if source.is_some() || hardware.is_some_and(|h| h.keyboard) {
-                    input_color
-                } else {
-                    muted
-                },
+                device_color(devices.keyboard),
             );
             mouse(
                 painter,
                 egui::pos2(center.x + 4.0, icon_y),
-                if source.is_some() || hardware.is_some_and(|h| h.mouse) {
-                    input_color
-                } else {
-                    muted
-                },
+                device_color(devices.mouse),
             );
             let audio = synced
                 && plan
@@ -806,8 +973,23 @@ impl Desktop {
                 if audio { color } else { muted },
             );
             if audio && nodes.iter().all(|(n, _, _)| n.audio_playing) {
-                painter.circle_filled(egui::pos2(center.x + 41.0, icon_y + 24.0), 3.5, purple);
-                painter.circle_filled(egui::pos2(center.x + 52.0, icon_y + 24.0), 3.5, green);
+                for (offset, origin, color) in [
+                    (41.0, plan.map(|p| p.purple.as_str()), purple),
+                    (52.0, plan.map(|p| p.green.as_str()), green),
+                ] {
+                    let level = self
+                        .prefs
+                        .workspace
+                        .shared
+                        .audio_level(origin.unwrap_or_default());
+                    if !level.muted && level.volume > 0 {
+                        painter.circle_filled(
+                            egui::pos2(center.x + offset, icon_y + 24.0),
+                            3.5,
+                            color,
+                        );
+                    }
+                }
             }
         }
         painter.text(

@@ -41,7 +41,8 @@ impl Desktop {
         self.prefs.auto_update = false;
         self.prefs.autostart = false;
         self.startup_pending = false;
-        self.public_key = "11".repeat(32);
+        let own_green = case.starts_with("shared-") || case == "detected";
+        self.public_key = if own_green { "22" } else { "11" }.repeat(32);
         let mut local = Node {
             key: self.public_key.clone(),
             name: "Studio PC".into(),
@@ -54,13 +55,14 @@ impl Desktop {
             monitor: Default::default(),
             shared: Shared::default(),
             input: Some(InputStatus::Here),
+            monitor_input: None,
             audio_playing: true,
             audio_error: None,
             input_error: None,
             ack: String::new(),
         };
         let mut remote = local.clone();
-        remote.key = "22".repeat(32);
+        remote.key = if own_green { "11" } else { "22" }.repeat(32);
         remote.name = "Laptop".into();
         remote.hardware.keyboard = true;
         remote.hardware.mouse = true;
@@ -73,9 +75,48 @@ impl Desktop {
             local.input = Some(InputStatus::Here);
             remote.input = Some(InputStatus::Peer);
         }
+        if own_green {
+            local.hardware.keyboard = true;
+            local.hardware.mouse = true;
+            remote.hardware.keyboard = false;
+            remote.hardware.mouse = false;
+            local.input = Some(InputStatus::Here);
+            remote.input = Some(InputStatus::Peer);
+        }
+        if case == "detected" {
+            local.input = None;
+            remote.input = None;
+        }
+        if case.starts_with("shared-") {
+            for (node, input) in [(&mut local, 17), (&mut remote, 15)] {
+                node.monitor.enabled = true;
+                node.monitor.fingerprint = "preview-shared-monitor".into();
+                node.monitor.input = Some(input);
+                node.monitor.name = "Shared display".into();
+            }
+            let input = match case {
+                "shared-pending" => None,
+                "shared-peer" => Some(15),
+                _ => Some(17),
+            };
+            local.monitor_input = input;
+            remote.monitor_input = input;
+            if ["shared-peer", "shared-input-only"].contains(&case) {
+                local.input = Some(InputStatus::Peer);
+                remote.input = Some(InputStatus::Here);
+            }
+            self.prefs.workspace.monitor = local.monitor.clone();
+        }
+        let output = Plan::build(&local, &remote).audio_output;
+        local
+            .shared
+            .prepare_audio_levels(&local.key, &remote.key, output.as_deref());
+        remote.shared = local.shared.clone();
+        self.prefs.workspace.shared = local.shared.clone();
         self.pair.hardware = local.hardware.clone();
         self.prefs.discovery = !["offline", "settings", "light"].contains(&case);
-        if ["linked", "away", "syncing"].contains(&case) {
+        if ["linked", "away", "syncing", "detected"].contains(&case) || case.starts_with("shared-")
+        {
             let plan = Plan::build(&local, &remote);
             let digest = plan.digest(&local, &remote);
             local.ack = digest.clone();

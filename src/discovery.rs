@@ -228,11 +228,12 @@ mod tests {
     use super::*;
     #[test]
     fn untrusted_records_are_bounded_and_never_pair_or_connect() {
+        let protocol = crate::compatibility::PROTOCOL.to_string();
         let properties = [
             ("app", "desk-switch"),
             ("name", "Fixture PC"),
             ("version", crate::compatibility::VERSION),
-            ("protocol", "3"),
+            ("protocol", protocol.as_str()),
             (
                 "key",
                 "1111111111111111111111111111111111111111111111111111111111111111",
