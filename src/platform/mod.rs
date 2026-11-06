@@ -45,7 +45,12 @@ pub fn run(
             let monitor = linux_monitor::Ddc(id);
             #[cfg(windows)]
             let monitor = win_monitor::Ddc(id);
-            VideoWorker::start(monitor).map(|worker| (inputs, worker))
+            let worker = if crate::lifecycle::managed() {
+                VideoWorker::watch(monitor)
+            } else {
+                VideoWorker::start(monitor)
+            };
+            worker.map(|worker| (inputs, worker))
         })
         .transpose()?;
     match role {
@@ -56,11 +61,19 @@ pub fn run(
                 identity,
                 peer,
                 settings.edge,
+                settings.sharing,
                 settings.capture_devices,
                 video,
             ));
             #[cfg(windows)]
-            windows::run(address, identity, peer, settings.edge, video)
+            windows::run(
+                address,
+                identity,
+                peer,
+                settings.edge,
+                settings.sharing,
+                video,
+            )
         }
         Role::Receiver => crate::runtime()?.block_on(async {
             #[cfg(target_os = "linux")]

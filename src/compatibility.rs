@@ -2,11 +2,11 @@ use anyhow::{Result, ensure};
 use std::fmt;
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
-pub const PROTOCOL: u16 = 3;
+pub const PROTOCOL: u16 = 4;
 pub const BUILD_INFO: &str = concat!(
     "DESK-SWITCH-BUILD:{\"app\":\"",
     env!("CARGO_PKG_VERSION"),
-    "\",\"protocol\":3}"
+    "\",\"protocol\":4}"
 );
 const MAGIC: &[u8; 8] = b"DESKVER2";
 
@@ -116,6 +116,14 @@ mod tests {
                 .is_err()
         );
         assert!(current.require(None).is_err());
+        assert!(
+            current
+                .require(Some(&Version {
+                    protocol: PROTOCOL - 1,
+                    ..current.clone()
+                }))
+                .is_err()
+        );
         assert!(Version::decode(&[]).is_err());
         assert_eq!(
             serde_json::from_str::<Version>(BUILD_INFO.strip_prefix("DESK-SWITCH-BUILD:").unwrap())
