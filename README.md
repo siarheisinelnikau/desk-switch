@@ -1,259 +1,88 @@
 # Desk Switch
 
-Share one keyboard and mouse, switch one selected monitor's HDMI/DP input, and listen to the other PC's system audio. Windows ↔ Windows, Ubuntu Wayland ↔ Ubuntu Wayland and mixed pairs use the same protocol. The **host** keeps the physical keyboard and mouse attached. The other PC is the **receiver**.
+Two computers. One workspace. Share a keyboard, mouse and system audio between Windows and Ubuntu, with optional switching of a shared monitor's video input. Windows–Windows and Ubuntu–Ubuntu pairs use the same pairing flow.
 
-**F12** switches video and input in both directions. **F11** immediately restores host input and attempts to restore host video. A selected screen edge can transfer input alone or input with video. Audio has separate on/off and volume controls and continues across input and monitor switches.
+![The green PC lends its keyboard and mouse to the purple PC](docs/desktop.png)
 
-## Desktop window and tray
+## Install
 
-Ubuntu 24.04/26.04 x86-64: download **desk-switch-linux-x86_64.deb** from
-[the latest release](https://github.com/siarheisinelnikau/desk-switch/releases/latest), then install:
+Get the **same version on both PCs** from [Releases](https://github.com/siarheisinelnikau/desk-switch/releases/latest). New releases contain exactly two downloads:
 
-~~~sh
+- **Ubuntu 24.04/26.04 x86-64:** `desk-switch-linux-x86_64.deb`.
+- **Windows x86-64:** `desk-switch-windows-x86_64.exe`.
+
+```sh
 sudo apt install ./desk-switch-linux-x86_64.deb
-~~~
+```
 
-Open **Desk Switch** from the application menu, or run `desk-switch` without sudo.
-The installer includes the menu icon and declares desktop runtime dependencies.
-The separate file without `.deb` is a portable ELF executable, not an apt package.
-From 0.3.0 the Debian launcher runs the package-owned executable. In-app installer
-updates use your shared `rust-auto-updator` library and Ubuntu's standard polkit
-password prompt after **Update and restart**. Autostart uses the installed launcher
-with a TryExec guard, so removing the package disables that login entry while
-preserving settings and pairing. Old 0.2.x per-user copies retain portable update
-compatibility; install the current `.deb` once to switch to package-managed updates.
-Portable Linux binaries must stay in a user-writable directory.
+Open **Desk Switch** from Ubuntu's application menu or run the Windows executable. New profiles use **English** and **Dark**. Existing language/theme choices are preserved. Russian, German, French, Spanish and Italian are also available. Language and theme changes apply immediately to the window and tray.
 
-Launch the binary without arguments, or run `desk-switch gui`, to open the native Rust desktop window. It includes pairing, input roles and addresses, monitor/input selection, edge settings, audio device and volume controls, and recent service logs. The interface and tray support Russian, English, German, French, Spanish and Italian. **Запуск и обновления / Startup and updates** contains the language selector and Light, Dark and System themes. Changes apply immediately and are saved automatically. The existing CLI commands remain available.
+## Link your PCs
 
-![Desk Switch desktop window](docs/desktop.png)
+1. Turn on **Available on the network** on both PCs. Each advertises itself and discovers other computers at the same time. Different application/protocol versions remain visible with an update hint.
+2. Click **Link** beside the other PC. On that PC, click **Accept**. The application creates and exchanges keys automatically. Both screens show the same optional confirmation code: no tokens, IP addresses or manual key copying.
+3. Once settings are synchronized, one PC is purple and the other green. Both screens agree on those identities. Everything stays grey before synchronization and after a lost connection.
 
-![Light theme and language settings](docs/appearance-light.png)
+Approval is required before either key is pinned. Existing peers reconnect without another prompt. **Unlink computers** removes a live pair on both PCs; an offline peer can also be unlinked locally. Disabling availability stops discovery, the control connection and shared devices. Allow Desk Switch on your private LAN if the operating system requests firewall permission.
 
-![Dark theme and language settings](docs/appearance-dark.png)
+## Devices follow the pair
 
-1. Open **Компьютеры** on both PCs. Create their keys, copy each public key to the other PC, and pin both. Choose the PC with the physical keyboard/mouse as the host and the other as the receiver. Enter the receiver's LAN address on both.
-2. Open **Монитор и ввод**, enable switching, and click **Найти мониторы** on each PC. Select the shared physical monitor's local ID and fill in the two verified input codes as described below. Ubuntu hosts also need explicit keyboard/mouse paths under **Компьютеры**.
-3. Click **Подключить пару** on the receiver first, then on the host. Approve Ubuntu portal access when requested. Once authenticated, use **Переключить на другой ПК** in the window or tray menu. Clicking it again returns the monitor and input. **Аварийный возврат** restores control to the keyboard host.
-4. Configure audio separately under **Звук**: enable transmission on one PC and reception on the headphone PC. The tray's audio item starts/stops that PC's configured audio role. Volume and mute affect only the received stream.
+- **Keyboard and mouse:** the PC with both physical devices supplies input. With devices on both PCs, each controls itself by default; choose a shared source if wanted. Devices are checked every three seconds, so temporarily connecting input for setup does not require changing roles manually. Automatic capture currently uses relative mice and keyboards with F11/F12; touchpads are not host pointers.
+- **Audio:** both PCs agree on one listening PC. Automatic selection prefers a default headphone/Bluetooth output, then speakers, then HDMI/DisplayPort. Ties prefer the keyboard PC, then the purple PC. Choose the listening PC on either machine to override the decision everywhere. Volume/mute affect the received stream only; local sound keeps its system volume. Audio stays independent of input switching and never forwards a remote mix back to its source.
+- **Switching:** click **Switch keyboard and mouse** or press **F12**. **F11** returns input to the physical keyboard PC. Optionally enable screen-edge crossing and arrange the two PCs using **Swap PC positions**. The return edge is configured automatically.
+- **Colours:** a device retains its source PC's colour on the other PC. A lent keyboard/mouse becomes grey at the source. Headphone colours identify the listening PC; two coloured dots indicate both audio streams are connected.
 
-The tray provides Open, Switch, Emergency return, Audio on/off, and Quit. On Windows, click the icon to open its menu. On Ubuntu, the panel must support StatusNotifierItem/AppIndicator, as Ubuntu's AppIndicator GNOME extension does. Closing the window hides it while a usable tray is present; without one it exits cooperatively. If the tray disappears, the window reopens. **Завершить** / tray Quit stops the managed services and their normal recovery paths before exiting. A lost GUI command pipe also requests service shutdown.
+Shared choices made on either PC propagate automatically. Physical device details and monitor selection stay local. Device errors provide a retry action and details under **Diagnostics**.
 
-`desk-switch gui --tray` starts hidden only when the tray is available. Pairing and settings are local; `desktop.toml` stores window preferences beside the existing `settings.toml`. Physical video switching still needs two cables into the shared monitor and DDC/CI support; screen pixels are not sent over the network.
+## Optional shared monitor
 
-## Optional computer discovery
+Connect the physical monitor to both PCs, using different HDMI/DisplayPort inputs. On **each** PC, expand **This PC's monitor**, choose the local display, and enable **This is a shared monitor — switch it with input** while viewing that PC's input. The application reads and remembers that PC's current connection and exchanges it with its partner. There is no manual entry of the other PC's input code.
 
-Under **Компьютеры / Computers**, enable local network discovery on **both** PCs.
-It is off by default. The list shows names, roles, versions and IPv4/IPv6 addresses;
-choose the desired endpoint to fill the input and audio address fields. Receiver
-addresses bind locally; client addresses point to the other PC. Check the physical
-keyboard role and audio role, exchange public keys directly, then save/connect.
-Changing roles retains the selected endpoint; editing an address returns to manual
-configuration. Discovery never pins keys, connects or starts input/audio on its own.
-Different versions stay visible with an update hint and cannot be selected.
+DDC/CI writes are used only when both PCs opted in, the monitor identities match, and their saved input values differ. Reading a connection never switches the display. Until setup is complete, F12 switches input devices only. Enable DDC/CI in the monitor's own menu if its connection cannot be read. Monitors without a unique serial need matching EDID data. Re-read the local connection after moving a cable. Other displays are not switched.
 
-Discovery uses `_desk-switch._tcp.local.` with mDNS (UDP 5353). Allow multicast on
-your trusted LAN if filtered. Networks that isolate clients or block multicast
-still support manual IP entry. Disabling discovery stops browsing/advertising.
-Only name, role, ports and app/protocol versions are announced; private keys and
-input/audio data are never part of discovery.
+DDC/CI depends on the monitor and firmware. The previously tested LG setup reported “out of range” and is not considered validated. There is no automatic scan through possible video inputs or display mode changes.
 
-## Autostart and matching versions
+## Window, tray and startup
 
-From 0.2.0, the first successful GUI launch registers autostart for the current user by default. Ubuntu uses an XDG autostart entry; Windows uses the current user's Run key. It launches into the tray and retains the selected profile. Moving the executable requires opening it once from its new location to refresh the entry. **Запуск и обновления** lets you disable autostart.
+**X** and **Quit application** stop services and exit. **Minimize to tray** is separate. Quit first requests cooperative input release and audio shutdown; an unresponsive child is terminated after six seconds. Closing the GUI command pipe also requests shutdown. Losing the tray brings a hidden window back.
 
-![Startup and update settings in an isolated test profile](docs/startup-updates.png)
+Autostart is enabled after the first launch and can be disabled in **Settings**. It starts in the tray using the saved profile and availability choice. Ubuntu needs an AppIndicator/StatusNotifier host for a visible tray icon.
 
-**Подключать настроенную пару при запуске** defaults to enabled. No input service starts until both keys exist. Save valid role, address, monitor/edge and Ubuntu capture settings before the next launch. Portal consent and input-device permissions still apply. The audio start setting follows the last explicit audio on/off choice; audio starts disabled until enabled once, and its saved volume/mute are retained. Quit stops services and preserves startup preferences.
+![Settings: English and Dark are the initial defaults](docs/appearance-dark.png)
 
-Both encrypted input and audio handshakes exchange the exact application version and wire protocol before creating a usable connection. Different patch versions are rejected, as are different protocols and legacy clients that send no version. Both current clients report their local and remote versions; the GUI shows the mismatch and checks for an update. The protocol number remains 2 in release 0.3.0. The first upgrade from 0.1.0 requires replacing the binary on **both** PCs manually because 0.1.0 has no updater.
+## Updates
 
-## Automatic updates
+Installed Debian packages and the Windows executable use [`rust-auto-updator` 0.4.1](https://github.com/siarheisinelnikau/rust-auto-updator). The original core is included under `vendor/` with its licence and source hashes. The host additionally verifies a pinned Ed25519 signature covering each installer's exact URL, version, size and SHA-256. Signed metadata lives in the release description, keeping the download list limited to `.deb` and `.exe`.
 
-Automatic checks/downloads default to enabled, at launch and every six hours.
-Windows and installed Debian packages use the core of your **rust-auto-updator
-0.4.1**, vendored with its MIT license and source hashes for reproducible standalone
-CI builds. The host keeps its existing egui renderer, tray, settings and lifecycle.
-Before the shared library downloads anything, its chosen repository/version/URL,
-size and SHA-256 must match `update.json` verified with the project's pinned
-Ed25519 key. The shared library also checks PE or Debian metadata and handles
-staging, installation and restart. The installer itself has a signed hash too.
+Checks/downloads run at startup and every six hours. Click **Update and restart** to install; Ubuntu uses the standard system password dialog. Cancellation keeps the application open for retry. Settings and pairing survive updates. Both PCs must run the same application and protocol version before input or audio is accepted. Updates do not restart both machines simultaneously.
 
-Click **Обновить и перезапустить / Update and restart** to install. Settings are
-saved and managed input/audio services stop cooperatively before the installer.
-Ubuntu uses a system polkit password prompt on a worker thread; cancellation or
-failure keeps the window open and the verified download available for retry.
-Windows uses the library's portable replacement and first-frame health/rollback
-protocol. The application stays responsive during installation. Pairing keys,
-roles, volume and preferences remain in the profile. Restart resumes that profile.
+For the first upgrade from **0.3.x or older**, install the new `.deb` / replace the `.exe` once: older versions expect a separate metadata download. Subsequent updates use the two-file release format. Portable Linux binaries are no longer distributed. The `.deb` runs `/usr/lib/desk-switch/desk-switch` through its installed launcher so package ownership and future system updates work correctly.
 
-Portable Linux copies and existing 0.2.x update helpers retain the signed legacy
-path so installed older clients can upgrade. That path installs a newer raw binary
-at the next launch, with signature, bounds, size/SHA-256 and embedded version checks,
-plus the existing backup and immediate-startup rollback. It requires a user-writable
-application directory. Both encrypted input and audio always reject different app
-or protocol versions; update both PCs together.
+## Platform access
 
-The publisher's public key is committed in `release/update-public-key.hex`; the local private key stays in the ignored `.release-private/update-signing-key.pem`. Back up that private key. The release workflow builds/tests both OS targets and the Debian installer on Ubuntu 24.04, then creates a prerelease. Download both executable assets and the `.deb`, run `tools/prepare_release.py` locally, and commit the resulting signed `update.json` as `release/manifests/VERSION.json`. The promotion workflow verifies the signature, both public downloads and the installer's bundled binary before publishing the stable release. No private signing key is sent to GitHub. Existing version tags/releases must not be reused. Set `release/publish-request.json` to the new Cargo version's tag to request a build through the connector, or push that version tag normally.
+Ubuntu uses the desktop RemoteDesktop/EIS portal. Approve the system dialog when it appears. A Linux keyboard host also needs access to its automatically selected `/dev/input/event*` devices; pairing cannot grant system device permissions. PipeWire/WirePlumber provide audio. `ddcutil` and I²C access are needed only for optional monitor switching. The package recommends desktop audio/portal dependencies and suggests `ddcutil`.
 
-To prepare a reviewable local release without publishing:
+Windows uses native hooks, SendInput and WASAPI loopback/shared playback. Input cannot control a higher-privilege application without matching system permission. Headphone/Bluetooth detection is a default-output heuristic; explicitly selecting a listening PC overrides it everywhere.
 
-~~~sh
-python3 tools/prepare_release.py --tag v0.3.0 \
-  --linux target/release/desk-switch \
-  --windows target/x86_64-pc-windows-gnu/release/desk-switch.exe \
-  --deb dist/desk-switch-linux-x86_64.deb \
-  --out dist/v0.3.0
-~~~
+## Development and release
 
-`--build-info` prints the embedded build version/protocol. Automatic updates do not coordinate a simultaneous restart of both PCs: while one is on a newer version, the connection stays rejected until the other catches up. Neither peer can supply an arbitrary update URL or executable to the other.
+Requires Rust 1.99+, OpenSSL/X11/Wayland development libraries on Linux, and `dpkg-dev` / `desktop-file-utils` for packaging.
 
-## Build
-
-Install [rustup](https://rustup.rs/) and run the following on each PC.
-
-~~~sh
-cargo build --release --locked
-~~~
-
-Rust and dependencies are pinned. The binaries are target/release/desk-switch.exe and target/release/desk-switch.
-
-Windows needs Windows 10/11. Native MSVC builds need Visual Studio Build Tools with the C++ workload. For a static MSVC CRT set the RUSTFLAGS environment variable to -C target-feature=+crt-static before building.
-
-Ubuntu needs build-essential, pkg-config and libssl-dev to build, plus the usual X11/Wayland, xkbcommon and OpenGL/EGL desktop runtime libraries for the window. The GUI supports X11 and Wayland; Ubuntu input sharing requires Wayland. Run as your logged-in desktop user. Input uses the user session D-Bus, xdg-desktop-portal and a backend with RemoteDesktop v2 and EIS, such as compatible GNOME/Mutter with xdg-desktop-portal-gnome. Audio needs pipewire-bin and WirePlumber policy.
-
-Video switching on Ubuntu additionally needs ddcutil, i2c-dev and access to the selected /dev/i2c-* device. Use your distribution's package and device permission rules.
-
-## Set up once
-
-1. On each PC run desk-switch init. Copy each public key directly from the trusted PC to the other and run desk-switch pair OTHER_PUBLIC_KEY on both. Keep the identity file private. The public-key command displays an existing public key, and state-dir prints the settings directory.
-2. Choose the host, regardless of OS.
-3. Enable DDC/CI in the shared monitor. With it showing the host, run desk-switch probe on the host and record the selected monitor's ID and current VCP 0x60 value. Select the receiver input once during setup, run probe on the receiver and record its local ID and current value. Return the monitor to the host input.
-4. Put settings.toml in the state directory on both PCs. Use each PC's local monitor ID and the same two input codes on both.
-
-~~~toml
-[monitor]
-id = 'local Monitor ID for the shared physical monitor'
-host = 0x11
-peer = 0x0f
-~~~
-
-The example input codes are placeholders. Probe lists advertised inputs when available. Those codes do not identify which PC is connected to each port, so the two active-input readings establish that mapping. Passing a Monitor ID to probe queries just that display.
-
-Windows pins the monitor interface and EDID fingerprint. Ubuntu pins the DRM connector and EDID fingerprint and resolves its I²C bus at use time. An unavailable or ambiguous selection blocks DDC. The second monitor keeps its input. Recheck IDs after moving cables or changing topology.
-
-Existing windows and ubuntu settings remain accepted as aliases for host and peer, respectively. Use role names for new setups.
-
-## Run either OS in either role
-
-Start the receiver first using its LAN address. Use the same address on the host. On Windows replace ./desk-switch with .\desk-switch.exe.
-
-~~~sh
-# PC receiving input, Windows or Ubuntu
-./desk-switch run --role receiver 192.168.1.20:45876
-
-# PC with the physical keyboard and mouse, Windows or Ubuntu
-./desk-switch run --role host 192.168.1.20:45876
-~~~
-
-Allow the receiver's TCP port from the host if using a firewall. Wait for authentication, release held keys/buttons and press F12. F12 returns, and F11 provides emergency recovery.
-
-The shorter run IP:PORT command preserves the original defaults of Windows host and Ubuntu receiver. Explicit roles support same-OS pairs and reversed mixed pairs. Roles stay fixed during a run while the input destination changes.
-
-Approve keyboard/pointer access in each Ubuntu portal dialog. Consent stays open during reconnects and may be requested again after restart or compositor revocation.
-
-## Ubuntu Wayland host
-
-The Ubuntu host reads only the selected event devices and reinjects local input through its consented EIS session. Select a relative USB/Bluetooth mouse and a keyboard with F11/F12. Absolute touchpads and tablets are outside this capture backend.
-
-Add stable event paths to the host's settings.toml.
-
-~~~toml
-[capture]
-devices = [
-    "/dev/input/by-id/your-keyboard-event-kbd",
-    "/dev/input/by-id/your-mouse-event-mouse",
-]
-~~~
-
-Your desktop user needs read access to these selected devices. Grant access during setup using your distribution's ACL or udev mechanism. Desk Switch checks access and device types before grabbing input. Start with all keys/buttons released. It does not grant permissions.
-
-While this host runs, the chosen devices feed local EIS or the authenticated receiver. Portal failure, device removal or process exit releases kernel grabs. F11 and an expired peer lease return routing to local EIS. Events queued during portal consent are discarded before capture starts.
-
-The InputCapture portal currently permits activation only through compositor triggers, so it cannot implement immediate F12 takeover by itself. [InputCapture lifecycle](https://flatpak.github.io/xdg-desktop-portal/docs/doc-org.freedesktop.portal.InputCapture.html)
-
-## Optional screen edge
-
-Add an edge section on both PCs. Use the same mode and select each screen/side separately. For a host to the left of the receiver, choose right on the host and left on the receiver.
-
-~~~toml
-[edge]
-mode = "input"           # off, input, or video
-screen = '\\.\DISPLAY2'   # Windows Screen name from probe
-side = "right"
-~~~
-
-On Ubuntu, portal-check --consent opens a temporary input session and lists EIS screen IDs such as 0,0,1920,1080. It requests consent and sends no input. Use the exact ID in the screen setting. The portal-check command without --consent only queries capabilities. Bidirectional edges require an EIS absolute pointer region. Recheck it after layout/scaling changes.
-
-Only the chosen edge transfers between PCs. Other edges allow normal local screen movement. Holding a key or dragging prevents edge entry. A transfer places the cursor just inside the destination edge at the matching proportional position. The receiver's return edge reverses an edge-originated transfer.
-
-Input mode makes no DDC calls and works without a monitor section. F12 during input-only use upgrades to a full transfer if video is configured. F12-originated transfers return using F12/F11.
-
-On an Ubuntu host with edge mode enabled, the software controls absolute pointer placement across EIS regions. Startup centres the local cursor on the selected host screen.
-
-## Optional sound from the other PC
-
-Either OS can send or receive audio independently of the keyboard host role. Keep headphones on the audio receiving PC. Its local sound mixes with the remote stream through shared-mode WASAPI on Windows or normal PipeWire playback on Ubuntu. Audio starts off.
-
-On the PC whose system sound you want to hear, list audio sources, then start the sender.
-
-~~~sh
-./desk-switch audio sources
-./desk-switch audio serve 192.168.1.30:45877
-# Optional explicit source
-./desk-switch audio serve 192.168.1.30:45877 --source 'PLAYBACK_SOURCE'
-~~~
-
-On the headphone PC, list audio outputs and connect to the sender.
-
-~~~sh
-./desk-switch audio outputs
-./desk-switch audio play 192.168.1.30:45877 --volume 50
-# Optional explicit output
-./desk-switch audio play 192.168.1.30:45877 --output 'PLAYBACK_OUTPUT' --volume 50
-~~~
-
-Use .\desk-switch.exe on Windows. Ubuntu IDs are PipeWire sink names. Windows IDs are active playback endpoint IDs. The default is the local default playback output. Sources always refer to a playback device's system mix.
-
-Use a different TCP port from input/video and allow it from the paired audio receiver if using a firewall. Capture starts only after that receiver explicitly requests audio. The receiving audio terminal accepts on, off, volume 0 through volume 100, mute, unmute, status and quit. These adjust only remote audio. Volume/mute last for that process. Pass --mute to start muted. Ctrl+C exits either audio instance.
-
-The stream is one-way per session, 48 kHz stereo PCM, about 1.54 Mbit/s before framing. Separate authenticated connections, bounded credits and short playout buffers isolate audio from input. Stale/broken streams are cleared before reconnecting. Avoid routing a received stream back into another sender's system mix.
-
-Ubuntu captures a selected sink monitor with device fallback disabled. Windows uses shared WASAPI loopback on a render endpoint. Choose a playback sink that stays present during video switching. HDMI audio can disappear when the monitor changes input, so use a persistent output or virtual sink in that case. Local sound on the sending output may also play. [WirePlumber policy](https://pipewire.pages.freedesktop.org/wireplumber/policies/linking.html), [WASAPI loopback](https://learn.microsoft.com/en-us/windows/win32/coreaudio/loopback-recording)
-
-## Compatibility and validation
-
-- Full switching needs readable/writable VCP 0x60 from each PC while its input is active. The source writes and the destination reads the result before forwarding begins. Firmware reporting stale/incorrect values can prevent reliable handoff.
-- Failed handoffs, link loss, queue overflow or expired leases restore host input. The receiver releases its keys/buttons. Video recovery is best effort when the active PC or DDC adapter becomes unavailable.
-- Windows uses the normal interactive desktop. Validate elevated apps, secure desktops and exclusive device capture separately. Physical key codes use the receiving keyboard layout. F11/F12 are reserved on the host.
-
-~~~sh
+```sh
 cargo fmt --all --check
 cargo clippy --locked --all-targets -- -D warnings
 cargo test --locked
-~~~
+cargo build --locked --release
+python3 tools/package_deb.py --binary target/release/desk-switch --out dist
+python3 tools/verify_deb.py dist/desk-switch-linux-x86_64.deb
+```
 
-Tests use synthetic devices, PCM and loopback TCP. On each real pair validate full switching with the second monitor visible, F11/link loss with held keys/buttons, edges/scaling, and simultaneous local/remote audio on the selected headphones. Ubuntu host device access and portal consent also need validation on the target PC.
+Tests use synthetic input/audio/monitor devices and loopback peer connections. They cover approval/rejection, automatic key exchange, reconnection, simultaneous requests, shared decisions, capability changes, monitor mappings, version rejection, signed metadata and input release. GUI screenshots use isolated fixture PCs, a private Xvfb display and private D-Bus; they never switch a real monitor or grab input. Native CI builds/tests on Ubuntu and Windows. Real two-PC multicast, interactive Windows and monitor firmware still need target-machine validation. The explicit CLI remains available through `--help`.
 
-Desktop validation uses an isolated Xvfb display and private D-Bus StatusNotifier watcher to check settings persistence, key creation/pinning, autostart in a private XDG directory, the menu, hidden-window command handling, show/hide/quit, and watcher loss/reappearance. Test profiles disable automatic connection/audio/update checks. Managed sender shutdown is checked through both a stop command and pipe EOF without opening an audio device. Updater installation, immediate-failure rollback and tampered-payload rejection use signed synthetic executables in temporary directories. Windows desktop/tray/autostart/updater code is cross-compiled; interactive Windows and real monitor validation must be done on the target PCs.
+Set `release/publish-request.json` to the new version tag to build a prerelease. Download the two installers, then sign locally:
 
-[ddcutil troubleshooting](https://www.ddcutil.com/faq/), [setvcp](https://www.ddcutil.com/command_setvcp/), [Win32 SetVCPFeature](https://learn.microsoft.com/en-us/windows/win32/api/lowlevelmonitorconfigurationapi/nf-lowlevelmonitorconfigurationapi-setvcpfeature), [RemoteDesktop portal](https://flatpak.github.io/xdg-desktop-portal/docs/doc-org.freedesktop.portal.RemoteDesktop.html).
+```sh
+python3 tools/prepare_release.py --tag vVERSION --windows PATH.exe --deb PATH.deb --out dist/signed
+```
 
-MIT licensed.
-
-Appearance validation covers all six catalogs, placeholders, native tray labels and
-safe quit in a private Xvfb display and private D-Bus. Live theme/language changes
-are checked together with saved preferences and the tray's updated language.
-Discovery tests use synthetic mDNS records and endpoint selection without browsing
-the real LAN. The shared updater must match the signed artifact before download;
-package checks validate the real `.deb`, its root-owned layout and launcher.
+Commit the metadata as `release/manifests/VERSION.json`. Promotion verifies the signature, public downloads, package metadata and both embedded build stamps before publishing stable. The signing key stays in the ignored `.release-private/` directory and is never sent to GitHub. Back it up. Existing tags and signed releases must not be reused.

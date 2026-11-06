@@ -8,6 +8,8 @@ pub mod portal;
 mod receiver;
 #[cfg(target_os = "linux")]
 pub use linux_monitor::{discover, probe};
+#[cfg(target_os = "linux")]
+pub use linux_monitor::{list_displays, read_monitor};
 
 #[cfg(windows)]
 mod win_input;
@@ -19,6 +21,8 @@ mod win_receive;
 mod windows;
 #[cfg(windows)]
 pub use win_monitor::{discover, probe};
+#[cfg(windows)]
+pub use win_monitor::{list_displays, read_monitor};
 
 use crate::{
     config::{Identity, Key, Role, Settings},
@@ -83,4 +87,6 @@ pub struct MonitorInfo {
     pub current: Option<u16>,
     pub inputs: Vec<u16>,
     pub error: Option<String>,
+    #[serde(default)]
+    pub fingerprint: String,
 }

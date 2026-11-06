@@ -28,6 +28,7 @@ pub struct Worker {
     pub peer_version: Option<String>,
     pub version_error: Option<String>,
     pub stopping: bool,
+    stopping_since: Option<Instant>,
     pub exit_ok: Option<bool>,
     pub data: Option<serde_json::Value>,
     started: Instant,
@@ -101,6 +102,7 @@ impl Worker {
             peer_version: None,
             version_error: None,
             stopping: false,
+            stopping_since: None,
             exit_ok: None,
             data: None,
             started: Instant::now(),
@@ -150,6 +152,14 @@ impl Worker {
             self.input.take();
         }
         self.stopping = true;
+        self.stopping_since = Some(Instant::now());
+    }
+
+    pub fn force_stop(&mut self) {
+        self.input.take();
+        if let Some(child) = &mut self.child {
+            let _ = child.kill();
+        }
     }
 
     fn line(&mut self, line: String) {
@@ -195,6 +205,13 @@ impl Worker {
     }
 
     pub fn poll(&mut self) {
+        if self
+            .stopping_since
+            .is_some_and(|time| time.elapsed() > Duration::from_secs(6))
+        {
+            self.force_stop();
+            self.stopping_since = None;
+        }
         for _ in 0..256 {
             match self.events.try_recv() {
                 Ok(line) => self.line(line),
@@ -296,5 +313,21 @@ mod tests {
         assert!(worker.settled());
         assert_eq!(worker.exit_ok, Some(true));
         assert_eq!(worker.data, Some(serde_json::json!([1, 2])));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_unresponsive_child_cannot_block_quit_forever() {
+        let mut command = Command::new("/bin/sleep");
+        command.arg("30");
+        let mut worker = Worker::spawn(Kind::Input, command).unwrap();
+        worker.stop();
+        worker.stopping_since = Some(Instant::now() - Duration::from_secs(7));
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while worker.running() && Instant::now() < deadline {
+            worker.poll();
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(!worker.running());
     }
 }

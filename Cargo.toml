@@ -1,6 +1,6 @@
 [package]
 name = "desk-switch"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2024"
 rust-version = "1.99"
 license = "MIT"
@@ -10,6 +10,7 @@ description = "Switch a shared monitor, input and audio between Windows and Ubun
 rust-auto-updator = { path = "vendor/rust-auto-updator" }
 mdns-sd = "=0.21.4"
 flume = "0.12"
+socket2 = "0.6"
 anyhow = "1.0"
 eframe = { version = "0.35", default-features = false, features = ["default_fonts", "glow", "x11", "wayland"] }
 serde_json = "1.0"
@@ -46,6 +47,7 @@ windows-sys = { version = "0.61", features = [
     "Win32_System_Registry",
     "Win32_System_Threading",
     "Win32_UI_HiDpi",
+    "Win32_UI_Input",
     "Win32_UI_Input_KeyboardAndMouse",
     "Win32_UI_WindowsAndMessaging",
 ] }
