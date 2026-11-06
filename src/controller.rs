@@ -86,7 +86,7 @@ impl Controller {
             bail!("exit edge was never armed");
         }
         self.exit = exit;
-        self.upgrade = hotkey && transfer.mode == Mode::Input;
+        self.upgrade = hotkey && transfer.mode == Mode::Input && self.inputs.is_some();
         self.phase = Phase::Returning;
         Ok(Effect::Send(Message::Return(transfer.id)))
     }
@@ -189,6 +189,50 @@ impl Controller {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn input_only_hotkey_round_trips_without_a_monitor_or_video_upgrade() {
+        let mut controller = Controller::new(None);
+        for id in 1..=3 {
+            assert_eq!(
+                controller
+                    .start(Transfer {
+                        id,
+                        mode: Mode::Input,
+                        edge: None
+                    })
+                    .unwrap(),
+                Effect::Send(Message::Prepare {
+                    id,
+                    inputs: None,
+                    edge: None
+                })
+            );
+            assert_eq!(
+                controller.message(Message::Ready(id)).unwrap(),
+                Effect::Send(Message::Activate(id))
+            );
+            assert_eq!(
+                controller.message(Message::Active(id)).unwrap(),
+                Effect::Forward
+            );
+            assert_eq!(
+                controller.return_home(None, true).unwrap(),
+                Effect::Send(Message::Return(id))
+            );
+            assert_eq!(
+                controller.message(Message::Returning(id)).unwrap(),
+                Effect::Send(Message::Returned(id))
+            );
+            assert_eq!(
+                controller.finished(),
+                Effect::Local {
+                    position: None,
+                    upgrade: false
+                }
+            );
+        }
+    }
 
     const INPUTS: Inputs = Inputs { host: 17, peer: 15 };
 
