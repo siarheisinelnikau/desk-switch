@@ -38,7 +38,7 @@ mod native {
 
     fn document(executable: &Path, state: &Path) -> Result<String> {
         Ok(format!(
-            "[Desktop Entry]\nType=Application\nName=Desk Switch\nComment=Share input and audio with a paired PC\nExec={} gui --tray --state-dir {}\nTerminal=false\nX-GNOME-Autostart-enabled=true\n",
+            "[Desktop Entry]\nType=Application\nName=Desk Switch\nComment=Share input and audio with a paired PC\nExec={} gui --tray --state-dir {}\nTryExec={}\nTerminal=false\nX-GNOME-Autostart-enabled=true\n",
             quote(
                 executable
                     .to_str()
@@ -48,7 +48,11 @@ mod native {
                 state
                     .to_str()
                     .context("autostart settings path is not UTF-8")?
-            )?
+            )?,
+            executable
+                .to_str()
+                .context("invalid executable path")?
+                .replace('\\', "\\\\")
         ))
     }
 
@@ -70,6 +74,14 @@ mod native {
     }
 
     pub fn sync(enabled: bool, executable: &Path, state: &Path) -> Result<()> {
+        let launcher = std::env::var_os("DESK_SWITCH_PACKAGED_LAUNCHER").map(PathBuf::from);
+        if let Some(path) = &launcher {
+            ensure!(
+                path.is_absolute() && path.is_file(),
+                "packaged launcher is unavailable"
+            );
+        }
+        let executable = launcher.as_deref().unwrap_or(executable);
         let config_home = std::env::var_os("XDG_CONFIG_HOME")
             .map(PathBuf::from)
             .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".config")))
@@ -92,6 +104,7 @@ mod native {
                 fs::read_to_string(root.join("autostart/com.deskswitch.Desktop.desktop")).unwrap();
             assert!(entry.contains("100%%.bin\" gui --tray --state-dir \""));
             assert!(entry.contains("profile with spaces\""));
+            assert!(entry.contains("TryExec="));
             sync_in(&root, false, &executable, &state).unwrap();
             assert!(
                 !root
