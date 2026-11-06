@@ -24,6 +24,8 @@ pub struct Worker {
     events: Receiver<String>,
     pub logs: VecDeque<String>,
     pub input_status: Option<InputStatus>,
+    pub monitor_input: Option<u16>,
+    pub monitoring: bool,
     pub audio_playing: bool,
     pub peer_version: Option<String>,
     pub version_error: Option<String>,
@@ -98,6 +100,8 @@ impl Worker {
             events,
             logs: VecDeque::new(),
             input_status: None,
+            monitor_input: None,
+            monitoring: false,
             audio_playing: false,
             peer_version: None,
             version_error: None,
@@ -188,6 +192,7 @@ impl Worker {
                     };
                 }
                 Event::Input(status) => self.input_status = Some(status),
+                Event::Monitor(input) => self.monitor_input = input,
                 Event::Audio { playing, .. } => self.audio_playing = playing && self.running(),
             }
             return;
@@ -204,7 +209,8 @@ impl Worker {
         self.logs.push_back(line);
     }
 
-    pub fn poll(&mut self) {
+    pub fn poll(&mut self) -> bool {
+        let was_running = self.running();
         if self
             .stopping_since
             .is_some_and(|time| time.elapsed() > Duration::from_secs(6))
@@ -245,6 +251,7 @@ impl Worker {
                 }
             }
         }
+        was_running && !self.running() && !self.stopping && self.exit_ok == Some(false)
     }
 }
 
@@ -293,6 +300,24 @@ mod tests {
             std::thread::sleep(Duration::from_millis(5));
         }
         assert_eq!(worker.exit_ok, Some(true));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_failed_child_is_reported_once_so_retry_can_replace_it() {
+        let mut command = Command::new("/bin/sh");
+        command.args(["-c", "exit 1"]);
+        let mut worker = Worker::spawn(Kind::Input, command).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let mut failures = 0;
+        while worker.running() && Instant::now() < deadline {
+            failures += usize::from(worker.poll());
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(failures, 1);
+        assert_eq!(worker.exit_ok, Some(false));
+        // Retaining logs must not re-latch an already acknowledged failure.
+        assert!(!worker.poll());
     }
 
     #[cfg(unix)]

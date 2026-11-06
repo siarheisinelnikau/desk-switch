@@ -12,7 +12,7 @@ use windows_sys::Win32::{
     UI::WindowsAndMessaging::{PostThreadMessageW, WM_QUIT},
 };
 
-struct WindowsCursor(u32);
+struct WindowsCursor(u32, bool);
 
 impl super::host::Cursor for WindowsCursor {
     async fn request_toggle(&self) -> Result<()> {
@@ -23,10 +23,14 @@ impl super::host::Cursor for WindowsCursor {
         Ok(())
     }
     async fn center(&self) -> Result<()> {
-        win_input::center()
+        if self.1 { win_input::center() } else { Ok(()) }
     }
     async fn enter(&self, edge: &Edge, position: u16) -> Result<()> {
-        win_input::enter(edge, position)
+        if self.1 {
+            win_input::enter(edge, position)
+        } else {
+            Ok(())
+        }
     }
 }
 
@@ -35,12 +39,19 @@ pub fn run(
     identity: Identity,
     peer: Key,
     edge: Option<Edge>,
+    sharing: crate::config::InputSharing,
     video: Option<(Inputs, VideoWorker)>,
 ) -> Result<()> {
     let gate = Arc::new(Gate::new());
     let (control_tx, controls) = mpsc::channel(8);
     let (input_tx, events) = mpsc::channel(256);
-    let hooks = Hooks::install(Arc::clone(&gate), edge.clone(), control_tx, input_tx)?;
+    let hooks = Hooks::install(
+        Arc::clone(&gate),
+        edge.clone(),
+        sharing,
+        control_tx,
+        input_tx,
+    )?;
     let hook_thread = unsafe { GetCurrentThreadId() };
     let runtime = crate::runtime()?;
     let thread = std::thread::Builder::new()
@@ -56,7 +67,7 @@ pub fn run(
                     video,
                     controls,
                     events,
-                    cursor: WindowsCursor(hook_thread),
+                    cursor: WindowsCursor(hook_thread, sharing.mouse),
                 },
             ));
             unsafe {

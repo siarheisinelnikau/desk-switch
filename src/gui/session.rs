@@ -38,6 +38,8 @@ pub(super) struct Pair {
     pub input_failed: bool,
     pub audio_failed: bool,
     scanned: bool,
+    pub monitor_input: Option<u16>,
+    last_monitor_check: Option<Instant>,
 }
 
 impl Desktop {
@@ -57,6 +59,14 @@ impl Desktop {
                 .as_ref()
                 .filter(|w| w.connected())
                 .and_then(|w| w.input_status),
+            monitor_input: match self
+                .input
+                .as_ref()
+                .filter(|w| w.running() && !w.stopping && w.monitoring)
+            {
+                Some(worker) => worker.monitor_input,
+                None => self.pair.monitor_input,
+            },
             audio_playing: self
                 .audio
                 .as_ref()
@@ -107,6 +117,8 @@ impl Desktop {
         self.pair.plan = None;
         self.pair.active_plan = None;
         self.pair.synced = false;
+        self.pair.monitor_input = None;
+        self.pair.last_monitor_check = None;
         self.pair.request = None;
         self.pair.outgoing = None;
         self.pair.busy = false;
@@ -242,6 +254,8 @@ impl Desktop {
                     self.pair.plan = None;
                     self.pair.active_plan = None;
                     self.pair.synced = false;
+                    self.pair.monitor_input = None;
+                    self.pair.last_monitor_check = None;
                     self.pair.request = None;
                     self.pair.outgoing = None;
                     self.pair.busy = false;
@@ -256,7 +270,34 @@ impl Desktop {
             }
         }
         let node = self.local_node();
+        if let Some(remote) = &self.pair.remote {
+            let keyboard = Plan::can_disable(&node, remote, true);
+            let mouse = Plan::can_disable(&node, remote, false);
+            let shared = &mut self.prefs.workspace.shared;
+            if (!keyboard && !shared.keyboard_enabled) || (!mouse && !shared.mouse_enabled) {
+                shared.keyboard_enabled |= !keyboard;
+                shared.mouse_enabled |= !mouse;
+                self.shared_changed();
+            }
+        }
+        let node = self.local_node();
         self.pair.plan = self.pair.remote.as_ref().map(|r| Plan::build(&node, r));
+        if let Some(remote) = &self.pair.remote {
+            let output = self
+                .pair
+                .plan
+                .as_ref()
+                .and_then(|p| p.audio_output.as_deref());
+            if output.is_some()
+                && self.prefs.workspace.shared.prepare_audio_levels(
+                    &self.public_key,
+                    &remote.key,
+                    output,
+                )
+            {
+                self.shared_changed();
+            }
+        }
         self.pair.synced = self.pair.scanned
             && self
                 .pair
@@ -408,6 +449,8 @@ impl Desktop {
         if !self.pair.synced {
             if let Some(active) = &self.pair.active_plan {
                 if (active.input_source != plan.input_source
+                    || active.keyboard_enabled != plan.keyboard_enabled
+                    || active.mouse_enabled != plan.mouse_enabled
                     || active.monitor != plan.monitor
                     || active.edge != plan.edge
                     || active.purple_on_left != plan.purple_on_left)
@@ -424,6 +467,21 @@ impl Desktop {
             return;
         }
         self.pair.active_plan = Some(plan.clone());
+        if Plan::shared_monitor(&self.local_node(), &remote)
+            && plan.monitor.is_none()
+            && self
+                .input
+                .as_ref()
+                .is_none_or(|w| !w.running() || !w.monitoring)
+            && self.query.is_none()
+            && self
+                .pair
+                .last_monitor_check
+                .is_none_or(|t| t.elapsed() >= Duration::from_secs(5))
+        {
+            self.pair.last_monitor_check = Some(Instant::now());
+            self.scan(QueryKind::MonitorStatus);
+        }
         let mut input_profile = String::new();
         if let Some(source) = plan.input_source.as_ref() {
             let host = source == &self.public_key;
@@ -439,6 +497,10 @@ impl Desktop {
             }
             self.prefs.address = endpoint.to_string();
             self.form.monitor_enabled = plan.monitor.is_some();
+            self.form.sharing = config::InputSharing {
+                keyboard: plan.keyboard_enabled,
+                mouse: plan.mouse_enabled,
+            };
             self.form.monitor_id = self.prefs.workspace.monitor.id.clone();
             if let Some(inputs) = plan.monitor {
                 self.form.host_code = format!("{:02X}", inputs.host);
@@ -482,20 +544,11 @@ impl Desktop {
             self.pair.input_profile = input_profile.clone();
             self.pair.input_failed = false;
         }
-        if !input_profile.is_empty() {
-            if self
-                .input
-                .as_ref()
-                .is_some_and(|w| !w.running() && !w.stopping && w.exit_ok == Some(false))
-            {
+        if !input_profile.is_empty() && !self.input_running() && !self.pair.input_failed {
+            let result = self.start_input();
+            if let Err(error) = result {
                 self.pair.input_failed = true;
-            }
-            if !self.input_running() && !self.pair.input_failed {
-                let result = self.start_input();
-                if let Err(error) = result {
-                    self.pair.input_failed = true;
-                    self.notice = Some((format!("{error:#}"), true));
-                }
+                self.notice = Some((format!("{error:#}"), true));
             }
         }
         let mut audio_profile = String::new();
@@ -512,8 +565,13 @@ impl Desktop {
                 });
             }
             self.prefs.audio_address = endpoint.to_string();
-            self.prefs.volume = self.prefs.workspace.shared.volume;
-            self.prefs.muted = self.prefs.workspace.shared.muted;
+            let shared = &self.prefs.workspace.shared;
+            let incoming = shared.audio_level(&remote.key);
+            let native = shared.audio_level(&self.public_key);
+            self.prefs.volume = incoming.volume;
+            self.prefs.muted = incoming.muted;
+            self.prefs.native_volume = native.volume;
+            self.prefs.native_muted = native.muted;
             let output_device = format!(
                 "{}:{}",
                 self.pair.hardware.audio_name, remote.hardware.audio_name
@@ -534,13 +592,6 @@ impl Desktop {
             self.pair.audio_failed = false;
         }
         if !audio_profile.is_empty() {
-            if self
-                .audio
-                .as_ref()
-                .is_some_and(|w| !w.running() && !w.stopping && w.exit_ok == Some(false))
-            {
-                self.pair.audio_failed = true;
-            }
             if !self.audio_running() && !self.pair.audio_failed {
                 let result: Result<()> = (|| {
                     let args = self.prefs.audio_args()?;
@@ -563,10 +614,21 @@ impl Desktop {
                 let shared = &self.prefs.workspace.shared;
                 if let Some(worker) = &mut self.audio {
                     // Commands are small and only emitted when the shared mix changes.
-                    let mix = format!("{}:{}", shared.volume, shared.muted);
+                    let incoming = shared.audio_level(&remote.key);
+                    let native = shared.audio_level(&self.public_key);
+                    let mix = format!(
+                        "{}:{}:{}:{}",
+                        incoming.volume, incoming.muted, native.volume, native.muted
+                    );
                     if self.applied_mix != mix {
-                        let _ = worker.command(&format!("volume {}", shared.volume));
-                        let _ = worker.command(if shared.muted { "mute" } else { "unmute" });
+                        let _ = worker.command(&format!("volume {}", incoming.volume));
+                        let _ = worker.command(if incoming.muted { "mute" } else { "unmute" });
+                        let _ = worker.command(&format!("native-volume {}", native.volume));
+                        let _ = worker.command(if native.muted {
+                            "native-mute"
+                        } else {
+                            "native-unmute"
+                        });
                         self.applied_mix = mix;
                     }
                 }

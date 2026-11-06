@@ -27,6 +27,7 @@ pub enum Event {
         compatible: bool,
     },
     Input(InputStatus),
+    Monitor(Option<u16>),
     Audio {
         playing: bool,
         message: String,

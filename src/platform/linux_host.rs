@@ -9,7 +9,10 @@ use crate::{
     wire::Input,
 };
 use anyhow::{Context, Result, ensure};
-use evdev::{Device, EventSummary, InputEvent, KeyCode, RelativeAxisCode, SynchronizationCode};
+use evdev::{
+    AbsoluteAxisCode, Device, EventSummary, InputEvent, KeyCode, RelativeAxisCode,
+    SynchronizationCode,
+};
 use futures_util::{StreamExt, future::poll_fn};
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -89,7 +92,11 @@ fn open_devices(paths: &[PathBuf]) -> Result<Vec<Device>> {
         let device = Device::open(path).with_context(|| format!(
             "opening {}; grant this desktop user access to this selected event device during setup", path.display()))?;
         ensure!(
-            device.supported_absolute_axes().is_none(),
+            !crate::workspace::hardware::absolute_pointer(|code| {
+                device
+                    .supported_absolute_axes()
+                    .is_some_and(|axes| axes.contains(AbsoluteAxisCode(code as u16)))
+            }),
             "absolute devices and touchpads are not supported as the host pointer; select a relative USB/Bluetooth mouse"
         );
         devices.push(device);
@@ -124,15 +131,17 @@ struct Routing {
     owners: BTreeMap<(usize, u16), Owner>,
     hotkeys: BTreeSet<(usize, u16)>,
     cooldown: Instant,
+    sharing: crate::config::InputSharing,
 }
 
 impl Routing {
-    fn new(gate: Arc<Gate>) -> Self {
+    fn new(gate: Arc<Gate>, sharing: crate::config::InputSharing) -> Self {
         Self {
             gate,
             owners: BTreeMap::new(),
             hotkeys: BTreeSet::new(),
             cooldown: Instant::now(),
+            sharing,
         }
     }
 
@@ -180,6 +189,11 @@ impl Routing {
             return (None, None);
         }
         let (token, route) = self.gate.current();
+        let route = if self.sharing.allows(input) {
+            route
+        } else {
+            Route::Local
+        };
         let fallback = match route {
             Route::Local => Owner::Local,
             Route::Hold => Owner::Suppressed,
@@ -264,6 +278,7 @@ pub async fn run(
     identity: Identity,
     peer: Key,
     edge: Option<Edge>,
+    sharing: crate::config::InputSharing,
     paths: Vec<PathBuf>,
     video: Option<(Inputs, VideoWorker)>,
 ) -> Result<()> {
@@ -303,7 +318,7 @@ pub async fn run(
         println!("Ubuntu host active. F12 switches, F11 restores local input. Closing the process releases the selected devices.");
         tokio::select! {
             result = coordinator => result,
-            result = capture(&mut portal, streams, high_resolution, gate, control_send, event_send, cursor_receive) => result,
+            result = capture(&mut portal, (streams, high_resolution), gate, control_send, event_send, cursor_receive, sharing) => result,
         }
     }.await;
     // Drop grabs before awaiting D-Bus cleanup, including failures halfway through setup.
@@ -315,14 +330,14 @@ pub async fn run(
 
 async fn capture(
     portal: &mut Portal,
-    mut streams: Vec<evdev::EventStream>,
-    high_resolution: Vec<[bool; 2]>,
+    (mut streams, high_resolution): (Vec<evdev::EventStream>, Vec<[bool; 2]>),
     gate: Arc<Gate>,
     controls: mpsc::Sender<Control>,
     events: mpsc::Sender<(u64, Input)>,
     mut cursor: mpsc::Receiver<CursorCommand>,
+    sharing: crate::config::InputSharing,
 ) -> Result<()> {
-    let mut routing = Routing::new(Arc::clone(&gate));
+    let mut routing = Routing::new(Arc::clone(&gate), sharing);
     let mut motion = (0..streams.len())
         .map(|_| Motion::default())
         .collect::<Vec<_>>();
@@ -368,14 +383,14 @@ async fn capture(
                         {
                             gate.emergency();
                         }
-                        if gate.current().1 != Route::Local && local_active {
+                        if gate.current().1 != Route::Local && local_active && !sharing.needs_local() {
                             portal.release()?;
                             local_active = false;
                         }
                         let _ = command.reply.send(Ok(()));
                     }
                     CursorAction::Suspend => {
-                        if local_active {
+                        if local_active && !sharing.needs_local() {
                             portal.release()?;
                             local_active = false;
                         }
@@ -422,7 +437,7 @@ async fn capture(
                     EventSummary::RelativeAxis(_, code, value) => motion[device].axis(code, value, high_resolution[device]),
                     EventSummary::Synchronization(_, SynchronizationCode::SYN_REPORT, _) => {
                         let (token, active) = gate.current();
-                        let owner = match active {
+                        let owner = match if sharing.mouse { active } else { Route::Local } {
                             Route::Local => Owner::Local,
                             Route::Hold => Owner::Suppressed,
                             Route::Remote => Owner::Remote(token),
@@ -433,7 +448,7 @@ async fn capture(
                     }
                     _ => {}
                 }
-                if gate.current().1 != Route::Local && local_active {
+                if gate.current().1 != Route::Local && local_active && !sharing.needs_local() {
                     portal.release()?;
                     local_active = false;
                 }
@@ -484,7 +499,7 @@ mod tests {
     #[test]
     fn emergency_discards_remote_held_keys_until_their_physical_release() {
         let gate = Arc::new(Gate::new());
-        let mut routing = Routing::new(Arc::clone(&gate));
+        let mut routing = Routing::new(Arc::clone(&gate), Default::default());
         let (toggle, _) = routing.key(0, 88, 1);
         assert!(matches!(toggle, Some(Control::Toggle(_))));
         let token = gate.current().0;
@@ -500,6 +515,34 @@ mod tests {
         ));
         let (_, fresh) = routing.key(0, 30, 1);
         assert!(matches!(fresh, Some((Owner::Local, _))));
+    }
+
+    #[test]
+    fn unshared_keyboard_stays_local_while_mouse_and_emergency_still_work() {
+        let gate = Arc::new(Gate::new());
+        let mut routing = Routing::new(
+            Arc::clone(&gate),
+            crate::config::InputSharing {
+                keyboard: false,
+                mouse: true,
+            },
+        );
+        let token = gate.begin().unwrap();
+        assert!(gate.forward(token));
+        assert!(matches!(
+            routing.key(0, 30, 1).1,
+            Some((Owner::Local, Input::Key { down: true, .. }))
+        ));
+        assert!(matches!(
+            routing.key(0, 272, 1).1,
+            Some((Owner::Remote(_), Input::Button { down: true, .. }))
+        ));
+        routing.key(0, 87, 1);
+        assert!(gate.current().1 == Route::Local);
+        assert!(matches!(
+            routing.key(0, 30, 0).1,
+            Some((Owner::Local, Input::Key { down: false, .. }))
+        ));
     }
 
     #[test]

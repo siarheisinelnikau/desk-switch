@@ -160,6 +160,35 @@ pub struct MonitorSettings {
 #[serde(deny_unknown_fields)]
 pub struct CaptureSettings {
     pub devices: Vec<PathBuf>,
+    #[serde(default)]
+    pub sharing: InputSharing,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(default)]
+pub struct InputSharing {
+    pub keyboard: bool,
+    pub mouse: bool,
+}
+impl Default for InputSharing {
+    fn default() -> Self {
+        Self {
+            keyboard: true,
+            mouse: true,
+        }
+    }
+}
+#[cfg(target_os = "linux")]
+impl InputSharing {
+    pub fn allows(self, input: crate::wire::Input) -> bool {
+        match input {
+            crate::wire::Input::Key { .. } => self.keyboard,
+            _ => self.mouse,
+        }
+    }
+    pub fn needs_local(self) -> bool {
+        !self.keyboard || !self.mouse
+    }
 }
 
 #[derive(Clone, Deserialize, Serialize)]
@@ -180,6 +209,7 @@ pub struct Edge {
 pub struct Settings {
     pub monitor: Option<(String, Inputs)>,
     pub edge: Option<Edge>,
+    pub sharing: InputSharing,
     #[cfg(target_os = "linux")]
     pub capture_devices: Vec<PathBuf>,
 }
@@ -277,6 +307,11 @@ impl Settings {
                 })
             }
         };
+        let sharing = config
+            .capture
+            .as_ref()
+            .map(|c| c.sharing)
+            .unwrap_or_default();
         let capture_devices = config
             .capture
             .map(|capture| capture.devices)
@@ -288,6 +323,7 @@ impl Settings {
         Ok(Self {
             monitor,
             edge,
+            sharing,
             #[cfg(target_os = "linux")]
             capture_devices,
         })
