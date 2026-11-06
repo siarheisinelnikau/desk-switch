@@ -6,6 +6,9 @@ use std::path::{Path, PathBuf};
 #[derive(Clone, Deserialize, Serialize)]
 #[serde(default)]
 pub struct Preferences {
+    pub language: String,
+    pub theme: String,
+    pub discovery: bool,
     pub autostart: bool,
     pub auto_connect: bool,
     pub auto_audio: bool,
@@ -23,6 +26,9 @@ pub struct Preferences {
 impl Default for Preferences {
     fn default() -> Self {
         Self {
+            language: "ru".into(),
+            theme: "system".into(),
+            discovery: false,
             autostart: true,
             auto_connect: true,
             auto_audio: false,
@@ -218,6 +224,9 @@ mod tests {
                 .unwrap();
         assert!(prefs.autostart && prefs.auto_connect && prefs.auto_update);
         assert!(!prefs.auto_audio);
+        assert!(!prefs.discovery);
+        assert_eq!(prefs.theme, "system");
+        assert_eq!(prefs.language, "ru");
         assert_eq!(prefs.volume, 25);
         assert!(prefs.muted);
     }
