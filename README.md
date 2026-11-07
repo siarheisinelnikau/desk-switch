@@ -119,7 +119,7 @@ Tests use synthetic input/audio/monitor devices and loopback peer connections. T
 
 For optimized native UI QA, build with `cargo build --locked --profile diagnostic --features eframe/__screenshot`. Set `EFRAME_SCREENSHOT_TO` to an absolute PNG path and run `target/diagnostic/desk-switch gui-preview shared-audio --state-dir ABSOLUTE_ISOLATED_DIRECTORY`; the capture exits after layout settles. Without that variable, `DESK_SWITCH_RENDER_PROBE=ABSOLUTE_JSON_PATH` runs a bounded visible/hidden/restored fixture check and exits. The probe reports UI frame counts and the actual renderer; it does not certify real device services or GPU presentation timings.
 
-Set `release/publish-request.json` to the new version tag to build and test both installers. If the `DESK_SWITCH_UPDATE_SIGNING_KEY` Actions secret contains the existing pinned Ed25519 private key (PEM or base64-encoded PEM), CI verifies that key, signs the tested installers, then promotes the release automatically. A missing secret leaves a prerelease candidate outside the stable update channel. The private key is never uploaded as an artifact or committed.
+Set `release/publish-request.json` to the new version tag to build and test both installers. The isolated signing job requires `DESK_SWITCH_UPDATE_SIGNING_KEY` in the `release` GitHub environment, containing the existing pinned Ed25519 private key (PEM or base64-encoded PEM). CI verifies that key, signs the tested installers, then publishes and verifies the signed stable release using the existing promotion checks. A missing or incorrect key stops publication. The private key is never uploaded as an artifact or committed. See [signing setup and backup](docs/signing.md).
 
 For local signing instead, download the two tested installers, then run:
 
@@ -127,4 +127,6 @@ For local signing instead, download the two tested installers, then run:
 python3 tools/prepare_release.py --tag vVERSION --windows PATH.exe --deb PATH.deb --out dist/signed
 ```
 
-Commit the metadata as `release/manifests/VERSION.json`. Promotion verifies the signature, public downloads, package metadata and both embedded build stamps before publishing stable. The signing key stays in the ignored `.release-private/` directory and is never sent to GitHub. Back it up. Existing tags and signed releases must not be reused.
+The public signed `update.json` is saved in the `desk-switch-signed-metadata` Actions artifact. The publication job verifies the signed metadata and public installers before attaching the envelope to release notes and promoting stable.
+
+Commit the locally generated metadata, or the workflow's verified `update.json`, as `release/manifests/VERSION.json` to request stable promotion. Promotion verifies the signature, public downloads, package metadata and both embedded build stamps before publishing stable. The private key remains excluded from Git and release assets; an encrypted copy is supplied to the signing job through GitHub Secrets. Back up the local key independently. Existing tags and signed releases must not be reused.
