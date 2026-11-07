@@ -340,7 +340,8 @@ impl Desktop {
                     }
                     self.notice = Some((error, true));
                     if !remote_only {
-                        self.update_ready = self.prepared_update.is_some();
+                        self.update_ready =
+                            self.prepared_update.is_some() || self.candidate_update.is_some();
                     }
                 }
                 Effect::PeerRestart(version) => {

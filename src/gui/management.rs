@@ -226,7 +226,13 @@ impl Desktop {
                 "This PC is installing an update"
             );
             match message {
-                Message::CheckUpdates { .. } => self.check_updates(ctx),
+                Message::CheckUpdates { .. } => {
+                    ensure!(
+                        !self.update_action_busy(),
+                        "Another update operation is already in progress."
+                    );
+                    self.check_updates(ctx);
+                }
                 Message::SetMonitor {
                     expected, monitor, ..
                 } => {

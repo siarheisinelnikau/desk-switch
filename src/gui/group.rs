@@ -294,14 +294,24 @@ impl Desktop {
                     self.group.reply_target = None;
                 }
                 Event::Update { source, message } => {
-                    if self
-                        .group
-                        .update_target
-                        .as_ref()
-                        .is_none_or(|target| target == &source)
-                    {
-                        self.group.update_target = Some(source);
+                    let current = self.paired_update.is_some()
+                        && self.group.update_target.as_ref() == Some(&source);
+                    if current {
                         self.receive_update(message, ctx);
+                    } else if let workspace::update::Message::Prepare { id, .. } = &message {
+                        if self.update_action_busy() || self.download_action.is_some() {
+                            let _ = self.update_send_to(
+                                &source,
+                                workspace::update::Message::Failed {
+                                    id: *id,
+                                    message: "Another update operation is already in progress."
+                                        .into(),
+                                },
+                            );
+                        } else {
+                            self.group.update_target = Some(source);
+                            self.receive_update(message, ctx);
+                        }
                     }
                 }
                 Event::UpdateSent(message) => self.sent_update(&message, ctx),
@@ -1209,4 +1219,132 @@ pub(super) fn selection(
                 }
             });
     });
+}
+
+impl Desktop {
+    pub(super) fn group_diagnostics(&self, ui: &mut egui::Ui) {
+        let Some(state) = &self.group.workspace else {
+            return;
+        };
+        let mut local = self.local_node();
+        self.group.data.report(&mut local);
+        local.monitor_error = self.group.monitor_error.clone();
+        if let Some(error) = &self.group.data.error {
+            local.diagnostics.line("Workspace", error);
+        }
+        if let Some(error) = self
+            .group
+            .clipboard
+            .as_ref()
+            .and_then(|value| value.status())
+        {
+            local.diagnostics.line("Clipboard", &error);
+        }
+
+        ui.heading(tr("Diagnostics"));
+        ui.weak(tr(
+            "Recent service messages from every computer in this workspace.",
+        ));
+        ui.add_space(12.0);
+        if ui.button(tr("Copy diagnostics")).clicked() {
+            // Workspace and Node contain public connection/settings state, never
+            // the private identity. Refresh local worker output at copy time.
+            let mut snapshot = state.clone();
+            if let Some(member) = snapshot.members.get_mut(&self.public_key) {
+                member.node = local.clone();
+            }
+            let report = format!(
+                "Desk Switch {} / protocol {}\nWorkspace protocol: {}\nLocal computer: {}\n{}\n",
+                crate::compatibility::VERSION,
+                crate::compatibility::PROTOCOL,
+                model::PROTOCOL,
+                self.public_key,
+                serde_json::to_string_pretty(&snapshot).unwrap_or_default()
+            );
+            ui.ctx().copy_text(report);
+        }
+        ui.weak(tr(
+            "The copied report includes all computers and workspace settings. Offline computers show the last received diagnostics.",
+        ));
+        ui.add_space(12.0);
+
+        for (key, member) in &state.members {
+            let is_local = key == &self.public_key;
+            let node = if is_local { &local } else { &member.node };
+            let errors = [
+                ("Keyboard & mouse", &node.input_error),
+                ("Shared monitor", &node.monitor_error),
+                ("Sound", &node.audio_error),
+                ("Microphone", &node.microphone_error),
+            ];
+            let has_errors = errors.iter().any(|(_, error)| error.is_some());
+            let platform = match node.diagnostics.platform.as_str() {
+                "windows" => "Windows",
+                "linux" => "Ubuntu",
+                "macos" => "macOS",
+                _ => "—",
+            };
+            let version = node
+                .version
+                .as_ref()
+                .map(|value| value.app.as_str())
+                .unwrap_or("—");
+            let header = format!(
+                "{} · {platform} · {version} · {}",
+                node.name,
+                tr(if member.online {
+                    "Connected"
+                } else {
+                    "Offline"
+                })
+            );
+            egui::Frame::group(ui.style())
+                .fill(ui.visuals().window_fill())
+                .corner_radius(12)
+                .inner_margin(16)
+                .show(ui, |ui| {
+                    ui.set_min_width(ui.available_width());
+                    egui::CollapsingHeader::new(header)
+                        .id_salt(("group-computer-diagnostics", key))
+                        .default_open(is_local || has_errors)
+                        .show(ui, |ui| {
+                            ui.horizontal_wrapped(|ui| {
+                                if is_local {
+                                    ui.weak(tr("This PC"));
+                                }
+                                if let Some(version) = &node.version {
+                                    ui.weak(format!("{} {}", tr("Protocol:"), version.protocol));
+                                }
+                            });
+                            if !member.online {
+                                ui.weak(tr("Offline: showing the last received diagnostics."));
+                            }
+                            for (name, error) in errors {
+                                if let Some(error) = error {
+                                    ui.colored_label(
+                                        ui.visuals().error_fg_color,
+                                        format!("{}: {}", tr(name), tr(error)),
+                                    );
+                                }
+                            }
+                            if node.diagnostics.logs.is_empty() {
+                                ui.weak(tr("No recent service messages."));
+                            } else {
+                                egui::ScrollArea::vertical()
+                                    .id_salt(("group-computer-service-logs", key))
+                                    .max_height(230.0)
+                                    .stick_to_bottom(true)
+                                    .show(ui, |ui| {
+                                        for line in &node.diagnostics.logs {
+                                            ui.label(
+                                                RichText::new(tr(line)).monospace().size(12.0),
+                                            );
+                                        }
+                                    });
+                            }
+                        });
+                });
+            ui.add_space(8.0);
+        }
+    }
 }
