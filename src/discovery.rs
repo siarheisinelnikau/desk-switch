@@ -159,6 +159,8 @@ pub fn computer_name() -> String {
         .unwrap_or_else(|| {
             if cfg!(windows) {
                 "Windows PC"
+            } else if cfg!(target_os = "macos") {
+                "Mac"
             } else {
                 "Ubuntu PC"
             }

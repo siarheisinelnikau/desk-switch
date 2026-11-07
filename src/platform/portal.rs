@@ -366,7 +366,7 @@ impl Portal {
         if let Some(fraction) = edge {
             let config = self.edge.as_ref().unwrap();
             let screen = self.find_screen(&config.screen)?;
-            let (x, y) = config.side.entry(screen.rect, fraction);
+            let (x, y) = config.entry(screen.rect, fraction);
             self.absolute(&screen, x, y)?;
             self.cursor = Some((x, y));
         }
@@ -525,7 +525,7 @@ impl Portal {
             .as_ref()
             .context("the local return edge is disabled")?;
         let screen = self.find_screen(&edge.screen)?;
-        let (x, y) = edge.side.entry(screen.rect, position);
+        let (x, y) = edge.entry(screen.rect, position);
         self.absolute(&screen, x, y)?;
         self.cursor = Some((x, y));
         self.connection.flush()?;

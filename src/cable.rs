@@ -21,6 +21,12 @@ pub enum Platform {
     MacOS,
 }
 impl Platform {
+    pub fn can_run_on(self, platform: &str) -> bool {
+        matches!(
+            (self, platform),
+            (Self::Windows, "windows") | (Self::MacOS, "macos")
+        )
+    }
     pub fn label(self) -> &'static str {
         match self {
             Self::Windows => "Windows",
@@ -137,31 +143,296 @@ fn extract_at(platform: Platform, downloads: &Path) -> Result<PathBuf> {
     result
 }
 
-pub struct Job(mpsc::Receiver<Result<PathBuf, String>>);
+pub struct Job {
+    receive: mpsc::Receiver<Result<PathBuf, String>>,
+    installing: bool,
+}
 impl Job {
     pub fn start(platform: Platform, ctx: eframe::egui::Context) -> Result<Self> {
+        Self::operation(platform, false, ctx)
+    }
+    pub fn install(platform: Platform, ctx: eframe::egui::Context) -> Result<Self> {
+        ensure!(
+            platform.can_run_on(std::env::consts::OS),
+            "Choose an installer for the selected computer's operating system"
+        );
+        Self::operation(platform, true, ctx)
+    }
+    fn operation(platform: Platform, installing: bool, ctx: eframe::egui::Context) -> Result<Self> {
         let (send, receive) = mpsc::channel();
         std::thread::Builder::new()
-            .name("VB-CABLE extraction".into())
+            .name(
+                if installing {
+                    "VB-CABLE installer launch"
+                } else {
+                    "VB-CABLE extraction"
+                }
+                .into(),
+            )
             .spawn(move || {
                 let result = dirs::download_dir()
                     .context("The Downloads folder is not available")
                     .and_then(|downloads| extract_at(platform, &downloads))
+                    .and_then(|directory| {
+                        if installing {
+                            let installer = verified_installer(platform, &directory)?;
+                            launch_installer(&installer, &directory)?;
+                        }
+                        Ok(directory)
+                    })
                     .map_err(|error| format!("{error:#}"));
                 let _ = send.send(result);
-                ctx.request_repaint();
+                ctx.request_repaint_of(eframe::egui::ViewportId::ROOT);
             })?;
-        Ok(Self(receive))
+        Ok(Self {
+            receive,
+            installing,
+        })
+    }
+    pub fn installing(&self) -> bool {
+        self.installing
     }
     pub fn poll(&self) -> Option<Result<PathBuf, String>> {
-        match self.0.try_recv() {
+        match self.receive.try_recv() {
             Ok(result) => Some(result),
             Err(mpsc::TryRecvError::Empty) => None,
             Err(mpsc::TryRecvError::Disconnected) => {
-                Some(Err("Installer extraction stopped".into()))
+                Some(Err("The installer operation stopped".into()))
             }
         }
     }
+}
+
+fn installer_name(platform: Platform) -> &'static str {
+    match platform {
+        Platform::Windows if cfg!(target_arch = "x86") => "VBCABLE_Setup.exe",
+        Platform::Windows => "VBCABLE_Setup_x64.exe",
+        Platform::MacOS => "VBCable_MACDriver_Pack108.dmg",
+    }
+}
+
+/// Verify the complete freshly extracted package immediately before running its
+/// official entry point. No executable path or argument is accepted from a peer.
+fn verified_installer(platform: Platform, directory: &Path) -> Result<PathBuf> {
+    ensure!(
+        directory.is_absolute(),
+        "The installer directory must be absolute"
+    );
+    let directory = directory.canonicalize()?;
+    let bytes = platform.bytes();
+    ensure!(
+        format!("{:x}", Sha256::digest(bytes)) == platform.sha256(),
+        "The bundled VB-CABLE archive is damaged"
+    );
+    let mut archive = zip::ZipArchive::new(Cursor::new(bytes))?;
+    for index in 0..archive.len() {
+        let mut entry = archive.by_index(index)?;
+        if entry.is_dir() {
+            continue;
+        }
+        let name = entry.enclosed_name().context("Unsafe installer path")?;
+        let path = directory.join(name);
+        ensure!(
+            !fs::symlink_metadata(&path)?.file_type().is_symlink(),
+            "An installer file was replaced with a link"
+        );
+        ensure!(
+            path.canonicalize()?.starts_with(&directory),
+            "Installer files must remain in their extracted directory"
+        );
+        let expected = {
+            let mut data = Vec::new();
+            (&mut entry).take(LIMIT + 1).read_to_end(&mut data)?;
+            data
+        };
+        ensure!(
+            fs::metadata(&path)?.len() == expected.len() as u64,
+            "An extracted installer file changed. Extract a fresh saved installer and try again."
+        );
+        let actual = fs::read(&path)?;
+        ensure!(
+            actual == expected,
+            "An extracted installer file changed. Extract a fresh saved installer and try again."
+        );
+    }
+    let path = directory.join(installer_name(platform));
+    ensure!(
+        path.is_file(),
+        "The official installer is missing from its archive"
+    );
+    Ok(path)
+}
+
+#[cfg(windows)]
+fn shell_wide(value: &std::ffi::OsStr) -> Vec<u16> {
+    use std::os::windows::ffi::OsStrExt;
+    let mut units = value.encode_wide().collect::<Vec<_>>();
+    // canonicalize returns extended paths, while Shell verbs expect ordinary
+    // drive/UNC paths. Keep the original UTF-16 code units and argument boundary.
+    if units.starts_with(&[92, 92, 63, 92, 85, 78, 67, 92]) {
+        units.drain(..8);
+        units.splice(0..0, [92, 92]);
+    } else if units.starts_with(&[92, 92, 63, 92]) && units.get(5) == Some(&58) {
+        units.drain(..4);
+    }
+    units.push(0);
+    units
+}
+
+#[cfg(windows)]
+fn launch_installer(installer: &Path, directory: &Path) -> Result<()> {
+    use windows::Win32::System::Com::{
+        COINIT_APARTMENTTHREADED, COINIT_DISABLE_OLE1DDE, CoInitializeEx, CoUninitialize,
+    };
+    use windows_sys::Win32::{
+        Foundation::{CloseHandle, ERROR_CANCELLED, GetLastError},
+        UI::{
+            Shell::{
+                SEE_MASK_FLAG_LOG_USAGE, SEE_MASK_FLAG_NO_UI, SEE_MASK_NOASYNC,
+                SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW, ShellExecuteExW,
+            },
+            WindowsAndMessaging::SW_SHOWNORMAL,
+        },
+    };
+    unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE) }
+        .ok()
+        .context("Could not initialize the Windows installer launcher")?;
+    struct Apartment;
+    impl Drop for Apartment {
+        fn drop(&mut self) {
+            unsafe {
+                CoUninitialize();
+            }
+        }
+    }
+    let _apartment = Apartment;
+    let file = shell_wide(installer.as_os_str());
+    let directory = shell_wide(directory.as_os_str());
+    let verb = shell_wide(std::ffi::OsStr::new("runas"));
+    let mut info: SHELLEXECUTEINFOW = unsafe { std::mem::zeroed() };
+    info.cbSize = std::mem::size_of::<SHELLEXECUTEINFOW>() as u32;
+    info.fMask =
+        SEE_MASK_NOCLOSEPROCESS | SEE_MASK_FLAG_NO_UI | SEE_MASK_NOASYNC | SEE_MASK_FLAG_LOG_USAGE;
+    info.lpVerb = verb.as_ptr();
+    info.lpFile = file.as_ptr();
+    info.lpDirectory = directory.as_ptr();
+    // The official standalone installer stays visible. Do not invent silent
+    // flags or treat its launch as a completed driver installation.
+    info.nShow = SW_SHOWNORMAL;
+    if unsafe { ShellExecuteExW(&mut info) } == 0 {
+        let error = unsafe { GetLastError() };
+        if error == ERROR_CANCELLED {
+            anyhow::bail!("The Windows administrator prompt was cancelled");
+        }
+        return Err(std::io::Error::from_raw_os_error(error as i32))
+            .context("Could not open the official VB-CABLE installer");
+    }
+    if !info.hProcess.is_null() {
+        unsafe {
+            CloseHandle(info.hProcess);
+        }
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn launch_installer(installer: &Path, directory: &Path) -> Result<()> {
+    use std::process::{Command, Stdio};
+    use std::time::{Duration, Instant};
+    let mount = directory.join("VB-CABLE-image");
+    fs::create_dir(&mount)?;
+    let mut child = Command::new("/usr/bin/hdiutil")
+        .args(["attach", "-readonly", "-nobrowse", "-mountpoint"])
+        .arg(&mount)
+        .arg(installer)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .context("Could not mount the saved official VB-CABLE disk image")?;
+    let since = Instant::now();
+    loop {
+        if let Some(status) = child.try_wait()? {
+            ensure!(
+                status.success(),
+                "Could not mount the saved disk image. Open the extracted .dmg manually."
+            );
+            break;
+        }
+        if since.elapsed() > Duration::from_secs(30) {
+            let _ = child.kill();
+            let _ = child.wait();
+            anyhow::bail!(
+                "Mounting the saved disk image timed out. Open the extracted .dmg manually."
+            );
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let package = match mounted_package(&mount) {
+        Ok(package) => package,
+        Err(error) => {
+            let _ = Command::new("/usr/bin/open").arg(&mount).spawn();
+            return Err(error).context(
+                "The disk image is open in Finder. Start its VB-CABLE installer manually",
+            );
+        }
+    };
+    let status = Command::new("/usr/bin/open")
+        .args(["-b", "com.apple.installer"])
+        .arg(package)
+        .status()?;
+    ensure!(
+        status.success(),
+        "Could not open the official package in macOS Installer"
+    );
+    // Installer may continue reading the package after open returns. Keep this
+    // read-only image mounted; the user can eject it after the official setup.
+    Ok(())
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn mounted_package(mount: &Path) -> Result<PathBuf> {
+    let root = mount.canonicalize()?;
+    let mut directories = vec![(root.clone(), 0)];
+    let mut packages = Vec::new();
+    let mut visited = 0;
+    while let Some((directory, depth)) = directories.pop() {
+        for entry in fs::read_dir(directory)? {
+            let entry = entry?;
+            visited += 1;
+            ensure!(
+                visited <= 128,
+                "The disk image contains too many installer entries"
+            );
+            let kind = entry.file_type()?;
+            if kind.is_symlink() {
+                continue;
+            }
+            let path = entry.path();
+            ensure!(
+                path.canonicalize()?.starts_with(&root),
+                "The installer package is outside its disk image"
+            );
+            if path
+                .extension()
+                .is_some_and(|extension| extension == "pkg" || extension == "mpkg")
+            {
+                packages.push(path);
+            } else if kind.is_dir() && depth < 2 {
+                directories.push((path, depth + 1));
+            }
+        }
+    }
+    ensure!(
+        packages.len() == 1,
+        "The disk image does not contain exactly one installer package"
+    );
+    Ok(packages.pop().unwrap())
+}
+
+#[cfg(not(any(windows, target_os = "macos")))]
+fn launch_installer(_: &Path, _: &Path) -> Result<()> {
+    anyhow::bail!("VB-CABLE installers can run only on their matching Windows or macOS computer")
 }
 
 pub fn open_folder(path: &Path) -> Result<()> {
@@ -218,5 +489,90 @@ mod tests {
         assert!(unpack(&data, &root).is_err());
         assert_eq!(fs::read_dir(&root).unwrap().count(), 0);
         fs::remove_dir(root).unwrap();
+    }
+
+    #[test]
+    fn installer_entry_points_are_fixed_and_modified_packages_are_rejected_before_launch() {
+        let root =
+            std::env::temp_dir().join(format!("desk-switch-cable-verify-{}", std::process::id()));
+        fs::create_dir_all(&root).unwrap();
+        for platform in [Platform::Windows, Platform::MacOS] {
+            let extracted = extract_at(platform, &root).unwrap();
+            let executable = verified_installer(platform, &extracted).unwrap();
+            assert_eq!(executable.file_name().unwrap(), installer_name(platform));
+            assert_eq!(
+                executable.parent().unwrap(),
+                extracted.canonicalize().unwrap()
+            );
+            // Verifying just the EXE/DMG is insufficient: the Windows installer
+            // also reads companion driver/INF files from the same directory.
+            let companion = if platform == Platform::Windows {
+                extracted.join("vbMmeCable64_win10.inf")
+            } else {
+                executable
+            };
+            fs::write(companion, b"modified installer content").unwrap();
+            assert!(verified_installer(platform, &extracted).is_err());
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn mac_package_selection_uses_only_one_package_inside_the_mounted_image() {
+        let root =
+            std::env::temp_dir().join(format!("desk-switch-cable-mount-{}", std::process::id()));
+        let folder = root.join("VB-CABLE");
+        fs::create_dir_all(&folder).unwrap();
+        fs::write(
+            root.join("Uninstall.command"),
+            b"not an installation entry point",
+        )
+        .unwrap();
+        assert!(mounted_package(&root).is_err());
+        let package = folder.join("VBCABLE.pkg");
+        fs::write(&package, b"synthetic package; never executed").unwrap();
+        assert_eq!(
+            mounted_package(&root).unwrap(),
+            package.canonicalize().unwrap()
+        );
+        fs::write(root.join("Other.pkg"), b"ambiguous").unwrap();
+        assert!(mounted_package(&root).is_err());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_foreign_platform_cannot_start_an_installer_job() {
+        let platform = if cfg!(target_os = "macos") {
+            Platform::Windows
+        } else {
+            Platform::MacOS
+        };
+        assert!(Job::install(platform, eframe::egui::Context::default()).is_err());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn shell_paths_preserve_unicode_spaces_and_unc_paths_without_namespace_prefixes() {
+        for (source, expected) in [
+            (
+                r"\\?\C:\Users\Иван\Downloads\Desk Switch\VBCABLE_Setup_x64.exe",
+                r"C:\Users\Иван\Downloads\Desk Switch\VBCABLE_Setup_x64.exe",
+            ),
+            (
+                r"\\?\UNC\server\share\Desk Switch\VBCABLE_Setup_x64.exe",
+                r"\\server\share\Desk Switch\VBCABLE_Setup_x64.exe",
+            ),
+            (
+                r"C:\Users\user\Downloads\VBCABLE_Setup_x64.exe",
+                r"C:\Users\user\Downloads\VBCABLE_Setup_x64.exe",
+            ),
+        ] {
+            let wide = shell_wide(std::ffi::OsStr::new(source));
+            assert_eq!(wide.last(), Some(&0));
+            assert_eq!(
+                String::from_utf16(&wide[..wide.len() - 1]).unwrap(),
+                expected
+            );
+        }
     }
 }

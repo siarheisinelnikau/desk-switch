@@ -6,6 +6,8 @@ use tokio::net::{TcpListener, TcpStream};
 
 #[cfg(target_os = "linux")]
 use super::linux::Capture;
+#[cfg(target_os = "macos")]
+use super::macos::Capture;
 #[cfg(windows)]
 use super::windows_capture::Capture;
 

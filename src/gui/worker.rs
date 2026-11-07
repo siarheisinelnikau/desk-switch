@@ -46,6 +46,8 @@ impl OutputLevel {
 }
 
 pub struct Worker {
+    pub cycle_input: bool,
+    pub cycle_input_position: Option<u16>,
     pub kind: Kind,
     child: Option<Child>,
     input: Option<ChildStdin>,
@@ -82,6 +84,9 @@ impl Worker {
         let mut command = Command::new(executable);
         command.args(args).env("DESK_SWITCH_STATE", dir);
         if kind == Kind::Input {
+            if dir.join("group-input").exists() {
+                command.env("DESK_SWITCH_GROUP_INPUT", "1");
+            }
             let prefs = super::model::Preferences::load(dir)?;
             command.env(
                 "DESK_SWITCH_REMOTE_CURSOR",
@@ -156,15 +161,17 @@ impl Worker {
                             send.try_send(line).is_ok()
                         };
                         if sent && let Some(ctx) = &ctx {
-                            ctx.request_repaint();
+                            ctx.request_repaint_of(eframe::egui::ViewportId::ROOT);
                         }
                     }
                     if let Some(ctx) = &ctx {
-                        ctx.request_repaint();
+                        ctx.request_repaint_of(eframe::egui::ViewportId::ROOT);
                     }
                 })?;
         }
         Ok(Self {
+            cycle_input: false,
+            cycle_input_position: None,
             kind,
             child: Some(child),
             input,
@@ -294,6 +301,14 @@ impl Worker {
             && let Ok(event) = serde_json::from_str::<Event>(json)
         {
             match event {
+                Event::CycleInput => {
+                    self.cycle_input = true;
+                    self.cycle_input_position = None;
+                }
+                Event::CycleInputEdge(position) => {
+                    self.cycle_input = true;
+                    self.cycle_input_position = Some(position);
+                }
                 Event::PeerVersion {
                     app,
                     protocol,

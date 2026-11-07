@@ -3,6 +3,12 @@ mod host;
 mod linux_host;
 #[cfg(target_os = "linux")]
 mod linux_monitor;
+#[cfg(target_os = "macos")]
+mod macos;
+#[cfg(any(target_os = "macos", test))]
+mod macos_keys;
+#[cfg(target_os = "macos")]
+mod macos_monitor;
 mod monitor_service;
 #[cfg(target_os = "linux")]
 pub mod portal;
@@ -11,6 +17,8 @@ mod receiver;
 pub use linux_monitor::{discover, probe};
 #[cfg(target_os = "linux")]
 pub use linux_monitor::{list_displays, read_monitor};
+#[cfg(target_os = "macos")]
+pub use macos_monitor::{discover, list_displays, probe, read_monitor};
 
 #[cfg(any(windows, test))]
 mod cursor_policy;
@@ -36,6 +44,16 @@ use crate::{
 use anyhow::Result;
 use std::net::SocketAddr;
 
+pub fn select_monitor(id: &str, input: u16) -> Result<()> {
+    #[cfg(target_os = "macos")]
+    let monitor = macos_monitor::Ddc(id.into());
+    #[cfg(windows)]
+    let monitor = win_monitor::Ddc(id.into());
+    #[cfg(target_os = "linux")]
+    let monitor = linux_monitor::Ddc(id.into());
+    crate::video::select_once(monitor, input)
+}
+
 pub fn run_monitor_service(
     id: &str,
     host: u16,
@@ -48,6 +66,8 @@ pub fn run_monitor_service(
         "select a monitor and remember distinct connections on both PCs"
     );
     crate::lifecycle::install();
+    #[cfg(target_os = "macos")]
+    let monitor = macos_monitor::Ddc(id.into());
     #[cfg(target_os = "linux")]
     let monitor = linux_monitor::Ddc(id.into());
     #[cfg(windows)]
@@ -73,6 +93,8 @@ pub fn run(
     let video = settings
         .monitor
         .map(|(id, inputs)| {
+            #[cfg(target_os = "macos")]
+            let monitor = macos_monitor::Ddc(id);
             #[cfg(target_os = "linux")]
             let monitor = linux_monitor::Ddc(id);
             #[cfg(windows)]
@@ -87,6 +109,15 @@ pub fn run(
         .transpose()?;
     match role {
         Role::Host => {
+            #[cfg(target_os = "macos")]
+            return macos::run(
+                address,
+                identity,
+                peer,
+                settings.edge,
+                settings.sharing,
+                video,
+            );
             #[cfg(target_os = "linux")]
             return crate::runtime()?.block_on(linux_host::run(
                 address,
@@ -107,6 +138,11 @@ pub fn run(
             )
         }
         Role::Receiver => crate::runtime()?.block_on(async {
+            #[cfg(target_os = "macos")]
+            {
+                let mut sink = macos::NativeSink::new(settings.edge)?;
+                receiver::run(address, identity, peer, &mut sink, video).await
+            }
             #[cfg(target_os = "linux")]
             {
                 let mut sink = portal::Portal::open(settings.edge).await?;

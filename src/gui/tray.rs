@@ -101,6 +101,7 @@ mod native {
     }
 
     impl ksni::Tray for Item {
+        const MENU_ON_ACTIVATE: bool = false;
         fn id(&self) -> String {
             "desk-switch".into()
         }
@@ -157,6 +158,7 @@ mod native {
                 .into()
             };
             vec![
+                item("Quick controls", Action::QuickOpen { x: 0, y: 0 }, true),
                 item("Открыть Desk Switch", Action::Show, true),
                 MenuItem::Separator,
                 item(
@@ -224,7 +226,7 @@ mod native {
     }
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "macos"))]
 mod native {
     use super::*;
     use tray_icon::{
@@ -325,12 +327,15 @@ mod native {
                     );
                 }
             }));
+            #[cfg(windows)]
             let metric = unsafe {
                 windows_sys::Win32::UI::WindowsAndMessaging::GetSystemMetrics(
                     windows_sys::Win32::UI::WindowsAndMessaging::SM_CXSMICON,
                 )
             }
             .max(16) as usize;
+            #[cfg(target_os = "macos")]
+            let metric = 32usize;
             let size = [16usize, 20, 24, 32, 48, 64]
                 .into_iter()
                 .min_by_key(|size| size.abs_diff(metric))

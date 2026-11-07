@@ -22,10 +22,13 @@ pub enum Device {
 pub enum Command {
     Toggle(Device, bool),
     Level { remote: bool, level: AudioLevel },
+    GroupLevel { index: usize, level: AudioLevel },
+    Target(usize),
 }
 
 #[derive(Clone, Default, PartialEq)]
 struct Snapshot {
+    targets: Vec<(usize, String, bool)>,
     connected: bool,
     can_switch: bool,
     monitor: bool,
@@ -43,6 +46,7 @@ struct Snapshot {
 }
 #[derive(Clone, PartialEq)]
 struct Level {
+    group_index: Option<usize>,
     name: String,
     remote: bool,
     system: bool,
@@ -81,6 +85,8 @@ impl Popup {
             ctx.send_viewport_cmd_to(id(), egui::ViewportCommand::Close);
         } else {
             state.open = true;
+            #[cfg(target_os = "linux")]
+            super::linux_activation::request(super::linux_activation::Role::Quick);
             state.seen_focus = false;
             state.position = position(ctx, x, y);
         }
@@ -95,6 +101,11 @@ impl Popup {
         };
         if was_open {
             ctx.send_viewport_cmd_to(id(), egui::ViewportCommand::Close);
+        }
+    }
+    pub fn repaint(&self, ctx: &egui::Context) {
+        if self.state.lock().unwrap().open {
+            ctx.request_repaint_of(id());
         }
     }
 }
@@ -116,6 +127,37 @@ fn fitted(anchor: Pos2, bounds: egui::Rect) -> Pos2 {
     egui::pos2(x, y)
 }
 fn position(ctx: &egui::Context, x: i32, y: i32) -> Pos2 {
+    #[cfg(target_os = "macos")]
+    if let Some(mtm) = objc2::MainThreadMarker::new() {
+        // AppKit points and CoreGraphics screen pixels differ on Retina. Read
+        // the logical mouse/work area here rather than using tray-icon's
+        // physical coordinates with the focused root window's scale factor.
+        let screens = objc2_app_kit::NSScreen::screens(mtm);
+        if let Some(primary) = screens.firstObject() {
+            let frame = primary.frame();
+            let top = frame.origin.y + frame.size.height;
+            let mouse = objc2_app_kit::NSEvent::mouseLocation();
+            if let Some(screen) = screens.iter().find(|screen| {
+                let frame = screen.frame();
+                mouse.x >= frame.origin.x
+                    && mouse.x < frame.origin.x + frame.size.width
+                    && mouse.y >= frame.origin.y
+                    && mouse.y < frame.origin.y + frame.size.height
+            }) {
+                let area = screen.visibleFrame();
+                return fitted(
+                    egui::pos2(mouse.x as f32, (top - mouse.y) as f32),
+                    egui::Rect::from_min_size(
+                        egui::pos2(
+                            area.origin.x as f32,
+                            (top - area.origin.y - area.size.height) as f32,
+                        ),
+                        egui::vec2(area.size.width as f32, area.size.height as f32),
+                    ),
+                );
+            }
+        }
+    }
     #[cfg(windows)]
     unsafe {
         use windows_sys::Win32::{Foundation::POINT, Graphics::Gdi::*, UI::HiDpi::*};
@@ -150,6 +192,49 @@ fn position(ctx: &egui::Context, x: i32, y: i32) -> Pos2 {
 
 impl Desktop {
     pub(super) fn quick_action(&mut self, command: Command) {
+        if let Some(state) = self.group.workspace.clone() {
+            use crate::group::net::Action as GroupAction;
+            match command {
+                Command::Toggle(device, enabled) => {
+                    let mut value = state.settings.clone();
+                    match device {
+                        Device::Audio => value.audio_enabled = enabled,
+                        Device::Keyboard => value.keyboard_enabled = enabled,
+                        Device::Mouse => value.mouse_enabled = enabled,
+                        Device::Microphone => {
+                            value.microphone_enabled = enabled;
+                            value.microphone_binding = None;
+                        }
+                    }
+                    self.group_action(GroupAction::Settings {
+                        expected: state.revision,
+                        value,
+                    });
+                }
+                Command::GroupLevel { index, level } => {
+                    if let Some(member) = state.members.values().nth(index) {
+                        let mut value = member.preferences.clone();
+                        if state.plan().audio.as_ref() == Some(&member.node.key) {
+                            value.output = Some(level);
+                        } else {
+                            value.audio = level;
+                        }
+                        self.group_action(GroupAction::Member {
+                            key: member.node.key.clone(),
+                            expected: member.preferences.clone(),
+                            value,
+                        });
+                    }
+                }
+                Command::Target(index) => {
+                    if let Some(key) = state.members.keys().nth(index) {
+                        self.group_action(GroupAction::Activate { key: key.clone() });
+                    }
+                }
+                Command::Level { .. } => {}
+            }
+            return;
+        }
         let local = self.local_node();
         match command {
             Command::Toggle(Device::Keyboard, false)
@@ -191,6 +276,7 @@ impl Desktop {
                 let Some(key) = key else { return };
                 self.prefs.workspace.shared.audio_levels.insert(key, level);
             }
+            Command::GroupLevel { .. } | Command::Target(_) => {}
         }
         self.shared_changed();
     }
@@ -258,12 +344,80 @@ impl Desktop {
         for (node, is_remote) in [(Some(&local), false), (remote, true)] {
             if let Some(node) = node {
                 snapshot.levels.push(Level {
+                    group_index: None,
                     name: node.name.clone(),
                     remote: is_remote,
                     system: output == Some(node.key.as_str()),
                     value: shared.audio_level(&node.key),
                 });
             }
+        }
+        if let Some(workspace) = &self.group.workspace {
+            let plan = workspace.plan();
+            snapshot.connected = workspace
+                .members
+                .values()
+                .filter(|member| member.online)
+                .count()
+                > 1;
+            snapshot.can_switch = snapshot.connected;
+            snapshot.monitor = false;
+            snapshot.peer = format!(
+                "{} {}",
+                workspace
+                    .members
+                    .values()
+                    .filter(|member| member.online)
+                    .count(),
+                crate::i18n::tr("computers connected")
+            );
+            snapshot.target = workspace
+                .active_input
+                .as_ref()
+                .and_then(|key| workspace.members.get(key))
+                .map(|member| member.node.name.clone())
+                .unwrap_or_default();
+            snapshot.output = plan
+                .audio
+                .as_ref()
+                .and_then(|key| workspace.members.get(key))
+                .map(|member| member.node.hardware.audio_name.clone())
+                .unwrap_or_default();
+            snapshot.levels.clear();
+            for (index, member) in workspace.members.values().enumerate() {
+                snapshot
+                    .targets
+                    .push((index, member.node.name.clone(), member.compatible()));
+                let system = plan.audio.as_ref() == Some(&member.node.key);
+                snapshot.levels.push(Level {
+                    group_index: Some(index),
+                    name: member.node.name.clone(),
+                    remote: member.node.key != self.public_key,
+                    system,
+                    value: if system {
+                        member
+                            .native_output
+                            .or(member.preferences.output)
+                            .unwrap_or_default()
+                    } else {
+                        member.preferences.audio
+                    },
+                });
+            }
+            snapshot.can_disable_keyboard = workspace
+                .active_input
+                .as_ref()
+                .and_then(|key| workspace.members.get(key))
+                .is_none_or(|member| {
+                    plan.input.as_ref() == Some(&member.node.key) || member.node.hardware.keyboard
+                });
+            snapshot.can_disable_mouse = workspace
+                .active_input
+                .as_ref()
+                .and_then(|key| workspace.members.get(key))
+                .is_none_or(|member| {
+                    plan.input.as_ref() == Some(&member.node.key) || member.node.hardware.mouse
+                });
         }
         let position = {
             let mut state = self.quick.state.lock().unwrap();
@@ -374,11 +528,27 @@ fn content(ui: &mut egui::Ui, snapshot: &Snapshot, mut send: impl FnMut(Action))
                     .truncate(),
                 );
             }
+            if !snapshot.targets.is_empty() {
+                egui::ComboBox::from_id_salt("quick-input-target")
+                    .width(WIDTH - 64.0)
+                    .selected_text(tr("Switch to computer…"))
+                    .show_ui(ui, |ui| {
+                        for (index, name, enabled) in &snapshot.targets {
+                            if ui.add_enabled(*enabled, egui::Button::new(name)).clicked() {
+                                send(Action::Quick(Command::Target(*index)));
+                            }
+                        }
+                    });
+            }
             if ui
                 .add_enabled(
                     snapshot.can_switch,
-                    egui::Button::new(tr("Switch to the other PC"))
-                        .min_size(Vec2::new(WIDTH - 32.0, 34.0)),
+                    egui::Button::new(tr(if snapshot.targets.is_empty() {
+                        "Switch to the other PC"
+                    } else {
+                        "Switch to next computer"
+                    }))
+                    .min_size(Vec2::new(WIDTH - 32.0, 34.0)),
                 )
                 .clicked()
             {
@@ -436,41 +606,53 @@ fn content(ui: &mut egui::Ui, snapshot: &Snapshot, mut send: impl FnMut(Action))
                 .on_hover_text(&snapshot.output);
             }
             ui.separator();
-            for row in &snapshot.levels {
-                ui.horizontal(|ui| {
-                    ui.add_sized(
-                        [144.0, 18.0],
-                        egui::Label::new(RichText::new(&row.name).strong()).truncate(),
-                    )
-                    .on_hover_text(&row.name);
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        ui.label(
-                            RichText::new(tr(if row.system {
-                                "System volume"
+            egui::ScrollArea::vertical()
+                .max_height((ui.available_height() - 50.0).max(80.0))
+                .auto_shrink([false, true])
+                .show(ui, |ui| {
+                    for row in &snapshot.levels {
+                        ui.horizontal(|ui| {
+                            ui.add_sized(
+                                [144.0, 18.0],
+                                egui::Label::new(RichText::new(&row.name).strong()).truncate(),
+                            )
+                            .on_hover_text(&row.name);
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    ui.label(
+                                        RichText::new(tr(if row.system {
+                                            "System volume"
+                                        } else {
+                                            "Relative volume"
+                                        }))
+                                        .small()
+                                        .color(ui.visuals().weak_text_color()),
+                                    );
+                                },
+                            );
+                        });
+                        let mut level = row.value;
+                        let changed = ui
+                            .horizontal(|ui| {
+                                let slider = ui
+                                    .add(egui::Slider::new(&mut level.volume, 0..=100).suffix(" %"))
+                                    .changed();
+                                ui.checkbox(&mut level.muted, tr("Mute")).changed() || slider
+                            })
+                            .inner;
+                        if changed {
+                            send(Action::Quick(if let Some(index) = row.group_index {
+                                Command::GroupLevel { index, level }
                             } else {
-                                "Relative volume"
-                            }))
-                            .small()
-                            .color(ui.visuals().weak_text_color()),
-                        );
-                    });
+                                Command::Level {
+                                    remote: row.remote,
+                                    level,
+                                }
+                            }));
+                        }
+                    }
                 });
-                let mut level = row.value;
-                let changed = ui
-                    .horizontal(|ui| {
-                        let slider = ui
-                            .add(egui::Slider::new(&mut level.volume, 0..=100).suffix(" %"))
-                            .changed();
-                        ui.checkbox(&mut level.muted, tr("Mute")).changed() || slider
-                    })
-                    .inner;
-                if changed {
-                    send(Action::Quick(Command::Level {
-                        remote: row.remote,
-                        level,
-                    }));
-                }
-            }
             if !snapshot.notice.is_empty() {
                 ui.add(
                     egui::Label::new(

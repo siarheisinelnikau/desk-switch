@@ -25,11 +25,11 @@ def candidate_updates(release, version):
         "linux-x86_64-deb": "desk-switch-linux-x86_64.deb",
     }
     assets = release["assets"]
-    assert len(assets) == len(names), "Expected exactly one Windows and one Linux installer"
+    assert len(assets) == len(names), "Expected the complete native platform/architecture matrix"
     assert len({asset["id"] for asset in assets}) == len(assets), "Duplicate asset identifiers"
     updates = []
     for platform, canonical in names.items():
-        matches = [asset for asset in assets if asset["name"] in {previous[platform], canonical}]
+        matches = [asset for asset in assets if asset["name"] in {previous.get(platform, canonical), canonical}]
         assert len(matches) == 1, f"Unexpected or duplicate installer for {platform}"
         asset = matches[0]
         assert asset["state"] == "uploaded" and asset["size"] > 0, "Installer upload is incomplete"

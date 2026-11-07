@@ -7,6 +7,9 @@ mod native;
 #[cfg(windows)]
 #[path = "mixer_windows.rs"]
 mod native;
+#[cfg(target_os = "macos")]
+#[path = "mixer_macos.rs"]
+mod native;
 
 use crate::{config, workspace::AudioLevel};
 use anyhow::{Context, Result, ensure};

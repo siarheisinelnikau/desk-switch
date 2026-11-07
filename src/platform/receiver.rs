@@ -94,9 +94,6 @@ pub async fn run(
             }
         };
         println!("host peer authenticated.");
-        crate::lifecycle::report(crate::lifecycle::Event::Input(
-            crate::lifecycle::InputStatus::Peer,
-        ));
         let mut transfer = None;
         let mut last_id = 0;
         let result = tokio::select! {
@@ -136,6 +133,9 @@ async fn session(
     last_id: &mut u64,
 ) -> Result<()> {
     let mut commands = crate::lifecycle::commands();
+    crate::lifecycle::report(crate::lifecycle::Event::Input(
+        crate::lifecycle::InputStatus::Peer,
+    ));
     let mut lease = Instant::now() + LEASE;
     let mut settle_until = Instant::now();
     let mut job: Option<oneshot::Receiver<Result<VideoResult>>> = None;
@@ -154,6 +154,7 @@ async fn session(
             command = commands.recv() => match command {
                 Ok(crate::lifecycle::Command::Switch) => pipe.send(Message::SwitchRequested).await?,
                 Ok(crate::lifecycle::Command::SetupSwitch) => pipe.send(Message::SetupSwitchRequested).await?,
+                Ok(crate::lifecycle::Command::SwitchEdge(_) | crate::lifecycle::Command::EnterEdge(_)) => {},
                 Ok(crate::lifecycle::Command::Emergency) => bail!("local emergency recovery requested"),
                 Ok(crate::lifecycle::Command::MicrophoneVolume(_)) | Err(_) => {}
             },

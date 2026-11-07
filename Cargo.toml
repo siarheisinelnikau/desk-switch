@@ -1,10 +1,10 @@
 [package]
 name = "desk-switch"
-version = "0.4.11"
+version = "0.5.0"
 edition = "2024"
 rust-version = "1.99"
 license = "MIT"
-description = "Switch a shared monitor, input and audio between Windows and Ubuntu PCs"
+description = "Share monitors, input and audio across Windows, Ubuntu and macOS computers"
 
 [dependencies]
 rust-auto-updator = { path = "vendor/rust-auto-updator" }
@@ -12,7 +12,9 @@ mdns-sd = "=0.21.4"
 flume = "0.12"
 socket2 = "0.6"
 anyhow = "1.0"
-eframe = { version = "0.35", default-features = false, features = ["default_fonts", "glow", "x11", "wayland"] }
+base64 = "0.22"
+arboard = { version = "3.6", features = ["image-data"] }
+eframe = { version = "0.35", default-features = false, features = ["default_fonts"] }
 serde_json = "1.0"
 ed25519-dalek = "2.2"
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"] }
@@ -28,6 +30,8 @@ toml = "0.9"
 tokio = { version = "1.48", features = ["rt", "macros", "net", "sync", "time", "io-util", "signal"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
+zbus = { version = "5.19", default-features = false, features = ["tokio", "blocking-api"] }
+eframe = { version = "0.35", default-features = false, features = ["glow", "x11", "wayland"] }
 libc = "0.2"
 ashpd = { version = "0.13", default-features = false, features = ["tokio", "remote_desktop", "screencast"] }
 futures-util = "0.3"
@@ -38,6 +42,11 @@ ksni = { version = "0.3.6", features = ["blocking"] }
 tokio = { version = "1.48", features = ["process"] }
 
 [target.'cfg(windows)'.dependencies]
+egui-winit = { version = "=0.35.0", default-features = false, features = ["clipboard", "links"] }
+egui_software_backend = { path = "vendor/egui_software_backend", default-features = false, features = ["std"] }
+softbuffer = { version = "=0.4.8", default-features = false }
+winit = { version = "=0.30.13", default-features = false, features = ["rwh_06"] }
+bytemuck = "1"
 tray-icon = { version = "0.25", default-features = false }
 wasapi = "0.26"
 windows = { version = "0.62", features = ["Win32_Media_Audio", "Win32_Media_Audio_Endpoints", "Win32_System_Com"] }
@@ -52,11 +61,19 @@ windows-sys = { version = "0.61", features = [
     "Win32_System_Registry",
     "Win32_System_Threading",
     "Win32_UI_HiDpi",
+    "Win32_UI_Shell",
     "Win32_UI_Accessibility",
     "Win32_UI_Input",
     "Win32_UI_Input_KeyboardAndMouse",
     "Win32_UI_WindowsAndMessaging",
 ] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+eframe = { version = "0.35", default-features = false, features = ["glow"] }
+tokio = { version = "1.48", features = ["process"] }
+tray-icon = { version = "0.25", default-features = false }
+objc2 = "0.6"
+objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "NSPasteboard", "NSEvent", "NSScreen"] }
 
 [profile.release]
 lto = "thin"
@@ -69,3 +86,6 @@ winresource = { version = "0.1.34", default-features = false }
 inherits = "release"
 debug-assertions = true
 strip = false
+
+[profile.dev.package.egui_software_backend]
+opt-level = 3
