@@ -418,7 +418,8 @@ pub(super) fn acknowledge(state: &Path) {
 }
 fn start(executable: &Path, state: &Path, health: Option<&Path>) -> Result<std::process::Child> {
     let mut command = Command::new(executable);
-    command.args(["gui", "--tray", "--state-dir"]).arg(state);
+    // A visible first frame is required for the startup-health acknowledgment.
+    command.args(["gui", "--state-dir"]).arg(state);
     if let Some(health) = health {
         command.arg("--macos-update-health").arg(health);
     }
@@ -457,6 +458,23 @@ fn apply(path: &Path) -> Result<()> {
             &ticket.state.join("updates/last-error.txt"),
             &format!("{error:#}"),
         );
+        // Also cover failures between the desktop closing and the first new
+        // process starting. Only restart an exact copy of this old executable,
+        // never an arbitrary path from an edited/stale update ticket.
+        let executable = ticket.app.join("Contents/MacOS/desk-switch");
+        let same_binary = (|| -> Result<bool> {
+            let current = std::env::current_exe()?;
+            let size = fs::metadata(&current)?.len();
+            ensure!(size <= MAX_BINARY, "The update helper is too large");
+            Ok(fs::metadata(&executable)?.len() == size
+                && fs::read(&executable)? == fs::read(current)?)
+        })();
+        if same_binary.unwrap_or(false)
+            && let Ok(lock) = crate::config::lock(&ticket.state, "desktop.lock")
+        {
+            drop(lock);
+            let _ = start(&executable, &ticket.state, None);
+        }
     }
     result
 }
@@ -523,7 +541,7 @@ fn apply_inner(path: &Path, ticket: &Ticket) -> Result<()> {
         let restored = fs::rename(&backup, &ticket.app);
         let _ = fs::remove_dir_all(&staging);
         restored.context("The previous application could not be restored")?;
-        return Err(error
+        return Err(anyhow::Error::from(error)
             .context("Installing the new application failed; the previous bundle was restored"));
     }
     drop(locks);
@@ -552,11 +570,6 @@ fn apply_inner(path: &Path, ticket: &Ticket) -> Result<()> {
         fs::rename(&ticket.app, &failed)?;
         fs::rename(&backup, &ticket.app)
             .context("Restoring the previous complete application bundle")?;
-        let _ = start(
-            &ticket.app.join("Contents/MacOS/desk-switch"),
-            &ticket.state,
-            None,
-        );
         let _ = fs::remove_dir_all(&failed);
         let _ = fs::remove_dir_all(&staging);
         bail!("The updated application did not confirm startup; the previous bundle was restored");

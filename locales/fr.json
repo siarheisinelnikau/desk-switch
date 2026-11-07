@@ -554,5 +554,12 @@
   "Another update operation is already in progress.": "Une autre opération de mise à jour est déjà en cours.",
   "Reconnect the selected computer before updating it.": "Reconnectez l’ordinateur sélectionné avant de le mettre à jour.",
   "Paired installation requires the installed application edition.": "L’installation conjointe nécessite la version installée de l’application.",
-  "Version {version} is available. Choose Download and install to update.": "La version {version} est disponible. Choisissez « Télécharger et installer » pour mettre à jour."
+  "Version {version} is available. Choose Download and install to update.": "La version {version} est disponible. Choisissez « Télécharger et installer » pour mettre à jour.",
+  "Diagnostics": "Diagnostic",
+  "Protocol:": "Protocole :",
+  "No recent service messages.": "Aucun message de service récent.",
+  "Recent service messages from every computer in this workspace.": "Messages récents des services de chaque ordinateur de cet espace de travail.",
+  "The copied report includes all computers and workspace settings. Offline computers show the last received diagnostics.": "Le rapport copié contient tous les ordinateurs et les paramètres de l’espace de travail. Pour les ordinateurs hors ligne, le dernier diagnostic reçu est affiché.",
+  "Select a monitor": "Choisir un écran",
+  "Microphone level": "Niveau du microphone"
 }

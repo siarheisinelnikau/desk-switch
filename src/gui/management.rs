@@ -146,7 +146,7 @@ impl Desktop {
                 Duration::from_secs(8)
             },
         });
-        ctx.request_repaint();
+        ctx.request_repaint_of(eframe::egui::ViewportId::ROOT);
         Ok(())
     }
     pub(super) fn check_remote_updates(&mut self, ctx: &egui::Context) {
@@ -347,7 +347,7 @@ impl Desktop {
                 .is_some_and(|(kind, _)| matches!(kind, super::QueryKind::Monitors)),
             "Could not start the monitor read"
         );
-        ctx.request_repaint();
+        ctx.request_repaint_of(eframe::egui::ViewportId::ROOT);
         Ok(())
     }
 
@@ -366,7 +366,7 @@ impl Desktop {
         }
         // Publish the recorded input on the next group tick, after the query's
         // result has been applied to preferences in this tick.
-        ctx.request_repaint();
+        ctx.request_repaint_of(eframe::egui::ViewportId::ROOT);
     }
 
     fn start_cable_job(

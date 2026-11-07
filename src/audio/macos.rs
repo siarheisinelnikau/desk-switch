@@ -46,26 +46,15 @@ impl Capture {
                 "macOS system capture follows the default output. Select Automatic or make this output the macOS default"
             );
         }
-        if media == Media::Microphone
-            && let Some(source) = source
-        {
-            ensure!(
-                devices()?
-                    .microphones
-                    .iter()
-                    .any(|device| device.id == source),
-                "The selected physical macOS microphone is unavailable"
-            );
-        }
         let mut command = crate::macos_native::async_command(if media == Media::System {
             "capture-system"
         } else {
             "capture-microphone"
         })?;
-        if media == Media::Microphone
-            && let Some(source) = source
-        {
-            command.arg(source);
+        if media == Media::Microphone {
+            let microphones = devices()?.microphones;
+            let selected=microphones.iter().find(|device|source.map_or(device.default,|source|device.id==source)).context("The selected/default macOS microphone is not a physical input. Select a physical microphone explicitly; virtual microphone feeds are never recaptured")?;
+            command.arg(&selected.id);
         }
         let mut child = command
             .stdin(Stdio::null())
