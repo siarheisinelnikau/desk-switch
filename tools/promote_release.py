@@ -9,7 +9,7 @@ import tempfile
 import tomllib
 import urllib.request
 
-from prepare_release import checked_binary
+from prepare_release import checked_binary, checked_macos_archive
 from release_assets import asset_names
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -51,7 +51,7 @@ def main():
         assert set(release["targets"]) == set(targets)
         info = json.loads(subprocess.check_output(["gh", "release", "view", tag, "--repo", REPOSITORY, "--json", "isPrerelease,assets,body"], text=True))
         assets = {asset["name"]: asset for asset in info["assets"]}
-        assert set(assets) == set(targets.values()), "Only the .deb and .exe belong in this release"
+        assert set(assets) == set(targets.values()), "Release artifacts do not match the signed platform/architecture matrix"
         for platform, filename in targets.items():
             artifact = release["targets"][platform]
             assert artifact["url"] == f"https://github.com/{REPOSITORY}/releases/download/{tag}/{filename}"
@@ -63,7 +63,9 @@ def main():
             path.write_bytes(data)
             if platform == "windows-x86_64":
                 checked_binary(path, platform, version, protocol)
-            else:
+            elif platform.startswith("macos-"):
+                checked_macos_archive(path, platform, version, protocol)
+            elif platform == "linux-x86_64-deb":
                 subprocess.run(["dpkg-deb", "--extract", str(path), str(work / "installed")], check=True)
                 checked_binary(work / "installed/usr/lib/desk-switch/desk-switch", "linux-x86_64", version, protocol)
                 assert subprocess.check_output(["dpkg-deb", "--field", str(path), "Package"], text=True).strip() == "desk-switch"
@@ -71,7 +73,7 @@ def main():
                 assert subprocess.check_output(["dpkg-deb", "--field", str(path), "Architecture"], text=True).strip() == "amd64"
         notes = work / "notes.md"
         # A maintainer may have cleared Prerelease manually before this job.
-        # The signature, both binaries and package metadata were still verified
+        # The signature, native binaries and package metadata were still verified
         # above. Repair the missing envelope without changing the release files.
         expected_notes = signed_notes(info["body"], manifest.read_text(), (ROOT / f"release/notes/{version}.md").read_text())
         notes.write_text(expected_notes)
@@ -81,7 +83,7 @@ def main():
         assert signed_notes(published["body"], manifest.read_text(), "") == published["body"], "Signed metadata was not saved"
         latest = json.loads(subprocess.check_output(["gh", "api", f"repos/{REPOSITORY}/releases/latest"], text=True))
         assert latest["tag_name"] == tag, "The signed release is not the update channel's latest release"
-        print(f"Published signed stable {tag}: .deb + .exe only")
+        print(f"Published signed stable {tag}: {len(targets)} verified native artifacts")
 
 
 

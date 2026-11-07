@@ -11,6 +11,8 @@ use tokio::sync::{broadcast, watch};
 #[derive(Clone, Copy, Debug)]
 pub enum Command {
     Switch,
+    SwitchEdge(u16),
+    EnterEdge(u16),
     SetupSwitch,
     Emergency,
     MicrophoneVolume(u8),
@@ -26,6 +28,8 @@ pub enum InputStatus {
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub enum Event {
+    CycleInput,
+    CycleInputEdge(u16),
     PeerVersion {
         app: Option<String>,
         protocol: Option<u16>,
@@ -60,6 +64,10 @@ pub fn managed() -> bool {
     std::env::var_os("DESK_SWITCH_MANAGED").is_some()
 }
 
+pub fn group_input() -> bool {
+    std::env::var_os("DESK_SWITCH_GROUP_INPUT").is_some()
+}
+
 fn controls() -> &'static Controls {
     CONTROLS.get_or_init(|| {
         let (stop, _) = watch::channel(false);
@@ -81,6 +89,16 @@ fn controls() -> &'static Controls {
                     match line.trim() {
                         "switch" => {
                             let _ = command_send.send(Command::Switch);
+                        }
+                        value if value.starts_with("switch-edge ") => {
+                            if let Ok(position) = value[12..].trim().parse::<u16>() {
+                                let _ = command_send.send(Command::SwitchEdge(position));
+                            }
+                        }
+                        value if value.starts_with("enter-edge ") => {
+                            if let Ok(position) = value[11..].trim().parse::<u16>() {
+                                let _ = command_send.send(Command::EnterEdge(position));
+                            }
                         }
                         "setup-switch" => {
                             let _ = command_send.send(Command::SetupSwitch);

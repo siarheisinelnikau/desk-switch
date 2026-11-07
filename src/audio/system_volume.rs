@@ -8,6 +8,9 @@ mod native;
 #[cfg(windows)]
 #[path = "system_volume_windows.rs"]
 mod native;
+#[cfg(target_os = "macos")]
+#[path = "system_volume_macos.rs"]
+mod native;
 
 use crate::{lifecycle, workspace::AudioLevel};
 use anyhow::{Context, Result, ensure};

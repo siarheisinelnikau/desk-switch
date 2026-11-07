@@ -12,12 +12,15 @@ mod controller;
 mod discovery;
 mod edge;
 mod gate;
+mod group;
 mod gui;
 mod i18n;
 #[cfg(any(windows, test))]
 mod keys;
 mod lifecycle;
-#[cfg(any(windows, target_os = "linux"))]
+#[cfg(target_os = "macos")]
+mod macos_native;
+#[cfg(any(windows, target_os = "linux", target_os = "macos"))]
 mod platform;
 mod transport;
 mod updater;
@@ -79,6 +82,10 @@ fn run() -> Result<()> {
         }
         ["help" | "--help" | "-h"] => println!("{USAGE}"),
         ["--build-info"] => println!("{}", compatibility::BUILD_INFO),
+        #[cfg(target_os = "macos")]
+        ["macos-export-helper", name, destination] => {
+            macos_native::export(name, std::path::Path::new(destination))?
+        }
         ["--version" | "-V"] => println!(
             "Desk Switch {} (protocol {})",
             compatibility::VERSION,
@@ -103,6 +110,7 @@ fn run() -> Result<()> {
             serde_json::to_string(&platform::discover()?)?
         ),
         ["probe", id] => platform::probe(Some(id))?,
+        ["monitor-select", id, input] => platform::select_monitor(id, input.parse()?)?,
         ["monitor-read", id] => println!(
             "@desk-switch-data {}",
             serde_json::to_string(&platform::read_monitor(id)?)?

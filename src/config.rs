@@ -25,7 +25,7 @@ pub fn hex(bytes: &[u8]) -> String {
     result
 }
 
-fn key(value: &str) -> Result<Key> {
+pub(crate) fn key(value: &str) -> Result<Key> {
     let bytes = value.as_bytes();
     ensure!(
         bytes.len() == 64 && bytes.iter().all(u8::is_ascii_hexdigit),
@@ -45,7 +45,9 @@ pub fn state_dir() -> Result<PathBuf> {
     }
     #[cfg(windows)]
     let base = std::env::var_os("LOCALAPPDATA").map(PathBuf::from);
-    #[cfg(not(windows))]
+    #[cfg(target_os = "macos")]
+    let base = dirs::config_dir();
+    #[cfg(not(any(windows, target_os = "macos")))]
     let base = std::env::var_os("XDG_CONFIG_HOME")
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".config")));
@@ -209,11 +211,23 @@ pub struct Edge {
     pub screen: String,
     pub side: Side,
 }
+impl Edge {
+    pub fn entry(&self, rect: crate::edge::Rect, position: u16) -> (f64, f64) {
+        // Groups form a forward cycle: crossing the right edge enters the next
+        // computer from its left. A legacy pair keeps its configured entry side.
+        let side = if crate::lifecycle::group_input() {
+            Side::Left
+        } else {
+            self.side
+        };
+        side.entry(rect, position)
+    }
+}
 
 pub struct Settings {
     pub monitor: Option<(String, Inputs)>,
     pub edge: Option<Edge>,
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "macos"))]
     pub sharing: InputSharing,
     #[cfg(target_os = "linux")]
     pub capture: CaptureSettings,
@@ -330,7 +344,7 @@ impl Settings {
         Ok(Self {
             monitor,
             edge,
-            #[cfg(windows)]
+            #[cfg(any(windows, target_os = "macos"))]
             sharing,
             #[cfg(target_os = "linux")]
             capture,

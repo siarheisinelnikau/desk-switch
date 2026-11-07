@@ -48,6 +48,9 @@ def check(package):
             assert policy.find("annotate[@key='org.freedesktop.policykit.exec.path']").text == f"/usr/lib/desk-switch/{executable}"
         assert (extracted / "usr/share/desk-switch/update-public-key.hex").read_bytes() == (ROOT / "release/update-public-key.hex").read_bytes()
         assert (extracted / "usr/share/doc/desk-switch/VB-CABLE-NOTICE.txt").is_file()
+        companion = extracted / "usr/share/gnome-shell/extensions/desk-switch@siarheisinelnikau"
+        assert json.loads((companion / "metadata.json").read_text())["uuid"] == "desk-switch@siarheisinelnikau"
+        assert (companion / "extension.js").read_bytes() == (ROOT / "packaging/linux/gnome-extension/extension.js").read_bytes()
         launcher = extracted / "usr/bin/desk-switch"
         result = subprocess.check_output([str(launcher), "--build-info"], env=environment, text=True).strip()
         stamp = json.loads(result.removeprefix("DESK-SWITCH-BUILD:"))

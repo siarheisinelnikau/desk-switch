@@ -9,6 +9,46 @@ pub fn sync(enabled: bool, executable: &Path, state: &Path) -> Result<()> {
     native::sync(enabled, executable, state).context("настройка автозапуска")
 }
 
+#[cfg(target_os = "macos")]
+mod native {
+    use super::*;
+    fn xml(value: &Path) -> Result<String> {
+        let value = value.to_str().context("The autostart path is not UTF-8")?;
+        ensure!(
+            !value.chars().any(char::is_control),
+            "Invalid autostart path"
+        );
+        Ok(value
+            .replace('&', "&amp;")
+            .replace('<', "&lt;")
+            .replace('>', "&gt;")
+            .replace('"', "&quot;")
+            .replace('\'', "&apos;"))
+    }
+    pub fn sync(enabled: bool, executable: &Path, state: &Path) -> Result<()> {
+        let path = dirs::home_dir()
+            .context("The home directory is unavailable")?
+            .join("Library/LaunchAgents/com.deskswitch.Desktop.plist");
+        if !enabled {
+            match std::fs::remove_file(path) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
+            }
+        } else {
+            let document = format!(
+                "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n<plist version=\"1.0\"><dict><key>Label</key><string>com.deskswitch.Desktop</string><key>ProgramArguments</key><array><string>{}</string><string>gui</string><string>--tray</string><string>--state-dir</string><string>{}</string></array><key>RunAtLoad</key><true/><key>KeepAlive</key><false/></dict></plist>\n",
+                xml(executable)?,
+                xml(state)?
+            );
+            if std::fs::read_to_string(&path).ok().as_deref() != Some(&document) {
+                crate::config::write_atomic(&path, &document)?;
+            }
+        }
+        Ok(())
+    }
+}
+
 #[cfg(target_os = "linux")]
 mod native {
     use super::*;

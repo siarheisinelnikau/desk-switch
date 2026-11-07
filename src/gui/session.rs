@@ -51,7 +51,7 @@ pub(super) struct Pair {
     pub audio_failed: bool,
     #[cfg(target_os = "linux")]
     pub input_access_attempts: std::collections::BTreeSet<String>,
-    scanned: bool,
+    pub(super) scanned: bool,
     pub monitor_input: Option<u16>,
 }
 
@@ -334,6 +334,10 @@ impl Desktop {
     }
 
     pub(super) fn tick_pair(&mut self, ctx: &egui::Context) {
+        self.tick_group(ctx);
+        if self.group.service.is_some() || self.group.preview {
+            return;
+        }
         self.sync_pair(ctx);
         if let Some(snapshot) = self.pair.probe.as_ref().and_then(Probe::poll) {
             if let Some(error) = snapshot.error {

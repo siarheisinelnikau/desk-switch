@@ -45,6 +45,8 @@ def main():
             "usr/share/doc/desk-switch/VB-CABLE-NOTICE.txt": ROOT / "assets/third-party/vb-cable/NOTICE.txt",
             "usr/share/doc/desk-switch/copyright": ROOT / "LICENSE",
             "usr/share/doc/desk-switch/rust-auto-updator-LICENSE": ROOT / "vendor/rust-auto-updator/LICENSE",
+            "usr/share/gnome-shell/extensions/desk-switch@siarheisinelnikau/metadata.json": ROOT / "packaging/linux/gnome-extension/metadata.json",
+            "usr/share/gnome-shell/extensions/desk-switch@siarheisinelnikau/extension.js": ROOT / "packaging/linux/gnome-extension/extension.js",
         }
         for name, source in files.items():
             target = stage / name

@@ -394,7 +394,7 @@ pub fn enter(edge: &Edge, position: u16) -> Result<()> {
         matches.next().is_none(),
         "Windows return edge screen is ambiguous"
     );
-    let (x, y) = edge.side.entry(screen.rect, position);
+    let (x, y) = edge.entry(screen.rect, position);
     move_cursor(x, y)
 }
 

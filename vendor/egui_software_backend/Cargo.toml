@@ -1,0 +1,22 @@
+[package]
+name = "egui_software_backend"
+version = "0.0.2"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/DGriffin91/egui_software_backend"
+autoexamples = false
+autotests = false
+
+[features]
+default = ["std"]
+std = []
+raster_stats = ["std"]
+rayon = ["dep:rayon"]
+log = ["dep:log"]
+
+[dependencies]
+egui = { version = "=0.35.0", default-features = false }
+constify = "0.0.1"
+strength_reduce = "0.2.4"
+rayon = { version = "1.11", optional = true }
+log = { version = "0.4", optional = true }

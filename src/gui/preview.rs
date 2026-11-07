@@ -17,6 +17,30 @@ struct PreviewApp {
 }
 
 impl eframe::App for PreviewApp {
+    fn raw_input_hook(&mut self, _: &egui::Context, input: &mut egui::RawInput) {
+        if let Some(directory) = std::env::var_os("DESK_SWITCH_VIEWPORT_PROBE") {
+            for event in &input.events {
+                if let egui::Event::Screenshot {
+                    user_data, image, ..
+                } = event
+                    && let Some(name) = user_data
+                        .data
+                        .as_ref()
+                        .and_then(|data| data.downcast_ref::<String>())
+                {
+                    let path = PathBuf::from(&directory).join(format!("{name}.png"));
+                    image::save_buffer(
+                        path,
+                        image.as_raw(),
+                        image.width() as u32,
+                        image.height() as u32,
+                        image::ColorType::Rgba8,
+                    )
+                    .unwrap();
+                }
+            }
+        }
+    }
     fn logic(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
         eframe::App::logic(&mut self.desktop, ctx, frame);
         if let Some(capture) = &mut self.capture {
@@ -34,6 +58,55 @@ impl eframe::App for PreviewApp {
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         eframe::App::ui(&mut self.desktop, ui, frame);
     }
+}
+
+fn viewport_probe(
+    ctx: egui::Context,
+    send: std::sync::mpsc::Sender<Action>,
+    output: PathBuf,
+) -> Result<()> {
+    anyhow::ensure!(
+        output.is_absolute(),
+        "viewport probe needs an absolute output path"
+    );
+    std::fs::create_dir_all(&output)?;
+    std::thread::Builder::new()
+        .name("Desk Switch bounded viewport probe".into())
+        .spawn(move || {
+            use std::time::Duration;
+            std::thread::sleep(Duration::from_secs(2));
+            for (name, action, popup) in [
+                ("both-visible", Action::QuickOpen { x: 1200, y: 400 }, true),
+                ("main-hidden", Action::Hide, true),
+                ("restored", Action::Show, false),
+                ("both-again", Action::QuickOpen { x: 1200, y: 400 }, true),
+                ("popup-closed", Action::QuickClose, false),
+                ("hidden", Action::Hide, false),
+                ("restored-again", Action::Show, false),
+            ] {
+                super::tray::dispatch(&send, &ctx, action);
+                std::thread::sleep(Duration::from_secs(2));
+                for (id, suffix) in [
+                    (egui::ViewportId::ROOT, "main"),
+                    (super::popup::id(), "popup"),
+                ] {
+                    if (id == egui::ViewportId::ROOT && name != "main-hidden" && name != "hidden")
+                        || (id == super::popup::id() && popup)
+                    {
+                        ctx.send_viewport_cmd_to(
+                            id,
+                            egui::ViewportCommand::Screenshot(egui::UserData::new(format!(
+                                "{name}-{suffix}"
+                            ))),
+                        );
+                        ctx.request_repaint_of(id);
+                    }
+                }
+            }
+            std::thread::sleep(Duration::from_secs(1));
+            super::tray::dispatch(&send, &ctx, Action::Quit);
+        })?;
+    Ok(())
 }
 
 fn render_probe(
@@ -104,6 +177,7 @@ pub fn run(case: &str, dir: PathBuf) -> Result<()> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("Desk Switch")
+            .with_active(false)
             .with_inner_size(if case == "quick-controls" {
                 [344.0, 442.0]
             } else if capturing || std::env::var_os("EFRAME_SCREENSHOT_TO").is_some() {
@@ -124,6 +198,74 @@ pub fn run(case: &str, dir: PathBuf) -> Result<()> {
         ..Default::default()
     };
     let case = case.to_owned();
+    run_native_preview(options, move |ctx, backend| {
+        eprintln!("Desk Switch preview renderer: {backend}");
+        let mut app = Desktop::new(ctx.clone(), dir, false);
+        app.fixture(&case);
+        if let Ok(language) = std::env::var("DESK_SWITCH_PREVIEW_LANGUAGE") {
+            if !crate::i18n::LANGUAGES
+                .iter()
+                .any(|(code, _)| *code == language)
+            {
+                anyhow::bail!("Unknown preview language");
+            }
+            app.prefs.language = language;
+            crate::i18n::set_language(&app.prefs.language);
+        }
+        let frames = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let causes = std::sync::Arc::new(std::sync::Mutex::new(std::collections::BTreeMap::new()));
+        if let Some(output) = std::env::var_os("DESK_SWITCH_VIEWPORT_PROBE") {
+            viewport_probe(ctx.clone(), app.quick.sender(), output.into())?;
+        }
+        if let Some(output) = std::env::var_os("DESK_SWITCH_RENDER_PROBE") {
+            render_probe(
+                ctx.clone(),
+                frames.clone(),
+                backend,
+                causes.clone(),
+                output.into(),
+                app.quick.sender(),
+            )?;
+        }
+        Ok(PreviewApp {
+            desktop: app,
+            frames,
+            causes,
+            capture: capture_path.map(|output| Capture {
+                output,
+                since: std::time::Instant::now(),
+                frames: 0,
+                requested: false,
+                result: Some(capture_send),
+            }),
+        })
+    })?;
+    if capturing {
+        capture_result
+            .recv_timeout(std::time::Duration::from_secs(1))?
+            .map_err(anyhow::Error::msg)?;
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn run_native_preview(
+    options: eframe::NativeOptions,
+    create: impl FnOnce(egui::Context, String) -> Result<PreviewApp> + 'static,
+) -> Result<()> {
+    super::software::run(options.viewport, move |cc| {
+        create(cc.egui_ctx.clone(), "CPU / Windows GDI".into())
+            .map(|app| Box::new(app) as Box<dyn super::software::App>)
+            .map_err(|error| error.to_string())
+    })
+    .map_err(anyhow::Error::msg)
+}
+
+#[cfg(not(windows))]
+fn run_native_preview(
+    options: eframe::NativeOptions,
+    create: impl FnOnce(egui::Context, String) -> Result<PreviewApp> + 'static,
+) -> Result<()> {
     eframe::run_native(
         "Desk Switch",
         options,
@@ -140,53 +282,38 @@ pub fn run(case: &str, dir: PathBuf) -> Result<()> {
                     )
                 })
                 .unwrap_or_else(|| "Unknown renderer".into());
-            eprintln!("Desk Switch preview renderer: {backend}");
-            let mut app = Desktop::new(cc.egui_ctx.clone(), dir, false);
-            app.fixture(&case);
-            if let Ok(language) = std::env::var("DESK_SWITCH_PREVIEW_LANGUAGE") {
-                if !crate::i18n::LANGUAGES
-                    .iter()
-                    .any(|(code, _)| *code == language)
-                {
-                    return Err("Unknown preview language".into());
-                }
-                app.prefs.language = language;
-                crate::i18n::set_language(&app.prefs.language);
-            }
-            let frames = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
-            let causes =
-                std::sync::Arc::new(std::sync::Mutex::new(std::collections::BTreeMap::new()));
-            if let Some(output) = std::env::var_os("DESK_SWITCH_RENDER_PROBE") {
-                render_probe(
-                    cc.egui_ctx.clone(),
-                    frames.clone(),
-                    backend,
-                    causes.clone(),
-                    output.into(),
-                    app.quick.sender(),
-                )?;
-            }
-            Ok(Box::new(PreviewApp {
-                desktop: app,
-                frames,
-                causes,
-                capture: capture_path.map(|output| Capture {
-                    output,
-                    since: std::time::Instant::now(),
-                    frames: 0,
-                    requested: false,
-                    result: Some(capture_send),
-                }),
-            }))
+            create(cc.egui_ctx.clone(), backend)
+                .map(|app| Box::new(app) as Box<dyn eframe::App>)
+                .map_err(Into::into)
         }),
     )
-    .map_err(|error| anyhow::anyhow!(error.to_string()))?;
-    if capturing {
-        capture_result
-            .recv_timeout(std::time::Duration::from_secs(1))?
-            .map_err(anyhow::Error::msg)?;
+    .map_err(|error| anyhow::anyhow!(error.to_string()))
+}
+
+#[cfg(windows)]
+impl super::software::App for PreviewApp {
+    fn logic(&mut self, ctx: &egui::Context) {
+        super::software::App::logic(&mut self.desktop, ctx);
+        if let Some(capture) = &mut self.capture {
+            capture.tick(ctx, &mut self.desktop);
+        }
     }
-    Ok(())
+    fn ui(&mut self, ui: &mut egui::Ui) {
+        for cause in ui.ctx().repaint_causes() {
+            *self
+                .causes
+                .lock()
+                .unwrap()
+                .entry(cause.to_string())
+                .or_default() += 1;
+        }
+        self.frames
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        super::software::App::ui(&mut self.desktop, ui);
+    }
+    fn raw_input_hook(&mut self, ctx: &egui::Context, input: &mut egui::RawInput) {
+        eframe::App::raw_input_hook(self, ctx, input);
+    }
 }
 
 impl Desktop {
@@ -519,6 +646,85 @@ impl Desktop {
                         mouse: !keyboard,
                     });
             }
+        }
+        if case == "shared-four" {
+            let mut members = std::collections::BTreeMap::new();
+            for (index, (name, platform, key)) in [
+                ("Studio PC", "windows", self.public_key.clone()),
+                ("Ubuntu mini", "linux", "11".repeat(32)),
+                ("MacBook Pro", "macos", "33".repeat(32)),
+                ("Office PC", "windows", "44".repeat(32)),
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let mut node = local.clone();
+                node.key = key.clone();
+                node.name = name.into();
+                node.diagnostics.platform = platform.into();
+                node.hardware.keyboard = index == 0;
+                node.hardware.mouse = index == 0;
+                node.hardware.audio_score = if index == 0 { 99 } else { 20 };
+                node.hardware.audio_name = if index == 0 {
+                    "USB Headphones"
+                } else {
+                    "System speakers"
+                }
+                .into();
+                node.hardware.microphone_score = if index == 1 { 99 } else { 20 };
+                node.hardware.microphone_name = if index == 1 {
+                    "USB microphone"
+                } else {
+                    "Built-in microphone"
+                }
+                .into();
+                node.hardware.microphone_receive = true;
+                node.monitor.enabled = index < 2;
+                node.monitor.input = Some(if index == 0 { 15 } else { 17 });
+                node.shared = Default::default();
+                node.ack.clear();
+                if let Some(management) = &mut node.management {
+                    management.update.ready = false;
+                    management.update.version = None;
+                    management.update.channel_version = None;
+                }
+                let mut preferences = crate::group::model::MemberPreferences::default();
+                preferences.audio.volume = [100, 50, 25, 15][index];
+                members.insert(
+                    key,
+                    crate::group::model::Member {
+                        node,
+                        address: format!("192.0.2.{}:45880", index + 1).parse().unwrap(),
+                        online: true,
+                        native_output: (index == 0).then_some(crate::workspace::AudioLevel {
+                            volume: 90,
+                            muted: false,
+                        }),
+                        preferences,
+                        input_ready: 0,
+                    },
+                );
+            }
+            let mut state = crate::group::model::Workspace {
+                hub: self.public_key.clone(),
+                revision: 8,
+                settings: crate::group::model::Settings {
+                    clipboard_enabled: true,
+                    microphone_enabled: true,
+                    monitor_enabled: true,
+                    ..Default::default()
+                },
+                members,
+                active_input: Some("11".repeat(32)),
+                active_input_entry: None,
+                activation: 1,
+                active_monitor: Some("11".repeat(32)),
+            };
+            state.bind_microphone();
+            self.group.workspace = Some(state);
+            self.group.preview = true;
+            self.group.selected = self.public_key.clone();
+            self.preview_scroll = 0.0;
         }
         self.preview = Some(local);
     }

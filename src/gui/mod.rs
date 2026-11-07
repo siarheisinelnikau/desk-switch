@@ -1,3 +1,8 @@
+mod group;
+mod group_compat;
+mod group_data;
+#[cfg(target_os = "linux")]
+mod linux_activation;
 mod management;
 mod model;
 mod paired_update;
@@ -5,6 +10,8 @@ mod popup;
 #[cfg(debug_assertions)]
 mod preview;
 mod session;
+#[cfg(windows)]
+mod software;
 mod tray;
 mod view;
 mod worker;
@@ -54,6 +61,7 @@ enum QueryKind {
 }
 
 pub struct Desktop {
+    group: group::Group,
     ctx: egui::Context,
     dir: PathBuf,
     prefs: Preferences,
@@ -151,6 +159,16 @@ pub fn run_at(start_hidden: bool, dir: PathBuf) -> Result<()> {
             .with_icon(icon),
         ..Default::default()
     };
+    #[cfg(windows)]
+    return software::run(options.viewport, move |cc| {
+        Ok(Box::new(Desktop::new(
+            cc.egui_ctx.clone(),
+            dir,
+            start_hidden,
+        )))
+    })
+    .map_err(anyhow::Error::msg);
+    #[cfg(not(windows))]
     eframe::run_native(
         "Desk Switch",
         options,
@@ -191,6 +209,7 @@ impl Desktop {
             Err(error) => (None, Some(format!("{error:#}"))),
         };
         Self {
+            group: Default::default(),
             ctx,
             dir,
             prefs,
@@ -322,6 +341,10 @@ impl Desktop {
     }
 
     fn switch(&mut self) {
+        if self.group.workspace.is_some() {
+            self.group_cycle();
+            return;
+        }
         if self.prefs.workspace.shared.monitor_enabled
             && self.pair.plan.as_ref().is_none_or(|p| p.monitor.is_none())
             && !self
@@ -465,6 +488,8 @@ impl Desktop {
     fn action(&mut self, action: Action, ctx: &egui::Context) {
         match action {
             Action::Show => {
+                #[cfg(target_os = "linux")]
+                linux_activation::request(linux_activation::Role::Main);
                 self.quick.close(ctx);
                 self.hidden = false;
                 ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
@@ -866,6 +891,7 @@ impl Desktop {
             .quitting_since
             .is_some_and(|time| time.elapsed() > Duration::from_secs(6))
         {
+            self.group.data.force_stop();
             for worker in [
                 &mut self.input,
                 &mut self.monitor,
@@ -879,6 +905,7 @@ impl Desktop {
             }
         }
         if self.quitting
+            && self.group.data.quiet()
             && !self.input_running()
             && !self.monitor_running()
             && !self.audio_running()
@@ -943,7 +970,7 @@ impl Desktop {
         }
         let managed =
             std::env::current_exe().is_ok_and(|path| crate::updater::shared_managed(&path));
-        let failed_update = if managed {
+        let failed_update = if managed && !cfg!(target_os = "macos") {
             None
         } else {
             std::fs::read_to_string(self.dir.join("updates/last-error.txt")).ok()
@@ -1076,6 +1103,20 @@ impl eframe::App for Desktop {
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _: &mut eframe::Frame) {
+        self.render(ui);
+        self.paired_update_dialog(ui.ctx());
+        self.cable_dialog(ui.ctx());
+        self.presented = true;
+    }
+}
+
+#[cfg(windows)]
+impl software::App for Desktop {
+    fn logic(&mut self, ctx: &egui::Context) {
+        self.tick(ctx);
+        self.quick_popup(ctx);
+    }
+    fn ui(&mut self, ui: &mut egui::Ui) {
         self.render(ui);
         self.paired_update_dialog(ui.ctx());
         self.cable_dialog(ui.ctx());
