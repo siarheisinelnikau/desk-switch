@@ -1,7 +1,6 @@
-use super::{Action, Desktop, Page};
+use super::{Desktop, Page};
 use eframe::egui::{self, Align, Color32, FontId, RichText, Stroke, Vec2};
 
-const NAVY: Color32 = Color32::from_rgb(26, 34, 57);
 const ACCENT: Color32 = Color32::from_rgb(82, 99, 224);
 
 struct Palette {
@@ -414,68 +413,7 @@ impl Desktop {
             return;
         }
         let ctx = root.ctx().clone();
-        egui::Panel::left("navigation")
-            .exact_size(180.0)
-            .resizable(false)
-            .frame(egui::Frame::new().fill(NAVY).inner_margin(18))
-            .show(root, |ui| {
-                ui.add_space(12.0);
-                ui.label(
-                    RichText::new("Desk Switch")
-                        .size(22.0)
-                        .strong()
-                        .color(Color32::WHITE),
-                );
-                ui.label(
-                    RichText::new(crate::i18n::tr("YOUR COMPUTERS. ONE WORKSPACE."))
-                        .size(10.0)
-                        .color(Color32::from_rgb(150, 160, 184)),
-                );
-                ui.add_space(36.0);
-                for (page, label) in [
-                    (Page::Overview, "Рабочее место"),
-                    (Page::Application, "Настройки"),
-                    (Page::Diagnostics, "Диагностика"),
-                ] {
-                    let selected = self.page == page;
-                    let button = egui::Button::new(RichText::new(crate::i18n::tr(label)).color(
-                        if selected {
-                            Color32::WHITE
-                        } else {
-                            Color32::from_rgb(170, 181, 207)
-                        },
-                    ))
-                    .fill(if selected {
-                        Color32::from_rgb(52, 65, 103)
-                    } else {
-                        Color32::TRANSPARENT
-                    })
-                    .stroke(Stroke::NONE)
-                    .min_size(Vec2::new(ui.available_width(), 43.0));
-                    if ui.add(button).clicked() {
-                        self.page = page;
-                    }
-                }
-                ui.with_layout(egui::Layout::bottom_up(Align::LEFT), |ui| {
-                    if ui.button(crate::i18n::tr("Закрыть приложение")).clicked() {
-                        self.action(Action::Quit, &ctx);
-                    }
-                    if ui
-                        .add_enabled(
-                            self.tray.as_ref().is_some_and(super::tray::Tray::available),
-                            egui::Button::new(crate::i18n::tr("Свернуть в трей")),
-                        )
-                        .clicked()
-                    {
-                        self.action(Action::Hide, &ctx);
-                    }
-                    ui.label(
-                        RichText::new(format!("v{}", env!("CARGO_PKG_VERSION")))
-                            .size(11.0)
-                            .color(Color32::from_rgb(143, 154, 183)),
-                    );
-                });
-            });
+        self.workspace_toolbar(root);
         egui::CentralPanel::default()
             .frame(egui::Frame::new().fill(palette(root).bg).inner_margin(26))
             .show(root, |ui| {
@@ -496,32 +434,228 @@ impl Desktop {
                         ui.spinner();
                         return;
                     }
-                    match self.page {
-                        Page::Overview if self.group.workspace.is_some() => self.group_overview(ui),
-                        Page::Application if self.group.workspace.is_some() => {
-                            self.group_settings(ui)
-                        }
-                        Page::Overview => self.overview(ui),
-                        Page::Application => self.application(ui),
-                        Page::Diagnostics => self.diagnostics(ui),
+                    if self.group.workspace.is_some() {
+                        self.group_overview(ui);
+                    } else {
+                        self.overview(ui);
                     }
-                    if let Some((message, error)) = self.notice.clone() {
+                    if self.page == Page::Overview && self.notice.is_some() {
                         ui.add_space(10.0);
-                        card(ui, |ui| {
-                            ui.horizontal_wrapped(|ui| {
-                                ui.label(RichText::new(crate::i18n::tr(message)).color(if error {
-                                    palette(ui).error
-                                } else {
-                                    palette(ui).ink
-                                }));
-                                if ui.small_button(crate::i18n::tr("Скрыть")).clicked() {
-                                    self.notice = None;
-                                }
-                            });
-                        });
+                        self.notice_banner(ui);
                     }
                 });
             });
+        if !self.quitting {
+            self.settings_windows(&ctx);
+            self.group_add_dialog(&ctx);
+        }
+    }
+
+    fn notice_banner(&mut self, ui: &mut egui::Ui) {
+        let Some((message, error)) = self.notice.clone() else {
+            return;
+        };
+        let colors = palette(ui);
+        egui::Frame::new()
+            .fill(colors.bg)
+            .stroke(Stroke::new(
+                1.0,
+                if error { colors.error } else { colors.line },
+            ))
+            .corner_radius(8)
+            .inner_margin(12)
+            .show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.horizontal_wrapped(|ui| {
+                    ui.add(
+                        egui::Label::new(RichText::new(crate::i18n::tr(message)).color(if error {
+                            colors.error
+                        } else {
+                            colors.ink
+                        }))
+                        .wrap(),
+                    );
+                    if ui.small_button(crate::i18n::tr("Скрыть")).clicked() {
+                        self.notice = None;
+                    }
+                });
+            });
+        ui.add_space(10.0);
+    }
+
+    fn workspace_toolbar(&mut self, root: &mut egui::Ui) {
+        let ctx = root.ctx().clone();
+        let logo_id = egui::Id::new("desk-switch-toolbar-logo");
+        let logo =
+            if let Some(logo) = ctx.data(|data| data.get_temp::<egui::TextureHandle>(logo_id)) {
+                logo
+            } else {
+                let image =
+                    egui::ColorImage::from_rgba_unmultiplied([32, 32], &super::tray::icon_rgba(32));
+                let logo = ctx.load_texture("Desk Switch", image, egui::TextureOptions::LINEAR);
+                ctx.data_mut(|data| data.insert_temp(logo_id, logo.clone()));
+                logo
+            };
+        egui::Panel::top("workspace-toolbar")
+            .resizable(false)
+            .frame(
+                egui::Frame::new()
+                    .fill(palette(root).card)
+                    .stroke(Stroke::new(1.0, palette(root).line))
+                    .inner_margin(egui::Margin::symmetric(24, 16)),
+            )
+            .show(root, |ui| {
+                ui.horizontal(|ui| {
+                    ui.image((logo.id(), Vec2::splat(32.0)));
+                    ui.vertical(|ui| {
+                        ui.spacing_mut().item_spacing.y = 2.0;
+                        ui.label(RichText::new("Desk Switch").size(23.0).strong());
+                        ui.label(
+                            RichText::new(crate::i18n::tr("YOUR COMPUTERS. ONE WORKSPACE."))
+                                .size(10.0)
+                                .color(palette(ui).muted),
+                        );
+                    });
+                    ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
+                        let settings_label = crate::i18n::tr("Settings");
+                        let settings = ui
+                            .add_enabled(
+                                !self.quitting,
+                                egui::Button::new(RichText::new("⚙").size(23.0))
+                                    .selected(self.page != Page::Overview)
+                                    .min_size(Vec2::splat(42.0)),
+                            )
+                            .on_hover_text(&settings_label);
+                        settings.widget_info(|| {
+                            egui::WidgetInfo::labeled(
+                                egui::WidgetType::Button,
+                                !self.quitting,
+                                &settings_label,
+                            )
+                        });
+                        if settings.clicked() {
+                            self.group.add_open = false;
+                            self.page = Page::Application;
+                        }
+                        egui::Frame::new()
+                            .fill(palette(ui).selection)
+                            .stroke(Stroke::new(1.0, ACCENT))
+                            .corner_radius(8)
+                            .inner_margin(egui::Margin::symmetric(12, 7))
+                            .show(ui, |ui| {
+                                ui.label(
+                                    RichText::new(format!("v{}", crate::compatibility::VERSION))
+                                        .strong(),
+                                );
+                            })
+                            .response
+                            .on_hover_text(format!(
+                                "{} {}",
+                                crate::i18n::tr("Installed version:"),
+                                crate::compatibility::VERSION,
+                            ));
+                        if self.group.workspace.is_some()
+                            && ui
+                                .add_enabled(
+                                    !self.quitting,
+                                    egui::Button::new(format!(
+                                        "+ {}",
+                                        crate::i18n::tr("Add a computer")
+                                    ))
+                                    .min_size(Vec2::new(0.0, 40.0)),
+                                )
+                                .clicked()
+                        {
+                            self.page = Page::Overview;
+                            self.group.add_open = true;
+                        }
+                    });
+                });
+            });
+    }
+
+    fn settings_windows(&mut self, ctx: &egui::Context) {
+        let available = ctx.content_rect();
+        let max_size = (available.size() - Vec2::new(48.0, 132.0)).max(Vec2::new(320.0, 240.0));
+        let size = Vec2::new(920.0, 780.0).min(max_size);
+        let position = egui::pos2(available.center().x - size.x * 0.5, available.top() + 100.0);
+        match self.page {
+            Page::Application => {
+                let mut open = true;
+                egui::Window::new(crate::i18n::tr("Settings"))
+                    .id(egui::Id::new("workspace-settings"))
+                    .open(&mut open)
+                    .collapsible(false)
+                    .default_pos(position)
+                    .default_size(size)
+                    .min_size([560.0, 360.0])
+                    .max_size(max_size)
+                    .show(ctx, |ui| {
+                        self.notice_banner(ui);
+                        egui::ScrollArea::vertical()
+                            .id_salt("workspace-settings-scroll")
+                            .auto_shrink([false, false])
+                            .show(ui, |ui| {
+                                if self.group.workspace.is_some() {
+                                    self.group_settings(ui);
+                                } else {
+                                    self.application(ui);
+                                }
+                                ui.add_space(12.0);
+                                ui.separator();
+                                egui::CollapsingHeader::new(crate::i18n::tr("Advanced"))
+                                    .id_salt("settings-advanced")
+                                    .show(ui, |ui| {
+                                        ui.horizontal_wrapped(|ui| {
+                                            if ui.button(crate::i18n::tr("Diagnostics")).clicked() {
+                                                self.page = Page::Diagnostics;
+                                            }
+                                            if self.group.workspace.is_some()
+                                                && ui
+                                                    .add_enabled(
+                                                        self.group.selected == self.public_key,
+                                                        egui::Button::new(crate::i18n::tr(
+                                                            "Retry devices",
+                                                        )),
+                                                    )
+                                                    .on_disabled_hover_text(crate::i18n::tr(
+                                                        "Select this PC to retry its devices.",
+                                                    ))
+                                                    .clicked()
+                                            {
+                                                self.group.data.retry();
+                                            }
+                                        });
+                                    });
+                            });
+                    });
+                if !open {
+                    self.page = Page::Overview;
+                }
+            }
+            Page::Diagnostics => {
+                let mut open = true;
+                egui::Window::new(crate::i18n::tr("Diagnostics"))
+                    .id(egui::Id::new("workspace-diagnostics"))
+                    .open(&mut open)
+                    .collapsible(false)
+                    .default_pos(position)
+                    .default_size(size)
+                    .min_size([560.0, 360.0])
+                    .max_size(max_size)
+                    .show(ctx, |ui| {
+                        self.notice_banner(ui);
+                        egui::ScrollArea::vertical()
+                            .id_salt("workspace-diagnostics-scroll")
+                            .auto_shrink([false, false])
+                            .show(ui, |ui| self.diagnostics(ui));
+                    });
+                if !open {
+                    self.page = Page::Application;
+                }
+            }
+            Page::Overview => {}
+        }
     }
 
     fn overview(&mut self, ui: &mut egui::Ui) {
@@ -1554,7 +1688,8 @@ impl Desktop {
             self.group_diagnostics(ui);
             return;
         }
-        title(ui, "Диагностика", "Состояние служб и последние сообщения.");
+        note(ui, "Состояние служб и последние сообщения.");
+        ui.add_space(12.0);
         if ui.button(crate::i18n::tr("Copy diagnostics")).clicked() {
             let mut report = format!("Desk Switch {} / protocol {}\nPair synchronized: {}\n{}\n",
                 crate::compatibility::VERSION, crate::compatibility::PROTOCOL, self.pair.synced,
@@ -1662,11 +1797,11 @@ impl Desktop {
     }
 
     fn application(&mut self, ui: &mut egui::Ui) {
-        title(
+        note(
             ui,
-            "Настройки",
             "Manage both PCs, their application settings and signed updates.",
         );
+        ui.add_space(12.0);
         self.update_settings(ui);
         self.application_settings(ui);
         self.device_settings(ui);

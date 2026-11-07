@@ -241,6 +241,10 @@ impl Workspace {
             "Workspace settings changed. Review them and try again."
         );
         settings.validate(&self.members)?;
+        ensure!(
+            !self.switch_pending() || settings.monitor_enabled == self.settings.monitor_enabled,
+            "The previous switch is still finishing. Wait for the monitor before switching again."
+        );
         let previous = self.plan();
         if let Some(active) = &self.active_input
             && previous
@@ -812,6 +816,13 @@ pub(crate) mod tests {
         state.activate(&key(2), Some(12_345)).unwrap();
         assert!(state.switch_pending());
         let pending = state.clone();
+        let mut disabled = state.settings.clone();
+        disabled.monitor_enabled = false;
+        assert!(state.set_settings(state.revision, disabled).is_err());
+        assert_eq!(
+            state, pending,
+            "Disabling video cannot bypass an in-flight monitor command"
+        );
         assert!(state.activate(&key(3), None).is_err());
         assert!(state.activate(&key(2), Some(12_345)).is_err());
         assert_eq!(state, pending);

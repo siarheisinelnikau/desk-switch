@@ -40,14 +40,20 @@ Permissions are granted through macOS itself and cannot be bypassed. On macOS 15
 ## Link your computers
 
 1. Start Desk Switch on the computers you want to link. The workspace advertises itself on the local network while the application is running.
-2. Expand **Add a computer**, choose a discovered computer and click **Connect**. Approve the connection with **Allow** on the invited computer. Compare the displayed security code when confirming a new identity; keys are created and exchanged automatically.
+2. Click **+ Add a computer** in the header. In **Nearby computers**, choose a discovered computer and click **Connect**. Approve the connection with **Allow** on the invited computer. Compare the displayed security code when confirming a new identity; keys are created and exchanged automatically. The dialog shows the pending approval, completion or a connection error.
 3. Repeat for each additional computer. Every member sees the complete workspace, connection status and device roles. Use **Switch here** on a computer's card to select it, or **Settings** to manage it.
 
 One computer coordinates the workspace. **That coordinating computer must keep Desk Switch running** for membership, settings, switching requests and shared clipboard delivery. Keyboard/mouse, system audio and microphone streams use direct authenticated connections between their source and destination computers. Automatic replacement of an offline coordinator is not implemented.
 
 You can add computers and change shared settings from any connected member. Previously approved identities reconnect without another prompt. Settings changes are checked against the current revision so simultaneous edits cannot silently overwrite each other. Offline computers remain visible, and unavailable or incompatible devices are excluded from active routes.
 
-If discovery is unavailable, enter an address under **Add a computer → IP address**. Use `IP`, `IP:port`, or `[IPv6]:port`; the workspace control port is **45880/TCP**. A routed network or VPN and appropriate firewall access are required across subnets; Desk Switch does not provide NAT traversal. Direct device connections use **45876/TCP** for input and **45877/TCP** for system audio. Microphone fanout uses one TCP listener on the source for each receiver, allocated from **49000** by the member's sorted identity index: for a workspace of N computers, allow **49000 through 49000 + N − 1** on the microphone source. Legacy pairing/management uses **45878/TCP**; **45879/TCP** is the earlier two-computer microphone port, not the new fanout range. Allow Desk Switch on your private LAN if the operating system requests firewall permission.
+If discovery is unavailable, open **+ Add a computer → Manual IP**. Enter a numeric address such as `192.168.1.20`, `192.168.1.20:45880`, `fd00::20` or `[fd00::20]:45880`, then click **Connect** or press Enter. The default workspace control port is **45880/TCP**. The field validates the address and port, and the dialog shows approval, success and errors. Hostnames, URLs, multicast/broadcast addresses and port zero are rejected. When a saved workspace coordinator is offline, entering its current address reconnects that pinned identity even if automatic connection is disabled; an address never authorizes replacing its key.
+
+![Add a computer by entering a numeric address in the Manual IP dialog](docs/manual-ip.png)
+
+IPv4 and **routable IPv6** addresses (global or ULA) are supported by the control, input, audio and microphone listeners. A routed network or VPN and appropriate firewall access are required across subnets; Desk Switch does not provide NAT traversal. IPv6 link-local interface scope numbers are local to each computer, and Desk Switch does not translate them between members. Use IPv4 or a routable IPv6 address for a workspace spanning computers with different interface scopes.
+
+Direct device connections use **45876/TCP** for input and **45877/TCP** for system audio. Microphone fanout uses one TCP listener on the source for each receiver, allocated from **49000** by the member's sorted identity index: for a workspace of N computers, allow **49000 through 49000 + N − 1** on the microphone source. Legacy pairing/management uses **45878/TCP**; **45879/TCP** is the earlier two-computer microphone port, not the new fanout range. Allow Desk Switch on your private LAN if the operating system requests firewall permission.
 
 ## Devices across the workspace
 
@@ -57,7 +63,7 @@ If discovery is unavailable, enter an address under **Add a computer → IP addr
 - **Clipboard:** enable **Shared clipboard** to copy text and images between members. It is off by default; [limits and platform setup](#shared-clipboard) are described below.
 - **Monitor:** enable **Switch the shared monitor** and configure the participating computers' ports. A destination connected to that monitor selects its own saved input once when activated. Computers using separate displays can leave their participation disabled.
 
-Shared keyboard, mouse, sound, microphone, clipboard and monitor options are independent. Return borrowed input with F11 before changing its source or device bindings. A settings change that would strand borrowed input is rejected, and held keys are released during a valid reconfiguration. Missing explicit devices pause their service rather than silently selecting a replacement. **Retry devices** restarts failed routes without recreating the workspace.
+Shared keyboard, mouse, sound, microphone, clipboard and monitor options are independent. Return borrowed input with F11 before changing its source or device bindings. A settings change that would strand borrowed input is rejected, and held keys are released during a valid reconfiguration. Missing explicit devices pause their service rather than silently selecting a replacement. **Settings → Advanced → Retry devices** restarts this computer's failed routes without recreating the workspace; select this computer before retrying.
 
 The listening computer reads the output's existing system level, including changes from media keys or OS controls. Desk Switch does not replace it with a saved volume at startup. Each received stream gets one relative gain before playback: **90% system volume × 50% relative volume = 45%** conceptually. OS volume curves are not necessarily linear in acoustic loudness. Adjusting one remote stream never changes local applications or the output's master volume; system mute silences the listening output, while a source's relative mute affects that source alone. Received audio is excluded from capture to avoid sending it back around the workspace. Standard shared desktop audio is supported; exclusive or encoded passthrough streams are outside this mixer.
 
@@ -65,7 +71,7 @@ Audio uses 48 kHz stereo PCM. Windows capture follows actual device samples; par
 
 ## Choose devices and manage computers
 
-Open **Settings** and choose any workspace member from the computer selector. The page shows that computer's application preferences, installed version, updates, physical device choices and shared-monitor connection. Theme, language, login startup, automatic connection, automatic update checks and the Windows remote-cursor option can be changed from another member. Changes apply to the selected computer.
+The workspace fills the main window, with the original Desk Switch icon, installed version, **+ Add a computer** and a **Settings gear** in its header. Click the gear or a computer card's **Settings** action to open the Settings window over the workspace. Choose any member from its computer selector to manage that computer's application preferences, installed version, updates, physical device choices and shared-monitor connection. Theme, language, login startup, automatic connection, automatic update checks and the Windows remote-cursor option can be changed from another member. Changes apply to the selected computer. **Settings → Advanced → Diagnostics** opens detailed state and service logs.
 
 Device choices default to **Automatic**. Select a specific keyboard, mouse, output, microphone or virtual microphone when needed. Linux keyboards and relative mice can be selected separately, including composite HID interfaces. Windows and macOS share their physical keyboard/mouse group; those adapters cannot reliably suppress one individual device. A missing explicit selection pauses the corresponding service.
 
@@ -107,7 +113,7 @@ DDC/CI depends on the monitor and firmware. Some LG monitors can show a recurrin
 
 **X** hides the main window in the tray and keeps sharing active. **Left-click** the tray icon to open compact controls beside the pointer: switch destination, enable or disable sound/microphone/keyboard/mouse, and adjust each computer's system or relative volume and mute. **Right-click** opens the native tray menu. **Open Desk Switch** opens the full window; Escape or loss of focus closes the popup. On Wayland, the compositor controls popup placement.
 
-**Quit application** releases input, stops services and exits; an unresponsive child is terminated after six seconds. If no working tray is available, X exits instead of leaving an inaccessible background process. Losing the tray brings a hidden window back.
+Use **Quit application** from quick controls or the native tray menu to release input, stop services and exit; an unresponsive child is terminated after six seconds. If no working tray is available, X exits instead of leaving an inaccessible background process. Losing the tray brings a hidden window back.
 
 ![Compact quick controls for a four-computer workspace, with a scrollable volume list](docs/workspace-quick-controls.png)
 
@@ -125,7 +131,7 @@ Each computer independently downloads from the canonical repository and verifies
 
 An installed Ubuntu package updates without an application password prompt. Its fixed system helper accepts only a newer Desk Switch amd64 package whose exact bytes match the pinned project signature; it cannot install another package or an arbitrary file. Initial `.deb` installation still uses Ubuntu's normal administrator authorization. No generic system authorization policy is weakened.
 
-Recent service logs and diagnostics are synchronized over authenticated, encrypted workspace connections. **Diagnostics → Copy diagnostics** includes member state and recent service messages. Offline reports remain labelled as such. Snapshots are bounded and do not reconfigure device services.
+Recent service logs and diagnostics are synchronized over authenticated, encrypted workspace connections. Open **Settings → Advanced → Diagnostics → Copy diagnostics** to collect member state and recent service messages. Offline reports remain labelled as such. Snapshots are bounded and do not reconfigure device services.
 
 For the first upgrade from **0.4.8 or older**, install the current `.deb` or replace the `.exe` once on each computer: those releases do not support the architecture-labelled names and remote management. The saved **0.4.11** partner remains reachable through a limited management/update bridge while upgrading, so it can be updated from the computer already running 0.5.0. Device sharing waits for matching versions. Install **0.5.0 on every intended member** before creating a larger workspace. Portable Linux binaries are no longer distributed; the `.deb` uses its installed launcher and package-owned binary so future system updates work correctly.
 
@@ -155,7 +161,7 @@ python3 tools/package_deb.py --binary target/release/desk-switch --out dist
 python3 tools/verify_deb.py dist/desk-switch-v0.5.0-linux-x86-64.deb
 ```
 
-Tests use synthetic input/audio/monitor devices and isolated loopback connections. The multi-computer integration test links four encrypted peers, propagates settings, sends member-management requests and checks reconnect behavior. Clipboard tests use fake native backends or a private D-Bus with binary text/image payloads; the Node suite evaluates the shipped GNOME companion against a mocked Shell. They never use the user's clipboard or change a real monitor. A four-computer localhost test verifies networking and routing logic, not four physical computers.
+Tests use synthetic input/audio/monitor devices and isolated loopback connections. The multi-computer integration test links four encrypted peers, propagates settings, sends member-management requests and checks reconnect behavior, including an explicit pinned-controller connection with automatic connection disabled. Native listener tests authenticate IPv4 and IPv6 peers and exchange PCM without physical audio hardware. Clipboard tests use fake native backends or a private D-Bus with binary text/image payloads; the Node suite evaluates the shipped GNOME companion against a mocked Shell. They never use the user's clipboard or change a real monitor. A four-computer localhost test verifies networking and routing logic, not four physical computers.
 
 Native CI compiles and tests on Ubuntu, Windows, Apple Silicon macOS and Intel macOS, then packages the corresponding release artifacts. macOS functionality remains untested on physical hardware. Real multicast discovery, input devices, desktop consent, VB-CABLE, audio quality, monitor firmware and OS permissions need target-machine testing.
 
@@ -168,7 +174,9 @@ Additional isolated Linux checks:
 
 Set `release/publish-request.json` to a **new** version tag to request all four native artifacts. The isolated signing job uses the existing `DESK_SWITCH_UPDATE_SIGNING_KEY` secret in the `release` GitHub environment. It verifies the pinned identity and each artifact before signing. Publication independently downloads and checks the exact bytes, Debian metadata, PE/ELF/Mach-O architecture, embedded build stamps, and macOS bundle identity/helper contents before publishing stable. A missing or incorrect key stops publication; private keys are never committed or uploaded as artifacts. See [signing setup and backup](docs/signing.md).
 
-To verify the pipeline without publishing, open **Actions → Release → Run workflow** on `main` and leave **Publish a new version after build and signing checks** unchecked. Enable publication only for a prepared new version. Existing tags and signed releases must not be reused or overwritten.
+To hold a request while finishing changes, set `"hold": true` in `release/publish-request.json`. The request gate then skips native builds, signing and publication. Omit `hold` or set it to `false` to allow the normal pipeline. A newer request on the same Git ref cancels an unfinished older run, so the latest unpublished request supersedes it; cancellation does not rewrite published releases.
+
+To verify the pipeline without publishing, first ensure the request is not on hold, then open **Actions → Release → Run workflow** on `main` and leave **Publish a new version after build and signing checks** unchecked. Enable publication only for a prepared new version. Existing tags and signed releases must not be reused or overwritten.
 
 For local preparation with the existing private key, supply all four tested artifacts:
 

@@ -18,6 +18,21 @@ struct PreviewApp {
 
 impl eframe::App for PreviewApp {
     fn raw_input_hook(&mut self, _: &egui::Context, input: &mut egui::RawInput) {
+        if std::env::var_os("DESK_SWITCH_RENDER_PROBE").is_some() {
+            for event in &input.events {
+                let name = match event {
+                    egui::Event::PointerMoved(_) => Some("input:PointerMoved"),
+                    egui::Event::PointerButton { .. } => Some("input:PointerButton"),
+                    egui::Event::MouseWheel { .. } => Some("input:MouseWheel"),
+                    egui::Event::Key { .. } => Some("input:Key"),
+                    egui::Event::Text(_) => Some("input:Text"),
+                    _ => None,
+                };
+                if let Some(name) = name {
+                    *self.causes.lock().unwrap().entry(name.into()).or_default() += 1;
+                }
+            }
+        }
         if let Some(directory) = std::env::var_os("DESK_SWITCH_VIEWPORT_PROBE") {
             for event in &input.events {
                 if let egui::Event::Screenshot {
@@ -137,16 +152,18 @@ fn render_probe(
                 std::thread::sleep(Duration::from_secs(2));
                 let start = frames.load(Ordering::Relaxed);
                 let popup_start = super::popup::FRAMES.load(Ordering::Relaxed);
+                let input_start: u64 = causes.lock().unwrap().iter().filter(|(key, _)| key.starts_with("input:")).map(|(_, count)| count).sum();
                 let since = Instant::now();
                 std::thread::sleep(Duration::from_secs(6));
                 samples.push(serde_json::json!({
                     "state": state, "seconds": since.elapsed().as_secs_f64(),
                     "ui_frames": frames.load(Ordering::Relaxed) - start,
                     "popup_ui_frames": super::popup::FRAMES.load(Ordering::Relaxed) - popup_start,
+                    "input_events": causes.lock().unwrap().iter().filter(|(key, _)| key.starts_with("input:")).map(|(_, count)| count).sum::<u64>() - input_start,
                 }));
             }
             let result = serde_json::to_string_pretty(&serde_json::json!({
-                "backend": backend, "fixture": true, "samples": samples,
+                "backend": backend, "fixture": true, "isolated_offscreen": true, "samples": samples,
                 "total_ui_frames": frames.load(Ordering::Relaxed),
                 "repaint_causes": *causes.lock().unwrap(),
             }))
@@ -174,7 +191,7 @@ pub fn run(case: &str, dir: PathBuf) -> Result<()> {
     }
     let (capture_send, capture_result) = std::sync::mpsc::sync_channel(1);
     let capturing = capture_path.is_some();
-    let options = eframe::NativeOptions {
+    let mut options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("Desk Switch")
             .with_active(false)
@@ -197,6 +214,9 @@ pub fn run(case: &str, dir: PathBuf) -> Result<()> {
             }),
         ..Default::default()
     };
+    if std::env::var_os("DESK_SWITCH_RENDER_PROBE").is_some() {
+        options.viewport = options.viewport.with_position([-15_000.0, -15_000.0]);
+    }
     let case = case.to_owned();
     run_native_preview(options, move |ctx, backend| {
         eprintln!("Desk Switch preview renderer: {backend}");
@@ -647,10 +667,7 @@ impl Desktop {
                     });
             }
         }
-        if matches!(
-            case,
-            "shared-four" | "shared-four-settings" | "shared-four-quick-controls"
-        ) {
+        if case.starts_with("shared-four") {
             let mut members = std::collections::BTreeMap::new();
             for (index, (name, platform, key)) in [
                 ("Studio PC", "windows", self.public_key.clone()),
@@ -732,8 +749,17 @@ impl Desktop {
             self.group.workspace = Some(state);
             self.group.preview = true;
             self.group.selected = self.public_key.clone();
-            if case == "shared-four-settings" {
+            if matches!(case, "shared-four-settings" | "shared-four-settings-error") {
                 self.page = Page::Application;
+            }
+            if case == "shared-four-settings-error" {
+                self.notice = Some(("The selected monitor is unavailable".into(), true));
+            }
+            if case == "shared-four-diagnostics" {
+                self.page = Page::Diagnostics;
+            }
+            if case == "shared-four-ip" {
+                self.preview_manual_connection();
             }
             self.preview_scroll = 0.0;
         }

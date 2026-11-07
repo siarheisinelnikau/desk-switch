@@ -43,10 +43,26 @@ pub(super) struct Group {
     monitor_seen: Option<Option<String>>,
     pub(super) monitor_job: Option<super::worker::Worker>,
     pub preview: bool,
+    pub add_open: bool,
+    add_mode: AddMode,
+    add_pending: Option<AddPending>,
+    add_result: Option<(String, bool)>,
     #[cfg(target_os = "linux")]
     input_permission_retries: std::collections::BTreeSet<String>,
     manual: String,
     pub clipboard: Option<crate::group::clipboard::Clipboard>,
+}
+
+#[derive(Clone, Copy, Default, PartialEq)]
+enum AddMode {
+    #[default]
+    Nearby,
+    Manual,
+}
+struct AddPending {
+    address: SocketAddr,
+    key: String,
+    until: std::time::Instant,
 }
 
 impl Group {
@@ -242,10 +258,17 @@ impl Desktop {
         for event in events {
             match event {
                 Event::Request(request) => {
+                    self.page = Page::Overview;
+                    self.group.add_open = false;
                     self.group.request = Some(request);
                     self.action(super::Action::Show, ctx);
                 }
-                Event::Error(error) => self.notice = Some((error, true)),
+                Event::Error(error) => {
+                    if self.group.add_pending.take().is_some() {
+                        self.group.add_result = Some((error.clone(), true));
+                    }
+                    self.notice = Some((error, true));
+                }
                 Event::State(state) => {
                     self.prefs.workspace.shared.input = state.settings.input.clone();
                     self.prefs.workspace.shared.audio = state.settings.audio.clone();
@@ -280,6 +303,22 @@ impl Desktop {
                             )
                         })
                         .collect();
+                    if let Some(pending) = &self.group.add_pending
+                        && let Some(member) = state.members.values().find(|member| {
+                            member.online
+                                && member.node.key != self.public_key
+                                && (if pending.key.is_empty() {
+                                    member.address.ip().to_canonical()
+                                        == pending.address.ip().to_canonical()
+                                } else {
+                                    member.node.key == pending.key
+                                })
+                        })
+                    {
+                        self.group.add_result =
+                            Some((format!("{}: {}", tr("Connected"), member.node.name), false));
+                        self.group.add_pending = None;
+                    }
                     self.group.workspace = Some(*state);
                 }
                 Event::Management { source, message } => {
@@ -329,6 +368,20 @@ impl Desktop {
                         clipboard.receive(mime, bytes, digest);
                     }
                 }
+            }
+        }
+        if let Some(pending) = &self.group.add_pending {
+            let remaining = pending
+                .until
+                .saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() {
+                self.group.add_pending = None;
+                self.group.add_result = Some((
+                    "The connection was not approved. Check the address and try again.".into(),
+                    true,
+                ));
+            } else {
+                ctx.request_repaint_after_for(remaining, egui::ViewportId::ROOT);
             }
         }
         self.tick_group_compat(ctx);
@@ -573,7 +626,6 @@ impl Desktop {
     }
 
     pub(super) fn group_overview(&mut self, ui: &mut egui::Ui) {
-        ui.heading(tr("Your workspace"));
         ui.label(tr(
             "Share your devices across all connected computers. Change settings from any computer.",
         ));
@@ -707,6 +759,7 @@ impl Desktop {
                                             });
                                         }
                                         if ui.button(tr("Settings")).clicked() {
+                                            self.group.add_open = false;
                                             self.group.selected = key.clone();
                                             self.page = Page::Application;
                                         }
@@ -788,65 +841,114 @@ impl Desktop {
                     }
                 }
             });
-        ui.add_space(12.0);
-        egui::CollapsingHeader::new(tr("Add a computer"))
-            .default_open(state.members.len() < 2)
-            .show(ui, |ui| {
-                let available = self
-                    .discovered
-                    .values()
-                    .filter(|peer| {
-                        peer.public_key
-                            .as_ref()
-                            .is_some_and(|key| !state.members.contains_key(key))
-                    })
-                    .cloned()
-                    .collect::<Vec<_>>();
-                for peer in available {
-                    ui.horizontal(|ui| {
-                        ui.label(&peer.name);
-                        ui.weak(&peer.version);
-                        if ui.button(tr("Connect")).clicked()
-                            && let (Some(key), Some(address)) = (
-                                peer.public_key,
-                                peer.addresses.iter().find(|address| address.is_ipv4()),
-                            )
-                        {
-                            self.group_action(Action::Invite {
-                                key,
-                                address: SocketAddr::new(address.ip(), model::PORT),
+    }
+
+    fn begin_group_invite(&mut self, address: SocketAddr, key: String, ctx: &egui::Context) {
+        if self.group.add_pending.is_some() {
+            return;
+        }
+        let result = self
+            .group
+            .service
+            .as_ref()
+            .context("The workspace is disconnected")
+            .and_then(|service| {
+                service.action(Action::Invite {
+                    address,
+                    key: key.clone(),
+                })
+            });
+        match result {
+            Ok(()) => {
+                self.group.add_result = Some((
+                    "Connection requested. Approve it on the other computer.".into(),
+                    false,
+                ));
+                self.group.add_pending = Some(AddPending {
+                    address,
+                    key,
+                    until: std::time::Instant::now() + std::time::Duration::from_secs(60),
+                });
+                ctx.request_repaint_after_for(
+                    std::time::Duration::from_secs(60),
+                    egui::ViewportId::ROOT,
+                );
+            }
+            Err(error) => self.group.add_result = Some((error.to_string(), true)),
+        }
+    }
+    pub(super) fn group_add_dialog(&mut self, ctx: &egui::Context) {
+        if !self.group.add_open {
+            return;
+        }
+        let Some(state) = self.group.workspace.clone() else {
+            return;
+        };
+        let mut open = self.group.add_open;
+        egui::Window::new(tr("Add a computer"))
+            .id(egui::Id::new("workspace-add-computer"))
+            .open(&mut open).collapsible(false).resizable(false).default_width(520.0)
+            .default_pos(ctx.content_rect().center() - egui::vec2(260.0, 180.0))
+            .show(ctx, |ui| {
+                ui.label(tr("Connect over your local network or VPN. Approve the request on the other computer."));
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    ui.selectable_value(&mut self.group.add_mode, AddMode::Nearby, tr("Nearby computers"));
+                    ui.selectable_value(&mut self.group.add_mode, AddMode::Manual, tr("Manual IP"));
+                });
+                ui.separator();
+                let waiting = self.group.add_pending.is_some();
+                if self.group.add_mode == AddMode::Manual {
+                    ui.label(tr("IP address"));
+                    let edit = ui.add(egui::TextEdit::singleline(&mut self.group.manual)
+                        .desired_width(f32::INFINITY).margin(egui::Margin::symmetric(10, 9)).hint_text("192.168.1.20"));
+                    if edit.changed() && !waiting { self.group.add_result = None; }
+                    ui.weak(tr("Use IP, IP:port, or [IPv6]:port. Default port: 45880."));
+                    let enter = edit.lost_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter));
+                    let connect = ui.add_enabled(!waiting && !self.group.manual.trim().is_empty(), egui::Button::new(tr("Connect"))).clicked();
+                    if (connect || enter) && !waiting {
+                        match manual_address(&self.group.manual) {
+                            Ok(address) => self.begin_group_invite(address, String::new(), ctx),
+                            Err(error) => self.group.add_result = Some((error.to_string(), true)),
+                        }
+                    }
+                } else {
+                    let available = self.discovered.values().filter(|peer| peer.public_key.as_ref().is_some_and(|key| state.members.get(key).is_none_or(|member| !member.online))).cloned().collect::<Vec<_>>();
+                    if available.is_empty() {
+                        ui.weak(tr("Nearby computers will appear here. You can also connect by IP address."));
+                        if ui.button(tr("Use an IP address")).clicked() { self.group.add_mode = AddMode::Manual; }
+                    }
+                    egui::ScrollArea::vertical().max_height(280.0).show(ui, |ui| {
+                        for peer in available {
+                            ui.horizontal_wrapped(|ui| {
+                                ui.add(egui::Label::new(egui::RichText::new(&peer.name).strong()).truncate());
+                                ui.weak(&peer.version);
+                                let address = peer.addresses.iter().find(|address| address.is_ipv4()).or_else(|| peer.addresses.first()).copied();
+                                if ui.add_enabled(!waiting && address.is_some(), egui::Button::new(tr("Connect"))).clicked()
+                                    && let (Some(key), Some(address)) = (peer.public_key, address)
+                                {
+                                    self.begin_group_invite(SocketAddr::new(address.ip(), model::PORT), key, ctx);
+                                }
                             });
                         }
                     });
                 }
-                ui.horizontal(|ui| {
-                    ui.label(tr("IP address"));
-                    ui.text_edit_singleline(&mut self.group.manual);
-                    if ui.button(tr("Connect")).clicked() {
-                        let value = self.group.manual.trim();
-                        let address = value.parse::<SocketAddr>().or_else(|_| {
-                            value
-                                .parse::<std::net::IpAddr>()
-                                .map(|ip| SocketAddr::new(ip, model::PORT))
-                        });
-                        match address {
-                            Ok(address) => self.group_action(Action::Invite {
-                                address,
-                                key: String::new(),
-                            }),
-                            Err(error) => self.notice = Some((error.to_string(), true)),
-                        }
-                    }
-                });
-                if ui.button(tr("Retry devices")).clicked() {
-                    self.group.data.retry();
+                if let Some((message, failed)) = &self.group.add_result {
+                    ui.add_space(8.0);
+                    ui.colored_label(if *failed { ui.visuals().error_fg_color } else { ui.visuals().text_color() }, tr(message));
                 }
             });
+        self.group.add_open = open;
+    }
+    #[cfg(debug_assertions)]
+    pub(super) fn preview_manual_connection(&mut self) {
+        self.group.add_open = true;
+        self.group.add_mode = AddMode::Manual;
+        self.group.manual = "192.0.2.42".into();
     }
 
     pub(super) fn group_settings(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
-        ui.heading(tr("Settings"));
         let Some(state) = self.group.workspace.clone() else {
             return;
         };
@@ -1359,7 +1461,6 @@ impl Desktop {
             local.diagnostics.line("Clipboard", &error);
         }
 
-        ui.heading(tr("Diagnostics"));
         ui.weak(tr(
             "Recent service messages from every computer in this workspace.",
         ));
@@ -1463,6 +1564,64 @@ impl Desktop {
                         });
                 });
             ui.add_space(8.0);
+        }
+    }
+}
+
+fn manual_address(value: &str) -> Result<SocketAddr> {
+    use std::net::{IpAddr, Ipv4Addr};
+    let value = value.trim();
+    anyhow::ensure!(value.len() <= 128, "IP address is too long");
+    let address = value
+        .parse::<IpAddr>()
+        .map(|ip| SocketAddr::new(ip, model::PORT))
+        .or_else(|_| value.parse::<SocketAddr>())
+        .context("Enter an IP address, optionally followed by :port")?;
+    let address = match address {
+        SocketAddr::V6(value) => value
+            .ip()
+            .to_ipv4_mapped()
+            .map(|ip| SocketAddr::new(ip.into(), value.port()))
+            .unwrap_or(address),
+        _ => address,
+    };
+    anyhow::ensure!(
+        address.port() != 0
+            && !address.ip().is_unspecified()
+            && !address.ip().is_multicast()
+            && address.ip() != IpAddr::V4(Ipv4Addr::BROADCAST),
+        "Enter the other computer's unicast IP address"
+    );
+    Ok(address)
+}
+
+#[cfg(test)]
+mod manual_tests {
+    use super::*;
+    #[test]
+    fn manual_connection_addresses_keep_ports_and_normalize_mapped_ipv4() {
+        assert_eq!(
+            manual_address(" 192.0.2.42 ").unwrap().to_string(),
+            "192.0.2.42:45880"
+        );
+        assert_eq!(manual_address("192.0.2.42:1234").unwrap().port(), 1234);
+        assert_eq!(manual_address("fd00::20").unwrap().port(), model::PORT);
+        assert_eq!(manual_address("[fd00::20]:1234").unwrap().port(), 1234);
+        assert_eq!(
+            manual_address("::ffff:192.0.2.42").unwrap().to_string(),
+            "192.0.2.42:45880"
+        );
+        for value in [
+            "",
+            "host.example",
+            "https://192.0.2.42",
+            "0.0.0.0",
+            "::",
+            "224.0.0.1",
+            "255.255.255.255",
+            "192.0.2.42:0",
+        ] {
+            assert!(manual_address(value).is_err(), "{value}");
         }
     }
 }

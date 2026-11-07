@@ -213,6 +213,8 @@ impl Desktop {
                 Ok(coordinator) => {
                     self.update_confirmation = false;
                     self.paired_update = Some(coordinator);
+                    self.group.add_open = false;
+                    self.group.selected = self.public_key.clone();
                     self.page = super::Page::Application;
                     self.action(Action::Show, ctx);
                     let effects = if self.prepared_update.is_some()

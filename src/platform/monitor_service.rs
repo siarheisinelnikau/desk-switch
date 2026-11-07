@@ -10,7 +10,7 @@ use crate::{
 use anyhow::{Context, Result, bail, ensure};
 use std::{net::SocketAddr, time::Duration};
 use tokio::{
-    net::{TcpListener, TcpStream},
+    net::TcpStream,
     sync::{broadcast, oneshot},
     time::{Instant, MissedTickBehavior, interval, sleep, timeout},
 };
@@ -241,7 +241,7 @@ pub async fn run(
     (inputs, video): (Inputs, VideoWorker),
 ) -> Result<()> {
     let listener = if role == Role::Receiver {
-        Some(TcpListener::bind(address).await?)
+        Some(crate::listen::tcp(address)?)
     } else {
         None
     };
@@ -293,6 +293,7 @@ mod tests {
         Arc,
         atomic::{AtomicU16, AtomicUsize, Ordering::SeqCst},
     };
+    use tokio::net::TcpListener;
     struct Display {
         input: Arc<AtomicU16>,
         writes: Arc<AtomicUsize>,
