@@ -141,4 +141,8 @@ Commit the locally generated metadata, or the workflow's verified `update.json`,
 
 ## Inspiration
 
-Desk Switch was inspired by the idea behind [Hotseat](https://github.com/muspelheim/hotseat). Thank you to its creators for the inspiration.
+A good friend of mine shared this idea with me and showed me [Hotseat](https://github.com/muspelheim/hotseat), his project for switching monitor inputs on macOS. That inspired me to build Desk Switch for the systems I use: Ubuntu and Windows.
+
+I wanted to extend the idea beyond the monitor and share a keyboard, mouse, speakers or headphones, and microphone between computers, all from one workspace.
+
+Thank you, my friend, for sharing the idea and inspiring me to bring Desk Switch to life.
