@@ -1550,6 +1550,10 @@ impl Desktop {
     }
 
     fn diagnostics(&mut self, ui: &mut egui::Ui) {
+        if self.group.workspace.is_some() {
+            self.group_diagnostics(ui);
+            return;
+        }
         title(ui, "Диагностика", "Состояние служб и последние сообщения.");
         if ui.button(crate::i18n::tr("Copy diagnostics")).clicked() {
             let mut report = format!("Desk Switch {} / protocol {}\nPair synchronized: {}\n{}\n",

@@ -709,7 +709,7 @@ impl InstallJob {
                     .handoff(&state)
                     .map_err(|error| format!("{error:#}"));
                 let _ = send.send((prepared, installed));
-                ctx.request_repaint();
+                ctx.request_repaint_of(eframe::egui::ViewportId::ROOT);
             })?;
         Ok(Self { result })
     }
