@@ -318,7 +318,7 @@ impl super::software::App for PreviewApp {
 
 impl Desktop {
     fn fixture(&mut self, case: &str) {
-        #[cfg(windows)]
+        #[cfg(any(windows, target_os = "macos"))]
         if let Some(tray) = &self.tray {
             tray.preview_label();
         }
