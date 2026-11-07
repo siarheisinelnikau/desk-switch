@@ -20,6 +20,8 @@ jobs:
       - run: cargo test --locked
       - if: runner.os == 'Linux'
         run: |
+          node tools/test_gnome_companion.mjs
+          python3 tools/test_release_assets.py
           python3 tools/test_input_access.py
           python3 tools/test_update_install.py
           udevadm verify packaging/linux/99-desk-switch-input-access.rules

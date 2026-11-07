@@ -18,6 +18,7 @@ jobs:
         run: |
           python3 tools/test_promote_release.py
           python3 tools/test_normalize_release_assets.py
+          python3 tools/test_release_assets.py
       - name: Normalize filenames on an existing unsigned release candidate
         env:
           GH_TOKEN: ${{ github.token }}
@@ -33,7 +34,7 @@ jobs:
           with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
               print(f'ready={str(ready).lower()}', file=output)
           PY
-      - name: Verify both binaries and Debian package, then publish
+      - name: Verify signed native artifacts, then publish
         if: steps.manifest.outputs.ready == 'true'
         env:
           GH_TOKEN: ${{ github.token }}

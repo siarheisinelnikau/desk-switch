@@ -86,6 +86,15 @@ impl State {
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub enum Message {
+    InstallCable {
+        id: u64,
+        platform: crate::cable::Platform,
+    },
+    SetMonitor {
+        id: u64,
+        expected: super::Monitor,
+        monitor: super::Monitor,
+    },
     ExtractCable {
         id: u64,
         platform: crate::cable::Platform,
@@ -106,6 +115,8 @@ pub enum Message {
 impl Message {
     pub fn id(&self) -> u64 {
         match self {
+            Self::InstallCable { id, .. } => *id,
+            Self::SetMonitor { id, .. } => *id,
             Self::ExtractCable { id, .. }
             | Self::CheckUpdates { id }
             | Self::SetApplication { id, .. }
@@ -115,6 +126,16 @@ impl Message {
     pub fn validate(&self) -> Result<()> {
         ensure!(self.id() > 0, "invalid management request");
         match self {
+            Self::SetMonitor {
+                expected, monitor, ..
+            } => {
+                for value in [expected, monitor] {
+                    ensure!(
+                        value.id.len() <= 1024 && value.name.len() <= 256 && value.input != Some(0),
+                        "Invalid monitor selection"
+                    );
+                }
+            }
             Self::SetApplication {
                 expected,
                 application,

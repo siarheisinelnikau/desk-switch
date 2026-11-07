@@ -208,15 +208,13 @@ impl Desktop {
         for effect in effects {
             match effect {
                 Effect::Send(message) => {
-                    if let Some(service) = &self.pair.service {
-                        if let Err(error) = service.update(message) {
-                            self.notice = Some((error.to_string(), true));
-                        }
-                    } else {
-                        self.notice = Some((
-                            "Waiting to reconnect before continuing the paired update.".into(),
-                            true,
-                        ));
+                    let target = self
+                        .group
+                        .update_target
+                        .clone()
+                        .unwrap_or_else(|| self.peer_key.clone());
+                    if let Err(error) = self.update_send_to(&target, message) {
+                        self.notice = Some((error.to_string(), true));
                     }
                 }
                 Effect::Download => self.check_updates(ctx),
@@ -272,10 +270,16 @@ impl Desktop {
     }
 
     pub(super) fn tick_paired_update(&mut self, ctx: &egui::Context) {
+        let connected = self.update_target_connected(
+            self.group
+                .update_target
+                .as_deref()
+                .unwrap_or(&self.peer_key),
+        );
         if self.install_job.is_none()
             && let Some(coordinator) = &mut self.paired_update
         {
-            let effects = coordinator.expired(self.pair.remote.is_some());
+            let effects = coordinator.expired(connected);
             self.apply_update_effects(effects, ctx);
         }
     }
