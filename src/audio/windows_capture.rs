@@ -39,18 +39,26 @@ pub struct Capture {
 
 impl Capture {
     pub async fn open(source: Option<&str>) -> Result<Self> {
+        Self::open_media(source, super::Media::System).await
+    }
+    pub async fn open_media(source: Option<&str>, media: super::Media) -> Result<Self> {
         let stop = Arc::new(AtomicBool::new(false));
         let worker_stop = Arc::clone(&stop);
         let (send, receive) = mpsc::channel(4);
         let (ready_send, ready) = oneshot::channel();
         let source = source.map(str::to_owned);
         let thread = thread::Builder::new()
-            .name("Desk Switch loopback".into())
+            .name("Desk Switch capture".into())
             .spawn(move || {
                 let mut ready_send = Some(ready_send);
                 let result = (|| {
                     let _com = Com::open()?;
-                    let device = output_device(source.as_deref())?;
+                    let device = match media {
+                        super::Media::System => output_device(source.as_deref())?,
+                        super::Media::Microphone => {
+                            super::output::microphone_device(source.as_deref())?
+                        }
+                    };
                     let label = device.get_friendlyname()?;
                     let mut audio = device.get_iaudioclient()?;
                     let format =
@@ -64,11 +72,11 @@ impl Capture {
                                 buffer_duration_hns: 200_000,
                             },
                         )
-                        .context("initializing shared WASAPI loopback capture at 48 kHz stereo")?;
+                        .context("initializing shared WASAPI capture capture at 48 kHz stereo")?;
                     let capture: IAudioCaptureClient =
                         unsafe { audio.as_iaudioclient().GetService()? };
                     audio.start_stream()?;
-                    println!("Capturing the system mix of {label}.");
+                    println!("Capturing {media:?} from {label}.");
                     if ready_send.take().unwrap().send(Ok(())).is_err() {
                         audio.stop_stream()?;
                         return Ok(());
@@ -82,7 +90,7 @@ impl Capture {
                     if let Some(ready) = ready_send {
                         let _ = ready.send(Err(error));
                     } else {
-                        eprintln!("WASAPI loopback stopped: {error:#}");
+                        eprintln!("WASAPI capture stopped: {error:#}");
                     }
                 }
             })?;
@@ -95,7 +103,7 @@ impl Capture {
         };
         ready
             .await
-            .context("WASAPI loopback worker stopped during setup")??;
+            .context("WASAPI capture worker stopped during setup")??;
         Ok(result)
     }
 
@@ -135,7 +143,7 @@ fn record(
             let read = (|| {
                 ensure!(
                     bytes <= RATE as usize / 5 * BLOCK_ALIGN,
-                    "WASAPI loopback packet exceeds its buffer bound"
+                    "WASAPI capture packet exceeds its buffer bound"
                 );
                 if flags & AUDCLNT_BUFFERFLAGS_DATA_DISCONTINUITY.0 as u32 != 0 {
                     pending.clear();
@@ -206,7 +214,7 @@ impl AsyncRead for Capture {
                 Poll::Ready(None) => {
                     return Poll::Ready(Err(io::Error::new(
                         io::ErrorKind::UnexpectedEof,
-                        "WASAPI loopback ended",
+                        "WASAPI capture ended",
                     )));
                 }
                 Poll::Pending => return Poll::Pending,

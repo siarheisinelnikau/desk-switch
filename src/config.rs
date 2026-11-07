@@ -161,6 +161,10 @@ pub struct MonitorSettings {
 pub struct CaptureSettings {
     pub devices: Vec<PathBuf>,
     #[serde(default)]
+    pub keyboard: Option<PathBuf>,
+    #[serde(default)]
+    pub mouse: Option<PathBuf>,
+    #[serde(default)]
     pub sharing: InputSharing,
 }
 
@@ -209,9 +213,10 @@ pub struct Edge {
 pub struct Settings {
     pub monitor: Option<(String, Inputs)>,
     pub edge: Option<Edge>,
+    #[cfg(windows)]
     pub sharing: InputSharing,
     #[cfg(target_os = "linux")]
-    pub capture_devices: Vec<PathBuf>,
+    pub capture: CaptureSettings,
 }
 
 pub fn read_settings(dir: &Path) -> Result<FileSettings> {
@@ -312,20 +317,23 @@ impl Settings {
             .as_ref()
             .map(|c| c.sharing)
             .unwrap_or_default();
-        let capture_devices = config
-            .capture
-            .map(|capture| capture.devices)
-            .unwrap_or_default();
+        let capture = config.capture.unwrap_or(CaptureSettings {
+            devices: Vec::new(),
+            keyboard: None,
+            mouse: None,
+            sharing,
+        });
         ensure!(
-            capture_devices.len() <= 16,
+            capture.devices.len() <= 16,
             "at most 16 capture devices may be selected"
         );
         Ok(Self {
             monitor,
             edge,
+            #[cfg(windows)]
             sharing,
             #[cfg(target_os = "linux")]
-            capture_devices,
+            capture,
         })
     }
 }

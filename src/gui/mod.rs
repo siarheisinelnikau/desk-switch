@@ -8,6 +8,7 @@ mod worker;
 #[cfg(debug_assertions)]
 pub use preview::run as run_preview;
 
+#[cfg(debug_assertions)]
 use crate::lifecycle::InputStatus;
 use crate::{config, platform::MonitorInfo};
 use anyhow::{Context, Result};
@@ -41,6 +42,8 @@ enum Page {
 enum QueryKind {
     Monitors,
     MonitorStatus,
+    #[cfg(target_os = "linux")]
+    InputAccess,
 }
 
 pub struct Desktop {
@@ -52,9 +55,11 @@ pub struct Desktop {
     peer_key: String,
     input: Option<Worker>,
     audio: Option<Worker>,
+    microphone: Option<Worker>,
     query: Option<(QueryKind, Worker)>,
     monitors: Vec<MonitorInfo>,
     notice: Option<(String, bool)>,
+    device_notice: Option<(Kind, String)>,
     tray: Option<tray::Tray>,
     tray_error: Option<String>,
     tray_snapshot: (bool, bool, bool),
@@ -79,6 +84,7 @@ pub struct Desktop {
     discovery_error: Option<String>,
     pair: session::Pair,
     applied_mix: String,
+    applied_microphone_volume: Option<u8>,
     quitting_since: Option<Instant>,
     #[cfg(debug_assertions)]
     preview: Option<crate::workspace::Node>,
@@ -161,9 +167,11 @@ impl Desktop {
             peer_key,
             input: None,
             audio: None,
+            microphone: None,
             query: None,
             monitors: Vec::new(),
             notice: prefs_error.or(settings_error).map(|error| (error, true)),
+            device_notice: None,
             tray,
             tray_error,
             tray_snapshot: (false, false, false),
@@ -188,6 +196,7 @@ impl Desktop {
             discovery_error: None,
             pair: session::Pair::default(),
             applied_mix: String::new(),
+            applied_microphone_volume: None,
             quitting_since: None,
             #[cfg(debug_assertions)]
             preview: None,
@@ -199,6 +208,9 @@ impl Desktop {
     }
     fn audio_running(&self) -> bool {
         self.audio.as_ref().is_some_and(Worker::running)
+    }
+    fn microphone_running(&self) -> bool {
+        self.microphone.as_ref().is_some_and(Worker::running)
     }
     fn connected(&self) -> bool {
         #[cfg(debug_assertions)]
@@ -328,6 +340,12 @@ impl Desktop {
             return;
         }
         let args: Vec<String> = match kind {
+            #[cfg(target_os = "linux")]
+            QueryKind::InputAccess => {
+                let mut args = vec!["input-access".into()];
+                args.extend(self.form.capture_devices.lines().map(str::to_owned));
+                args
+            }
             QueryKind::Monitors | QueryKind::MonitorStatus => vec![
                 "monitor-read".into(),
                 self.prefs.workspace.monitor.id.clone(),
@@ -361,22 +379,45 @@ impl Desktop {
         for (worker, failed) in [
             (&mut self.input, &mut self.pair.input_failed),
             (&mut self.audio, &mut self.pair.audio_failed),
+            (&mut self.microphone, &mut self.pair.microphone_failed),
         ] {
             let Some(worker) = worker else { continue };
             if worker.poll() {
                 *failed = true;
-                self.notice = Some((
-                    worker
-                        .logs
-                        .back()
-                        .cloned()
-                        .unwrap_or_else(|| "Служба завершилась с ошибкой.".into()),
-                    true,
-                ));
+                let error = worker
+                    .logs
+                    .back()
+                    .cloned()
+                    .unwrap_or_else(|| "Служба завершилась с ошибкой.".into());
+                self.device_notice = Some((worker.kind, error.clone()));
+                self.notice = Some((error, true));
             }
         }
         self.tick_pair(ctx);
-        let version_error = [&self.input, &self.audio]
+        if let Some((kind, error)) = &self.device_notice {
+            let ready = [&self.input, &self.audio, &self.microphone]
+                .into_iter()
+                .flatten()
+                .find(|worker| worker.kind == *kind)
+                .is_some_and(|worker| {
+                    if *kind == Kind::Input {
+                        worker.connected()
+                    } else {
+                        worker.running() && worker.audio_playing
+                    }
+                });
+            if ready {
+                if self
+                    .notice
+                    .as_ref()
+                    .is_some_and(|(message, failed)| *failed && message == error)
+                {
+                    self.notice = None;
+                }
+                self.device_notice = None;
+            }
+        }
+        let version_error = [&self.input, &self.audio, &self.microphone]
             .into_iter()
             .flatten()
             .find_map(|worker| worker.version_error.clone());
@@ -411,6 +452,7 @@ impl Desktop {
                     if self.prefs.auto_update
                         && !self.input_running()
                         && !self.audio_running()
+                        && !self.microphone_running()
                         && !self.quitting
                         && !self.dir.join("updates/last-error.txt").exists()
                     {
@@ -428,7 +470,11 @@ impl Desktop {
                 }
             }
         }
-        if self.install_pending && !self.input_running() && !self.audio_running() {
+        if self.install_pending
+            && !self.input_running()
+            && !self.audio_running()
+            && !self.microphone_running()
+        {
             self.install_pending = false;
             if let Some(prepared) = self.prepared_update.take() {
                 match crate::updater::InstallJob::start(prepared, &self.dir, ctx.clone()) {
@@ -479,6 +525,14 @@ impl Desktop {
                             "Устройства не ответили. Проверьте системные зависимости.".into()
                         }))?;
                 match kind {
+                    #[cfg(target_os = "linux")]
+                    QueryKind::InputAccess => {
+                        anyhow::ensure!(
+                            value["input_access"] == true,
+                            "input access was not granted"
+                        );
+                        self.retry_devices();
+                    }
                     QueryKind::Monitors => {
                         let monitor: MonitorInfo = serde_json::from_value(value)?;
                         if monitor.id == self.prefs.workspace.monitor.id {
@@ -535,11 +589,18 @@ impl Desktop {
             .quitting_since
             .is_some_and(|time| time.elapsed() > Duration::from_secs(6))
         {
-            for worker in [&mut self.input, &mut self.audio].into_iter().flatten() {
+            for worker in [&mut self.input, &mut self.audio, &mut self.microphone]
+                .into_iter()
+                .flatten()
+            {
                 worker.force_stop();
             }
         }
-        if self.quitting && !self.input_running() && !self.audio_running() {
+        if self.quitting
+            && !self.input_running()
+            && !self.audio_running()
+            && !self.microphone_running()
+        {
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
         }
         ctx.request_repaint_after(Duration::from_millis(200));

@@ -146,7 +146,7 @@ async fn session(
             command = commands.recv() => match command {
                 Ok(crate::lifecycle::Command::Switch) => pipe.send(Message::SwitchRequested).await?,
                 Ok(crate::lifecycle::Command::Emergency) => bail!("local emergency recovery requested"),
-                Err(_) => {}
+                Ok(crate::lifecycle::Command::MicrophoneVolume(_)) | Err(_) => {}
             },
             _ = tick.tick() => {
                 let Some(active) = transfer.as_mut() else { continue };

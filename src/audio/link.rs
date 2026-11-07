@@ -85,19 +85,22 @@ pub struct Link {
 
 impl Link {
     pub async fn open(
-        mut stream: TcpStream,
+        stream: TcpStream,
         identity: &Identity,
         peer: &Key,
         initiator: bool,
     ) -> Result<Self> {
-        let state = authenticate(
-            &mut stream,
-            identity,
-            peer,
-            initiator,
-            b"Desk Switch audio 1",
-        )
-        .await?;
+        Self::open_media(stream, identity, peer, initiator, super::Media::System).await
+    }
+
+    pub async fn open_media(
+        mut stream: TcpStream,
+        identity: &Identity,
+        peer: &Key,
+        initiator: bool,
+        media: super::Media,
+    ) -> Result<Self> {
+        let state = authenticate(&mut stream, identity, peer, initiator, media.purpose()).await?;
         Ok(Self {
             stream,
             state,

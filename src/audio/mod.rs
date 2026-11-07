@@ -1,7 +1,9 @@
 mod link;
 #[cfg(target_os = "linux")]
 mod linux;
+mod microphone;
 mod mixer;
+pub use microphone::run as run_microphone;
 #[cfg(windows)]
 #[path = "windows_output.rs"]
 mod output;
@@ -123,7 +125,7 @@ fn list() -> Result<()> {
     crate::runtime()?.block_on(linux::list())
 }
 
-#[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub struct AudioDevice {
     pub id: String,
     pub name: String,
@@ -136,3 +138,39 @@ pub fn devices() -> Result<Vec<AudioDevice>> {
     #[cfg(target_os = "linux")]
     crate::runtime()?.block_on(linux::devices())
 }
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Media {
+    System,
+    Microphone,
+}
+impl Media {
+    fn purpose(self) -> &'static [u8] {
+        match self {
+            Self::System => b"Desk Switch audio 1",
+            Self::Microphone => b"Desk Switch microphone 1",
+        }
+    }
+}
+
+pub fn microphones() -> Result<Vec<AudioDevice>> {
+    #[cfg(windows)]
+    return output::microphones();
+    #[cfg(target_os = "linux")]
+    crate::runtime()?.block_on(linux::microphones())
+}
+
+pub fn microphone_bridges() -> Result<Vec<AudioDevice>> {
+    #[cfg(windows)]
+    return output::microphone_bridges();
+    #[cfg(target_os = "linux")]
+    Ok(vec![AudioDevice {
+        id: "pipewire-virtual-microphone".into(),
+        name: "Desk Switch microphone".into(),
+        default: true,
+    }])
+}
+
+#[cfg(windows)]
+const SESSION_GROUP: windows::core::GUID =
+    windows::core::GUID::from_u128(0x879598a0_7a44_485b_9ad3_03e5cbce55b1);
