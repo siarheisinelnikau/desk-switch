@@ -192,6 +192,41 @@ impl Settings {
     }
 }
 
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct MonitorResult {
+    pub error: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct MonitorCommand {
+    pub id: u64,
+    pub writer: Key,
+    pub destination: Key,
+    pub connection: String,
+    pub input: u16,
+    pub deadline_ms: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub interrupted: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub result: Option<MonitorResult>,
+}
+
+fn monitor_message(error: &str) -> Result<()> {
+    ensure!(
+        error.len() <= 2048 && !error.chars().any(char::is_control),
+        "Invalid monitor result"
+    );
+    Ok(())
+}
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .min(u128::from(u64::MAX)) as u64
+}
+
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct Workspace {
     pub hub: Key,
@@ -204,6 +239,10 @@ pub struct Workspace {
     #[serde(default)]
     pub activation: u64,
     pub active_monitor: Option<Key>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub confirmed_monitor: Option<Key>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub monitor_command: Option<MonitorCommand>,
 }
 impl Workspace {
     fn next_revision(&self) -> Result<u64> {
@@ -227,11 +266,54 @@ impl Workspace {
                 "Invalid monitor acknowledgement"
             );
         }
-        for key in [&self.active_input, &self.active_monitor]
-            .into_iter()
-            .flatten()
+        for key in [
+            &self.active_input,
+            &self.active_monitor,
+            &self.confirmed_monitor,
+        ]
+        .into_iter()
+        .flatten()
         {
             ensure!(self.members.contains_key(key), "Unknown active computer");
+        }
+        if let Some(command) = &self.monitor_command {
+            ensure!(
+                command.id > 0
+                    && command.id <= self.activation
+                    && command.input != 0
+                    && command.deadline_ms > 0,
+                "Invalid monitor command"
+            );
+            ensure!(
+                !command.connection.is_empty()
+                    && command.connection.len() <= 1024
+                    && !command.connection.chars().any(char::is_control),
+                "Invalid monitor command connection"
+            );
+            ensure!(
+                self.members.contains_key(&command.writer)
+                    && self.members.contains_key(&command.destination),
+                "Unknown monitor command participant"
+            );
+            if command.result.is_none() {
+                ensure!(
+                    command.id == self.activation
+                        && self.active_input.as_ref() == Some(&command.destination),
+                    "Stale pending monitor command"
+                );
+            }
+            for error in [
+                command.interrupted.as_ref(),
+                command
+                    .result
+                    .as_ref()
+                    .and_then(|result| result.error.as_ref()),
+            ]
+            .into_iter()
+            .flatten()
+            {
+                monitor_message(error)?;
+            }
         }
         self.settings.validate(&self.members)
     }
@@ -303,14 +385,21 @@ impl Workspace {
             native.is_none_or(|level| level.volume <= 100),
             "Invalid system volume"
         );
-        if self.active_input.as_deref() == Some(key) && ready < self.activation {
-            // A terminal error acknowledges its exact monitor attempt. Ignore
-            // delayed errors from before a new command or an explicit retry.
-            node.monitor_error = None;
-        }
         let mut member = self.members.get(key).context("Unknown computer")?.clone();
+        // Monitor completion belongs to the authenticated command executor.
+        // Ordinary Node snapshots cannot grant readiness or erase its failure.
+        if let Some(command) = &self.monitor_command {
+            if command.destination == key {
+                node.monitor_error = command
+                    .result
+                    .as_ref()
+                    .and_then(|result| result.error.clone())
+                    .or_else(|| command.interrupted.clone());
+            }
+        } else if self.active_input.as_deref() == Some(key) {
+            node.monitor_error = member.node.monitor_error.clone();
+        }
         member.node = node;
-        member.input_ready = ready;
         if let Some(native) = native {
             member.native_output = Some(native);
         }
@@ -318,19 +407,19 @@ impl Workspace {
         self.members.insert(key.into(), member);
         Ok(())
     }
-    /// Readiness acknowledges the monitor command and settling time, never an
-    /// input receiver's authentication. An offline target cannot hold this gate.
+    /// An interrupted writer must acknowledge cancellation before another PC is
+    /// allowed to issue a physical command, even if its connection is offline.
     pub fn switch_pending(&self) -> bool {
-        self.active_input
+        self.monitor_command
             .as_ref()
-            .and_then(|key| self.members.get(key))
-            .is_some_and(|member| {
-                member.online
-                    && self.activation > member.input_ready
-                    && member.node.monitor_error.is_none()
-            })
+            .is_some_and(|command| command.result.is_none())
     }
-    pub fn activate(&mut self, destination: &str, position: Option<u16>) -> Result<()> {
+    pub fn activate(
+        &mut self,
+        requester: &str,
+        destination: &str,
+        position: Option<u16>,
+    ) -> Result<()> {
         ensure!(
             !self.switch_pending(),
             "The previous switch is still finishing. Wait for the monitor before switching again."
@@ -346,7 +435,7 @@ impl Workspace {
         }
         if self.active_input.as_deref() == Some(destination)
             && self.active_input_entry == position
-            && (!monitor || self.active_monitor.as_deref() == Some(destination))
+            && (!monitor || self.confirmed_monitor.as_deref() == Some(destination))
             && member.node.monitor_error.is_none()
         {
             return Ok(());
@@ -356,21 +445,110 @@ impl Workspace {
             .activation
             .checked_add(1)
             .context("Too many input switches")?;
+        let command = if monitor && self.confirmed_monitor.as_deref() != Some(destination) {
+            let eligible = |key: &str| {
+                self.members.get(key).is_some_and(|member| {
+                    member.compatible()
+                        && member.node.monitor.enabled
+                        && !member.node.monitor.id.is_empty()
+                })
+            };
+            let writer = self
+                .confirmed_monitor
+                .as_deref()
+                .filter(|key| eligible(key))
+                .unwrap_or(requester);
+            ensure!(
+                eligible(writer),
+                "Use a PC connected to the shared monitor to select its next input."
+            );
+            Some(MonitorCommand {
+                id: activation,
+                writer: writer.into(),
+                destination: destination.into(),
+                connection: self.members[writer].node.monitor.id.clone(),
+                input: self.monitor_input(destination)?,
+                deadline_ms: now_ms().saturating_add(25_000),
+                interrupted: None,
+                result: None,
+            })
+        } else {
+            None
+        };
         self.active_input = Some(destination.into());
         self.active_input_entry = position;
         if monitor {
             self.active_monitor = Some(destination.into());
-            // A recorded failure permits one explicit retry. Clearing it as part
-            // of this transition prevents another request racing that retry.
-            self.members
-                .get_mut(destination)
-                .unwrap()
-                .node
-                .monitor_error = None;
         }
+        let member = self.members.get_mut(destination).unwrap();
+        member.node.monitor_error = None;
+        member.input_ready = if command.is_some() { 0 } else { activation };
+        self.monitor_command = command;
         self.revision = revision;
         self.activation = activation;
         Ok(())
+    }
+    pub fn monitor_result(&mut self, writer: &str, id: u64, error: Option<String>) -> Result<()> {
+        if let Some(error) = &error {
+            monitor_message(error)?;
+        }
+        ensure!(
+            self.members.contains_key(writer) && id > 0 && id <= self.activation,
+            "Unexpected monitor command result"
+        );
+        if id < self.activation
+            && self
+                .monitor_command
+                .as_ref()
+                .is_none_or(|command| command.id != id)
+        {
+            // An authenticated acknowledgement may still be queued after a
+            // return/new request. It cannot change a later command's state.
+            return Ok(());
+        }
+        let command = self
+            .monitor_command
+            .as_ref()
+            .context("No monitor command is pending")?;
+        ensure!(
+            command.writer == writer && command.id == id,
+            "Unexpected monitor command result"
+        );
+        let error = if let Some(interrupted) = &command.interrupted {
+            Some(error.unwrap_or_else(|| interrupted.clone()))
+        } else {
+            error
+        };
+        if let Some(result) = &command.result {
+            ensure!(
+                result.error == error,
+                "Monitor command already completed with another result"
+            );
+            return Ok(());
+        }
+        let destination = command.destination.clone();
+        self.confirmed_monitor = error.is_none().then(|| destination.clone());
+        let member = self.members.get_mut(&destination).unwrap();
+        member.node.monitor_error = error.clone();
+        member.input_ready = id;
+        self.monitor_command.as_mut().unwrap().result = Some(MonitorResult { error });
+        Ok(())
+    }
+    pub fn expire_monitor(&mut self) {
+        if let Some(command) = &mut self.monitor_command
+            && command.result.is_none()
+            && command.interrupted.is_none()
+            && now_ms() >= command.deadline_ms
+        {
+            let error="Monitor command timed out. Waiting for its writer to confirm cancellation; no retry was sent.".to_owned();
+            command.interrupted = Some(error.clone());
+            self.confirmed_monitor = None;
+            self.members
+                .get_mut(&command.destination)
+                .unwrap()
+                .node
+                .monitor_error = Some(error);
+        }
     }
     /// Release borrowed input after its local fail-open, preserving the last
     /// physical monitor selection. Only an explicit Activate may request DDC.
@@ -679,6 +857,7 @@ pub(crate) mod tests {
                     devices: inventory,
                     monitor: workspace::Monitor {
                         enabled: true,
+                        id: format!("display-{index}"),
                         input: Some(index as u16 + 14),
                         ..Default::default()
                     },
@@ -716,6 +895,8 @@ pub(crate) mod tests {
             active_input_entry: None,
             activation: 0,
             active_monitor: None,
+            confirmed_monitor: None,
+            monitor_command: None,
         }
     }
 
@@ -786,25 +967,25 @@ pub(crate) mod tests {
             state.active_monitor = Some(key(1));
             state.active_input_entry = Some(999);
             let original = state.clone();
-            assert!(state.activate(&key(4), position).is_err());
+            assert!(state.activate(&key(1), &key(4), position).is_err());
             assert_eq!(state, original);
 
             state.members.get_mut(&key(2)).unwrap().node.monitor.input = Some(15);
             let original = state.clone();
-            assert!(state.activate(&key(2), position).is_err());
+            assert!(state.activate(&key(1), &key(2), position).is_err());
             assert_eq!(state, original);
 
             state.members.get_mut(&key(2)).unwrap().node.monitor.input = Some(16);
             state.revision = u64::MAX - 1;
             let original = state.clone();
-            assert!(state.activate(&key(2), position).is_err());
+            assert!(state.activate(&key(1), &key(2), position).is_err());
             assert_eq!(state, original);
 
             state.revision = 0;
             state.activation = u64::MAX;
             state.members.get_mut(&key(1)).unwrap().input_ready = u64::MAX;
             let original = state.clone();
-            assert!(state.activate(&key(2), position).is_err());
+            assert!(state.activate(&key(1), &key(2), position).is_err());
             assert_eq!(state, original);
         }
     }
@@ -813,7 +994,7 @@ pub(crate) mod tests {
     fn switches_wait_for_terminal_monitor_ack_and_allow_one_explicit_retry() {
         let mut state = fixture(3);
         state.settings.monitor_enabled = true;
-        state.activate(&key(2), Some(12_345)).unwrap();
+        state.activate(&key(1), &key(2), Some(12_345)).unwrap();
         assert!(state.switch_pending());
         let pending = state.clone();
         let mut disabled = state.settings.clone();
@@ -823,8 +1004,8 @@ pub(crate) mod tests {
             state, pending,
             "Disabling video cannot bypass an in-flight monitor command"
         );
-        assert!(state.activate(&key(3), None).is_err());
-        assert!(state.activate(&key(2), Some(12_345)).is_err());
+        assert!(state.activate(&key(1), &key(3), None).is_err());
+        assert!(state.activate(&key(1), &key(2), Some(12_345)).is_err());
         assert_eq!(state, pending);
 
         let mut node = state.members[&key(2)].node.clone();
@@ -833,32 +1014,59 @@ pub(crate) mod tests {
         assert!(state.switch_pending());
         assert!(state.members[&key(2)].node.monitor_error.is_none());
         state.update_node(&key(2), node, None, 1).unwrap();
+        assert!(
+            state.switch_pending(),
+            "A target snapshot cannot acknowledge the writer's command"
+        );
+        assert!(state.monitor_result(&key(2), 1, None).is_err());
+        state
+            .monitor_result(&key(1), 1, Some("/dev/i2c-5: EIO".into()))
+            .unwrap();
         assert!(!state.switch_pending());
-        state.activate(&key(2), Some(12_345)).unwrap();
+        assert!(state.confirmed_monitor.is_none());
+        state.activate(&key(1), &key(2), Some(12_345)).unwrap();
+        assert_eq!(state.monitor_command.as_ref().unwrap().writer, key(1));
         assert_eq!(state.activation, 2);
         assert!(state.switch_pending());
         assert!(state.members[&key(2)].node.monitor_error.is_none());
-        assert!(state.activate(&key(2), Some(12_345)).is_err());
+        assert!(state.activate(&key(1), &key(2), Some(12_345)).is_err());
 
         let mut node = state.members[&key(2)].node.clone();
         node.input_error = Some("Native input is still reconnecting".into());
         state.update_node(&key(2), node, None, 2).unwrap();
+        assert!(state.switch_pending());
+        state.monitor_result(&key(1), 2, None).unwrap();
         assert!(
             !state.switch_pending(),
             "Input authentication must not hold the monitor gate"
         );
         let completed = state.clone();
-        state.activate(&key(2), Some(12_345)).unwrap();
+        state.activate(&key(1), &key(2), Some(12_345)).unwrap();
         assert_eq!(
             state, completed,
             "A completed duplicate must not send another monitor command"
         );
 
-        state.activate(&key(3), None).unwrap();
+        state.activate(&key(1), &key(3), None).unwrap();
+        assert_eq!(
+            state.monitor_command.as_ref().unwrap().writer,
+            key(2),
+            "The visible PC writes, independently of keyboard ownership"
+        );
         assert!(state.switch_pending());
         state.members.get_mut(&key(3)).unwrap().online = false;
+        assert!(
+            state.switch_pending(),
+            "Offline status cannot permit overlapping physical commands"
+        );
+        state.monitor_command.as_mut().unwrap().deadline_ms = 1;
+        state.expire_monitor();
+        assert!(state.switch_pending());
+        assert!(state.activate(&key(1), &key(1), None).is_err());
+        state.monitor_result(&key(2), 3, None).unwrap();
         assert!(!state.switch_pending());
-        state.activate(&key(1), None).unwrap();
+        assert!(state.confirmed_monitor.is_none());
+        state.activate(&key(1), &key(1), None).unwrap();
         let before = state.clone();
         let node = state.members[&key(1)].node.clone();
         assert!(
@@ -873,13 +1081,17 @@ pub(crate) mod tests {
     fn failed_input_returns_preserve_the_monitor_and_cannot_bypass_an_inflight_switch() {
         let mut state = fixture(3);
         state.settings.monitor_enabled = true;
-        state.activate(&key(2), Some(123)).unwrap();
+        state.activate(&key(1), &key(2), Some(123)).unwrap();
         let pending = state.clone();
         assert!(state.return_input().is_err());
         assert_eq!(state, pending);
         let node = state.members[&key(2)].node.clone();
         state
             .update_node(&key(2), node, None, state.activation)
+            .unwrap();
+        assert!(state.switch_pending());
+        state
+            .monitor_result(&key(1), state.activation, None)
             .unwrap();
         let monitor = state.active_monitor.clone();
         state.return_input().unwrap();
@@ -892,6 +1104,65 @@ pub(crate) mod tests {
         let returned = state.clone();
         state.return_input().unwrap();
         assert_eq!(state, returned);
+    }
+
+    #[test]
+    fn delayed_monitor_results_cannot_modify_later_generations() {
+        let mut state = fixture(3);
+        state.settings.monitor_enabled = true;
+        state.activate(&key(1), &key(2), None).unwrap();
+        state.monitor_result(&key(1), 1, None).unwrap();
+        state.return_input().unwrap();
+        let returned = state.clone();
+        state.monitor_result(&key(1), 1, None).unwrap();
+        assert_eq!(state, returned);
+        state.activate(&key(1), &key(3), None).unwrap();
+        let pending = state.clone();
+        state.monitor_result(&key(1), 1, None).unwrap();
+        assert_eq!(state, pending);
+        assert!(
+            state
+                .monitor_result(&key(1), 1, Some("bad\0error".into()))
+                .is_err()
+        );
+        assert!(state.monitor_result(&key(1), 3, None).is_err());
+        assert!(state.monitor_result(&key(2), 4, None).is_err());
+        assert_eq!(state, pending);
+        state
+            .monitor_result(&key(2), 3, Some("I/O error after issuance".into()))
+            .unwrap();
+        let failed = state.clone();
+        state.monitor_result(&key(1), 1, None).unwrap();
+        assert_eq!(state, failed);
+    }
+
+    #[test]
+    fn legacy_failed_destination_is_not_treated_as_a_confirmed_writer() {
+        let mut previous = fixture(3);
+        previous.settings.monitor_enabled = true;
+        previous.active_input = Some(key(2));
+        previous.active_monitor = Some(key(2));
+        previous.activation = 7;
+        previous.members.get_mut(&key(2)).unwrap().input_ready = 7;
+        previous
+            .members
+            .get_mut(&key(2))
+            .unwrap()
+            .node
+            .monitor_error = Some("DDCRC_RETRIES(EIO)".into());
+        let mut json = serde_json::to_value(previous).unwrap();
+        json.as_object_mut().unwrap().remove("confirmed_monitor");
+        json.as_object_mut().unwrap().remove("monitor_command");
+        let mut state: Workspace = serde_json::from_value(json).unwrap();
+        state.validate().unwrap();
+        assert!(state.monitor_command.is_none() && state.confirmed_monitor.is_none());
+        state.activate(&key(1), &key(2), None).unwrap();
+        let command = state.monitor_command.as_ref().unwrap();
+        assert_eq!(command.writer, key(1));
+        assert_eq!(command.destination, key(2));
+        assert_eq!(command.input, 16);
+        assert_eq!(state.members[&key(2)].input_ready, 0);
+        assert!(state.switch_pending());
     }
 
     #[test]

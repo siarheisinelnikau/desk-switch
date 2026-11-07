@@ -34,6 +34,27 @@ pub(super) struct Spec {
     activate: bool,
     native: Option<AudioLevel>,
 }
+impl Spec {
+    fn input_host(&self) -> bool {
+        self.kind == Kind::Input && self.args.get(2).is_some_and(|role| role == "host")
+    }
+
+    fn switched_after_generation(
+        &self,
+        status: Option<crate::lifecycle::InputStatus>,
+        switched: bool,
+    ) -> bool {
+        // Peer means forwarding only on the host. A receiver reports Peer as
+        // soon as it authenticates, before it receives an input transfer.
+        self.input_host()
+            && (status == Some(crate::lifecycle::InputStatus::Peer)
+                || (!self.desired_remote && switched))
+    }
+
+    fn return_host_input(&self, switched: bool) -> bool {
+        self.input_host() && !self.desired_remote && switched
+    }
+}
 struct Task {
     spec: Spec,
     worker: Worker,
@@ -480,7 +501,7 @@ impl Data {
         for (name, task) in &mut self.tasks {
             if task.worker.poll() {
                 self.error = task.worker.logs.back().cloned();
-                if task.spec.kind == Kind::Input && task.spec.desired_remote && !task.cycling {
+                if task.spec.input_host() && task.spec.desired_remote && !task.cycling {
                     self.returned = true;
                 }
             }
@@ -493,13 +514,16 @@ impl Data {
             }
             if task.worker.cycle_input {
                 task.worker.cycle_input = false;
-                task.cycling = true;
-                self.cycle = true;
-                self.cycle_position = task.worker.cycle_input_position.take();
+                let position = task.worker.cycle_input_position.take();
+                if task.spec.input_host() {
+                    task.cycling = true;
+                    self.cycle = true;
+                    self.cycle_position = position;
+                }
             }
             if task.spec.kind == Kind::Input {
                 self.input = task.worker.input_status;
-                if task.spec.args.get(2).is_some_and(|role| role == "host") {
+                if task.spec.input_host() {
                     if task.worker.input_status == Some(crate::lifecycle::InputStatus::Peer) {
                         task.was_remote = true;
                     }
@@ -515,7 +539,11 @@ impl Data {
                 if let Some(error) = task.worker.new_switch_error.take() {
                     task.switch_failed = true;
                     self.error = Some(error);
-                    if task.spec.desired_remote && !task.cycling && !task.worker.stopping {
+                    if task.spec.input_host()
+                        && task.spec.desired_remote
+                        && !task.cycling
+                        && !task.worker.stopping
+                    {
                         self.returned = true;
                     }
                 }
@@ -583,9 +611,8 @@ impl Data {
                 task.switch_failed = false;
                 // A new activation may retry a rejected switch, but must not
                 // toggle an already active destination back to the source.
-                task.switched = task.worker.input_status
-                    == Some(crate::lifecycle::InputStatus::Peer)
-                    || (!spec.desired_remote && task.switched);
+                task.switched =
+                    spec.switched_after_generation(task.worker.input_status, task.switched);
             }
             if matches!(spec.kind, Kind::AudioReceive | Kind::MicrophoneReceive)
                 && task.spec.args != spec.args
@@ -618,7 +645,7 @@ impl Data {
                 && spec.edge
                 && task.local_entry != Some(spec.generation)
                 && task.worker.input_status == Some(crate::lifecycle::InputStatus::Here)
-                && task.spec.args.get(2).is_some_and(|role| role == "host")
+                && spec.input_host()
                 && let Some(position) = spec.entry
                 && task
                     .worker
@@ -628,7 +655,8 @@ impl Data {
                 task.local_entry = Some(spec.generation);
             }
             task.spec.entry = spec.entry;
-            if spec.activate
+            if spec.input_host()
+                && spec.activate
                 && !task.switched
                 && !task.switch_failed
                 && task.worker.input_status == Some(crate::lifecycle::InputStatus::Here)
@@ -645,7 +673,7 @@ impl Data {
                     task.switched = true;
                 }
             }
-            if !spec.desired_remote && task.switched {
+            if spec.return_host_input(task.switched) {
                 let _ = task.worker.command("emergency");
                 task.switched = false;
                 task.was_remote = false;
@@ -666,6 +694,88 @@ impl Data {
 mod tests {
     use super::*;
     use std::net::{Ipv6Addr, SocketAddr, SocketAddrV6};
+
+    #[test]
+    fn receiver_authentication_and_monitor_generations_never_request_emergency_return() {
+        use crate::lifecycle::InputStatus;
+        let mut state = crate::group::model::tests::fixture(2);
+        let source = state.plan().input.unwrap();
+        let receiver = state
+            .members
+            .keys()
+            .find(|key| *key != &source)
+            .unwrap()
+            .clone();
+        let original = desired(&state, &receiver, &[], true).unwrap()["input"].clone();
+        let mut switched = true;
+        for generation in 1..=7 {
+            state.activation = generation;
+            state.active_input = Some(receiver.clone());
+            let member = state.members.get_mut(&receiver).unwrap();
+            member.input_ready = generation;
+            member.node.monitor_error = (generation == 7).then(|| "DDCRC_RETRIES(EIO)".into());
+            let wanted = desired(&state, &receiver, &[], true).unwrap();
+            let spec = &wanted["input"];
+            assert!(!spec.input_host() && !spec.desired_remote && !spec.activate);
+            assert!(
+                equivalent(&original, spec),
+                "monitor state must not restart the authenticated receiver"
+            );
+            // Receivers report Peer at authentication and Here when input is active.
+            for status in [InputStatus::Peer, InputStatus::Here, InputStatus::Peer] {
+                switched = spec.switched_after_generation(Some(status), switched);
+                assert!(!switched);
+                assert!(!spec.return_host_input(switched));
+            }
+            assert!(
+                !spec.return_host_input(true),
+                "even stale host bookkeeping must never send emergency to a receiver"
+            );
+        }
+    }
+
+    #[test]
+    fn host_keeps_forwarding_while_monitor_state_changes_and_returns_only_to_its_owner() {
+        use crate::lifecycle::InputStatus;
+        let mut state = crate::group::model::tests::fixture(2);
+        let source = state.plan().input.unwrap();
+        let receiver = state
+            .members
+            .keys()
+            .find(|key| *key != &source)
+            .unwrap()
+            .clone();
+        state.active_input = Some(receiver.clone());
+        state.activation = 5;
+        state.members.get_mut(&receiver).unwrap().input_ready = 5;
+        let active = desired(&state, &source, &[], true).unwrap()["input"].clone();
+        assert!(active.input_host() && active.activate);
+        let mut switched = active.switched_after_generation(Some(InputStatus::Peer), true);
+        assert!(switched && !active.return_host_input(switched));
+
+        state.activation = 6;
+        let waiting = desired(&state, &source, &[], true).unwrap()["input"].clone();
+        assert!(!waiting.activate && equivalent(&active, &waiting));
+        switched = waiting.switched_after_generation(Some(InputStatus::Peer), switched);
+        assert!(switched && !waiting.return_host_input(switched));
+
+        let member = state.members.get_mut(&receiver).unwrap();
+        member.input_ready = 6;
+        member.node.monitor_error = Some("DDCRC_RETRIES(EIO)".into());
+        let failed = desired(&state, &source, &[], true).unwrap()["input"].clone();
+        assert!(!failed.activate && equivalent(&active, &failed));
+        switched = failed.switched_after_generation(Some(InputStatus::Peer), switched);
+        assert!(switched && !failed.return_host_input(switched));
+
+        state.active_input = Some(source.clone());
+        state.activation = 7;
+        let returned = desired(&state, &source, &[], true).unwrap()["input"].clone();
+        assert!(equivalent(&active, &returned));
+        switched = returned.switched_after_generation(Some(InputStatus::Peer), switched);
+        assert!(returned.return_host_input(switched));
+        switched = returned.switched_after_generation(Some(InputStatus::Here), false);
+        assert!(!returned.return_host_input(switched));
+    }
 
     #[test]
     fn scoped_ipv6_peers_keep_their_interfaces_for_input_audio_and_microphone_links() {
