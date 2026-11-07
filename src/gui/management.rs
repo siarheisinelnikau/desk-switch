@@ -1,6 +1,6 @@
 use super::Desktop;
 use crate::workspace::management::{self, Application, Message, State, Update};
-use anyhow::{Context, Result, ensure};
+use anyhow::{Result, ensure};
 use eframe::egui;
 use std::time::{Duration, Instant};
 
@@ -74,6 +74,7 @@ impl Desktop {
             return Err(error);
         }
         self.appearance_changed(ctx);
+        self.quick.repaint(ctx);
         if application.show_remote_cursor != previous.show_remote_cursor
             && let Some(worker) = self.input.as_mut().filter(|worker| worker.running())
         {
@@ -124,16 +125,15 @@ impl Desktop {
             Message::SetApplication { application, .. } => Some(application.clone()),
             _ => None,
         };
-        self.pair
-            .service
-            .as_ref()
-            .context("The other PC is disconnected")?
-            .manage(message.clone())?;
+        self.management_send_to(&self.peer_key, message.clone())?;
         self.management_pending = Some(Pending {
             id: message.id(),
             since: Instant::now(),
             application,
-            cable: matches!(message, Message::ExtractCable { .. }),
+            cable: matches!(
+                message,
+                Message::ExtractCable { .. } | Message::InstallCable { .. }
+            ),
         });
         ctx.request_repaint();
         Ok(())
@@ -167,14 +167,21 @@ impl Desktop {
             return;
         }
         let id = message.id();
-        if let Message::ExtractCable { platform, .. } = message {
-            let result = self.start_cable_job(platform, ctx);
+        if let Message::ExtractCable { platform, .. } | Message::InstallCable { platform, .. } =
+            &message
+        {
+            let result = self.start_cable_job(
+                *platform,
+                matches!(message, Message::InstallCable { .. }),
+                ctx,
+            );
             if result.is_ok() {
                 self.cable_reply = Some(id);
+                self.group.cable_target = self.group.reply_target.clone();
                 return;
             }
-            if let Some(service) = &self.pair.service {
-                let _ = service.manage(Message::Reply {
+            {
+                self.management_reply(Message::Reply {
                     id,
                     error: result
                         .err()
@@ -190,6 +197,21 @@ impl Desktop {
             );
             match message {
                 Message::CheckUpdates { .. } => self.check_updates(ctx),
+                Message::SetMonitor {
+                    expected, monitor, ..
+                } => {
+                    ensure!(
+                        self.prefs.workspace.monitor == expected,
+                        "Monitor settings changed. Review the current values and try again."
+                    );
+                    ensure!(
+                        !monitor.enabled
+                            || self.monitors.iter().any(|found| found.id == monitor.id),
+                        "The selected monitor is unavailable"
+                    );
+                    self.prefs.workspace.monitor = monitor;
+                    self.prefs.save(&self.dir)?;
+                }
                 Message::SetApplication {
                     expected,
                     application,
@@ -201,7 +223,9 @@ impl Desktop {
                     );
                     self.apply_application(&application, ctx)?;
                 }
-                Message::Reply { .. } | Message::ExtractCable { .. } => unreachable!(),
+                Message::Reply { .. }
+                | Message::ExtractCable { .. }
+                | Message::InstallCable { .. } => unreachable!(),
             }
             Ok::<_, anyhow::Error>(())
         })();
@@ -211,13 +235,12 @@ impl Desktop {
                 .err()
                 .map(|error| management::status_text(error.to_string(), 1024)),
         };
-        if let Some(service) = &self.pair.service {
-            let _ = service.manage(reply);
-        }
+        self.management_reply(reply);
     }
     pub(super) fn tick_management(&mut self, ctx: &egui::Context) {
         if let Some(pending) = &self.management_pending {
-            let remaining = Duration::from_secs(8).saturating_sub(pending.since.elapsed());
+            let remaining = Duration::from_secs(if pending.cable { 300 } else { 8 })
+                .saturating_sub(pending.since.elapsed());
             if remaining.is_zero() || self.pair.remote.is_none() {
                 self.management_pending = None;
                 self.notice = Some((
@@ -260,52 +283,76 @@ impl Desktop {
     fn start_cable_job(
         &mut self,
         platform: crate::cable::Platform,
+        installing: bool,
         ctx: &egui::Context,
     ) -> Result<()> {
         ensure!(
             self.cable_job.is_none(),
-            "Wait for the installer extraction to finish"
+            "Wait for the current installer operation to finish"
         );
         ensure!(
             !self.quitting && !self.install_pending && self.install_job.is_none(),
             "This PC is installing an update"
         );
-        self.cable_job = Some(crate::cable::Job::start(platform, ctx.clone())?);
+        self.cable_job = Some(if installing {
+            crate::cable::Job::install(platform, ctx.clone())?
+        } else {
+            crate::cable::Job::start(platform, ctx.clone())?
+        });
         self.cable_result = None;
         self.cable_remote_done = false;
         Ok(())
     }
     pub(super) fn extract_cable(&mut self, ctx: &egui::Context) {
+        self.request_cable(false, ctx);
+    }
+    pub(super) fn install_cable(&mut self, ctx: &egui::Context) {
+        self.request_cable(true, ctx);
+    }
+    fn request_cable(&mut self, installing: bool, ctx: &egui::Context) {
         self.cable_result = None;
         self.cable_remote_done = false;
         let result = if self.cable_remote {
             self.send_management(
-                Message::ExtractCable {
-                    id: request_id(),
-                    platform: self.cable_platform,
+                if installing {
+                    Message::InstallCable {
+                        id: request_id(),
+                        platform: self.cable_platform,
+                    }
+                } else {
+                    Message::ExtractCable {
+                        id: request_id(),
+                        platform: self.cable_platform,
+                    }
                 },
                 ctx,
             )
         } else {
-            self.start_cable_job(self.cable_platform, ctx)
+            self.start_cable_job(self.cable_platform, installing, ctx)
         };
         if let Err(error) = result {
             self.cable_result = Some(Err(error.to_string()));
         }
     }
     pub(super) fn tick_cable(&mut self, _ctx: &egui::Context) {
+        let installing = self
+            .cable_job
+            .as_ref()
+            .is_some_and(crate::cable::Job::installing);
         if let Some(result) = self.cable_job.as_ref().and_then(crate::cable::Job::poll) {
             self.cable_job = None;
-            if let Some(id) = self.cable_reply.take()
-                && let Some(service) = &self.pair.service
-            {
-                let _ = service.manage(Message::Reply {
+            if let Some(id) = self.cable_reply.take() {
+                self.management_reply(Message::Reply {
                     id,
                     error: result
                         .as_ref()
                         .err()
                         .map(|error| management::status_text(error.clone(), 1024)),
                 });
+                self.group.cable_target = None;
+            }
+            if installing && result.is_ok() {
+                self.notice = Some(("The official installer was opened. Complete its steps on that computer; restart it if the installer requests it.".into(), false));
             }
             self.cable_result = Some(result);
         }

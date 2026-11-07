@@ -11,6 +11,9 @@ use std::{
     sync::mpsc::{self, Receiver},
     time::{Duration, Instant},
 };
+#[cfg(target_os = "macos")]
+#[path = "updater_macos.rs"]
+mod macos;
 
 pub const CHANNEL: &str =
     "https://api.github.com/repos/siarheisinelnikau/desk-switch/releases/latest";
@@ -61,7 +64,10 @@ pub enum Outcome {
 }
 
 pub struct Prepared {
+    #[cfg(not(target_os = "macos"))]
     inner: rust_auto_updator::Prepared,
+    #[cfg(target_os = "macos")]
+    macos: macos::Prepared,
     #[cfg(target_os = "linux")]
     envelope: Envelope,
 }
@@ -114,11 +120,20 @@ fn verified(envelope: &Envelope, public_key: &str) -> Result<Release> {
 }
 
 fn target() -> Result<&'static str> {
-    ensure!(
-        cfg!(target_arch = "x86_64"),
-        "automatic updates currently require x86-64"
-    );
-    Ok(if cfg!(windows) { WINDOWS } else { LINUX })
+    #[cfg(target_os = "macos")]
+    return Ok(if cfg!(target_arch = "aarch64") {
+        "macos-arm64-app"
+    } else {
+        "macos-x86_64-app"
+    });
+    #[cfg(not(target_os = "macos"))]
+    {
+        ensure!(
+            cfg!(target_arch = "x86_64"),
+            "automatic updates currently require x86-64"
+        );
+        Ok(if cfg!(windows) { WINDOWS } else { LINUX })
+    }
 }
 
 fn https(url: &str) -> Result<reqwest::Url> {
@@ -389,9 +404,11 @@ impl Job {
 }
 
 pub fn shared_managed(executable: &Path) -> bool {
-    cfg!(windows) || executable == Path::new("/usr/lib/desk-switch/desk-switch")
+    cfg!(any(windows, target_os = "macos"))
+        || executable == Path::new("/usr/lib/desk-switch/desk-switch")
 }
 
+#[cfg(not(target_os = "macos"))]
 pub fn shared_config(dir: &Path) -> Result<rust_auto_updator::Config> {
     let config = if cfg!(windows) {
         rust_auto_updator::Config::new(
@@ -442,6 +459,11 @@ pub fn shared_config(dir: &Path) -> Result<rust_auto_updator::Config> {
     Ok(config)
 }
 
+#[cfg(target_os = "macos")]
+fn shared_download(dir: &Path, progress: impl FnMut(u64, u64)) -> Result<Outcome> {
+    macos::download(dir, progress)
+}
+#[cfg(not(target_os = "macos"))]
 fn shared_download(dir: &Path, progress: impl FnMut(u64, u64)) -> Result<Outcome> {
     let config = shared_config(dir)?;
     let Some(bytes) = fetch_release()? else {
@@ -475,6 +497,7 @@ fn shared_download(dir: &Path, progress: impl FnMut(u64, u64)) -> Result<Outcome
     ))
 }
 
+#[cfg(not(target_os = "macos"))]
 fn verify_shared_asset(
     signed: &Release,
     latest: &rust_auto_updator::Release,
@@ -494,29 +517,38 @@ fn verify_shared_asset(
     Ok(())
 }
 
+#[cfg(not(target_os = "macos"))]
 static CLEANUP: std::sync::Mutex<Option<PathBuf>> = std::sync::Mutex::new(None);
 
 pub fn shared_cli(args: &mut Vec<String>) -> Result<bool> {
-    if args.first().is_some_and(|arg| arg == "--apply-update") {
-        rust_auto_updator::apply_update(&shared_config(&crate::config::state_dir()?)?)
-            .map_err(anyhow::Error::msg)?;
-        return Ok(true);
-    }
-    if args.first().is_some_and(|arg| arg == "gui")
-        && args.len() >= 3
-        && args
-            .get(args.len() - 2)
-            .is_some_and(|arg| arg == "--cleanup-update")
+    #[cfg(target_os = "macos")]
+    return macos::cli(args);
+    #[cfg(not(target_os = "macos"))]
     {
-        let index = args.len() - 2;
-        let path = PathBuf::from(args.get(index + 1).context("missing cleanup directory")?);
-        args.drain(index..=index + 1);
-        *CLEANUP.lock().unwrap() = Some(path);
+        if args.first().is_some_and(|arg| arg == "--apply-update") {
+            rust_auto_updator::apply_update(&shared_config(&crate::config::state_dir()?)?)
+                .map_err(anyhow::Error::msg)?;
+            return Ok(true);
+        }
+        if args.first().is_some_and(|arg| arg == "gui")
+            && args.len() >= 3
+            && args
+                .get(args.len() - 2)
+                .is_some_and(|arg| arg == "--cleanup-update")
+        {
+            let index = args.len() - 2;
+            let path = PathBuf::from(args.get(index + 1).context("missing cleanup directory")?);
+            args.drain(index..=index + 1);
+            *CLEANUP.lock().unwrap() = Some(path);
+        }
+        Ok(false)
     }
-    Ok(false)
 }
 
 pub fn acknowledge_shared_start(dir: &Path) {
+    #[cfg(target_os = "macos")]
+    macos::acknowledge(dir);
+    #[cfg(not(target_os = "macos"))]
     if let Some(path) = CLEANUP.lock().unwrap().take()
         && let Ok(config) = shared_config(dir)
     {
@@ -530,11 +562,14 @@ pub struct InstallJob {
 
 impl InstallJob {
     pub fn start(mut prepared: Prepared, dir: &Path, ctx: eframe::egui::Context) -> Result<Self> {
+        #[cfg(not(target_os = "macos"))]
         prepared
             .inner
             .set_restart_args(shared_config(dir)?.install.restart_args)
             .map_err(anyhow::Error::msg)?;
         let (send, result) = mpsc::channel();
+        #[cfg(target_os = "macos")]
+        let state = dir.to_path_buf();
         #[cfg(target_os = "linux")]
         let envelope = {
             let path = dir.join("updates/install-envelope.json");
@@ -548,8 +583,13 @@ impl InstallJob {
                 let installed = prepared.inner.handoff_with_installer(|archive| {
                     install_signed_package(archive, &envelope).map_err(|error| error.to_string())
                 });
-                #[cfg(not(target_os = "linux"))]
+                #[cfg(windows)]
                 let installed = rust_auto_updator::handoff(&mut prepared.inner);
+                #[cfg(target_os = "macos")]
+                let installed = prepared
+                    .macos
+                    .handoff(&state)
+                    .map_err(|error| format!("{error:#}"));
                 let _ = send.send((prepared, installed));
                 ctx.request_repaint();
             })?;
@@ -869,7 +909,7 @@ mod tests {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(target_os = "macos")))]
 mod shared_tests {
     use super::*;
     #[test]

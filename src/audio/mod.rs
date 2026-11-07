@@ -3,6 +3,8 @@ mod capture_frames;
 mod link;
 #[cfg(target_os = "linux")]
 mod linux;
+#[cfg(target_os = "macos")]
+mod macos;
 mod microphone;
 mod mixer;
 pub use microphone::run as run_microphone;
@@ -11,6 +13,9 @@ pub use microphone::run as run_microphone;
 mod output;
 #[cfg(target_os = "linux")]
 #[path = "linux_output.rs"]
+mod output;
+#[cfg(target_os = "macos")]
+#[path = "macos_output.rs"]
 mod output;
 mod player;
 mod playout;
@@ -126,6 +131,18 @@ mod tests;
 fn list() -> Result<()> {
     #[cfg(windows)]
     return output::list();
+    #[cfg(target_os = "macos")]
+    {
+        for device in devices()? {
+            println!(
+                "{}{} — {}",
+                if device.default { "* " } else { "  " },
+                device.id,
+                device.name
+            );
+        }
+        return Ok(());
+    }
     #[cfg(target_os = "linux")]
     crate::runtime()?.block_on(linux::list())
 }
@@ -140,6 +157,8 @@ pub struct AudioDevice {
 pub fn devices() -> Result<Vec<AudioDevice>> {
     #[cfg(windows)]
     return output::devices();
+    #[cfg(target_os = "macos")]
+    return Ok(macos::devices()?.speakers);
     #[cfg(target_os = "linux")]
     crate::runtime()?.block_on(linux::devices())
 }
@@ -161,6 +180,8 @@ impl Media {
 pub fn microphones() -> Result<Vec<AudioDevice>> {
     #[cfg(windows)]
     return output::microphones();
+    #[cfg(target_os = "macos")]
+    return Ok(macos::devices()?.microphones);
     #[cfg(target_os = "linux")]
     crate::runtime()?.block_on(linux::microphones())
 }
@@ -168,6 +189,8 @@ pub fn microphones() -> Result<Vec<AudioDevice>> {
 pub fn microphone_bridges() -> Result<Vec<AudioDevice>> {
     #[cfg(windows)]
     return output::microphone_bridges();
+    #[cfg(target_os = "macos")]
+    return Ok(macos::devices()?.bridges);
     #[cfg(target_os = "linux")]
     Ok(vec![AudioDevice {
         id: "pipewire-virtual-microphone".into(),

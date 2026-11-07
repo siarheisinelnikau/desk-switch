@@ -237,7 +237,7 @@ impl Notifier {
             }
             self.events.send(event).is_ok()
         };
-        self.ctx.request_repaint();
+        self.ctx.request_repaint_of(eframe::egui::ViewportId::ROOT);
         sent
     }
 }
@@ -296,18 +296,19 @@ async fn write_record(stream: &mut TcpStream, data: &[u8]) -> Result<()> {
     Ok(())
 }
 
-struct Candidate {
-    stream: TcpStream,
-    noise: TransportState,
-    key: Key,
-    name: String,
-    code: String,
-    outgoing: bool,
+pub(crate) struct Candidate {
+    pub(crate) connection: [u8; 32],
+    pub(crate) stream: TcpStream,
+    pub(crate) noise: TransportState,
+    pub(crate) key: Key,
+    pub(crate) name: String,
+    pub(crate) code: String,
+    pub(crate) outgoing: bool,
     requested: bool,
-    address: SocketAddr,
-    version: Version,
+    pub(crate) address: SocketAddr,
+    pub(crate) version: Version,
 }
-async fn authenticate(
+pub(crate) async fn authenticate(
     stream: TcpStream,
     identity: &Identity,
     name: &str,
@@ -389,6 +390,7 @@ async fn authenticate_version(
     }
     let code = pairing_code(noise.get_handshake_hash());
     Ok(Candidate {
+        connection: noise.get_handshake_hash().try_into()?,
         stream,
         noise: noise.into_transport_mode()?,
         key,

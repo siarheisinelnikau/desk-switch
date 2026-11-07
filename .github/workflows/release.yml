@@ -23,6 +23,7 @@ concurrency:
 jobs:
   build:
     strategy:
+      fail-fast: false
       matrix:
         include:
           - os: ubuntu-24.04
@@ -49,6 +50,9 @@ jobs:
       - run: cargo test --locked
       - if: runner.os == 'Linux'
         run: |
+          python3 tools/test_release_assets.py
+          python3 tools/test_promote_release.py
+          python3 tools/test_normalize_release_assets.py
           python3 tools/test_input_access.py
           python3 tools/test_update_install.py
           udevadm verify packaging/linux/99-desk-switch-input-access.rules
@@ -73,8 +77,46 @@ jobs:
           path: dist/*.deb
           if-no-files-found: error
 
+  macos:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-15
+            target: aarch64-apple-darwin
+            architecture: arm64
+          - os: macos-15-intel
+            target: x86_64-apple-darwin
+            architecture: x86-64
+    runs-on: ${{ matrix.os }}
+    env:
+      MACOSX_DEPLOYMENT_TARGET: "13.0"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Prepare the native Rust target and Apple SDK
+        run: |
+          rustup update stable
+          rustup default stable
+          rustup target add ${{ matrix.target }}
+          xcrun --show-sdk-path
+      - run: cargo fmt --all --check
+      - run: cargo clippy --locked --target ${{ matrix.target }} --all-targets -- -D warnings
+      - run: cargo test --locked --target ${{ matrix.target }}
+      - run: cargo build --locked --release --target ${{ matrix.target }}
+      - name: Package the verified macOS app bundle
+        run: |
+          python3 tools/test_release_assets.py
+          python3 tools/package_macos.py --binary target/${{ matrix.target }}/release/desk-switch --out dist
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: desk-switch-macos-${{ matrix.architecture }}
+          path: dist/*-macos-${{ matrix.architecture }}.zip
+          if-no-files-found: error
+
   sign:
-    needs: build
+    needs: [build, macos]
     runs-on: ubuntu-24.04
     environment: release
     timeout-minutes: 10
@@ -100,7 +142,7 @@ jobs:
 
   publish:
     if: github.event_name != 'workflow_dispatch' || inputs.publish
-    needs: [build, sign]
+    needs: [build, macos, sign]
     runs-on: ubuntu-24.04
     permissions:
       contents: write
@@ -133,7 +175,8 @@ jobs:
           manifest = Path(f'release/manifests/{version}.json')
           manifest.parent.mkdir(parents=True, exist_ok=True)
           shutil.copy2('artifacts/update.json', manifest)
-          for source, name in [('desk-switch.exe',names['windows-x86_64']), (names['linux-x86_64-deb'],names['linux-x86_64-deb'])]:
+          for target, name in names.items():
+              source = 'desk-switch.exe' if target == 'windows-x86_64' else name
               shutil.copy2(Path('artifacts')/source, Path('dist')/name)
           installers = [Path('dist')/name for name in names.values()]
           existing = subprocess.run(['gh','api',f'repos/{os.environ["GITHUB_REPOSITORY"]}/releases/tags/{tag}'],capture_output=True,text=True)

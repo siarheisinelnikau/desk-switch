@@ -1,0 +1,824 @@
+//! Opt-in clipboard sharing. The worker owns the OS clipboard and never blocks
+//! the GUI. Wire hashes verify bytes; decoded fingerprints suppress
+//! echoes even when the OS re-encodes an image.
+use anyhow::{Context, Result, ensure};
+use sha2::{Digest, Sha256};
+use std::{
+    borrow::Cow,
+    sync::{Arc, Condvar, Mutex},
+    time::Duration,
+};
+
+pub type Content = (String, Vec<u8>, String);
+const LIMIT: usize = 8 * 1024 * 1024;
+const SIDE: usize = 4096;
+const INTERVAL: Duration = Duration::from_millis(400);
+
+#[derive(Clone, Debug, PartialEq)]
+enum Value {
+    Text(String),
+    Image {
+        width: usize,
+        height: usize,
+        rgba: Vec<u8>,
+    },
+}
+impl Value {
+    fn fingerprint(&self) -> String {
+        let mut digest = Sha256::new();
+        match self {
+            Self::Text(text) => {
+                digest.update(b"text/plain\0");
+                digest.update(text.as_bytes());
+            }
+            Self::Image {
+                width,
+                height,
+                rgba,
+            } => {
+                digest.update(b"image/rgba\0");
+                digest.update((*width as u64).to_le_bytes());
+                digest.update((*height as u64).to_le_bytes());
+                digest.update(rgba);
+            }
+        }
+        format!("{digest:x}", digest = digest.finalize())
+    }
+    fn encode(&self) -> Result<Content> {
+        let (mime, bytes) = match self {
+            Self::Text(text) => ("text/plain", text.as_bytes().to_vec()),
+            Self::Image {
+                width,
+                height,
+                rgba,
+            } => {
+                validate_image(*width, *height, rgba.len())?;
+                let mut bytes = Vec::new();
+                use image::ImageEncoder;
+                image::codecs::png::PngEncoder::new_with_quality(
+                    &mut bytes,
+                    image::codecs::png::CompressionType::Fast,
+                    image::codecs::png::FilterType::Adaptive,
+                )
+                .write_image(
+                    rgba,
+                    *width as u32,
+                    *height as u32,
+                    image::ExtendedColorType::Rgba8,
+                )?;
+                ("image/png", bytes)
+            }
+        };
+        ensure!(
+            bytes.len() <= LIMIT,
+            "Clipboard content exceeds the 8 MiB sharing limit"
+        );
+        let digest = hash(&bytes);
+        Ok((mime.into(), bytes, digest))
+    }
+}
+fn hash(bytes: &[u8]) -> String {
+    format!("{:x}", Sha256::digest(bytes))
+}
+fn validate_image(width: usize, height: usize, len: usize) -> Result<()> {
+    ensure!(
+        width > 0
+            && height > 0
+            && width <= SIDE
+            && height <= SIDE
+            && width
+                .checked_mul(height)
+                .and_then(|pixels| pixels.checked_mul(4))
+                == Some(len),
+        "Clipboard image exceeds 4096 × 4096 pixels or is damaged"
+    );
+    Ok(())
+}
+fn decode((mime, bytes, digest): Content) -> Result<Value> {
+    ensure!(
+        bytes.len() <= LIMIT && hash(&bytes) == digest,
+        "Clipboard checksum or size is invalid"
+    );
+    match mime.as_str() {
+        "text/plain" => Ok(Value::Text(
+            String::from_utf8(bytes).context("Clipboard text is not UTF-8")?,
+        )),
+        "image/png" => {
+            let mut reader = image::ImageReader::with_format(
+                std::io::Cursor::new(bytes),
+                image::ImageFormat::Png,
+            );
+            let mut limits = image::Limits::default();
+            limits.max_image_width = Some(SIDE as u32);
+            limits.max_image_height = Some(SIDE as u32);
+            limits.max_alloc = Some(64 * 1024 * 1024);
+            reader.limits(limits);
+            let image = reader
+                .decode()
+                .context("Clipboard PNG is damaged or too large")?
+                .to_rgba8();
+            Ok(Value::Image {
+                width: image.width() as usize,
+                height: image.height() as usize,
+                rgba: image.into_raw(),
+            })
+        }
+        _ => anyhow::bail!("Shared clipboard supports text and PNG images only"),
+    }
+}
+
+trait Backend {
+    fn read(&mut self) -> Result<Option<Value>>;
+    fn write(&mut self, value: &Value) -> Result<()>;
+}
+struct Native {
+    clipboard: arboard::Clipboard,
+    sequence: Option<u64>,
+    error: Option<String>,
+}
+#[cfg(windows)]
+fn native_sequence() -> Option<u64> {
+    #[link(name = "user32")]
+    unsafe extern "system" {
+        fn GetClipboardSequenceNumber() -> u32;
+    }
+    let sequence = unsafe { GetClipboardSequenceNumber() };
+    (sequence != 0).then_some(u64::from(sequence))
+}
+#[cfg(target_os = "macos")]
+fn native_sequence() -> Option<u64> {
+    use objc2::{
+        ClassType, msg_send,
+        rc::{Retained, autoreleasepool},
+    };
+    use objc2_app_kit::NSPasteboard;
+    autoreleasepool(|_| {
+        // NSPasteboard can be used on the clipboard worker, just as arboard
+        // does. Match its nullable lookup for non-GUI/launchd environments.
+        let pasteboard: Option<Retained<NSPasteboard>> =
+            unsafe { msg_send![NSPasteboard::class(), generalPasteboard] };
+        pasteboard.and_then(|pasteboard| u64::try_from(pasteboard.changeCount()).ok())
+    })
+}
+#[cfg(not(any(windows, target_os = "macos")))]
+fn native_sequence() -> Option<u64> {
+    None
+}
+impl Native {
+    fn read_value(&mut self) -> Result<Option<Value>> {
+        // A copied image may also advertise a URL/text description. Prefer its
+        // actual image rather than sending that ancillary text.
+        match self.clipboard.get_image() {
+            Ok(image) => {
+                validate_image(image.width, image.height, image.bytes.len())?;
+                return Ok(Some(Value::Image {
+                    width: image.width,
+                    height: image.height,
+                    rgba: image.bytes.into_owned(),
+                }));
+            }
+            Err(arboard::Error::ContentNotAvailable | arboard::Error::ConversionFailure) => {}
+            Err(error) => return Err(error.into()),
+        }
+        match self.clipboard.get_text() {
+            Ok(text) => {
+                ensure!(
+                    text.len() <= LIMIT,
+                    "Clipboard text exceeds the 8 MiB sharing limit"
+                );
+                Ok(Some(Value::Text(text)))
+            }
+            Err(arboard::Error::ContentNotAvailable) => Ok(None),
+            Err(error) => Err(error.into()),
+        }
+    }
+}
+impl Backend for Native {
+    fn read(&mut self) -> Result<Option<Value>> {
+        let sequence = native_sequence();
+        if sequence.is_some() && sequence == self.sequence {
+            if let Some(error) = &self.error {
+                anyhow::bail!("{error}");
+            }
+            return Ok(None);
+        }
+        let result = self.read_value();
+        let occupied = result
+            .as_ref()
+            .err()
+            .and_then(|error| error.downcast_ref::<arboard::Error>())
+            .is_some_and(|error| matches!(error, arboard::Error::ClipboardOccupied));
+        if !occupied {
+            self.sequence = sequence;
+            self.error = result.as_ref().err().map(ToString::to_string);
+        }
+        result
+    }
+    fn write(&mut self, value: &Value) -> Result<()> {
+        match value {
+            Value::Text(text) => self.clipboard.set_text(text.clone())?,
+            Value::Image {
+                width,
+                height,
+                rgba,
+            } => self.clipboard.set_image(arboard::ImageData {
+                width: *width,
+                height: *height,
+                bytes: Cow::Borrowed(rgba),
+            })?,
+        }
+        self.sequence = None;
+        self.error = None;
+        Ok(())
+    }
+}
+
+#[cfg(target_os = "linux")]
+mod gnome {
+    use super::*;
+    const NAME: &str = "io.github.siarheisinelnikau.DeskSwitch.Clipboard";
+    const PATH: &str = "/io/github/siarheisinelnikau/DeskSwitch/Clipboard";
+    pub(super) struct Gnome {
+        connection: zbus::blocking::Connection,
+        serial: u32,
+        error: Option<String>,
+    }
+    impl Gnome {
+        pub fn new() -> Result<Self> {
+            let connection = zbus::blocking::connection::Builder::session()?
+                .method_timeout(Duration::from_secs(2))
+                .build()?;
+            let proxy = zbus::blocking::Proxy::new(&connection, NAME, PATH, NAME)?;
+            let version: u32 = proxy.call("Version", &())?;
+            ensure!(version == 1, "Unsupported GNOME clipboard companion");
+            Ok(Self {
+                connection,
+                serial: 0,
+                error: None,
+            })
+        }
+    }
+    impl Backend for Gnome {
+        fn read(&mut self) -> Result<Option<Value>> {
+            let proxy = zbus::blocking::Proxy::new(&self.connection, NAME, PATH, NAME)?;
+            let (serial, mime, bytes): (u32, String, Vec<u8>) =
+                match proxy.call("Read", &(self.serial,)) {
+                    Ok(content) => content,
+                    Err(error) => {
+                        // Enabling/restarting the extension restarts its serial.
+                        // A failed call must make the next successful one fetch
+                        // content even if that new serial happens to match ours.
+                        self.serial = 0;
+                        self.error = None;
+                        return Err(error.into());
+                    }
+                };
+            if mime.is_empty() {
+                if self.serial == serial
+                    && let Some(error) = &self.error
+                {
+                    anyhow::bail!("{error}");
+                }
+                self.serial = serial;
+                self.error = None;
+                return Ok(None);
+            }
+            let digest = hash(&bytes);
+            self.serial = serial;
+            let value = decode((mime, bytes, digest));
+            self.error = value.as_ref().err().map(ToString::to_string);
+            value.map(Some)
+        }
+        fn write(&mut self, value: &Value) -> Result<()> {
+            let (mime, bytes, _) = value.encode()?;
+            let proxy = zbus::blocking::Proxy::new(&self.connection, NAME, PATH, NAME)?;
+            self.serial = proxy.call("Write", &(mime, bytes))?;
+            self.error = None;
+            Ok(())
+        }
+    }
+    pub fn required() -> bool {
+        let wayland = std::env::var("XDG_SESSION_TYPE").as_deref() == Ok("wayland")
+            || std::env::var_os("WAYLAND_DISPLAY").is_some();
+        let desktop = std::env::var("XDG_CURRENT_DESKTOP")
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        wayland && (desktop.contains("gnome") || desktop.contains("ubuntu"))
+    }
+}
+fn backend() -> Result<Box<dyn Backend>> {
+    #[cfg(target_os = "linux")]
+    if gnome::required() {
+        return gnome::Gnome::new()
+            .map(|backend| Box::new(backend) as Box<dyn Backend>)
+            .context(
+                "Enable Desk Switch Tray in GNOME Extensions to share text and images on Wayland",
+            );
+    }
+    Ok(Box::new(Native {
+        clipboard: arboard::Clipboard::new()?,
+        sequence: None,
+        error: None,
+    }))
+}
+
+#[derive(Default)]
+struct Engine {
+    fingerprint: Option<String>,
+    pending: Option<Value>,
+    rejected: Option<String>,
+}
+impl Engine {
+    fn receive(&mut self, content: Content) -> Result<()> {
+        self.pending = Some(decode(content)?);
+        Ok(())
+    }
+    fn step(&mut self, backend: &mut dyn Backend) -> Result<Option<Content>> {
+        if let Some(value) = self.pending.as_ref() {
+            self.rejected = None;
+            let fingerprint = value.fingerprint();
+            if self.fingerprint.as_ref() != Some(&fingerprint) {
+                backend.write(value)?;
+                self.fingerprint = Some(fingerprint);
+                // Some native formats normalize pixels/text on insertion.
+                // Read back once rather than echoing the new encoding.
+                if let Ok(Some(observed)) = backend.read() {
+                    self.fingerprint = Some(observed.fingerprint());
+                }
+            }
+            // The controller also acknowledges our own copies. Keep the
+            // originator's rich/native formats when its plain content matches.
+            self.pending = None;
+        }
+        let Some(value) = backend.read()? else {
+            if let Some(error) = &self.rejected {
+                anyhow::bail!("{error}");
+            }
+            return Ok(None);
+        };
+        let fingerprint = value.fingerprint();
+        if self.fingerprint.as_ref() == Some(&fingerprint) {
+            if let Some(error) = &self.rejected {
+                anyhow::bail!("{error}");
+            }
+            return Ok(None);
+        }
+        // Do not repeatedly re-encode a too-large unchanged image.
+        self.fingerprint = Some(fingerprint);
+        let result = value.encode();
+        self.rejected = result.as_ref().err().map(ToString::to_string);
+        result.map(Some)
+    }
+}
+
+#[derive(Default)]
+struct State {
+    enabled: bool,
+    generation: u64,
+    stop: bool,
+    incoming: Option<(u64, Content)>,
+    outgoing: Option<(u64, Content)>,
+    status: Option<String>,
+}
+#[derive(Default)]
+struct Shared {
+    state: Mutex<State>,
+    wake: Condvar,
+}
+pub struct Clipboard {
+    shared: Arc<Shared>,
+}
+impl Clipboard {
+    pub fn start(ctx: eframe::egui::Context) -> Result<Self> {
+        Self::spawn(ctx, backend)
+    }
+    fn spawn(
+        ctx: eframe::egui::Context,
+        mut factory: impl FnMut() -> Result<Box<dyn Backend>> + Send + 'static,
+    ) -> Result<Self> {
+        let shared = Arc::new(Shared::default());
+        let worker = shared.clone();
+        std::thread::Builder::new()
+            .name("Desk Switch shared clipboard".into())
+            .spawn(move || {
+                let mut native: Option<Box<dyn Backend>> = None;
+                let mut engine = Engine::default();
+                let mut generation = 0;
+                loop {
+                    let mut state = worker.state.lock().unwrap();
+                    while !state.enabled && !state.stop {
+                        state = worker.wake.wait(state).unwrap();
+                    }
+                    if state.stop {
+                        break;
+                    }
+                    let current = state.generation;
+                    if current != generation {
+                        engine = Engine::default();
+                        generation = current;
+                    }
+                    let content = state
+                        .incoming
+                        .take()
+                        .filter(|(epoch, _)| *epoch == current)
+                        .map(|(_, content)| content);
+                    drop(state);
+                    let result = (|| {
+                        if let Some(content) = content {
+                            engine.receive(content)?;
+                        }
+                        if native.is_none() {
+                            native = Some(factory()?);
+                        }
+                        // Disabling cancels queued operations. An OS call already
+                        // in flight finishes on this worker and never holds the UI.
+                        {
+                            let state = worker.state.lock().unwrap();
+                            if !state.enabled || state.generation != current {
+                                return Ok(None);
+                            }
+                        }
+                        engine.step(native.as_mut().unwrap().as_mut())
+                    })();
+                    let mut state = worker.state.lock().unwrap();
+                    if state.enabled && state.generation == current {
+                        let status = match result {
+                            Ok(content) => {
+                                if let Some(content) = content {
+                                    state.outgoing = Some((current, content));
+                                    ctx.request_repaint_of(eframe::egui::ViewportId::ROOT);
+                                }
+                                None
+                            }
+                            Err(error) => Some(format!("Shared clipboard: {error:#}")),
+                        };
+                        if state.status != status {
+                            state.status = status;
+                            ctx.request_repaint_of(eframe::egui::ViewportId::ROOT);
+                        }
+                    }
+                    if state.stop {
+                        break;
+                    }
+                    if state.incoming.is_none() && state.enabled && state.generation == current {
+                        let _ = worker.wake.wait_timeout(state, INTERVAL).unwrap();
+                    }
+                }
+            })?;
+        Ok(Self { shared })
+    }
+    pub fn enabled(&self, value: bool) {
+        let mut state = self.shared.state.lock().unwrap();
+        if state.enabled != value {
+            state.enabled = value;
+            state.generation = state.generation.wrapping_add(1);
+            state.incoming = None;
+            state.outgoing = None;
+            state.status = None;
+            self.shared.wake.notify_one();
+        }
+    }
+    pub fn receive(&self, mime: String, bytes: Vec<u8>, digest: String) {
+        if bytes.len() > LIMIT || !["text/plain", "image/png"].contains(&mime.as_str()) {
+            return;
+        }
+        let mut state = self.shared.state.lock().unwrap();
+        if state.enabled {
+            state.incoming = Some((state.generation, (mime, bytes, digest)));
+            self.shared.wake.notify_one();
+        }
+    }
+    pub fn poll(&self) -> Vec<Content> {
+        let mut state = self.shared.state.lock().unwrap();
+        let generation = state.generation;
+        state
+            .outgoing
+            .take()
+            .filter(|(epoch, _)| state.enabled && *epoch == generation)
+            .map(|(_, content)| vec![content])
+            .unwrap_or_default()
+    }
+    pub fn status(&self) -> Option<String> {
+        self.shared
+            .state
+            .lock()
+            .unwrap()
+            .status
+            .as_ref()
+            .map(|message| {
+                if let Some(detail) = message.strip_prefix("Shared clipboard: ") {
+                    format!(
+                        "{}: {}",
+                        crate::i18n::tr("Shared clipboard"),
+                        detail
+                            .split(": ")
+                            .map(crate::i18n::tr)
+                            .collect::<Vec<_>>()
+                            .join(": ")
+                    )
+                } else {
+                    crate::i18n::tr(message)
+                }
+            })
+    }
+}
+impl Drop for Clipboard {
+    fn drop(&mut self) {
+        let mut state = self.shared.state.lock().unwrap();
+        state.stop = true;
+        state.incoming = None;
+        state.outgoing = None;
+        self.shared.wake.notify_one();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    #[derive(Default)]
+    struct Fake {
+        value: Option<Value>,
+        writes: usize,
+        fail: bool,
+    }
+    impl Backend for Fake {
+        fn read(&mut self) -> Result<Option<Value>> {
+            Ok(self.value.clone())
+        }
+        fn write(&mut self, value: &Value) -> Result<()> {
+            if std::mem::take(&mut self.fail) {
+                anyhow::bail!("clipboard is temporarily occupied");
+            }
+            self.writes += 1;
+            self.value = Some(value.clone());
+            Ok(())
+        }
+    }
+    #[test]
+    fn remote_image_reencoding_does_not_echo_and_a_later_local_copy_is_shared() {
+        let image = Value::Image {
+            width: 2,
+            height: 1,
+            rgba: vec![255, 0, 0, 255, 0, 255, 0, 128],
+        };
+        let mut bytes = Vec::new();
+        use image::ImageEncoder;
+        if let Value::Image {
+            width,
+            height,
+            rgba,
+        } = &image
+        {
+            image::codecs::png::PngEncoder::new_with_quality(
+                &mut bytes,
+                image::codecs::png::CompressionType::Best,
+                image::codecs::png::FilterType::NoFilter,
+            )
+            .write_image(
+                rgba,
+                *width as u32,
+                *height as u32,
+                image::ExtendedColorType::Rgba8,
+            )
+            .unwrap();
+        }
+        assert_ne!(bytes, image.encode().unwrap().1);
+        let mut engine = Engine::default();
+        let mut backend = Fake::default();
+        let digest = hash(&bytes);
+        engine.receive(("image/png".into(), bytes, digest)).unwrap();
+        assert!(engine.step(&mut backend).unwrap().is_none());
+        assert!(engine.step(&mut backend).unwrap().is_none());
+        assert_eq!(backend.writes, 1);
+        backend.value = Some(Value::Text("New copy — привет\n".into()));
+        let content = engine.step(&mut backend).unwrap().unwrap();
+        assert_eq!(decode(content).unwrap(), backend.value.unwrap());
+    }
+    #[test]
+    fn a_busy_clipboard_retries_the_latest_received_value() {
+        let mut engine = Engine::default();
+        let mut backend = Fake {
+            fail: true,
+            ..Default::default()
+        };
+        engine
+            .receive(Value::Text("first".into()).encode().unwrap())
+            .unwrap();
+        assert!(engine.step(&mut backend).is_err());
+        engine
+            .receive(Value::Text("latest".into()).encode().unwrap())
+            .unwrap();
+        assert!(engine.step(&mut backend).unwrap().is_none());
+        assert_eq!(backend.value, Some(Value::Text("latest".into())));
+        assert_eq!(backend.writes, 1);
+    }
+    #[test]
+    fn the_controllers_own_copy_acknowledgement_preserves_native_clipboard_formats() {
+        let mut engine = Engine::default();
+        let mut backend = Fake {
+            value: Some(Value::Text("a local rich-text copy".into())),
+            ..Default::default()
+        };
+        let content = engine.step(&mut backend).unwrap().unwrap();
+        engine.receive(content).unwrap();
+        assert!(engine.step(&mut backend).unwrap().is_none());
+        assert_eq!(backend.writes, 0);
+    }
+    #[test]
+    fn malformed_payloads_are_rejected_without_any_native_write() {
+        assert!(decode(("text/plain".into(), vec![0xff], hash(&[0xff]))).is_err());
+        assert!(decode(("text/plain".into(), b"secret".to_vec(), "wrong".into())).is_err());
+        assert!(
+            decode((
+                "text/uri-list".into(),
+                b"file:///private".to_vec(),
+                hash(b"file:///private")
+            ))
+            .is_err()
+        );
+        assert!(decode(("image/png".into(), b"bad".to_vec(), hash(b"bad"))).is_err());
+        assert!(validate_image(4097, 1, 4097 * 4).is_err());
+        assert!(validate_image(1, 1, 3).is_err());
+    }
+    #[test]
+    fn disabled_worker_never_opens_native_clipboard_and_discards_queued_content() {
+        let opens = Arc::new(AtomicUsize::new(0));
+        let counter = opens.clone();
+        let clipboard = Clipboard::spawn(eframe::egui::Context::default(), move || {
+            counter.fetch_add(1, Ordering::SeqCst);
+            Ok(Box::new(Fake::default()))
+        })
+        .unwrap();
+        let content = Value::Text("must stay local".into()).encode().unwrap();
+        clipboard.receive(content.0, content.1, content.2);
+        std::thread::sleep(Duration::from_millis(50));
+        assert_eq!(opens.load(Ordering::SeqCst), 0);
+        assert!(clipboard.poll().is_empty());
+        clipboard.enabled(true);
+        clipboard.enabled(false);
+        assert!(clipboard.poll().is_empty());
+        assert!(clipboard.status().is_none());
+    }
+
+    #[test]
+    fn worker_wakes_hidden_root_and_discards_copies_when_disabled() {
+        struct SharedFake(Arc<Mutex<Fake>>);
+        impl Backend for SharedFake {
+            fn read(&mut self) -> Result<Option<Value>> {
+                self.0.lock().unwrap().read()
+            }
+            fn write(&mut self, value: &Value) -> Result<()> {
+                self.0.lock().unwrap().write(value)
+            }
+        }
+        fn wait(mut condition: impl FnMut() -> bool) {
+            let since = std::time::Instant::now();
+            while !condition() {
+                assert!(
+                    since.elapsed() < Duration::from_secs(2),
+                    "clipboard worker did not respond"
+                );
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        }
+        let ctx = eframe::egui::Context::default();
+        for _ in 0..8 {
+            let _ = ctx.run_ui(Default::default(), |_| {});
+        }
+        let wakes = Arc::new(AtomicUsize::new(0));
+        let reported = wakes.clone();
+        ctx.set_request_repaint_callback(move |request| {
+            assert_eq!(request.viewport_id, eframe::egui::ViewportId::ROOT);
+            reported.fetch_add(1, Ordering::SeqCst);
+        });
+        let fake = Arc::new(Mutex::new(Fake {
+            value: Some(Value::Text("local".into())),
+            ..Default::default()
+        }));
+        let backend = fake.clone();
+        let clipboard =
+            Clipboard::spawn(ctx, move || Ok(Box::new(SharedFake(backend.clone())))).unwrap();
+        clipboard.enabled(true);
+        wait(|| clipboard.shared.state.lock().unwrap().outgoing.is_some());
+        assert_eq!(
+            decode(clipboard.poll().pop().unwrap()).unwrap(),
+            Value::Text("local".into())
+        );
+        assert!(wakes.load(Ordering::SeqCst) > 0);
+        let (mime, bytes, digest) = Value::Text("remote".into()).encode().unwrap();
+        clipboard.receive(mime, bytes, digest);
+        wait(|| fake.lock().unwrap().writes == 1);
+        assert!(
+            clipboard.poll().is_empty(),
+            "remote writes must not be echoed"
+        );
+        fake.lock().unwrap().value = Some(Value::Text("queued before disable".into()));
+        wait(|| clipboard.shared.state.lock().unwrap().outgoing.is_some());
+        clipboard.enabled(false);
+        assert!(
+            clipboard.poll().is_empty(),
+            "disabling must discard queued outgoing data"
+        );
+        let (mime, bytes, digest) = Value::Text("must be ignored".into()).encode().unwrap();
+        clipboard.receive(mime, bytes, digest);
+        std::thread::sleep(Duration::from_millis(30));
+        assert_eq!(fake.lock().unwrap().writes, 1);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn gnome_bridge_uses_a_private_bus_and_real_binary_payloads() {
+        const MARKER: &str = "DESK_SWITCH_CLIPBOARD_PRIVATE_BUS";
+        if std::env::var(MARKER).as_deref() != Ok("1") {
+            let output = std::process::Command::new("dbus-run-session")
+                .arg("--")
+                .arg(std::env::current_exe().unwrap())
+                .args(["--exact", "group::clipboard::tests::gnome_bridge_uses_a_private_bus_and_real_binary_payloads", "--nocapture"])
+                .env(MARKER, "1")
+                .env("DESK_SWITCH_CLIPBOARD_PARENT_BUS", std::env::var("DBUS_SESSION_BUS_ADDRESS").unwrap_or_default())
+                .output()
+                .expect("dbus-run-session is required for the private clipboard protocol test");
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        let address = std::env::var("DBUS_SESSION_BUS_ADDRESS").unwrap();
+        assert!(!address.is_empty());
+        assert_ne!(
+            Some(address),
+            std::env::var("DESK_SWITCH_CLIPBOARD_PARENT_BUS").ok()
+        );
+        #[derive(Clone)]
+        struct Mock {
+            state: Arc<Mutex<(u32, String, Vec<u8>)>>,
+        }
+        #[zbus::interface(name = "io.github.siarheisinelnikau.DeskSwitch.Clipboard")]
+        impl Mock {
+            fn version(&self) -> u32 {
+                1
+            }
+            fn read(&self, known: u32) -> (u32, String, Vec<u8>) {
+                let state = self.state.lock().unwrap();
+                if state.0 == known {
+                    (state.0, String::new(), Vec::new())
+                } else {
+                    state.clone()
+                }
+            }
+            fn write(&self, mime: String, bytes: Vec<u8>) -> u32 {
+                let mut state = self.state.lock().unwrap();
+                state.0 += 1;
+                state.1 = mime;
+                state.2 = bytes;
+                state.0
+            }
+        }
+        let state = Arc::new(Mutex::new((
+            1,
+            "text/plain".to_owned(),
+            "Fixture — привет\n".as_bytes().to_vec(),
+        )));
+        let _server = zbus::blocking::connection::Builder::session()
+            .unwrap()
+            .name("io.github.siarheisinelnikau.DeskSwitch.Clipboard")
+            .unwrap()
+            .serve_at(
+                "/io/github/siarheisinelnikau/DeskSwitch/Clipboard",
+                Mock {
+                    state: state.clone(),
+                },
+            )
+            .unwrap()
+            .build()
+            .unwrap();
+        let mut bridge = gnome::Gnome::new().unwrap();
+        assert_eq!(
+            bridge.read().unwrap(),
+            Some(Value::Text("Fixture — привет\n".into()))
+        );
+        assert!(bridge.read().unwrap().is_none());
+        let image = Value::Image {
+            width: 2,
+            height: 1,
+            rgba: vec![255, 0, 0, 255, 0, 255, 0, 128],
+        };
+        bridge.write(&image).unwrap();
+        assert!(bridge.read().unwrap().is_none());
+        let stored = state.lock().unwrap().clone();
+        let digest = hash(&stored.2);
+        assert_eq!(decode((stored.1, stored.2, digest)).unwrap(), image);
+        let text = Value::Text("Another synthetic copy".into())
+            .encode()
+            .unwrap();
+        *state.lock().unwrap() = (3, text.0, text.1);
+        assert_eq!(
+            bridge.read().unwrap(),
+            Some(Value::Text("Another synthetic copy".into()))
+        );
+    }
+}

@@ -24,17 +24,22 @@ def main():
         raise SystemExit("Configure DESK_SWITCH_UPDATE_SIGNING_KEY in the release environment before publishing.")
     data = key.encode() if key.startswith("-----BEGIN") else base64.b64decode(key, validate=True)
     version = tomllib.loads((ROOT / "Cargo.toml").read_text())["package"]["version"]
+    names = asset_names(version)
     with tempfile.TemporaryDirectory(prefix="desk-switch-ci-sign-", dir=os.environ.get("RUNNER_TEMP")) as directory:
         path = Path(directory) / "signing-key.pem"
         path.write_bytes(data)
         path.chmod(0o600)
-        subprocess.run([
+        command = [
             sys.executable, str(ROOT / "tools/prepare_release.py"),
             "--windows", str(ROOT / "artifacts/desk-switch.exe"),
-            "--deb", str(ROOT / "artifacts" / asset_names(version)["linux-x86_64-deb"]),
+            "--deb", str(ROOT / "artifacts" / names["linux-x86_64-deb"]),
             "--tag", f"v{version}", "--key", str(path),
             "--out", str(ROOT / "dist/signed"),
-        ], check=True)
+        ]
+        for target, flag in [("macos-arm64-app", "--macos-arm64"), ("macos-x86_64-app", "--macos-x86-64")]:
+            if target in names:
+                command.extend([flag, str(ROOT / "artifacts" / names[target])])
+        subprocess.run(command, check=True)
     manifest = ROOT / f"release/manifests/{version}.json"
     manifest.parent.mkdir(parents=True, exist_ok=True)
     shutil.copyfile(ROOT / "dist/signed/update.json", manifest)

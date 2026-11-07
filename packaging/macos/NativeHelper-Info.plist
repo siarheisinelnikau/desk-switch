@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+<key>CFBundleIdentifier</key><string>com.deskswitch.NativeHelper</string>
+<key>CFBundleName</key><string>Desk Switch</string>
+<key>NSMicrophoneUsageDescription</key><string>Desk Switch shares the microphone you explicitly selected with your linked computers.</string>
+<key>NSAudioCaptureUsageDescription</key><string>Desk Switch shares system audio with the listening computer you selected.</string>
+</dict></plist>

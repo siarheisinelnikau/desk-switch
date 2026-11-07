@@ -14,7 +14,7 @@ pub struct Diagnostics {
 impl Diagnostics {
     pub fn validate(&self) -> Result<()> {
         ensure!(
-            ["", "linux", "windows"].contains(&self.platform.as_str()),
+            ["", "linux", "windows", "macos"].contains(&self.platform.as_str()),
             "invalid diagnostics platform"
         );
         ensure!(

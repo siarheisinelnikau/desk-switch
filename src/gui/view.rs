@@ -427,7 +427,7 @@ impl Desktop {
                         .color(Color32::WHITE),
                 );
                 ui.label(
-                    RichText::new(crate::i18n::tr("ДВА ПК. ОДНО МЕСТО."))
+                    RichText::new(crate::i18n::tr("YOUR COMPUTERS. ONE WORKSPACE."))
                         .size(10.0)
                         .color(Color32::from_rgb(150, 160, 184)),
                 );
@@ -497,6 +497,10 @@ impl Desktop {
                         return;
                     }
                     match self.page {
+                        Page::Overview if self.group.workspace.is_some() => self.group_overview(ui),
+                        Page::Application if self.group.workspace.is_some() => {
+                            self.group_settings(ui)
+                        }
                         Page::Overview => self.overview(ui),
                         Page::Application => self.application(ui),
                         Page::Diagnostics => self.diagnostics(ui),
@@ -523,7 +527,7 @@ impl Desktop {
     fn overview(&mut self, ui: &mut egui::Ui) {
         title(
             ui,
-            "Два компьютера. Всё вместе.",
+            "Your computers. One workspace.",
             "Свяжите ПК один раз. Устройства и настройки согласуются автоматически.",
         );
         card(ui, |ui| {
@@ -2003,17 +2007,25 @@ impl Desktop {
                     });
                     note(ui, self.cable_platform.archive());
                     ui.horizontal_wrapped(|ui| {
-                        ui.label(crate::i18n::tr("Extract on:"));
+                        ui.label(crate::i18n::tr("Computer:"));
                         ui.selectable_value(&mut self.cable_remote, false, crate::i18n::tr("This PC"));
                         ui.add_enabled_ui(self.pair.remote.as_ref().is_some_and(|node| node.management.is_some()), |ui| {
                             let name = self.settings_peer_name();
                             ui.selectable_value(&mut self.cable_remote, true, name);
                         });
                     });
-                    if ui.button(crate::i18n::tr("Extract saved installer")).clicked() { self.extract_cable(ctx); }
+                    let platform = if self.cable_remote { self.pair.remote.as_ref().map(|node| node.diagnostics.platform.as_str()).unwrap_or("") } else { std::env::consts::OS };
+                    let can_run = self.cable_platform.can_run_on(platform);
+                    let online = !self.cable_remote || self.group.workspace.as_ref().is_none_or(|state| state.members.get(&self.peer_key).is_some_and(|member| member.online));
+                    ui.horizontal_wrapped(|ui| {
+                        if ui.add_enabled(can_run && online, egui::Button::new(crate::i18n::tr("Run official installer"))).clicked() { self.install_cable(ctx); }
+                        if ui.button(crate::i18n::tr("Extract saved installer")).clicked() { self.extract_cable(ctx); }
+                    });
+                    if !can_run { note(ui, "Choose the matching Windows or macOS archive to run an installer on the selected computer. Ubuntu provides its virtual microphone without VB-CABLE."); }
+                    note(ui, "Opens the official standalone installer on the selected computer. Approve the operating system prompt and complete its steps. Opening the installer does not confirm installation.");
                 });
-                if busy { note(ui, "Extracting the original archive…"); }
-                if self.cable_remote_done { note(ui, "Extracted to Downloads / Desk Switch on the other PC."); }
+                if busy { note(ui, "Preparing the installer on the selected computer…"); }
+                if self.cable_remote_done { note(ui, "The request completed on the other computer. For installation, finish the official installer there; extraction alone does not install the driver."); }
                 if let Some(result) = &self.cable_result {
                     match result {
                         Ok(path) => {
@@ -2024,7 +2036,7 @@ impl Desktop {
                         Err(error) => { ui.colored_label(palette(ui).error, crate::i18n::tr(error)); }
                     }
                 }
-                note(ui, "Files are saved in Downloads / Desk Switch. The driver is installed manually; follow the included readme. Desk Switch supports Windows and Ubuntu; the macOS installer is provided as a backup.");
+                note(ui, "Original files are saved in Downloads / Desk Switch and remain available for manual installation. Follow the included readme; a computer restart may be required.");
             });
         self.cable_open = open;
     }

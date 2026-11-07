@@ -23,6 +23,11 @@ pub trait Monitor: Send + 'static {
     fn write(&mut self, input: u16) -> Result<()>;
 }
 
+pub fn select_once(mut monitor: impl Monitor, input: u16) -> Result<()> {
+    anyhow::ensure!(input != 0, "Select a valid monitor input");
+    write(&mut monitor, input)
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Job {
     Read,

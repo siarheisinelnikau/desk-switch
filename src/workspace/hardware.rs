@@ -481,6 +481,39 @@ pub struct InputEndpoint {
     pub mouse: bool,
 }
 
+#[cfg(target_os = "macos")]
+pub fn input_devices() -> Result<Vec<InputEndpoint>> {
+    #[derive(serde::Deserialize)]
+    struct Devices {
+        keyboards: Vec<String>,
+        mice: Vec<String>,
+    }
+    let devices: Devices = crate::macos_native::query("input-devices", &[])?;
+    let mut endpoints = Vec::new();
+    for (id, names, keyboard, mouse) in [
+        ("macos-keyboards", devices.keyboards, true, false),
+        ("macos-mice", devices.mice, false, true),
+    ] {
+        if !names.is_empty() {
+            endpoints.push(InputEndpoint {
+                info: AudioDevice {
+                    id: id.into(),
+                    name: format!(
+                        "Attached physical {}: {}",
+                        if keyboard { "keyboards" } else { "pointers" },
+                        names.join(", ")
+                    ),
+                    default: true,
+                },
+                path: PathBuf::new(),
+                keyboard,
+                mouse,
+            });
+        }
+    }
+    Ok(endpoints)
+}
+
 #[cfg(target_os = "linux")]
 pub fn inputs() -> Result<(bool, bool, Vec<PathBuf>)> {
     let devices = input_devices()?;

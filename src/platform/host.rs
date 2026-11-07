@@ -44,25 +44,43 @@ pub async fn connect<C: Cursor>(
     address: SocketAddr,
     identity: Identity,
     peer: Key,
+    io: Coordinator<C>,
+) -> Result<()> {
+    let gate = io.gate.clone();
+    let result = connect_mode(address, identity, peer, io, crate::lifecycle::group_input()).await;
+    gate.emergency();
+    result
+}
+
+async fn connect_mode<C: Cursor>(
+    address: SocketAddr,
+    identity: Identity,
+    peer: Key,
     mut io: Coordinator<C>,
+    group: bool,
 ) -> Result<()> {
     let shutdown = crate::lifecycle::shutdown();
     tokio::pin!(shutdown);
     loop {
-        let connection = tokio::select! {
-            result = &mut shutdown => { result?; break; }
-            result = async {
-                let stream = timeout(Duration::from_secs(2), TcpStream::connect(address)).await??;
-                Pipe::connect(stream, &identity, &peer, true).await
-            } => result,
+        let connection = async {
+            let stream = timeout(Duration::from_secs(2), TcpStream::connect(address)).await??;
+            Pipe::connect(stream, &identity, &peer, true).await
+        };
+        tokio::pin!(connection);
+        let connection = loop {
+            tokio::select! {
+                result = &mut shutdown => { result?; return Ok(()); }
+                control = io.controls.recv(), if group => {
+                    waiting_group_control(control.context("host hook stopped")?, &io.gate);
+                }
+                result = &mut connection => break result,
+            }
         };
         match connection {
             Ok(mut pipe) => {
                 println!("peer authenticated.");
-                crate::lifecycle::report(crate::lifecycle::Event::Input(
-                    crate::lifecycle::InputStatus::Here,
-                ));
                 let mut handoff = Handoff::new(io.video.as_ref().map(|(inputs, _)| *inputs));
+                handoff.group = group;
                 let result = tokio::select! {
                     result = &mut shutdown => { result?; None }
                     result = handoff.run(&mut pipe, &mut io) => Some(result),
@@ -91,22 +109,50 @@ pub async fn connect<C: Cursor>(
                 }
             }
             Err(error) => {
-                io.gate.emergency();
+                // No remote route exists before authentication. A group hotkey
+                // may already be queued with Hold, so leave that token for the
+                // waiting-control handler instead of invalidating its cycle.
+                if !group {
+                    io.gate.emergency();
+                }
                 crate::lifecycle::report(crate::lifecycle::Event::Input(
                     crate::lifecycle::InputStatus::Waiting,
                 ));
                 eprintln!("Waiting for peer: {error:#}");
             }
         }
-        tokio::select! {
-            result = &mut shutdown => { result?; break; }
-            _ = sleep(Duration::from_secs(1)) => {}
+        let backoff = sleep(Duration::from_secs(1));
+        tokio::pin!(backoff);
+        loop {
+            tokio::select! {
+                result = &mut shutdown => { result?; return Ok(()); }
+                control = io.controls.recv(), if group => {
+                    waiting_group_control(control.context("host hook stopped")?, &io.gate);
+                }
+                _ = &mut backoff => break,
+            }
         }
     }
     Ok(())
 }
 
+fn waiting_group_control(control: Control, gate: &Gate) {
+    let (token, event) = match control {
+        Control::Toggle(token) => (token, crate::lifecycle::Event::CycleInput),
+        Control::Edge { token, position } => {
+            (token, crate::lifecycle::Event::CycleInputEdge(position))
+        }
+    };
+    if gate.current() == (token, Route::Hold) {
+        gate.local(token);
+        crate::lifecycle::report(event);
+    }
+}
+
 struct Handoff {
+    group: bool,
+    group_requested: bool,
+    group_entry: Option<u16>,
     logic: Controller,
     token: Option<u64>,
     deadline: Option<Instant>,
@@ -201,6 +247,9 @@ async fn next_message(
 impl Handoff {
     fn new(inputs: Option<Inputs>) -> Self {
         Self {
+            group: crate::lifecycle::group_input(),
+            group_requested: false,
+            group_entry: None,
             logic: Controller::new(inputs),
             token: None,
             deadline: None,
@@ -234,10 +283,10 @@ impl Handoff {
         let mut ping = interval(PING_PERIOD);
         tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
         ping.set_missed_tick_behavior(MissedTickBehavior::Skip);
+        let mut commands = crate::lifecycle::commands();
         crate::lifecycle::report(crate::lifecycle::Event::Input(
             crate::lifecycle::InputStatus::Here,
         ));
-        let mut commands = crate::lifecycle::commands();
         let mut heartbeat = Heartbeat::new();
         loop {
             heartbeat.check()?;
@@ -255,7 +304,16 @@ impl Handoff {
             let effect = tokio::select! {
                 command = commands.recv() => {
                     match command {
-                        Ok(crate::lifecycle::Command::Switch) => io.cursor.request_toggle().await?,
+                        Ok(crate::lifecycle::Command::Switch) => { self.group_requested = true; self.group_entry = None; io.cursor.request_toggle().await?; }
+                        Ok(crate::lifecycle::Command::SwitchEdge(position)) if self.group && io.edge.is_some() => {
+                            self.group_requested = true;
+                            self.group_entry = Some(position);
+                            io.cursor.request_toggle().await?;
+                        }
+                        Ok(crate::lifecycle::Command::EnterEdge(position)) if self.group && self.logic.is_local() => {
+                            if let Some(edge) = &io.edge { io.cursor.enter(edge, position).await?; }
+                        }
+                        Ok(crate::lifecycle::Command::SwitchEdge(_) | crate::lifecycle::Command::EnterEdge(_)) => {},
                         Ok(crate::lifecycle::Command::SetupSwitch) => { self.allow_setup = true; io.cursor.request_toggle().await?; }
                         Ok(crate::lifecycle::Command::Emergency) => io.gate.emergency(),
                         Ok(crate::lifecycle::Command::MicrophoneVolume(_)) | Err(_) => {}
@@ -274,19 +332,35 @@ impl Handoff {
                     let control = control.context("host hook stopped")?;
                     match control {
                         Control::Toggle(token) if io.gate.current() == (token, Route::Hold) => {
-                            let setup = std::mem::take(&mut self.allow_setup);
-                            if self.logic.is_local() {
-                                if io.video.is_none() && (io.monitor_required)() && !setup {
+                            if self.group && !std::mem::take(&mut self.group_requested) {
+                                crate::lifecycle::report(crate::lifecycle::Event::CycleInput);
+                                if self.logic.is_remote() {
+                                    self.returning(None, true)?
+                                } else {
                                     io.gate.local(token);
-                                    crate::lifecycle::report(crate::lifecycle::Event::Switch { error: Some("Remember the video connection on both PCs before switching the shared monitor.".into()) });
                                     continue;
                                 }
-                                self.start(token, if io.video.is_some() {Mode::Video} else {Mode::Input}, None)?
-                            } else if self.logic.is_remote() {
-                                self.returning(None, true)?
-                            } else { continue; }
+                            } else {
+                                let entry = self.group_entry.take();
+                                let setup = std::mem::take(&mut self.allow_setup);
+                                if self.logic.is_local() {
+                                    if io.video.is_none() && (io.monitor_required)() && !setup {
+                                        io.gate.local(token);
+                                        crate::lifecycle::report(crate::lifecycle::Event::Switch { error: Some("Remember the video connection on both PCs before switching the shared monitor.".into()) });
+                                        continue;
+                                    }
+                                    self.start(token, if io.video.is_some() {Mode::Video} else {Mode::Input}, entry)?
+                                } else if self.logic.is_remote() {
+                                    self.returning(None, true)?
+                                } else { continue; }
+                            }
                         }
                         Control::Edge { token, position } if io.gate.current() == (token, Route::Hold) && self.logic.is_local() => {
+                            if self.group {
+                                io.gate.local(token);
+                                crate::lifecycle::report(crate::lifecycle::Event::CycleInputEdge(position));
+                                continue;
+                            }
                             if io.video.is_none() && (io.monitor_required)() {
                                 io.gate.local(token);
                                 continue;
@@ -321,6 +395,7 @@ impl Handoff {
                             let token = self.token.context("missing host route token")?;
                             // A simultaneous F12 has already put the hook in Hold and queued a return.
                             if !io.gate.hold(token) { continue; }
+                            if self.group { crate::lifecycle::report(crate::lifecycle::Event::CycleInputEdge(position)); }
                             self.returning(Some(position), false)?
                         }
                         Message::ExitEdge { id, .. } if self.logic.id() == Some(id) => continue,
@@ -564,6 +639,226 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn group_hotkeys_and_edge_fail_open_while_peer_authentication_is_stalled() {
+        let host = identity();
+        let peer = identity();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let gate = Arc::new(Gate::new());
+        let (send, controls) = mpsc::channel(8);
+        let (_event_send, events) = mpsc::channel(8);
+        let io = Coordinator {
+            gate: gate.clone(),
+            edge: None,
+            video: None,
+            controls,
+            events,
+            cursor: FixtureCursor {
+                gate: gate.clone(),
+                controls: send.clone(),
+                toggles: Arc::new(AtomicUsize::new(0)),
+            },
+            monitor_required: || false,
+        };
+        let source = connect_mode(address, host, peer.public, io, true);
+        let destination = async {
+            let (_stalled_connection, _) = listener.accept().await.unwrap();
+            for edge in [false, true] {
+                let token = gate.begin().unwrap();
+                send.send(if edge {
+                    Control::Edge {
+                        token,
+                        position: 21_845,
+                    }
+                } else {
+                    Control::Toggle(token)
+                })
+                .await
+                .unwrap();
+                timeout(Duration::from_millis(250), async {
+                    while gate.current().1 != Route::Local {
+                        sleep(Duration::from_millis(1)).await;
+                    }
+                })
+                .await
+                .expect(
+                    "group control waited for the heartbeat lease before restoring local input",
+                );
+                assert!(
+                    !gate.forward(token),
+                    "a late auth completion could reuse the released token"
+                );
+            }
+        };
+        timeout(Duration::from_secs(2),async {
+            tokio::select! { result=source=>panic!("authentication unexpectedly finished: {result:?}"),_=destination=>{} }
+        }).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn group_cycle_returns_active_input_without_breaking_the_authenticated_session() {
+        let host = identity();
+        let peer = identity();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let gate = Arc::new(Gate::new());
+        let toggles = Arc::new(AtomicUsize::new(0));
+        let (send, controls) = mpsc::channel(8);
+        let (_event_send, events) = mpsc::channel(8);
+        let mut io = Coordinator {
+            gate: gate.clone(),
+            edge: Some(Edge {
+                mode: Mode::Input,
+                screen: "auto".into(),
+                side: crate::edge::Side::Right,
+            }),
+            video: None,
+            controls,
+            events,
+            cursor: FixtureCursor {
+                gate: gate.clone(),
+                controls: send,
+                toggles: toggles.clone(),
+            },
+            monitor_required: || false,
+        };
+        let source = async {
+            let mut pipe = Pipe::connect(
+                TcpStream::connect(address).await.unwrap(),
+                &host,
+                &peer.public,
+                true,
+            )
+            .await
+            .unwrap();
+            let mut handoff = Handoff::new(None);
+            handoff.group = true;
+            // Model one explicit group activation arriving from the GUI. Later
+            // F12 requests are forwarded to the group and return this link home.
+            handoff.group_requested = true;
+            handoff.group_entry = Some(21_845);
+            assert!(handoff.run(&mut pipe, &mut io).await.is_err());
+        };
+        let destination = async {
+            let mut pipe = Pipe::connect(
+                listener.accept().await.unwrap().0,
+                &peer,
+                &host.public,
+                false,
+            )
+            .await
+            .unwrap();
+            pipe.send(Message::SwitchRequested).await.unwrap();
+            assert_eq!(
+                next(&mut pipe).await,
+                Message::Prepare {
+                    id: 1,
+                    inputs: None,
+                    edge: Some(21_845)
+                }
+            );
+            pipe.send(Message::Ready(1)).await.unwrap();
+            assert_eq!(next(&mut pipe).await, Message::Activate(1));
+            pipe.send(Message::Active(1)).await.unwrap();
+            while gate.current().1 != Route::Remote {
+                sleep(Duration::from_millis(1)).await;
+            }
+            pipe.send(Message::SwitchRequested).await.unwrap();
+            assert_eq!(next(&mut pipe).await, Message::Return(1));
+            pipe.send(Message::Returning(1)).await.unwrap();
+            assert_eq!(next(&mut pipe).await, Message::Returned(1));
+            while gate.current().1 != Route::Local {
+                sleep(Duration::from_millis(1)).await;
+            }
+            // No reconnect or second switch is necessary while the group picks
+            // its next destination; the existing heartbeat continues normally.
+            match pipe.messages.recv().await.unwrap().unwrap() {
+                Message::Ping(nonce) => pipe.send(Message::Pong(nonce)).await.unwrap(),
+                message => panic!("unexpected command after group return: {message:?}"),
+            }
+        };
+        timeout(Duration::from_secs(3), async {
+            tokio::join!(source, destination);
+        })
+        .await
+        .unwrap();
+        assert_eq!(toggles.load(SeqCst), 2);
+        assert!(gate.current().1 == Route::Local);
+    }
+
+    #[tokio::test]
+    async fn group_hotkey_is_actionable_during_reconnect_backoff() {
+        let host = identity();
+        let host_public = host.public;
+        let peer = identity();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let gate = Arc::new(Gate::new());
+        let (send, controls) = mpsc::channel(8);
+        let (_event_send, events) = mpsc::channel(8);
+        let io = Coordinator {
+            gate: gate.clone(),
+            edge: None,
+            video: None,
+            controls,
+            events,
+            cursor: FixtureCursor {
+                gate: gate.clone(),
+                controls: send.clone(),
+                toggles: Arc::new(AtomicUsize::new(0)),
+            },
+            monitor_required: || false,
+        };
+        let source = connect_mode(address, host, peer.public, io, true);
+        let destination = async {
+            let pipe = Pipe::connect(
+                listener.accept().await.unwrap().0,
+                &peer,
+                &host_public,
+                false,
+            )
+            .await
+            .unwrap();
+            drop(pipe);
+            while gate.reason() != "the emergency key was pressed" {
+                sleep(Duration::from_millis(1)).await;
+            }
+            let token = gate.begin().unwrap();
+            send.send(Control::Toggle(token)).await.unwrap();
+            timeout(Duration::from_millis(250), async {
+                while gate.current().1 != Route::Local {
+                    sleep(Duration::from_millis(1)).await;
+                }
+            })
+            .await
+            .expect("F12 was held for the reconnect backoff");
+            assert!(!gate.forward(token));
+        };
+        timeout(Duration::from_secs(3),async {
+            tokio::select!{result=source=>panic!("host reconnect loop exited: {result:?}"),_=destination=>{}}
+        }).await.unwrap();
+    }
+
+    #[test]
+    fn queued_group_control_cannot_revoke_a_newer_route() {
+        let gate = Gate::new();
+        let stale = gate.begin().unwrap();
+        gate.emergency();
+        let current = gate.begin().unwrap();
+        waiting_group_control(Control::Toggle(stale), &gate);
+        assert!(gate.current() == (current, Route::Hold));
+        waiting_group_control(
+            Control::Edge {
+                token: current,
+                position: 2_048,
+            },
+            &gate,
+        );
+        assert!(gate.current().1 == Route::Local);
+        assert!(!gate.forward(current));
+    }
+
+    #[tokio::test]
     async fn authenticated_tray_request_switches_video_and_input_in_both_directions() {
         let host = identity();
         let peer = identity();
@@ -775,10 +1070,14 @@ mod tests {
         let a = identity();
         let b = identity();
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let (a_stream, b_stream) = tokio::join!(
-            TcpStream::connect(listener.local_addr().unwrap()),
-            listener.accept()
-        );
+        let (a_stream, b_stream) = timeout(Duration::from_secs(2), async {
+            tokio::join!(
+                TcpStream::connect(listener.local_addr().unwrap()),
+                listener.accept()
+            )
+        })
+        .await
+        .expect("localhost fixture did not connect");
         let (a_pipe, b_pipe) = tokio::join!(
             Pipe::connect(a_stream.unwrap(), &a, &b.public, true),
             Pipe::connect(b_stream.unwrap().0, &b, &a.public, false)
