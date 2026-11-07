@@ -504,7 +504,7 @@
   "Switch the shared monitor": "Switch the shared monitor",
   "Switch to computer…": "Switch to computer…",
   "Switch to next computer": "Switch to next computer",
-  "Text and images. Files are planned for a later release.": "Text and images. Files are planned for a later release.",
+  "Text and images.": "Text and images.",
   "This computer uses the shared monitor": "This computer uses the shared monitor",
   "Unavailable": "Unavailable",
   "Virtual microphone": "Virtual microphone",
@@ -573,5 +573,12 @@
   "Nearby computers will appear here. You can also connect by IP address.": "Nearby computers will appear here. You can also connect by IP address.",
   "Use an IP address": "Use an IP address",
   "Connection requested. Approve it on the other computer.": "Connection requested. Approve it on the other computer.",
-  "The connection was not approved. Check the address and try again.": "The connection was not approved. Check the address and try again."
+  "The connection was not approved. Check the address and try again.": "The connection was not approved. Check the address and try again.",
+  "Reconnect the workspace controller before adding another computer.": "Reconnect the workspace controller before adding another computer.",
+  "Not shared": "Not shared",
+  "Monitor switch failed": "Monitor switch failed",
+  "Monitor input unknown": "Monitor input unknown",
+  "Monitor port is not configured": "Monitor port is not configured",
+  "The monitor view updates when you switch with Desk Switch.": "The monitor view updates when you switch with Desk Switch.",
+  "Device colour shows which PC it comes from": "Device colour shows which PC it comes from"
 }

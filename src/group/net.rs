@@ -12,7 +12,7 @@ use anyhow::{Context, Result, bail, ensure};
 use eframe::egui;
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::{BTreeMap, VecDeque},
+    collections::{BTreeMap, BTreeSet, VecDeque},
     net::SocketAddr,
     path::{Path, PathBuf},
     sync::{Arc, Mutex, mpsc},
@@ -80,6 +80,10 @@ pub enum Action {
         position: u16,
     },
     ReturnInput,
+    MonitorResult {
+        id: u64,
+        error: Option<String>,
+    },
     Invite {
         address: SocketAddr,
         key: String,
@@ -118,6 +122,10 @@ pub enum Event {
         mime: String,
         bytes: Vec<u8>,
         digest: String,
+    },
+    Reconnecting {
+        key: String,
+        reason: String,
     },
     Error(String),
 }
@@ -183,9 +191,96 @@ enum Incoming {
         candidate: Candidate,
         member: Box<Member>,
         controller: bool,
+        dial: Option<DialPermit>,
     },
     Packet(String, [u8; 32], Packet),
-    Closed(String, Option<[u8; 32]>, String),
+    Closed(String, Option<[u8; 32]>, Option<anyhow::Error>),
+}
+
+#[derive(Clone)]
+struct Internal {
+    sender: queue::Sender<Incoming>,
+    dialing: Arc<Mutex<BTreeSet<String>>>,
+}
+impl Internal {
+    async fn send(&self, event: Incoming) -> Result<()> {
+        self.sender
+            .send(event)
+            .await
+            .map_err(|_| anyhow::anyhow!("Workspace event loop stopped"))
+    }
+    fn reserve_dial(&self, peer: &str, address: SocketAddr) -> Option<DialPermit> {
+        let key = if peer.is_empty() {
+            format!("address:{}", canonical_address(address))
+        } else {
+            format!("peer:{peer}")
+        };
+        self.dialing
+            .lock()
+            .unwrap()
+            .insert(key.clone())
+            .then(|| DialPermit {
+                key,
+                dialing: self.dialing.clone(),
+            })
+    }
+}
+struct DialPermit {
+    key: String,
+    dialing: Arc<Mutex<BTreeSet<String>>>,
+}
+impl Drop for DialPermit {
+    fn drop(&mut self) {
+        self.dialing.lock().unwrap().remove(&self.key);
+    }
+}
+
+fn retryable_connection_error(error: &anyhow::Error) -> bool {
+    // A malformed authenticated packet remains a hard failure even when a
+    // wrapper also carries an I/O-shaped error. Never classify by message text.
+    let protocol_cause = |cause: &(dyn std::error::Error + 'static)| {
+        cause.is::<serde_json::Error>() || cause.is::<snow::Error>()
+    };
+    if error.chain().any(|cause| {
+        protocol_cause(cause)
+            || cause
+                .downcast_ref::<std::io::Error>()
+                .and_then(std::io::Error::get_ref)
+                .is_some_and(|inner| protocol_cause(inner))
+    }) {
+        return false;
+    }
+    error.chain().any(|cause| {
+        cause.is::<tokio::time::error::Elapsed>()
+            || cause.downcast_ref::<std::io::Error>().is_some_and(|error| {
+                matches!(
+                    error.kind(),
+                    std::io::ErrorKind::UnexpectedEof
+                        | std::io::ErrorKind::ConnectionReset
+                        | std::io::ErrorKind::ConnectionAborted
+                        | std::io::ErrorKind::BrokenPipe
+                        | std::io::ErrorKind::NotConnected
+                        | std::io::ErrorKind::TimedOut
+                        | std::io::ErrorKind::ConnectionRefused
+                        | std::io::ErrorKind::NetworkDown
+                        | std::io::ErrorKind::NetworkUnreachable
+                        | std::io::ErrorKind::HostUnreachable
+                        | std::io::ErrorKind::AddrNotAvailable
+                        | std::io::ErrorKind::Interrupted
+                        | std::io::ErrorKind::WouldBlock
+                        | std::io::ErrorKind::WriteZero
+                )
+            })
+    })
+}
+
+fn closure_event(key: String, known: bool, error: anyhow::Error) -> Event {
+    let reason = format!("{error:#}");
+    if known && retryable_connection_error(&error) {
+        Event::Reconnecting { key, reason }
+    } else {
+        Event::Error(reason)
+    }
 }
 
 pub struct Service {
@@ -362,6 +457,8 @@ fn load(dir: &Path, local: Member) -> Result<Workspace> {
             active_input_entry: None,
             activation: 0,
             active_monitor: None,
+            confirmed_monitor: None,
+            monitor_command: None,
         }
     };
     let mut local = local;
@@ -436,6 +533,8 @@ fn load(dir: &Path, local: Member) -> Result<Workspace> {
     }
     if let Some(saved) = state.members.get(&local.node.key) {
         local.preferences = saved.preferences.clone();
+        local.input_ready = saved.input_ready;
+        local.node.monitor_error = saved.node.monitor_error.clone();
     }
     state.members.insert(local.node.key.clone(), local);
     state.validate()?;
@@ -498,7 +597,8 @@ async fn setup(
     local: Member,
     state: Workspace,
     intent: Intent,
-    internal: queue::Sender<Incoming>,
+    internal: Internal,
+    dial: Option<DialPermit>,
 ) -> Result<()> {
     let peer = config::hex(&candidate.key);
     let trusted = state.members.contains_key(&peer);
@@ -594,6 +694,7 @@ async fn setup(
             candidate,
             member,
             controller,
+            dial,
         })
         .await?;
     Ok(())
@@ -606,8 +707,11 @@ fn dial(
     address: SocketAddr,
     expected: String,
     intent: Intent,
-    internal: queue::Sender<Incoming>,
+    internal: Internal,
 ) {
+    let Some(permit) = internal.reserve_dial(&expected, address) else {
+        return;
+    };
     let identity = config::Identity {
         private: identity.private,
         public: identity.public,
@@ -629,18 +733,26 @@ fn dial(
                 ),
             )
             .await??;
-            setup(candidate, local, state, intent, internal.clone()).await
+            setup(
+                candidate,
+                local,
+                state,
+                intent,
+                internal.clone(),
+                Some(permit),
+            )
+            .await
         }
         .await;
         if let Err(error) = result {
             let _ = internal
-                .send(Incoming::Closed(expected, None, format!("{error:#}")))
+                .send(Incoming::Closed(expected, None, Some(error)))
                 .await;
         }
     });
 }
 
-fn start_session(candidate: Candidate, internal: queue::Sender<Incoming>) -> Session {
+fn start_session(candidate: Candidate, internal: Internal) -> Session {
     let generation = candidate.connection;
     let (send, mut outgoing) = queue::channel(128);
     let (clipboard, mut clips) = tokio::sync::watch::channel::<Option<Arc<Packet>>>(None);
@@ -690,14 +802,7 @@ fn start_session(candidate: Candidate, internal: queue::Sender<Incoming>) -> Ses
         };
         reader.abort();
         let _ = internal
-            .send(Incoming::Closed(
-                key,
-                Some(generation),
-                result
-                    .err()
-                    .map(|error| format!("{error:#}"))
-                    .unwrap_or_default(),
-            ))
+            .send(Incoming::Closed(key, Some(generation), result.err()))
             .await;
     });
     Session {
@@ -715,6 +820,105 @@ struct Session {
     snapshot: tokio::sync::watch::Sender<Option<Arc<Packet>>>,
 }
 type Sessions = BTreeMap<String, Session>;
+
+const MAX_RETIRED_PER_PEER: usize = 4;
+#[derive(Default)]
+struct Links {
+    active: Sessions,
+    retired: BTreeMap<String, Vec<Session>>,
+}
+impl std::ops::Deref for Links {
+    type Target = Sessions;
+    fn deref(&self) -> &Self::Target {
+        &self.active
+    }
+}
+impl Links {
+    fn accepts(&self, key: &str, generation: [u8; 32]) -> Result<bool> {
+        if self
+            .active
+            .get(key)
+            .is_some_and(|session| session.generation <= generation)
+        {
+            return Ok(false);
+        }
+        ensure!(
+            self.retired
+                .get(key)
+                .is_none_or(|sessions| sessions.len() < MAX_RETIRED_PER_PEER),
+            "Too many unconfirmed workspace handovers for one computer"
+        );
+        Ok(true)
+    }
+    fn install(&mut self, key: String, session: Session) -> Result<bool> {
+        if !self.accepts(&key, session.generation)? {
+            return Ok(false);
+        }
+        if let Some(previous) = self.active.insert(key.clone(), session) {
+            // Retain all senders until a packet on the replacement proves the
+            // peer has activated it. Closing the old socket earlier can offline
+            // the peer before it processes its replacement Ready event.
+            self.retired.entry(key).or_default().push(previous);
+        }
+        Ok(true)
+    }
+    fn packet(&mut self, key: &str, generation: [u8; 32]) -> bool {
+        if !self
+            .active
+            .get(key)
+            .is_some_and(|session| session.generation == generation)
+        {
+            return false;
+        }
+        self.retired.remove(key);
+        true
+    }
+    fn closed(&mut self, key: &str, generation: [u8; 32]) -> bool {
+        if self
+            .active
+            .get(key)
+            .is_some_and(|session| session.generation == generation)
+        {
+            self.active.remove(key);
+            self.retired.remove(key);
+            return true;
+        }
+        if let Some(retired) = self.retired.get_mut(key) {
+            retired.retain(|session| session.generation != generation);
+            if retired.is_empty() {
+                self.retired.remove(key);
+            }
+        }
+        false
+    }
+    fn shutdown(&mut self) {
+        self.active.clear();
+        self.retired.clear();
+    }
+}
+
+fn close_session(
+    links: &mut Links,
+    state: &mut Workspace,
+    receipts: &mut UpdateReceipts,
+    own: &str,
+    key: &str,
+    generation: [u8; 32],
+) -> bool {
+    if !links.closed(key, generation) {
+        return false;
+    }
+    receipts.closed(key, &state.hub);
+    if let Some(member) = state.members.get_mut(key) {
+        member.online = false;
+    }
+    if key == state.hub {
+        for member in state.members.values_mut() {
+            member.online = member.node.key == own;
+        }
+    }
+    true
+}
 fn send(sessions: &Sessions, key: &str, packet: Packet) -> Result<()> {
     sessions
         .get(key)
@@ -793,7 +997,7 @@ fn apply(
     sessions: &Sessions,
     notify: &Notify,
     identity: &config::Identity,
-    internal: &queue::Sender<Incoming>,
+    internal: &Internal,
 ) -> Result<()> {
     ensure!(
         state.members.contains_key(source),
@@ -809,9 +1013,10 @@ fn apply(
             expected,
             value,
         } => state.set_member(&key, &expected, value)?,
-        Action::Activate { key } => state.activate(&key, None)?,
-        Action::ActivateEdge { key, position } => state.activate(&key, Some(position))?,
+        Action::Activate { key } => state.activate(source, &key, None)?,
+        Action::ActivateEdge { key, position } => state.activate(source, &key, Some(position))?,
         Action::ReturnInput => state.return_input()?,
+        Action::MonitorResult { id, error } => state.monitor_result(source, id, error)?,
         Action::Invite { address, key } => {
             if !key.is_empty() {
                 model::valid_key(&key)?;
@@ -926,7 +1131,7 @@ fn local_action(
     sessions: &Sessions,
     notify: &Notify,
     identity: &config::Identity,
-    internal: &queue::Sender<Incoming>,
+    internal: &Internal,
     receipts: &mut UpdateReceipts,
 ) -> Result<()> {
     if state.hub != own
@@ -993,7 +1198,7 @@ fn receive_packet(
     sessions: &Sessions,
     notify: &Notify,
     identity: &config::Identity,
-    internal: &queue::Sender<Incoming>,
+    internal: &Internal,
     receipts: &mut UpdateReceipts,
 ) -> Result<()> {
     ensure!(state.members.contains_key(key), "Unknown workspace member");
@@ -1008,9 +1213,10 @@ fn receive_packet(
             ensure!(remote.revision >= state.revision, "Stale controller state");
             let local = &state.members[own];
             let observed = remote.members.get_mut(own).unwrap();
+            let monitor_error = observed.node.monitor_error.clone();
             observed.node = local.node.clone();
+            observed.node.monitor_error = monitor_error;
             observed.native_output = local.native_output;
-            observed.input_ready = local.input_ready.min(remote.activation);
             remote.validate()?;
             *state = *remote;
         }
@@ -1120,9 +1326,13 @@ async fn run(
     let listener = TcpListener::from_std(listener)?;
     let identity = config::load_identity(&dir)?;
     let own = config::hex(&identity.public);
-    let (internal, mut incoming) = queue::channel(256);
+    let (sender, mut incoming) = queue::channel(256);
+    let internal = Internal {
+        sender,
+        dialing: Default::default(),
+    };
     let permits = Arc::new(tokio::sync::Semaphore::new(8));
-    let mut sessions = BTreeMap::new();
+    let mut sessions = Links::default();
     let mut receipts = UpdateReceipts::default();
     let mut approvals: BTreeMap<String, oneshot::Sender<bool>> = BTreeMap::new();
     let mut reconnect = tokio::time::interval(Duration::from_secs(3));
@@ -1139,11 +1349,14 @@ async fn run(
                     let identity = config::Identity { private: identity.private, public: identity.public };
                     tokio::spawn(async move {
                         let _permit = permit;
+                        let mut peer = String::new();
                         let result = async {
                             let candidate = timeout(AUTH, workspace::net::authenticate(stream, &identity, &local.node.name, false, None, local.address.port())).await??;
-                            setup(candidate, local, current, Intent::Invite, internal.clone()).await
+                            let key = config::hex(&candidate.key);
+                            if current.members.contains_key(&key) { peer = key; }
+                            setup(candidate, local, current, Intent::Invite, internal.clone(), None).await
                         }.await;
-                        if let Err(error) = result { let _ = internal.send(Incoming::Closed(String::new(), None, format!("{error:#}"))).await; }
+                        if let Err(error) = result { let _ = internal.send(Incoming::Closed(peer, None, Some(error))).await; }
                     });
                 }
             }
@@ -1172,18 +1385,24 @@ async fn run(
                 { notify.event(Event::Error(error.to_string())); }
             }
             _ = reconnect.tick() => {
-                if !connected_once && !state.members[&own].node.management.as_ref().is_none_or(|management|management.application.auto_connect) {continue;}
-                if state.hub != own && !sessions.contains_key(&state.hub) {
-                    if let Some(hub) = state.members.get(&state.hub) { dial(&identity, &state.members[&own], &state, hub.address, state.hub.clone(), Intent::Join, internal.clone()); }
-                } else if state.hub == own {
-                    for (key, member) in &state.members { if key != &own && !sessions.contains_key(key) { dial(&identity, &state.members[&own], &state, member.address, key.clone(), Intent::Invite, internal.clone()); } }
+                if state.hub == own {state.expire_monitor();}
+                if connected_once || state.members[&own].node.management.as_ref().is_none_or(|management|management.application.auto_connect) {
+                    if state.hub != own && !sessions.contains_key(&state.hub) {
+                        if let Some(hub) = state.members.get(&state.hub) { dial(&identity, &state.members[&own], &state, hub.address, state.hub.clone(), Intent::Join, internal.clone()); }
+                    } else if state.hub == own {
+                        for (key, member) in &state.members { if key != &own && !sessions.contains_key(key) { dial(&identity, &state.members[&own], &state, member.address, key.clone(), Intent::Invite, internal.clone()); } }
+                    }
                 }
             }
             event = incoming.recv() => match event.context("Workspace event loop stopped")? {
                 Incoming::Consent { request, accept } => { if !approvals.contains_key(&request.key) { approvals.insert(request.key.clone(), accept); notify.event(Event::Request(request)); } }
-                Incoming::Ready { candidate, member, controller } => {
+                Incoming::Ready { candidate, member, controller, dial: _dial } => {
                     let key = member.node.key.clone();
-                    if sessions.get(&key).is_some_and(|session:&Session| session.generation <= candidate.connection) { continue; }
+                    match sessions.accepts(&key, candidate.connection) {
+                        Ok(true) => {}
+                        Ok(false) => continue,
+                        Err(error) => {notify.event(Event::Error(error.to_string()));continue;}
+                    }
                     let result = (|| {
                         let mut next = state.clone();
                         let mut local_address = canonical_address(candidate.stream.local_addr()?);
@@ -1192,7 +1411,11 @@ async fn run(
                         if controller {
                             ensure!(state.hub == own, "Add computers through the workspace controller");
                             let mut member = *member;
-                            if let Some(saved) = state.members.get(&key) { member.preferences = saved.preferences.clone(); }
+                            if let Some(saved) = state.members.get(&key) {
+                                member.preferences = saved.preferences.clone();
+                                member.input_ready = saved.input_ready;
+                                member.node.monitor_error = saved.node.monitor_error.clone();
+                            }
                             next.members.insert(key.clone(), member);
                             next.revision = state.revision.checked_add(1).filter(|revision|*revision<u64::MAX).context("Workspace revision exhausted")?;
                         } else {
@@ -1203,7 +1426,7 @@ async fn run(
                         let connection = start_session(candidate, internal.clone());
                         if controller { connection.snapshot.send_replace(Some(Arc::new(Packet::State(Box::new(next.clone()))))); }
                         else { let local=&next.members[&own];connection.snapshot.send_replace(Some(Arc::new(Packet::Node(Box::new(local.node.clone()),local.native_output,local.input_ready)))); }
-                        sessions.insert(key, connection);
+                        ensure!(sessions.install(key, connection)?, "Workspace handover was superseded");
                         state = next;
                         connected_once = true;
                         Ok::<(), anyhow::Error>(())
@@ -1211,36 +1434,37 @@ async fn run(
                     if let Err(error) = result { notify.event(Event::Error(error.to_string())); }
                 }
                 Incoming::Packet(key, generation, packet) => {
-                    if !sessions.get(&key).is_some_and(|session| session.generation == generation) { continue; }
+                    if !sessions.packet(&key, generation) { continue; }
                     if let Err(error) = receive_packet(&key, packet, &own, &mut state, &sessions, &notify, &identity, &internal, &mut receipts) {
                         let _ = send(&sessions, &key, Packet::Error(workspace::management::status_text(error.to_string(),1024)));
                     }
                 }
                 Incoming::Closed(key, generation, error) => {
-                    if generation.is_some() && sessions.get(&key).is_some_and(|session| Some(session.generation) == generation) {
-                        sessions.remove(&key);
-                        receipts.closed(&key, &state.hub);
-                        if let Some(member) = state.members.get_mut(&key) { member.online = false; }
-                        if key == state.hub { for member in state.members.values_mut() { member.online = member.node.key == own; } }
+                    if let Some(generation) = generation && !close_session(&mut sessions, &mut state, &mut receipts, &own, &key, generation) { continue; }
+                    if let Some(error) = error && !key.is_empty() && !sessions.contains_key(&key) {
+                        notify.event(closure_event(key.clone(), state.members.contains_key(&key), error));
                     }
-                    if !error.is_empty() && !key.is_empty() && !sessions.contains_key(&key) { notify.event(Event::Error(error)); }
                 }
             }
         }
         if state != before {
             if state.hub == own {
                 state.bind_microphone();
-                if state
-                    .active_input
-                    .as_ref()
-                    .is_none_or(|key| !state.members.get(key).is_some_and(Member::compatible))
+                if !state.switch_pending()
+                    && state
+                        .active_input
+                        .as_ref()
+                        .is_none_or(|key| !state.members.get(key).is_some_and(Member::compatible))
                 {
                     state.active_input = state.plan().input;
                 }
                 broadcast(&sessions, &state);
             }
             notify.state(&state);
-            if (state.revision != before.revision || state.hub != before.hub)
+            if (state.revision != before.revision
+                || state.hub != before.hub
+                || state.monitor_command != before.monitor_command
+                || state.confirmed_monitor != before.confirmed_monitor)
                 && let Err(error) = save(&dir, &state)
             {
                 notify.event(Event::Error(format!(
@@ -1249,6 +1473,8 @@ async fn run(
             }
         }
     }
+    sessions.shutdown();
+    drop(incoming);
     save(&dir, &state)?;
     Ok(())
 }
@@ -1257,6 +1483,227 @@ async fn run(
 mod tests {
     use super::*;
     use std::time::Instant;
+
+    fn synthetic_session(generation: u8) -> (Session, queue::Receiver<Packet>) {
+        let (commands, receive) = queue::channel(1);
+        let (clipboard, _clips) = tokio::sync::watch::channel(None);
+        let (snapshot, _snapshots) = tokio::sync::watch::channel(None);
+        (
+            Session {
+                generation: [generation; 32],
+                commands,
+                clipboard,
+                snapshot,
+            },
+            receive,
+        )
+    }
+
+    #[test]
+    fn handover_keeps_the_old_link_until_the_peer_activates_the_replacement_in_either_event_order()
+    {
+        for old_closed_first in [false, true] {
+            let mut state = model::tests::fixture(3);
+            let own = state.hub.clone();
+            let peer = state
+                .members
+                .keys()
+                .find(|key| *key != &own)
+                .unwrap()
+                .clone();
+            let mut links = Links::default();
+            let mut receipts = UpdateReceipts::default();
+            let (old, old_receive) = synthetic_session(3);
+            assert!(links.install(peer.clone(), old).unwrap());
+            let (new, new_receive) = synthetic_session(2);
+            assert!(links.install(peer.clone(), new).unwrap());
+            // The remote end can still be on generation3 while its Ready(2)
+            // waits in the event queue. Keeping every old sender prevents a FIN.
+            assert!(!old_receive.is_closed());
+            if old_closed_first {
+                assert!(!close_session(
+                    &mut links,
+                    &mut state,
+                    &mut receipts,
+                    &own,
+                    &peer,
+                    [3; 32]
+                ));
+            }
+            assert!(links.packet(&peer, [2; 32]));
+            if !old_closed_first {
+                assert!(!close_session(
+                    &mut links,
+                    &mut state,
+                    &mut receipts,
+                    &own,
+                    &peer,
+                    [3; 32]
+                ));
+            }
+            assert!(old_receive.is_closed());
+            assert!(!new_receive.is_closed());
+            assert!(state.members[&peer].online);
+            assert_eq!(links[&peer].generation, [2; 32]);
+            assert!(!links.packet(&peer, [3; 32]));
+        }
+    }
+
+    #[test]
+    fn a_real_current_link_failure_is_immediately_offline_and_drops_all_retirees() {
+        let mut state = model::tests::fixture(3);
+        let own = state.hub.clone();
+        let peer = state
+            .members
+            .keys()
+            .find(|key| *key != &own)
+            .unwrap()
+            .clone();
+        let mut links = Links::default();
+        let mut receipts = UpdateReceipts::default();
+        let (old, old_receive) = synthetic_session(3);
+        links.install(peer.clone(), old).unwrap();
+        let (new, new_receive) = synthetic_session(2);
+        links.install(peer.clone(), new).unwrap();
+        assert!(close_session(
+            &mut links,
+            &mut state,
+            &mut receipts,
+            &own,
+            &peer,
+            [2; 32]
+        ));
+        assert!(!state.members[&peer].online);
+        assert!(
+            state
+                .members
+                .iter()
+                .filter(|(key, _)| *key != &peer)
+                .all(|(_, member)| member.online)
+        );
+        assert!(old_receive.is_closed() && new_receive.is_closed());
+        assert!(!links.contains_key(&peer) && !links.retired.contains_key(&peer));
+    }
+
+    #[test]
+    fn handover_capacity_preserves_protected_links_and_shutdown_releases_them() {
+        let mut links = Links::default();
+        let mut receives = Vec::new();
+        for generation in (6..=10).rev() {
+            let (session, receive) = synthetic_session(generation);
+            links.install("peer".into(), session).unwrap();
+            receives.push(receive);
+        }
+        let (overflow, overflow_receive) = synthetic_session(5);
+        assert!(links.install("peer".into(), overflow).is_err());
+        assert_eq!(links.retired["peer"].len(), MAX_RETIRED_PER_PEER);
+        assert!(receives.iter().all(|receive| !receive.is_closed()));
+        assert!(overflow_receive.is_closed());
+        let (other, other_receive) = synthetic_session(1);
+        assert!(links.install("other".into(), other).unwrap());
+        links.shutdown();
+        assert!(receives.iter().all(queue::Receiver::is_closed) && other_receive.is_closed());
+        assert!(links.active.is_empty() && links.retired.is_empty());
+    }
+
+    #[test]
+    fn single_flight_dial_permit_survives_queueing_and_canonicalizes_unknown_manual_addresses() {
+        let (sender, _incoming) = queue::channel(1);
+        let internal = Internal {
+            sender,
+            dialing: Default::default(),
+        };
+        let address = "192.0.2.1:45880".parse().unwrap();
+        let permit = internal.reserve_dial("peer", address).unwrap();
+        assert!(
+            internal
+                .reserve_dial("peer", "192.0.2.2:45880".parse().unwrap())
+                .is_none()
+        );
+        // Ready owns this same permit while queued; finishing authentication
+        // must not free the slot before the event loop accepts the candidate.
+        let (queued, receive) = mpsc::channel();
+        assert!(queued.send(permit).is_ok());
+        assert!(internal.reserve_dial("peer", address).is_none());
+        drop(receive.recv().unwrap());
+        assert!(internal.reserve_dial("peer", address).is_some());
+        let manual = internal
+            .reserve_dial("", "[::ffff:192.0.2.1]:45880".parse().unwrap())
+            .unwrap();
+        assert!(internal.reserve_dial("", address).is_none());
+        drop(manual);
+        assert!(internal.reserve_dial("", address).is_some());
+    }
+
+    #[test]
+    fn known_peer_socket_closures_reconnect_without_turning_protocol_errors_into_transport_errors()
+    {
+        use std::io::{Error, ErrorKind};
+        for kind in [
+            ErrorKind::UnexpectedEof,
+            ErrorKind::ConnectionReset,
+            ErrorKind::ConnectionAborted,
+            ErrorKind::BrokenPipe,
+            ErrorKind::TimedOut,
+            ErrorKind::ConnectionRefused,
+            ErrorKind::NetworkUnreachable,
+        ] {
+            let error =
+                anyhow::Error::new(Error::from(kind)).context("Reading the pinned peer's socket");
+            assert!(
+                matches!(closure_event("peer".into(),true,error),Event::Reconnecting{key,reason} if key=="peer" && !reason.is_empty())
+            );
+        }
+        #[cfg(windows)]
+        {
+            let reset = Error::from_raw_os_error(10054);
+            assert_eq!(reset.kind(), ErrorKind::ConnectionReset);
+            assert!(retryable_connection_error(&reset.into()));
+        }
+        assert!(matches!(
+            closure_event(
+                "new-peer".into(),
+                false,
+                Error::from(ErrorKind::ConnectionRefused).into()
+            ),
+            Event::Error(_)
+        ));
+        for error in [
+            anyhow::Error::new(serde_json::from_slice::<serde_json::Value>(b"{").unwrap_err())
+                .context("Reading a complete authenticated packet"),
+            anyhow::Error::new(snow::Error::Decrypt).context("Authenticating an encrypted packet"),
+            anyhow::anyhow!("Invalid monitor settings"),
+            anyhow::anyhow!("unexpected end of file"),
+            Error::from(ErrorKind::InvalidData).into(),
+            Error::from(ErrorKind::PermissionDenied).into(),
+            Error::new(
+                ErrorKind::ConnectionReset,
+                serde_json::from_slice::<serde_json::Value>(b"{").unwrap_err(),
+            )
+            .into(),
+        ] {
+            assert!(
+                !retryable_connection_error(&error),
+                "A protocol or settings failure was hidden as a reconnect: {error:#}"
+            );
+            assert!(matches!(
+                closure_event("peer".into(), true, error),
+                Event::Error(_)
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn known_peer_timeout_uses_its_typed_elapsed_cause() {
+        let elapsed = timeout(Duration::ZERO, std::future::pending::<()>())
+            .await
+            .unwrap_err();
+        let error = anyhow::Error::new(elapsed).context("Waiting for an authenticated peer packet");
+        assert!(matches!(
+            closure_event("peer".into(), true, error),
+            Event::Reconnecting { .. }
+        ));
+    }
 
     #[test]
     fn update_receipts_require_the_original_destination_and_exact_message() {
@@ -1905,6 +2352,7 @@ mod tests {
                 computer.state.as_ref().unwrap().active_input.as_ref() == Some(&keys[3])
             })
         });
+        let restart_events = forwarded.len();
         computers[3].service.stop();
         until(&mut computers, &mut forwarded, |computers, _| {
             computers[0]
@@ -1934,6 +2382,20 @@ mod tests {
                 .volume
                 == 23
         }));
+        assert!(
+            forwarded[restart_events..]
+                .iter()
+                .any(|(index, event)| *index == 0
+                    && matches!(event,Event::Reconnecting {key,..} if key==&keys[3])),
+            "A known peer's stop must be reported as reconnecting"
+        );
+        assert!(
+            !forwarded[restart_events..]
+                .iter()
+                .any(|(_, event)| matches!(event, Event::Error(_))),
+            "Ordinary stop/restart recovery produced a hard error: {:?}",
+            &forwarded[restart_events..]
+        );
         for computer in &computers {
             computer.service.stop();
         }

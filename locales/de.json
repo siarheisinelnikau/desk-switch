@@ -504,7 +504,7 @@
   "Switch the shared monitor": "Gemeinsamen Monitor umschalten",
   "Switch to computer…": "Zu einem Computer wechseln…",
   "Switch to next computer": "Zum nächsten Computer",
-  "Text and images. Files are planned for a later release.": "Text und Bilder. Dateien sind für eine spätere Version geplant.",
+  "Text and images.": "Text und Bilder.",
   "This computer uses the shared monitor": "Dieser Computer nutzt den gemeinsamen Monitor",
   "Unavailable": "Nicht verfügbar",
   "Virtual microphone": "Virtuelles Mikrofon",
@@ -573,5 +573,12 @@
   "Nearby computers will appear here. You can also connect by IP address.": "Computer in der Nähe werden hier angezeigt. Du kannst dich auch über eine IP-Adresse verbinden.",
   "Use an IP address": "IP-Adresse verwenden",
   "Connection requested. Approve it on the other computer.": "Verbindung angefragt. Bestätige sie auf dem anderen Computer.",
-  "The connection was not approved. Check the address and try again.": "Die Verbindung wurde nicht bestätigt. Prüfe die Adresse und versuche es erneut."
+  "The connection was not approved. Check the address and try again.": "Die Verbindung wurde nicht bestätigt. Prüfe die Adresse und versuche es erneut.",
+  "Reconnect the workspace controller before adding another computer.": "Verbinde dich erneut mit dem Koordinator des Arbeitsbereichs, bevor du einen weiteren Computer hinzufügst.",
+  "Not shared": "Nicht geteilt",
+  "Monitor switch failed": "Monitorwechsel fehlgeschlagen",
+  "Monitor input unknown": "Monitoreingang unbekannt",
+  "Monitor port is not configured": "Monitoranschluss nicht eingerichtet",
+  "The monitor view updates when you switch with Desk Switch.": "Die Monitoransicht wird aktualisiert, wenn du mit Desk Switch wechselst.",
+  "Device colour shows which PC it comes from": "Die Gerätefarbe zeigt den Ursprungs-PC"
 }
