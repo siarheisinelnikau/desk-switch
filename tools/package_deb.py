@@ -11,6 +11,7 @@ import tempfile
 import tomllib
 
 from prepare_release import checked_binary
+from release_assets import asset_names
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -73,7 +74,7 @@ def main():
             os.utime(path, (epoch, epoch))
         os.utime(stage, (epoch, epoch))
         args.out.mkdir(parents=True, exist_ok=True)
-        output = args.out.resolve() / "desk-switch-linux-x86_64.deb"
+        output = args.out.resolve() / asset_names(version)["linux-x86_64-deb"]
         subprocess.run(["dpkg-deb", "--root-owner-group", "-Zxz", "--build", str(stage), str(output)],
                        check=True, env=dict(os.environ, SOURCE_DATE_EPOCH=str(epoch)))
         subprocess.run(["dpkg-deb", "--info", str(output)], check=True)
