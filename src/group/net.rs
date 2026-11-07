@@ -161,6 +161,8 @@ enum Command {
     Node(Box<Node>, Option<workspace::AudioLevel>, u64),
     Approve(String, bool),
     Disconnect,
+    #[cfg(test)]
+    Raw(String, Box<Packet>),
 }
 enum Incoming {
     Consent {
@@ -1089,6 +1091,8 @@ async fn run(
             }
             command = commands.recv() => match command {
                 Some(Command::Disconnect) | None => break,
+                #[cfg(test)]
+                Some(Command::Raw(target, packet)) => { let _ = send(&sessions, &target, *packet); }
                 Some(Command::Approve(key, accept)) => { if let Some(approved) = approvals.remove(&key) { let _: Result<(), bool> = approved.send(accept); } }
                 Some(Command::Node(node,native,ready)) => {
                     match state.update_node(&own, *node.clone(), native, ready) {
@@ -1175,12 +1179,12 @@ async fn run(
                 broadcast(&sessions, &state);
             }
             notify.state(&state);
-            if state.revision != before.revision || state.hub != before.hub {
-                if let Err(error) = save(&dir, &state) {
-                    notify.event(Event::Error(format!(
-                        "Workspace settings could not be saved: {error}"
-                    )));
-                }
+            if (state.revision != before.revision || state.hub != before.hub)
+                && let Err(error) = save(&dir, &state)
+            {
+                notify.event(Event::Error(format!(
+                    "Workspace settings could not be saved: {error}"
+                )));
             }
         }
     }
@@ -1192,6 +1196,189 @@ async fn run(
 mod tests {
     use super::*;
     use std::time::Instant;
+
+    #[test]
+    fn update_receipts_require_the_original_destination_and_exact_message() {
+        let mut receipts = UpdateReceipts::default();
+        let message = workspace::update::Message::Handoff(42);
+        receipts.remember("destination".into(), message.clone());
+        receipts.remember("destination".into(), message.clone());
+        assert_eq!(receipts.0.len(), 1);
+        assert!(!receipts.confirm("another PC", &message));
+        assert!(!receipts.confirm("destination", &workspace::update::Message::Commit(42)));
+        assert!(receipts.confirm("destination", &message));
+        assert!(!receipts.confirm("destination", &message));
+        for id in 1..=128 {
+            receipts.remember(
+                "destination".into(),
+                workspace::update::Message::Handoff(id),
+            );
+        }
+        assert!(
+            receipts
+                .permit("destination", &workspace::update::Message::Handoff(129))
+                .is_err()
+        );
+        assert!(
+            receipts
+                .permit("destination", &workspace::update::Message::Handoff(1))
+                .is_ok()
+        );
+        receipts.closed("destination", "controller");
+        assert!(receipts.0.is_empty());
+    }
+
+    #[test]
+    fn maximum_binary_clipboards_fit_the_wire_limit_and_local_copies_coalesce() {
+        use sha2::{Digest, Sha256};
+        let bytes = vec![255; 8 * 1024 * 1024];
+        let digest = format!("{:x}", Sha256::digest(&bytes));
+        for packet in [
+            Packet::Action(Action::Clipboard {
+                mime: "image/png".into(),
+                bytes: bytes.clone(),
+                digest: digest.clone(),
+            }),
+            Packet::Clipboard {
+                source: "source".into(),
+                mime: "image/png".into(),
+                bytes,
+                digest,
+            },
+        ] {
+            let encoded = serde_json::to_vec(&packet).unwrap();
+            assert!(encoded.len() < MAX_PACKET);
+            let decoded: Packet = serde_json::from_slice(&encoded).unwrap();
+            let (mime, bytes, digest) = match decoded {
+                Packet::Action(Action::Clipboard {
+                    mime,
+                    bytes,
+                    digest,
+                })
+                | Packet::Clipboard {
+                    mime,
+                    bytes,
+                    digest,
+                    ..
+                } => (mime, bytes, digest),
+                _ => panic!("Unexpected clipboard round trip"),
+            };
+            assert_eq!(bytes.len(), 8 * 1024 * 1024);
+            clipboard_data(&mime, &bytes, &digest).unwrap();
+        }
+
+        let (commands, mut receive) = queue::channel(1);
+        let (_, events) = mpsc::channel();
+        let service = Service {
+            commands,
+            events,
+            snapshot: Default::default(),
+            clipboard: Default::default(),
+            clipboard_commands: Default::default(),
+        };
+        service.action(Action::ReturnInput).unwrap();
+        for index in 0..100u8 {
+            service
+                .action(Action::Clipboard {
+                    mime: "text/plain".into(),
+                    bytes: vec![index; 1024],
+                    digest: String::new(),
+                })
+                .unwrap();
+        }
+        assert!(
+            matches!(receive.try_recv().unwrap(),Command::Action(action) if matches!(*action,Action::ReturnInput))
+        );
+        assert!(receive.try_recv().is_err());
+        assert!(
+            matches!(service.clipboard_commands.latest.lock().unwrap().as_ref(),Some(Action::Clipboard{bytes,..}) if bytes==&vec![99;1024])
+        );
+    }
+
+    #[test]
+    fn migration_preserves_existing_identity_device_choices_and_levels() {
+        let root = std::env::temp_dir().join(format!(
+            "desk-switch-group-migration-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let identity = config::create_identity(&root).unwrap();
+        let own = config::hex(&identity.public);
+        let fixture = model::tests::fixture(2);
+        let peer = fixture.members.keys().next().unwrap().clone();
+        config::pair(&root, &peer).unwrap();
+        std::fs::write(
+            root.join("desktop.toml"),
+            "[workspace]\nlast_address='[::1]:45878'\npeer_name='Ubuntu'\n",
+        )
+        .unwrap();
+        let identity_bytes = std::fs::read(root.join("identity")).unwrap();
+        let peer_bytes = std::fs::read(root.join("peer")).unwrap();
+        let mut local = fixture.members.values().next().unwrap().clone();
+        local.node.key = own.clone();
+        local.node.shared.audio_levels.insert(
+            own.clone(),
+            workspace::AudioLevel {
+                volume: 75,
+                muted: false,
+            },
+        );
+        local.node.shared.audio_levels.insert(
+            peer.clone(),
+            workspace::AudioLevel {
+                volume: 25,
+                muted: true,
+            },
+        );
+        local.node.shared.devices.insert(
+            peer.clone(),
+            workspace::devices::Choices {
+                speaker: Some("saved output".into()),
+                ..Default::default()
+            },
+        );
+        local.node.shared.devices.insert(
+            own.clone(),
+            workspace::devices::Choices {
+                keyboard: Some("saved keyboard".into()),
+                ..Default::default()
+            },
+        );
+        let state = load(&root, local.clone()).unwrap();
+        assert_eq!(state.members[&own].preferences.audio.volume, 75);
+        assert_eq!(state.members[&peer].preferences.audio.volume, 25);
+        assert!(state.members[&peer].preferences.audio.muted);
+        assert_eq!(
+            state.members[&peer].preferences.devices.speaker.as_deref(),
+            Some("saved output")
+        );
+        assert_eq!(
+            state.members[&own].preferences.devices.keyboard.as_deref(),
+            Some("saved keyboard")
+        );
+        assert_eq!(
+            std::fs::read(root.join("identity")).unwrap(),
+            identity_bytes
+        );
+        assert_eq!(std::fs::read(root.join("peer")).unwrap(), peer_bytes);
+        save(&root, &state).unwrap();
+        local.node.shared = Default::default();
+        let reloaded = load(&root, local).unwrap();
+        assert_eq!(reloaded.settings, state.settings);
+        assert_eq!(
+            reloaded.members[&own].preferences,
+            state.members[&own].preferences
+        );
+        assert_eq!(
+            reloaded.members[&peer].preferences,
+            state.members[&peer].preferences
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     struct Computer {
         service: Service,
@@ -1353,6 +1540,63 @@ mod tests {
         until(&mut computers, &mut forwarded, |_, events| {
             events.iter().any(|(index,event)|*index==3 && matches!(event,Event::Management { source, message: workspace::management::Message::Reply { id:42, error:None } } if source==&keys[2]))
         });
+
+        // A malformed authenticated peer report must fail only that message;
+        // the controller and every other link remain usable afterwards.
+        let mut invalid = computers[1].member.node.clone();
+        invalid.hardware.audio_score = 101;
+        computers[1]
+            .service
+            .commands
+            .try_send(Command::Raw(
+                keys[0].clone(),
+                Box::new(Packet::Node(Box::new(invalid), None, 0)),
+            ))
+            .unwrap();
+        until(&mut computers, &mut forwarded, |_, events| {
+            events.iter().any(|(index,event)|*index==1 && matches!(event,Event::Error(error) if error.contains("invalid audio information")))
+        });
+
+        for (sender, target, id) in [(3, 2, 43), (0, 2, 44), (2, 0, 45)] {
+            let message = workspace::update::Message::Handoff(id);
+            computers[sender]
+                .service
+                .action(Action::Update {
+                    target: keys[target].clone(),
+                    message: message.clone(),
+                })
+                .unwrap();
+            until(&mut computers, &mut forwarded, |_, events| {
+                events.iter().any(|(index,event)|*index==target && matches!(event,Event::Update {source,message:received} if source==&keys[sender] && received==&message))
+            });
+            until(&mut computers, &mut forwarded, |_, events| {
+                events.iter().any(|(index, event)| {
+                    *index == sender
+                        && matches!(event,Event::UpdateSent(received) if received==&message)
+                })
+            });
+            assert!(!forwarded.iter().any(|(index, event)| *index != sender
+                && matches!(event,Event::UpdateSent(received) if received==&message)));
+        }
+        use sha2::{Digest, Sha256};
+        let bytes = b"Shared clipboard across four authenticated PCs".to_vec();
+        let digest = format!("{:x}", Sha256::digest(&bytes));
+        computers[3]
+            .service
+            .action(Action::Clipboard {
+                mime: "text/plain".into(),
+                bytes: bytes.clone(),
+                digest: digest.clone(),
+            })
+            .unwrap();
+        until(&mut computers, &mut forwarded, |_, events| {
+            (0..3).all(|receiver|events.iter().any(|(index,event)|*index==receiver && matches!(event,Event::Clipboard {source,bytes:received,digest:checksum,..} if source==&keys[3] && received==&bytes && checksum==&digest)))
+        });
+        assert!(
+            !forwarded.iter().any(|(index, event)| *index == 3
+                && matches!(event,Event::Clipboard {digest:checksum,..} if checksum==&digest)),
+            "Do not echo the source's own clipboard back to it"
+        );
         computers[1]
             .service
             .action(Action::Activate {
