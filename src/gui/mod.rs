@@ -1,6 +1,7 @@
 mod management;
 mod model;
 mod paired_update;
+mod popup;
 #[cfg(debug_assertions)]
 mod preview;
 mod session;
@@ -33,6 +34,9 @@ pub enum Action {
     Sound,
     Quit,
     Hide,
+    QuickOpen { x: i32, y: i32 },
+    QuickClose,
+    Quick(popup::Command),
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -68,6 +72,7 @@ pub struct Desktop {
     tray: Option<tray::Tray>,
     tray_error: Option<String>,
     tray_snapshot: tray::State,
+    quick: popup::Popup,
     monitor_setup_open: bool,
     actions: Receiver<Action>,
     hidden: bool,
@@ -112,6 +117,8 @@ pub struct Desktop {
     preview: Option<crate::workspace::Node>,
     #[cfg(debug_assertions)]
     preview_scroll: f32,
+    #[cfg(debug_assertions)]
+    preview_popup: bool,
 }
 
 pub fn run(start_hidden: bool) -> Result<()> {
@@ -178,6 +185,7 @@ impl Desktop {
             .unwrap_or_default();
         let (send, actions) = mpsc::channel();
         let startup_valid = prefs_error.is_none() && settings_error.is_none();
+        let quick = popup::Popup::new(send.clone());
         let (tray, tray_error) = match tray::Tray::new(send, ctx.clone()) {
             Ok(tray) => (Some(tray), None),
             Err(error) => (None, Some(format!("{error:#}"))),
@@ -201,6 +209,7 @@ impl Desktop {
             tray,
             tray_error,
             tray_snapshot: tray::State::default(),
+            quick,
             monitor_setup_open: false,
             actions,
             hidden: false,
@@ -245,6 +254,8 @@ impl Desktop {
             preview: None,
             #[cfg(debug_assertions)]
             preview_scroll: 0.0,
+            #[cfg(debug_assertions)]
+            preview_popup: false,
         }
     }
 
@@ -454,6 +465,7 @@ impl Desktop {
     fn action(&mut self, action: Action, ctx: &egui::Context) {
         match action {
             Action::Show => {
+                self.quick.close(ctx);
                 self.hidden = false;
                 ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
                 ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
@@ -473,6 +485,9 @@ impl Desktop {
                 }
             }
             Action::Sound => self.toggle_audio(),
+            Action::QuickOpen { x, y } => self.quick.open(ctx, x, y),
+            Action::QuickClose => self.quick.close(ctx),
+            Action::Quick(command) => self.quick_action(command),
             Action::Hide => {
                 if self.tray.as_ref().is_some_and(tray::Tray::available) {
                     self.hidden = true;
@@ -480,6 +495,7 @@ impl Desktop {
                 }
             }
             Action::Quit => {
+                self.quick.close(ctx);
                 if self.install_job.is_some() || self.install_pending {
                     self.notice = Some(("Installing the verified update…".into(), false));
                     self.hidden = false;
@@ -499,6 +515,18 @@ impl Desktop {
                 self.discovery.take();
             }
         }
+    }
+
+    fn close_window(&mut self, ctx: &egui::Context) {
+        ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+        self.action(
+            if self.tray.as_ref().is_some_and(tray::Tray::available) {
+                Action::Hide
+            } else {
+                Action::Quit
+            },
+            ctx,
+        );
     }
 
     fn scan(&mut self, kind: QueryKind) {
@@ -832,8 +860,7 @@ impl Desktop {
             }
         }
         if ctx.input(|input| input.viewport().close_requested()) && !self.quitting {
-            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
-            self.action(Action::Quit, ctx);
+            self.close_window(ctx);
         }
         if self
             .quitting_since
@@ -1045,6 +1072,7 @@ mod hotplug_tests {
 impl eframe::App for Desktop {
     fn logic(&mut self, ctx: &egui::Context, _: &mut eframe::Frame) {
         self.tick(ctx);
+        self.quick_popup(ctx);
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _: &mut eframe::Frame) {
