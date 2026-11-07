@@ -658,6 +658,9 @@ impl Desktop {
                                         })
                                     ));
                                     let mut roles = Vec::new();
+                                    if key == &state.hub {
+                                        roles.push(tr("Workspace coordinator"));
+                                    }
                                     if plan.input.as_ref() == Some(key) {
                                         roles.push(tr("Keyboard & mouse"));
                                     }
@@ -998,11 +1001,49 @@ impl Desktop {
                         .map(|version| version.app.as_str())
                         .unwrap_or("—")
                 ));
-                ui.label(tr(&management.update.status));
-                ui.horizontal(|ui| {
+                if self
+                    .group
+                    .workspace
+                    .as_ref()
+                    .is_some_and(|state| state.hub == member.node.key)
+                {
+                    ui.weak(tr(
+                        "Update this computer last to keep workspace management available.",
+                    ));
+                }
+                if management.update.failed {
+                    ui.colored_label(ui.visuals().error_fg_color, tr(&management.update.status));
+                } else {
+                    ui.label(tr(&management.update.status));
+                }
+                if let Some(progress) = &management.update.progress {
+                    ui.add(
+                        egui::ProgressBar::new(
+                            progress.downloaded as f32 / progress.total.max(1) as f32,
+                        )
+                        .show_percentage(),
+                    );
+                }
+                if self.group.update_target.as_ref() == Some(&member.node.key)
+                    && let Some((status, failed)) = &self.peer_update_status
+                {
+                    ui.colored_label(
+                        if *failed {
+                            ui.visuals().error_fg_color
+                        } else {
+                            ui.visuals().text_color()
+                        },
+                        tr(status),
+                    );
+                }
+                if !member.online {
+                    ui.weak(tr("Offline"));
+                }
+                ui.horizontal_wrapped(|ui| {
                     if ui
                         .add_enabled(
-                            !self.update_action_busy()
+                            member.online
+                                && !self.update_action_busy()
                                 && !management.update.checking
                                 && !management.update.installing,
                             egui::Button::new(tr("Check for updates")),
@@ -1022,7 +1063,9 @@ impl Desktop {
                     }
                     if ui
                         .add_enabled(
-                            management.update.can_install() && !self.update_action_busy(),
+                            member.online
+                                && management.update.can_install()
+                                && !self.update_action_busy(),
                             egui::Button::new(tr("Download and install")),
                         )
                         .clicked()
@@ -1142,7 +1185,14 @@ impl Desktop {
                     .selected_text(
                         monitor
                             .input
-                            .map(|input| format!("0x{input:02x}"))
+                            .map(|input| match input {
+                                15 => "DisplayPort".into(),
+                                16 => "DisplayPort 2".into(),
+                                17 => "HDMI 1".into(),
+                                18 => "HDMI 2".into(),
+                                3 => "DVI 1".into(),
+                                other => format!("0x{other:02x}"),
+                            })
                             .unwrap_or_else(|| tr("Choose this computer's port")),
                     )
                     .show_ui(ui, |ui| {
