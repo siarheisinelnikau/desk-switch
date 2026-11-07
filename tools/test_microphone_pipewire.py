@@ -54,6 +54,13 @@ try:
    if select.select([probe.stdout],[],[],.1)[0]:data.extend(os.read(probe.stdout.fileno(),65536))
   a=array.array('h');a.frombytes(data[:len(data)//2*2]);return a
  first=samples(1.5);assert first and max(map(abs,first))>1000,('no transmitted microphone tone',first[:10],(work/'run.log').read_text())
+ # After startup, a 1 kHz tone must not disappear in whole 10 ms blocks.
+ # This catches transport reconnect loops and playback starvation that a
+ # nonzero peak or average gain check alone would miss.
+ steady=first[len(first)//3:];blocks=[steady[i:i+960] for i in range(0,len(steady)-959,960)]
+ missing=sum(max(map(abs,block))<100 for block in blocks)
+ assert blocks and missing<=max(1,len(blocks)//50),('audio dropouts',missing,len(blocks),(work/'run.log').read_text()[-5000:])
+ print(f'PASS continuous synthetic audio: {len(blocks)} blocks, {missing} silent dropouts',flush=True)
  receiver.stdin.write(b'volume 25\n');receiver.stdin.flush();samples(.4)
  quarter=samples(1);assert quarter
  def rms(a):return math.sqrt(sum(x*x for x in a)/len(a))

@@ -3,8 +3,8 @@ use anyhow::{Context, Result, ensure};
 use std::{collections::VecDeque, time::Duration};
 use tokio::time::{Instant, timeout};
 
-const WINDOW: usize = 4;
-const FRESHNESS: Duration = Duration::from_millis(160);
+const WINDOW: usize = 12;
+const FRESHNESS: Duration = Duration::from_millis(400);
 const WARMUP: Duration = Duration::from_secs(3);
 const READY_TIMEOUT: Duration = Duration::from_secs(7);
 pub const SILENCE: Pcm = [0; FRAME_BYTES];
@@ -92,8 +92,6 @@ pub async fn receive(
     queue: &std::sync::Mutex<super::playout::Playout>,
     mut on_frame: impl FnMut(u64),
 ) -> Result<()> {
-    use tokio::time::timeout_at;
-
     let _cleanup = super::playout::ClearOnDrop(queue);
 
     link.send(Packet::Start, &SILENCE).await?;
@@ -115,21 +113,22 @@ pub async fn receive(
         let (expected, deadline) = requests.pop_front().unwrap();
         // The capture uses only a frame completed after the credit was sent.
         // Timing our own credit bounds the age without synchronizing the clocks.
-        let packet = timeout_at(deadline, link.receive(&mut pcm))
+        let packet = timeout(WARMUP, link.receive(&mut pcm))
             .await
-            .context("audio exceeded its latency budget")??;
+            .context("audio sender stopped supplying frames")??;
         let Packet::Audio { ticket, sequence } = packet else {
             anyhow::bail!("expected an audio frame");
         };
-        ensure!(
-            ticket == expected && Instant::now() < deadline,
-            "stale or unexpected audio frame"
-        );
-        queue
-            .lock()
-            .unwrap()
-            .push(sequence, pcm, std::time::Instant::now());
-        on_frame(sequence);
+        ensure!(ticket == expected, "unexpected audio frame ticket");
+        // A delayed packet is discarded, but its credit is renewed. A brief
+        // Wi-Fi stall should not tear down capture/playback for another second.
+        if Instant::now() < deadline {
+            queue
+                .lock()
+                .unwrap()
+                .push(sequence, pcm, std::time::Instant::now());
+            on_frame(sequence);
+        }
         let ticket = ticket + WINDOW as u64;
         requests.push_back((ticket, Instant::now() + FRESHNESS));
         link.send(Packet::Credit(ticket), &SILENCE).await?;

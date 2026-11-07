@@ -1,3 +1,5 @@
+#[cfg(any(windows, test))]
+mod capture_frames;
 mod link;
 #[cfg(target_os = "linux")]
 mod linux;

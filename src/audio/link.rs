@@ -23,7 +23,7 @@ const DATA_HEADER: usize = 17;
 const MAX_PLAIN: usize = DATA_HEADER + FRAME_BYTES;
 const TAG: usize = 16;
 const MAX_RECORD: usize = MAX_PLAIN + TAG;
-const WRITE_TIMEOUT: Duration = Duration::from_millis(125);
+const WRITE_TIMEOUT: Duration = Duration::from_millis(500);
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum Packet {

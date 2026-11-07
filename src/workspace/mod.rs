@@ -1,6 +1,8 @@
 pub mod devices;
+pub mod diagnostics;
 pub mod hardware;
 pub mod net;
+pub mod update;
 
 use crate::{config, lifecycle::InputStatus, video::Inputs};
 use anyhow::{Result, ensure};
@@ -92,7 +94,7 @@ impl Default for Shared {
             audio_levels: BTreeMap::new(),
             keyboard_enabled: true,
             mouse_enabled: true,
-            monitor_enabled: true,
+            monitor_enabled: false,
             edge: false,
             purple_on_left: true,
         }
@@ -200,6 +202,8 @@ pub struct Node {
     pub input: Option<InputStatus>,
     #[serde(default)]
     pub monitor_input: Option<u16>,
+    #[serde(default)]
+    pub monitor_error: Option<String>,
     pub audio_playing: bool,
     #[serde(default)]
     pub microphone_active: bool,
@@ -208,9 +212,12 @@ pub struct Node {
     pub audio_error: Option<String>,
     pub input_error: Option<String>,
     pub ack: String,
+    #[serde(default)]
+    pub diagnostics: diagnostics::Diagnostics,
 }
 impl Node {
     pub fn validate(&self, own: &str, peer: &str) -> Result<()> {
+        self.diagnostics.validate()?;
         ensure!(
             self.key == peer && own != peer,
             "unexpected computer identity"
@@ -300,9 +307,14 @@ impl Node {
                 || (self.ack.len() == 64 && self.ack.bytes().all(|c| c.is_ascii_hexdigit())),
             "invalid synchronization acknowledgement"
         );
-        for error in [&self.audio_error, &self.input_error, &self.microphone_error]
-            .into_iter()
-            .flatten()
+        for error in [
+            &self.audio_error,
+            &self.input_error,
+            &self.microphone_error,
+            &self.monitor_error,
+        ]
+        .into_iter()
+        .flatten()
         {
             ensure!(error.len() <= 2048, "status is too long");
         }
@@ -614,6 +626,7 @@ mod tests {
         a.hardware.keyboard = true;
         a.hardware.mouse = true;
         for n in [&mut a, &mut b] {
+            n.shared.monitor_enabled = true;
             n.monitor.enabled = true;
             n.monitor.fingerprint = "common-display".into();
         }
@@ -621,6 +634,7 @@ mod tests {
         b.monitor.id = "other-connector".into();
         let mut prefs = Preferences {
             monitor: b.monitor.clone(),
+            shared: b.shared.clone(),
             ..Default::default()
         };
         let saved = Monitor {
@@ -642,6 +656,10 @@ mod tests {
     #[test]
     fn common_monitor_layout_does_not_depend_on_ddc_setup_or_input_readiness() {
         let (mut a, mut b) = (node("a"), node("b"));
+        assert!(!Plan::common_monitor(&a, &b));
+        assert!(!Plan::common_monitor(&b, &a));
+        a.shared.monitor_enabled = true;
+        a.shared.changed("a");
         assert!(Plan::common_monitor(&a, &b));
         assert!(Plan::common_monitor(&b, &a));
         assert!(!Plan::shared_monitor(&a, &b));
@@ -661,6 +679,7 @@ mod tests {
     fn shared_monitor_is_available_when_both_pcs_have_their_own_keyboard_and_mouse() {
         let (mut a, mut b) = (node("a"), node("b"));
         for (node, input) in [(&mut a, 17), (&mut b, 15)] {
+            node.shared.monitor_enabled = true;
             node.hardware.keyboard = true;
             node.hardware.mouse = true;
             node.monitor.enabled = true;
@@ -698,12 +717,14 @@ mod tests {
             shared: Shared::default(),
             input: None,
             monitor_input: None,
+            monitor_error: None,
             audio_playing: false,
             microphone_active: false,
             microphone_error: None,
             audio_error: None,
             input_error: None,
             ack: String::new(),
+            diagnostics: Default::default(),
         }
     }
     #[test]
@@ -847,6 +868,8 @@ mod tests {
     fn monitor_mapping_comes_from_each_pcs_own_active_input() {
         let mut a = node("a");
         let mut b = node("b");
+        a.shared.monitor_enabled = true;
+        b.shared.monitor_enabled = true;
         a.hardware.keyboard = true;
         a.hardware.mouse = true;
         a.monitor = Monitor {

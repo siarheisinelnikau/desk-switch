@@ -3,6 +3,7 @@ mod host;
 mod linux_host;
 #[cfg(target_os = "linux")]
 mod linux_monitor;
+mod monitor_service;
 #[cfg(target_os = "linux")]
 pub mod portal;
 mod receiver;
@@ -35,9 +36,15 @@ use crate::{
 use anyhow::Result;
 use std::net::SocketAddr;
 
-pub fn run_monitor_service(id: &str, own: u16, other: u16) -> Result<()> {
+pub fn run_monitor_service(
+    id: &str,
+    host: u16,
+    other: u16,
+    role: Role,
+    address: SocketAddr,
+) -> Result<()> {
     anyhow::ensure!(
-        !id.is_empty() && own != 0 && other != 0 && own != other,
+        !id.is_empty() && host != 0 && other != 0 && host != other,
         "select a monitor and remember distinct connections on both PCs"
     );
     crate::lifecycle::install();
@@ -46,12 +53,13 @@ pub fn run_monitor_service(id: &str, own: u16, other: u16) -> Result<()> {
     #[cfg(windows)]
     let monitor = win_monitor::Ddc(id.into());
     let video = VideoWorker::watch(monitor)?;
-    crate::runtime()?.block_on(crate::video::monitor_service(
-        video,
-        crate::video::Inputs {
-            host: own,
-            peer: other,
-        },
+    let dir = crate::config::state_dir()?;
+    crate::runtime()?.block_on(monitor_service::run(
+        role,
+        address,
+        crate::config::load_identity(&dir)?,
+        crate::config::load_peer(&dir)?,
+        (crate::video::Inputs { host, peer: other }, video),
     ))
 }
 

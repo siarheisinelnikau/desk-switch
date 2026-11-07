@@ -4,7 +4,6 @@ use super::{
 };
 use anyhow::{Context, Result, ensure};
 use std::{
-    collections::VecDeque,
     io,
     pin::Pin,
     sync::{
@@ -69,7 +68,7 @@ impl Capture {
                             &Direction::Capture,
                             &StreamMode::PollingShared {
                                 autoconvert: true,
-                                buffer_duration_hns: 200_000,
+                                buffer_duration_hns: 600_000,
                             },
                         )
                         .context("initializing shared WASAPI capture capture at 48 kHz stereo")?;
@@ -128,9 +127,7 @@ fn record(
     stop: &AtomicBool,
     send: &mpsc::Sender<TimedPcm>,
 ) -> Result<()> {
-    let mut pending = VecDeque::with_capacity(FRAME_BYTES * 4);
-    let period = Duration::from_millis(10);
-    let mut next = Instant::now() + period;
+    let mut buffer = super::capture_frames::CaptureFrames::new(Instant::now());
     while !stop.load(Ordering::Acquire) {
         while unsafe { capture.GetNextPacketSize()? } != 0 {
             let mut pointer = std::ptr::null_mut();
@@ -146,17 +143,19 @@ fn record(
                     "WASAPI capture packet exceeds its buffer bound"
                 );
                 if flags & AUDCLNT_BUFFERFLAGS_DATA_DISCONTINUITY.0 as u32 != 0 {
-                    pending.clear();
+                    buffer.pending.clear();
                 }
                 if flags & AUDCLNT_BUFFERFLAGS_SILENT.0 as u32 != 0 {
-                    pending.extend(std::iter::repeat_n(0, bytes));
+                    buffer.pending.extend(std::iter::repeat_n(0, bytes));
                 } else {
                     ensure!(
                         bytes == 0 || !pointer.is_null(),
                         "WASAPI returned a null audio buffer"
                     );
                     if bytes != 0 {
-                        pending.extend(unsafe { std::slice::from_raw_parts(pointer, bytes) });
+                        buffer
+                            .pending
+                            .extend(unsafe { std::slice::from_raw_parts(pointer, bytes) });
                     }
                 }
                 Ok::<_, anyhow::Error>(())
@@ -165,22 +164,13 @@ fn record(
                 capture.ReleaseBuffer(frames)?;
             }
             read?;
-            while pending.len() > FRAME_BYTES * 4 {
-                pending.drain(..FRAME_BYTES.min(pending.len()));
-            }
         }
         let now = Instant::now();
-        if now >= next {
-            let mut pcm = [0; FRAME_BYTES];
-            let available = pcm.len().min(pending.len());
-            for sample in &mut pcm[..available] {
-                *sample = pending.pop_front().unwrap();
-            }
+        while let Some(pcm) = buffer.take(now) {
             match send.try_send(TimedPcm { pcm, time: now }) {
                 Ok(()) | Err(mpsc::error::TrySendError::Full(_)) => {}
                 Err(mpsc::error::TrySendError::Closed(_)) => return Ok(()),
             }
-            next = now + period;
         }
         thread::park_timeout(Duration::from_millis(3));
     }

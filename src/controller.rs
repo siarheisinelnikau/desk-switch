@@ -2,7 +2,7 @@ use crate::{
     video::{Inputs, Job},
     wire::{Message, Mode},
 };
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Transfer {
@@ -15,11 +15,14 @@ pub struct Transfer {
 enum Phase {
     Local,
     Preparing,
+    PeerSelecting,
     Writing,
     Verifying,
     Activating,
     Remote,
     Returning,
+    Restoring,
+    RestoreFallback,
     Checking,
 }
 
@@ -40,6 +43,7 @@ pub struct Controller {
     inputs: Option<Inputs>,
     exit: Option<u16>,
     upgrade: bool,
+    restore_fallback: bool,
 }
 
 impl Controller {
@@ -50,6 +54,7 @@ impl Controller {
             inputs,
             exit: None,
             upgrade: false,
+            restore_fallback: false,
         }
     }
 
@@ -98,20 +103,26 @@ impl Controller {
         match (self.phase, message) {
             (Phase::Preparing, Message::Ready(reply)) if reply == id => {
                 if mode == Mode::Video {
-                    let inputs = self
-                        .inputs
-                        .expect("video transfers require configured inputs");
-                    self.phase = Phase::Writing;
-                    Ok(Effect::Ddc(Job::Select {
-                        from: inputs.host,
-                        to: inputs.peer,
-                    }))
+                    self.phase = Phase::PeerSelecting;
+                    Ok(Effect::Send(Message::SelectMonitor(id)))
                 } else {
                     self.phase = Phase::Activating;
                     Ok(Effect::Send(Message::Activate(id)))
                 }
             }
-            (Phase::Verifying, Message::Observed { id: reply, input }) if reply == id => {
+            (Phase::PeerSelecting, Message::SelectFallback(reply)) if reply == id => {
+                let inputs = self
+                    .inputs
+                    .expect("video transfers require configured inputs");
+                self.phase = Phase::Writing;
+                Ok(Effect::Ddc(Job::Select {
+                    from: inputs.host,
+                    to: inputs.peer,
+                }))
+            }
+            (Phase::PeerSelecting | Phase::Verifying, Message::Observed { id: reply, input })
+                if reply == id =>
+            {
                 if self.inputs.map(|inputs| inputs.peer) != Some(input) {
                     bail!("receiver did not observe its configured monitor input");
                 }
@@ -124,11 +135,19 @@ impl Controller {
             }
             (Phase::Returning, Message::Returning(reply)) if reply == id => {
                 if mode == Mode::Video {
-                    self.phase = Phase::Checking;
-                    Ok(Effect::Ddc(Job::Read))
+                    self.phase = Phase::Restoring;
+                    let inputs = self.inputs.unwrap();
+                    Ok(Effect::Ddc(Job::Select {
+                        from: inputs.peer,
+                        to: inputs.host,
+                    }))
                 } else {
                     Ok(Effect::Send(Message::Returned(id)))
                 }
+            }
+            (Phase::RestoreFallback, Message::MonitorRestored(reply)) if reply == id => {
+                self.phase = Phase::Checking;
+                Ok(Effect::Ddc(Job::Read))
             }
             (_, Message::Rejected(reply)) if reply == id => {
                 bail!(
@@ -142,19 +161,40 @@ impl Controller {
     pub fn written(&mut self) -> Result<Effect> {
         let transfer = self
             .transfer
-            .filter(|_| self.phase == Phase::Writing)
+            .filter(|_| matches!(self.phase, Phase::Writing | Phase::Restoring))
             .ok_or_else(|| anyhow::anyhow!("unexpected DDC write result"))?;
-        self.phase = Phase::Verifying;
-        Ok(Effect::Send(Message::Verify(transfer.id)))
+        if self.phase == Phase::Restoring {
+            self.phase = Phase::Checking;
+            Ok(Effect::Ddc(Job::Read))
+        } else {
+            self.phase = Phase::Verifying;
+            Ok(Effect::Send(Message::Verify(transfer.id)))
+        }
     }
 
-    pub fn checked(&self, observed: Option<u16>) -> Result<Effect> {
+    pub fn write_failed(&mut self) -> Result<Effect> {
+        if self.phase != Phase::Restoring {
+            bail!("could not select the peer monitor input");
+        }
+        self.restore_on_peer()
+    }
+
+    fn restore_on_peer(&mut self) -> Result<Effect> {
+        let id = self.transfer.context("missing monitor transfer")?.id;
+        self.restore_fallback = true;
+        self.phase = Phase::RestoreFallback;
+        Ok(Effect::Send(Message::RestoreMonitor(id)))
+    }
+
+    pub fn checked(&mut self, observed: Option<u16>) -> Result<Effect> {
         let transfer = self
             .transfer
             .filter(|_| self.phase == Phase::Checking)
             .ok_or_else(|| anyhow::anyhow!("unexpected DDC read result"))?;
         if self.inputs.map(|inputs| inputs.host) == observed {
             Ok(Effect::Send(Message::Returned(transfer.id)))
+        } else if !self.restore_fallback {
+            self.restore_on_peer()
         } else {
             Ok(Effect::Ddc(Job::Read))
         }
@@ -253,6 +293,10 @@ mod tests {
         let mut controller = setup(Mode::Video);
         assert_eq!(
             controller.message(Message::Ready(3)).unwrap(),
+            Effect::Send(Message::SelectMonitor(3))
+        );
+        assert_eq!(
+            controller.message(Message::SelectFallback(3)).unwrap(),
             Effect::Ddc(Job::Select { from: 17, to: 15 })
         );
         assert_eq!(
@@ -285,6 +329,7 @@ mod tests {
 
         let mut controller = setup(Mode::Video);
         controller.message(Message::Ready(3)).unwrap();
+        controller.message(Message::SelectFallback(3)).unwrap();
         controller.written().unwrap();
         controller
             .message(Message::Observed { id: 3, input: 15 })
@@ -302,7 +347,6 @@ mod tests {
         let mut controller = setup(Mode::Video);
         assert_eq!(controller.id(), Some(3));
         controller.message(Message::Ready(3)).unwrap();
-        controller.written().unwrap();
         controller
             .message(Message::Observed { id: 3, input: 15 })
             .unwrap();
@@ -313,9 +357,17 @@ mod tests {
         );
         assert_eq!(
             controller.message(Message::Returning(3)).unwrap(),
+            Effect::Ddc(Job::Select { from: 15, to: 17 })
+        );
+        assert_eq!(controller.written().unwrap(), Effect::Ddc(Job::Read));
+        assert_eq!(
+            controller.checked(None).unwrap(),
+            Effect::Send(Message::RestoreMonitor(3))
+        );
+        assert_eq!(
+            controller.message(Message::MonitorRestored(3)).unwrap(),
             Effect::Ddc(Job::Read)
         );
-        assert_eq!(controller.checked(None).unwrap(), Effect::Ddc(Job::Read));
         assert_eq!(
             controller.checked(Some(15)).unwrap(),
             Effect::Ddc(Job::Read)
