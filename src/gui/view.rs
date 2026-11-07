@@ -408,6 +408,11 @@ fn device_picker(
 
 impl Desktop {
     pub(super) fn render(&mut self, root: &mut egui::Ui) {
+        #[cfg(debug_assertions)]
+        if self.preview_popup {
+            self.quick_preview(root);
+            return;
+        }
         let ctx = root.ctx().clone();
         egui::Panel::left("navigation")
             .exact_size(180.0)
