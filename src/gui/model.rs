@@ -130,10 +130,7 @@ impl Preferences {
             if self.muted {
                 args.push("--mute".into());
             }
-            args.extend(["--native-volume".into(), self.native_volume.to_string()]);
-            if self.native_muted {
-                args.push("--native-mute".into());
-            }
+            // Adopt the actual output volume on startup, including media-key changes.
             if !self.audio_output.trim().is_empty() {
                 args.extend(["--output".into(), self.audio_output.clone()]);
             }
