@@ -133,6 +133,11 @@ impl Worker {
         self.child.is_some()
     }
 
+    #[cfg(target_os = "linux")]
+    pub fn age(&self) -> Duration {
+        self.started.elapsed()
+    }
+
     pub fn connected(&self) -> bool {
         self.running()
             && !self.stopping

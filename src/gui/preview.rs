@@ -280,6 +280,8 @@ impl Desktop {
                         } else {
                             "/dev/input/fixture-mouse"
                         }),
+                        #[cfg(target_os = "linux")]
+                        generation: None,
                         keyboard,
                         mouse: !keyboard,
                     });

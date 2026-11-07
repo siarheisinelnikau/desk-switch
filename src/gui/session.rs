@@ -671,21 +671,33 @@ impl Desktop {
             || !self.pair.input_failed
             || self.prefs.role != "host"
             || self.query.is_some()
-            || self.form.capture_devices.is_empty()
-            || self
-                .pair
-                .input_access_attempts
-                .contains(&self.input_access_selection())
+            || self.input_permission_paths().is_empty()
         {
             return;
         }
         let permission_denied = self.input.as_ref().is_some_and(|worker| {
-            worker.logs.iter().any(|line| {
-                line.contains("Permission denied") || line.contains("grant this desktop user")
-            })
+            worker.age() >= Duration::from_secs(2)
+                && worker
+                    .logs
+                    .iter()
+                    .any(|line| super::input_permission_error(line))
         });
         if permission_denied {
-            self.scan(QueryKind::InputAccess);
+            // udev may finish restoring an existing grant just after the first
+            // open failed. Retry that open before considering a new auth dialog.
+            if self
+                .input_permission_paths()
+                .iter()
+                .all(|path| std::fs::File::open(path).is_ok())
+            {
+                self.pair.input_failed = false;
+            } else if !self
+                .pair
+                .input_access_attempts
+                .contains(&self.input_access_selection())
+            {
+                self.scan(QueryKind::InputAccess);
+            }
         }
     }
 
@@ -881,6 +893,21 @@ impl Desktop {
                 self.prefs.address,
                 toml::to_string(&self.form.document().unwrap_or_default()).unwrap_or_default()
             );
+            #[cfg(target_os = "linux")]
+            if host {
+                // Use the generation captured with the hardware inventory. A
+                // reused event path must not bind a stale selected identity to
+                // a different device before the next hardware scan.
+                for device in self.pair.inputs.iter().filter(|device| {
+                    self.form
+                        .capture_devices
+                        .lines()
+                        .any(|path| std::path::Path::new(path) == device.path)
+                }) {
+                    input_profile
+                        .push_str(&format!("\n{}:{:?}", device.info.id, device.generation));
+                }
+            }
         }
         if input_profile != self.pair.input_profile {
             if let Some(worker) = &mut self.input {
