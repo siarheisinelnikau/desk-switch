@@ -1,4 +1,4 @@
-"""Sign tested CI installers only when the pinned project's key is configured."""
+"""Sign tested CI installers with the required pinned project identity."""
 import base64
 import os
 from pathlib import Path
@@ -19,14 +19,12 @@ def output(ready):
 
 
 def main():
-    key = os.environ.get("DESK_SWITCH_UPDATE_SIGNING_KEY", "").strip()
+    key = os.environ.pop("DESK_SWITCH_UPDATE_SIGNING_KEY", "").strip()
     if not key:
-        output(False)
-        print("No update signing key is configured; publish a prerelease candidate only.")
-        return
+        raise SystemExit("Configure DESK_SWITCH_UPDATE_SIGNING_KEY in the release environment before publishing.")
     data = key.encode() if key.startswith("-----BEGIN") else base64.b64decode(key, validate=True)
     version = tomllib.loads((ROOT / "Cargo.toml").read_text())["package"]["version"]
-    with tempfile.TemporaryDirectory(prefix="desk-switch-ci-sign-") as directory:
+    with tempfile.TemporaryDirectory(prefix="desk-switch-ci-sign-", dir=os.environ.get("RUNNER_TEMP")) as directory:
         path = Path(directory) / "signing-key.pem"
         path.write_bytes(data)
         path.chmod(0o600)
@@ -38,6 +36,7 @@ def main():
             "--out", str(ROOT / "dist/signed"),
         ], check=True)
     manifest = ROOT / f"release/manifests/{version}.json"
+    manifest.parent.mkdir(parents=True, exist_ok=True)
     shutil.copyfile(ROOT / "dist/signed/update.json", manifest)
     output(True)
     print(f"Prepared pinned-key update metadata for v{version}.")
