@@ -777,6 +777,7 @@ pub(crate) mod tests {
     fn failed_switches_preserve_input_monitor_entry_and_counters() {
         for position in [None, Some(12_345)] {
             let mut state = fixture(3);
+            state.settings.monitor_enabled = true;
             state.active_input = Some(key(1));
             state.active_monitor = Some(key(1));
             state.active_input_entry = Some(999);
@@ -807,6 +808,7 @@ pub(crate) mod tests {
     #[test]
     fn switches_wait_for_terminal_monitor_ack_and_allow_one_explicit_retry() {
         let mut state = fixture(3);
+        state.settings.monitor_enabled = true;
         state.activate(&key(2), Some(12_345)).unwrap();
         assert!(state.switch_pending());
         let pending = state.clone();
@@ -859,6 +861,7 @@ pub(crate) mod tests {
     #[test]
     fn failed_input_returns_preserve_the_monitor_and_cannot_bypass_an_inflight_switch() {
         let mut state = fixture(3);
+        state.settings.monitor_enabled = true;
         state.activate(&key(2), Some(123)).unwrap();
         let pending = state.clone();
         assert!(state.return_input().is_err());
