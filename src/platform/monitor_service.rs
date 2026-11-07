@@ -345,6 +345,12 @@ mod tests {
             Ok(input)
         }
         fn write(&mut self, input: u16) -> Result<()> {
+            if !self.active_only {
+                ensure!(
+                    input == self.own,
+                    "the destination must select its own saved input"
+                );
+            }
             self.writes.fetch_add(1, SeqCst);
             self.input.store(input, SeqCst);
             Ok(())

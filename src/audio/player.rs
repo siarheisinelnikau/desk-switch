@@ -86,9 +86,10 @@ pub async fn play(
     peer: Key,
     output: Option<String>,
     mix: Mix,
-    mut native_level: crate::workspace::AudioLevel,
+    initial_system: super::system_volume::Change,
     dir: PathBuf,
 ) -> Result<()> {
+    let mut system = super::system_volume::SystemVolume::start(output.clone(), initial_system)?;
     let player = Player {
         address,
         identity: Arc::new(identity),
@@ -108,7 +109,8 @@ pub async fn play(
                 }
             }
         })?;
-    let mut native = super::mixer::NativeMixer::start(dir, native_level)?;
+    // Restore old per-application gains from earlier releases; never apply them again.
+    let mut native = super::mixer::NativeMixer::start(dir, Default::default())?;
     native.wait_ready().await?;
     let mut native_done = false;
     println!(
@@ -122,6 +124,10 @@ pub async fn play(
     let signal: Result<()> = loop {
         tokio::select! {
             result = &mut shutdown => break result.map_err(Into::into),
+            result = &mut system.done => {
+                break result.context("system volume worker stopped")?
+                    .and_then(|()| Err(anyhow::anyhow!("system volume worker stopped unexpectedly")));
+            }
             result = &mut native.done => {
                 native_done = true;
                 break match result {
@@ -138,14 +144,12 @@ pub async fn play(
                 };
                 match command.split_whitespace().collect::<Vec<_>>().as_slice() {
                     ["on"] if task.is_none() => {
-                        if let Err(error) = native.set(native_level) { break Err(error); }
                         player.status(format!("connecting to {address}"));
                         task = Some(tokio::spawn(player.clone().reconnect()));
                     }
                     ["on"] => println!("Remote audio is already enabled."),
                     ["off"] => {
                         stop(&mut task).await;
-                        if let Err(error) = native.set(crate::workspace::AudioLevel::default()) { break Err(error); }
                         player.status("off".into());
                     }
                     ["mute"] => {
@@ -165,14 +169,20 @@ pub async fn play(
                     },
                     ["native-volume", value] => match super::volume(value) {
                         Ok(volume) => {
-                            native_level.volume = volume;
-                            if task.is_some() && let Err(error) = native.set(native_level) { break Err(error); }
+                            system.set(0, super::system_volume::Change { volume: Some(volume), muted: None })?;
                         }
                         Err(error) => eprintln!("{error}"),
                     },
                     ["native-mute"] | ["native-unmute"] => {
-                        native_level.muted = command.trim() == "native-mute";
-                        if task.is_some() && let Err(error) = native.set(native_level) { break Err(error); }
+                        system.set(0, super::system_volume::Change { volume: None, muted: Some(command.trim() == "native-mute") })?;
+                    }
+                    ["system-level", request, volume, muted @ ("true" | "false")] => {
+                        match (request.parse::<u64>(), super::volume(volume)) {
+                            (Ok(request), Ok(volume)) => system.set(request, super::system_volume::Change {
+                                volume: Some(volume), muted: Some(*muted == "true"),
+                            })?,
+                            _ => eprintln!("Invalid system volume command."),
+                        }
                     }
                     ["status"] => {
                         let mix = *player.mix.lock().unwrap();

@@ -8,7 +8,7 @@ import subprocess
 
 ROOT = Path(__file__).resolve().parents[1]
 REPOSITORY = 'siarheisinelnikau/desk-switch'
-SECRET = 'UPDATE_SIGNING_KEY_PEM'
+SECRET = 'DESK_SWITCH_UPDATE_SIGNING_KEY'
 
 
 def gh(*arguments, data=None):

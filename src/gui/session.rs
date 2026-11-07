@@ -548,6 +548,27 @@ impl Desktop {
                 }
             }
         }
+        if self.prefs.discovery
+            && self.prefs.auto_connect
+            && !self.pair.auto_suspended
+            && self.pair.remote.is_none()
+            && !self.pair.busy
+            && !self.peer_key.is_empty()
+            && self.pair.service.is_some()
+            && let Some(since) = self.pair.last_dial
+        {
+            ctx.request_repaint_after(
+                Duration::from_secs(4)
+                    .saturating_sub(since.elapsed())
+                    .max(Duration::from_millis(100)),
+            );
+        }
+        if let Some(since) = self.pair.reconnect.0 {
+            let remaining = RECONNECT_GRACE.saturating_sub(since.elapsed());
+            if !remaining.is_zero() {
+                ctx.request_repaint_after(remaining);
+            }
+        }
         self.reconcile_services();
     }
 
@@ -626,6 +647,7 @@ impl Desktop {
     }
 
     pub(super) fn shared_changed(&mut self) {
+        self.ctx.request_repaint();
         self.prefs.workspace.shared.changed(&self.public_key);
         self.apply_input_monitor_requirement();
         if let Err(error) = self.prefs.save(&self.dir) {
@@ -803,7 +825,7 @@ impl Desktop {
             && self.query.is_none()
             && let Some(args) = args
         {
-            match Worker::start(Kind::Monitor, &args, &self.dir) {
+            match Worker::start(Kind::Monitor, &args, &self.dir, &self.ctx) {
                 Ok(mut worker) => {
                     worker.monitoring = true;
                     self.pair.monitor_input = None;
@@ -882,13 +904,18 @@ impl Desktop {
                 .as_ref()
                 .is_none_or(|w| !w.running() || !w.monitoring)
             && self.query.is_none()
-            && self
+        {
+            let remaining = self
                 .pair
                 .last_monitor_check
-                .is_none_or(|t| t.elapsed() >= Duration::from_secs(5))
-        {
-            self.pair.last_monitor_check = Some(Instant::now());
-            self.scan(QueryKind::MonitorStatus);
+                .map(|since| Duration::from_secs(5).saturating_sub(since.elapsed()))
+                .unwrap_or_default();
+            if remaining.is_zero() {
+                self.pair.last_monitor_check = Some(Instant::now());
+                self.scan(QueryKind::MonitorStatus);
+            } else {
+                self.ctx.request_repaint_after(remaining);
+            }
         }
         let mut input_profile = String::new();
         if let Some(source) = plan.input_source.as_ref() {
@@ -1077,7 +1104,9 @@ impl Desktop {
                         },
                         &args,
                         &self.dir,
+                        &self.ctx,
                     )?);
+                    self.applied_mix.clear();
                     Ok(())
                 })();
                 if let Err(error) = result {
@@ -1099,20 +1128,14 @@ impl Desktop {
                     // Commands are small and only emitted when the shared mix changes.
                     let incoming = shared.audio_level(&remote.key);
                     let native = shared.audio_level(&self.public_key);
-                    let mix = format!(
-                        "{}:{}:{}:{}",
-                        incoming.volume, incoming.muted, native.volume, native.muted
-                    );
+                    let mix = format!("{}:{}", incoming.volume, incoming.muted);
                     if self.applied_mix != mix {
                         let _ = worker.command(&format!("volume {}", incoming.volume));
                         let _ = worker.command(if incoming.muted { "mute" } else { "unmute" });
-                        let _ = worker.command(&format!("native-volume {}", native.volume));
-                        let _ = worker.command(if native.muted {
-                            "native-mute"
-                        } else {
-                            "native-unmute"
-                        });
                         self.applied_mix = mix;
+                    }
+                    if let Err(error) = worker.set_output_level(native) {
+                        self.notice = Some((format!("Changing system volume: {error:#}"), true));
                     }
                 }
             }
@@ -1198,6 +1221,7 @@ impl Desktop {
                 },
                 &args,
                 &self.dir,
+                &self.ctx,
             ) {
                 Ok(worker) => {
                     self.microphone = Some(worker);

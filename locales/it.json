@@ -397,5 +397,12 @@
   "The other PC did not complete the paired update. The verified download is kept for retry.": "L’altro PC non ha completato l’aggiornamento della coppia. Il download verificato viene conservato per riprovare.",
   "Switch back using Desk Switch on the other PC.": "Torna indietro usando Desk Switch sull’altro PC.",
   "Switch keyboard and mouse only for setup": "Trasferisci solo tastiera e mouse per la configurazione",
-  "Select the other PC's input in the monitor menu, then remember its connection there. Return input with F11; use the monitor menu to return the picture during this first setup.": "Seleziona l’ingresso dell’altro PC nel menu del monitor e memorizza lì la connessione. Restituisci il controllo con F11; durante questa prima configurazione, ripristina l’immagine dal menu del monitor."
+  "Select the other PC's input in the monitor menu, then remember its connection there. Return input with F11; use the monitor menu to return the picture during this first setup.": "Seleziona l’ingresso dell’altro PC nel menu del monitor e memorizza lì la connessione. Restituisci il controllo con F11; durante questa prima configurazione, ripristina l’immagine dal menu del monitor.",
+  "System volume of the shared output": "Volume di sistema dell’uscita condivisa",
+  "Relative to the shared output's system volume": "Relativo al volume di sistema dell’uscita condivisa",
+  "The listening PC controls system volume. The other PC is relative to it: 90% × 50% = 45%.": "Il PC di ascolto controlla il volume di sistema. Il volume dell’altro PC è relativo: 90% × 50% = 45%.",
+  "Shared monitor is off": "Monitor condiviso spento",
+  "Set up this PC": "Configura questo PC",
+  "Set up the other PC": "Configura l’altro PC",
+  "Same input on both PCs": "Stesso ingresso sui due PC"
 }
