@@ -97,7 +97,7 @@ pub fn read_monitor(id: &str) -> Result<super::MonitorInfo> {
         .into_iter()
         .find(|display| display.id == id)
         .context("The selected macOS display is unavailable")?;
-    info.current = Some(Ddc(id.into()).read()?);
+    info.current = Some(crate::video::read_once(Ddc(id.into()))?);
     Ok(info)
 }
 pub fn discover() -> Result<Vec<super::MonitorInfo>> {
