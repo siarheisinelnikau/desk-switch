@@ -531,8 +531,14 @@ impl Desktop {
             Action::Switch => self.switch(),
             Action::MonitorSwitch => self.switch_monitor(ctx),
             Action::MonitorSetup => {
-                self.page = Page::Overview;
-                self.monitor_setup_open = true;
+                if self.group.workspace.is_some() {
+                    self.group.add_open = false;
+                    self.group.selected = self.public_key.clone();
+                    self.page = Page::Application;
+                } else {
+                    self.page = Page::Overview;
+                    self.monitor_setup_open = true;
+                }
                 self.action(Action::Show, ctx);
             }
             Action::Emergency => {
