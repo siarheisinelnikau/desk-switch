@@ -123,4 +123,6 @@ Set `release/publish-request.json` to the new version tag to build a prerelease.
 python3 tools/prepare_release.py --tag vVERSION --windows PATH.exe --deb PATH.deb --out dist/signed
 ```
 
-Commit the metadata as `release/manifests/VERSION.json`. Promotion verifies the signature, public downloads, package metadata and both embedded build stamps before publishing stable. The signing key stays in the ignored `.release-private/` directory and is never sent to GitHub. Back it up. Existing tags and signed releases must not be reused.
+The Release workflow can also sign tested installers in an isolated job using `UPDATE_SIGNING_KEY_PEM` from the `release` GitHub environment. It attaches the signed envelope to prerelease notes and saves `update.json` in the `desk-switch-signed-metadata` Actions artifact. See [signing setup and backup](docs/signing.md).
+
+Commit the locally generated metadata, or the workflow's verified `update.json`, as `release/manifests/VERSION.json` to request stable promotion. Promotion verifies the signature, public downloads, package metadata and both embedded build stamps before publishing stable. The private key remains excluded from Git and release assets; an encrypted copy is supplied to the signing job through GitHub Secrets. Back up the local key independently. Existing tags and signed releases must not be reused.

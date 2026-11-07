@@ -10,6 +10,10 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
   build:
     strategy:
@@ -27,7 +31,9 @@ jobs:
     env:
       RUSTFLAGS: ${{ matrix.rustflags }}
     steps:
-      - uses: actions/checkout@v7.0.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - if: runner.os == 'Linux'
         run: |
           sudo apt-get update -qq
@@ -48,37 +54,83 @@ jobs:
           python3 tools/verify_deb.py dist/desk-switch-linux-x86_64.deb
           sudo apt-get --simulate install ./dist/desk-switch-linux-x86_64.deb
       - if: matrix.platform == 'windows'
-        uses: actions/upload-artifact@v7.0.2
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: desk-switch-${{ matrix.platform }}
           path: target/release/${{ matrix.binary }}
           if-no-files-found: error
       - if: matrix.platform == 'linux'
-        uses: actions/upload-artifact@v7.0.2
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: desk-switch-debian
           path: dist/desk-switch-linux-x86_64.deb
           if-no-files-found: error
 
-  publish:
+  sign:
     needs: build
     runs-on: ubuntu-24.04
-    permissions:
-      contents: write
+    environment: release
+    timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v7.0.1
-      - uses: actions/download-artifact@v8.0.2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           pattern: desk-switch-*
           path: artifacts
           merge-multiple: true
-      - name: Publish tested installers for signing
+      - name: Sign verified installers with the existing updater identity
+        env:
+          UPDATE_SIGNING_KEY_PEM: ${{ secrets.UPDATE_SIGNING_KEY_PEM }}
+        run: |
+          set -euo pipefail
+          set +x
+          : "${UPDATE_SIGNING_KEY_PEM:?Configure UPDATE_SIGNING_KEY_PEM in the release environment}"
+          tag="$(python3 -c 'import pathlib,tomllib; print("v" + tomllib.loads(pathlib.Path("Cargo.toml").read_text())["package"]["version"])')"
+          if [[ "$GITHUB_REF_TYPE" == tag ]]; then
+            test "$GITHUB_REF_NAME" = "$tag"
+          else
+            requested="$(python3 -c 'import json,pathlib; print(json.loads(pathlib.Path("release/publish-request.json").read_text())["tag"])')"
+            test "$requested" = "$tag"
+          fi
+          umask 077
+          key="$(mktemp "$RUNNER_TEMP/desk-switch-signing.XXXXXX.pem")"
+          trap 'rm -f -- "$key"' EXIT
+          printf '%s\n' "$UPDATE_SIGNING_KEY_PEM" > "$key"
+          unset UPDATE_SIGNING_KEY_PEM
+          python3 tools/prepare_release.py --tag "$tag" --key "$key" \
+            --windows artifacts/desk-switch.exe --deb artifacts/desk-switch-linux-x86_64.deb --out signed
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: desk-switch-signed-metadata
+          path: signed/update.json
+          if-no-files-found: error
+          retention-days: 30
+
+  publish:
+    needs: [build, sign]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: desk-switch-*
+          path: artifacts
+          merge-multiple: true
+      - name: Publish signed prerelease for review
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           python3 - <<'PY'
-          import json, os, shutil, subprocess, tomllib
+          import json, os, shutil, subprocess, sys, tomllib
           from pathlib import Path
+          sys.path.insert(0, 'tools')
+          from promote_release import signed_notes
           version = tomllib.loads(Path('Cargo.toml').read_text())['package']['version']
           tag = f'v{version}'
           if os.environ['GITHUB_REF_TYPE'] == 'tag':
@@ -88,5 +140,7 @@ jobs:
           Path('dist').mkdir()
           for source, name in [('desk-switch.exe','desk-switch-windows-x86_64.exe'), ('desk-switch-linux-x86_64.deb','desk-switch-linux-x86_64.deb')]:
               shutil.copy2(Path('artifacts')/source, Path('dist')/name)
-          subprocess.run(['gh','release','create',tag,*map(str,Path('dist').iterdir()),'--target',os.environ['GITHUB_SHA'],'--prerelease','--title',f'Desk Switch {tag}','--notes-file',f'release/notes/{version}.md'],check=True)
+          notes = Path(os.environ['RUNNER_TEMP']) / 'desk-switch-release-notes.md'
+          notes.write_text(signed_notes('',Path('artifacts/update.json').read_text(),Path(f'release/notes/{version}.md').read_text()))
+          subprocess.run(['gh','release','create',tag,*map(str,Path('dist').iterdir()),'--target',os.environ['GITHUB_SHA'],'--prerelease','--title',f'Desk Switch {tag}','--notes-file',str(notes)],check=True)
           PY
