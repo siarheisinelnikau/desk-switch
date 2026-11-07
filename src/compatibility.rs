@@ -73,17 +73,19 @@ pub struct Mismatch {
 
 impl fmt::Display for Mismatch {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "Несовместимые версии: этот ПК {} (протокол {}), другой ПК ",
-            self.local.app, self.local.protocol
-        )?;
         if let Some(peer) = &self.peer {
-            write!(f, "{} (протокол {})", peer.app, peer.protocol)?;
+            write!(
+                f,
+                "Incompatible versions: this PC {} (protocol {}), other PC {} (protocol {}). Update both PCs to the same version.",
+                self.local.app, self.local.protocol, peer.app, peer.protocol
+            )
         } else {
-            write!(f, "не сообщает версию (старый клиент)")?;
+            write!(
+                f,
+                "Incompatible versions: this PC {} (protocol {}), other PC does not report a version (legacy client). Update both PCs to the same version.",
+                self.local.app, self.local.protocol
+            )
         }
-        write!(f, ". Обновите оба ПК до одной версии.")
     }
 }
 impl std::error::Error for Mismatch {}
@@ -91,6 +93,59 @@ impl std::error::Error for Mismatch {}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn version_mismatch_is_localized_in_every_supported_language() {
+        let local = Version {
+            app: "0.4.3".into(),
+            protocol: 5,
+        };
+        let peer = Version {
+            app: "0.4.2".into(),
+            protocol: 4,
+        };
+        let known = local.require(Some(&peer)).unwrap_err().to_string();
+        let legacy = local.require(None).unwrap_err().to_string();
+        assert_eq!(
+            crate::i18n::tr_language("en", &known),
+            "Incompatible versions: this PC 0.4.3 (protocol 5), other PC 0.4.2 (protocol 4). Update both PCs to the same version."
+        );
+        assert_eq!(
+            crate::i18n::tr_language("en", &legacy),
+            "Incompatible versions: this PC 0.4.3 (protocol 5), other PC does not report a version (legacy client). Update both PCs to the same version."
+        );
+        for (language, prefix, protocol) in [
+            ("en", "Incompatible versions:", "protocol"),
+            ("ru", "Несовместимые версии:", "протокол"),
+            ("de", "Inkompatible Versionen:", "Protokoll"),
+            ("fr", "Versions incompatibles :", "protocole"),
+            ("es", "Versiones incompatibles:", "protocolo"),
+            ("it", "Versioni incompatibili:", "protocollo"),
+        ] {
+            let translated = crate::i18n::tr_language(language, &known);
+            let translated_legacy = crate::i18n::tr_language(language, &legacy);
+            for message in [&translated, &translated_legacy] {
+                assert!(message.starts_with(prefix), "{language}: {message}");
+                assert!(
+                    message.contains(&format!("0.4.3 ({protocol} 5)")),
+                    "{language}: {message}"
+                );
+            }
+            assert!(
+                translated.contains(&format!("0.4.2 ({protocol} 4)")),
+                "{language}: {translated}"
+            );
+            assert!(!translated_legacy.contains("0.4.2"));
+            if language != "en" {
+                assert_ne!(translated, known, "missing {language} translation");
+                assert_ne!(
+                    translated_legacy, legacy,
+                    "missing {language} legacy translation"
+                );
+            }
+        }
+    }
+
     #[test]
     fn requires_exact_app_and_protocol_and_rejects_legacy_payloads() {
         let current = Version::current();

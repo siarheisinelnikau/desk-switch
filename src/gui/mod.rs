@@ -25,6 +25,8 @@ use worker::{Kind, Worker};
 pub enum Action {
     Show,
     Switch,
+    MonitorSwitch,
+    MonitorSetup,
     Emergency,
     Sound,
     Quit,
@@ -54,6 +56,7 @@ pub struct Desktop {
     public_key: String,
     peer_key: String,
     input: Option<Worker>,
+    monitor: Option<Worker>,
     audio: Option<Worker>,
     microphone: Option<Worker>,
     query: Option<(QueryKind, Worker)>,
@@ -62,7 +65,8 @@ pub struct Desktop {
     device_notice: Option<(Kind, String)>,
     tray: Option<tray::Tray>,
     tray_error: Option<String>,
-    tray_snapshot: (bool, bool, bool),
+    tray_snapshot: tray::State,
+    monitor_setup_open: bool,
     actions: Receiver<Action>,
     hidden: bool,
     start_hidden: bool,
@@ -166,6 +170,7 @@ impl Desktop {
             public_key,
             peer_key,
             input: None,
+            monitor: None,
             audio: None,
             microphone: None,
             query: None,
@@ -174,7 +179,8 @@ impl Desktop {
             device_notice: None,
             tray,
             tray_error,
-            tray_snapshot: (false, false, false),
+            tray_snapshot: tray::State::default(),
+            monitor_setup_open: false,
             actions,
             hidden: false,
             start_hidden,
@@ -208,6 +214,9 @@ impl Desktop {
     }
     fn audio_running(&self) -> bool {
         self.audio.as_ref().is_some_and(Worker::running)
+    }
+    fn monitor_running(&self) -> bool {
+        self.monitor.as_ref().is_some_and(Worker::running)
     }
     fn microphone_running(&self) -> bool {
         self.microphone.as_ref().is_some_and(Worker::running)
@@ -283,6 +292,71 @@ impl Desktop {
         );
     }
 
+    fn monitor_switch_ready(&self) -> bool {
+        if !self.pair.synced {
+            return false;
+        }
+        let local = self.local_node();
+        let Some(inputs) = self
+            .pair
+            .remote
+            .as_ref()
+            .and_then(|r| crate::workspace::Plan::monitor_inputs(&local, r))
+        else {
+            return false;
+        };
+        if self
+            .pair
+            .plan
+            .as_ref()
+            .is_some_and(|p| p.input_source.is_some())
+        {
+            self.connected() && self.pair.plan.as_ref().is_some_and(|p| p.monitor.is_some())
+        } else {
+            if !self.pair.remote.as_ref().is_some_and(|remote| {
+                crate::workspace::Plan::monitor_only_available(&local, remote)
+            }) {
+                return false;
+            }
+            #[cfg(debug_assertions)]
+            if self.preview.is_some() {
+                return local.monitor_input == Some(inputs.host);
+            }
+            self.monitor.as_ref().is_some_and(|worker| {
+                worker.running() && !worker.stopping && worker.monitor_input == Some(inputs.host)
+            })
+        }
+    }
+
+    fn tray_state(&self) -> tray::State {
+        tray::State {
+            connected: self.connected() && self.pair.synced,
+            emergency: self.input_running(),
+            sound: self.audio_running(),
+            monitor: self.monitor_switch_ready(),
+            combined: self.pair.plan.as_ref().is_some_and(|p| p.monitor.is_some()),
+        }
+    }
+
+    fn switch_monitor(&mut self, ctx: &egui::Context) {
+        if !self.monitor_switch_ready() {
+            self.action(Action::MonitorSetup, ctx);
+        } else if self.connected() {
+            self.switch();
+        } else if self
+            .last_switch
+            .is_none_or(|time| time.elapsed() >= Duration::from_millis(800))
+        {
+            self.last_switch = Some(Instant::now());
+            let result = self
+                .monitor
+                .as_mut()
+                .context("shared monitor service is not ready")
+                .and_then(|worker| worker.command("switch"));
+            self.message(result, "Shared monitor switch requested. Use Desk Switch in the other PC's tray to switch back.");
+        }
+    }
+
     fn action(&mut self, action: Action, ctx: &egui::Context) {
         match action {
             Action::Show => {
@@ -292,6 +366,12 @@ impl Desktop {
                 ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
             }
             Action::Switch => self.switch(),
+            Action::MonitorSwitch => self.switch_monitor(ctx),
+            Action::MonitorSetup => {
+                self.page = Page::Overview;
+                self.monitor_setup_open = true;
+                self.action(Action::Show, ctx);
+            }
             Action::Emergency => {
                 if let Some(input) = &mut self.input {
                     let result = input.command("emergency");
@@ -342,6 +422,8 @@ impl Desktop {
         let args: Vec<String> = match kind {
             #[cfg(target_os = "linux")]
             QueryKind::InputAccess => {
+                let selection = self.input_access_selection();
+                self.pair.input_access_attempts.insert(selection);
                 let mut args = vec!["input-access".into()];
                 args.extend(self.form.capture_devices.lines().map(str::to_owned));
                 args
@@ -355,6 +437,20 @@ impl Desktop {
             Ok(worker) => self.query = Some((kind, worker)),
             Err(error) => self.notice = Some((format!("{error:#}"), true)),
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn input_access_selection(&self) -> String {
+        use std::os::unix::fs::MetadataExt;
+        self.form
+            .capture_devices
+            .lines()
+            .map(|path| {
+                let inode = std::fs::metadata(path).map(|m| (m.dev(), m.ino())).ok();
+                format!("{path}:{inode:?}")
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
     }
 
     fn tick(&mut self, ctx: &egui::Context) {
@@ -378,6 +474,7 @@ impl Desktop {
         }
         for (worker, failed) in [
             (&mut self.input, &mut self.pair.input_failed),
+            (&mut self.monitor, &mut self.pair.monitor_failed),
             (&mut self.audio, &mut self.pair.audio_failed),
             (&mut self.microphone, &mut self.pair.microphone_failed),
         ] {
@@ -394,14 +491,18 @@ impl Desktop {
             }
         }
         self.tick_pair(ctx);
+        #[cfg(target_os = "linux")]
+        self.request_input_access_if_needed();
         if let Some((kind, error)) = &self.device_notice {
-            let ready = [&self.input, &self.audio, &self.microphone]
+            let ready = [&self.input, &self.monitor, &self.audio, &self.microphone]
                 .into_iter()
                 .flatten()
                 .find(|worker| worker.kind == *kind)
                 .is_some_and(|worker| {
                     if *kind == Kind::Input {
                         worker.connected()
+                    } else if *kind == Kind::Monitor {
+                        worker.running() && worker.monitor_input.is_some()
                     } else {
                         worker.running() && worker.audio_playing
                     }
@@ -451,6 +552,7 @@ impl Desktop {
                     );
                     if self.prefs.auto_update
                         && !self.input_running()
+                        && !self.monitor_running()
                         && !self.audio_running()
                         && !self.microphone_running()
                         && !self.quitting
@@ -472,6 +574,7 @@ impl Desktop {
         }
         if self.install_pending
             && !self.input_running()
+            && !self.monitor_running()
             && !self.audio_running()
             && !self.microphone_running()
         {
@@ -536,6 +639,10 @@ impl Desktop {
                     QueryKind::Monitors => {
                         let monitor: MonitorInfo = serde_json::from_value(value)?;
                         if monitor.id == self.prefs.workspace.monitor.id {
+                            anyhow::ensure!(
+                                monitor.current.is_some_and(|input| input != 0),
+                                "The monitor did not report a usable current input. No input was changed."
+                            );
                             self.prefs.workspace.monitor.input = monitor.current;
                             self.pair.monitor_input = monitor.current;
                             self.prefs.workspace.monitor.fingerprint = monitor.fingerprint;
@@ -567,10 +674,10 @@ impl Desktop {
         if self.hidden && !tray_available {
             self.action(Action::Show, ctx);
         }
-        let snapshot = (self.connected(), self.input_running(), self.audio_running());
+        let snapshot = self.tray_state();
         if snapshot != self.tray_snapshot {
             if let Some(tray) = &mut self.tray {
-                tray.update(snapshot.0, snapshot.1, snapshot.2);
+                tray.update(snapshot);
             }
             self.tray_snapshot = snapshot;
         }
@@ -589,15 +696,21 @@ impl Desktop {
             .quitting_since
             .is_some_and(|time| time.elapsed() > Duration::from_secs(6))
         {
-            for worker in [&mut self.input, &mut self.audio, &mut self.microphone]
-                .into_iter()
-                .flatten()
+            for worker in [
+                &mut self.input,
+                &mut self.monitor,
+                &mut self.audio,
+                &mut self.microphone,
+            ]
+            .into_iter()
+            .flatten()
             {
                 worker.force_stop();
             }
         }
         if self.quitting
             && !self.input_running()
+            && !self.monitor_running()
             && !self.audio_running()
             && !self.microphone_running()
         {
@@ -610,11 +723,7 @@ impl Desktop {
         crate::i18n::set_language(&self.prefs.language);
         view::style(ctx, &self.prefs.theme);
         if let Some(tray) = &mut self.tray {
-            tray.update(
-                self.tray_snapshot.0,
-                self.tray_snapshot.1,
-                self.tray_snapshot.2,
-            );
+            tray.update(self.tray_snapshot);
         }
         if let Err(error) = self.prefs.save(&self.dir) {
             self.notice = Some((error.to_string(), true));
@@ -691,12 +800,7 @@ impl Desktop {
                 self.notice = Some((error.to_string(), true));
                 return;
             }
-            if let Some(input) = &mut self.input {
-                input.stop();
-            }
-            if let Some(audio) = &mut self.audio {
-                audio.stop();
-            }
+            self.stop_pair();
             self.query.take();
             self.install_pending = true;
             self.update_ready = false;

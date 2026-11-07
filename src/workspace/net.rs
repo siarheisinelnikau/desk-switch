@@ -21,6 +21,9 @@ use tokio::{
 
 const LIMIT: usize = 60 * 1024;
 const AUTH_TIMEOUT: Duration = Duration::from_secs(4);
+// Settings/GUI scheduling can stall briefly on Windows. Input fail-open timing
+// is independent (transport::LEASE) and is deliberately not relaxed here.
+const STATE_TIMEOUT: Duration = Duration::from_secs(12);
 const CONSENT_TIMEOUT: Duration = Duration::from_secs(90);
 
 #[derive(Clone, Debug)]
@@ -667,7 +670,7 @@ async fn session(
                     if Instant::now()>=deadline {notify.send(Event::Forgotten);return Ok(());}
                     continue;
                 }
-                ensure!(last_seen.elapsed()<Duration::from_secs(4),"Соединение с другим ПК потеряно");
+                ensure!(last_seen.elapsed()<STATE_TIMEOUT,"Соединение с другим ПК потеряно");
                 let state=local.borrow().clone();
                 send_frame(&mut write,&mut peer.noise,Frame::State(Box::new(state))).await?;
             }

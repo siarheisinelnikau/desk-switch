@@ -5,7 +5,7 @@ use crate::{
 };
 use anyhow::{Context, Result, bail, ensure};
 use ashpd::desktop::{
-    CreateSessionOptions, Session,
+    CreateSessionOptions, PersistMode, Session,
     remote_desktop::{
         ConnectToEISOptions, DeviceType, RemoteDesktop, SelectDevicesOptions, StartOptions,
     },
@@ -16,7 +16,7 @@ use reis::{
     event::{Connection, Device, DeviceCapability as Cap, EiEvent},
     tokio::EiConvertEventStream,
 };
-use std::{collections::BTreeSet, os::unix::net::UnixStream, time::Duration};
+use std::{collections::BTreeSet, os::unix::net::UnixStream, path::Path, time::Duration};
 use tokio::time::timeout;
 
 struct Screen {
@@ -53,6 +53,7 @@ pub async fn check() -> Result<RemoteDesktop> {
 }
 
 pub struct Portal {
+    _permission_lock: std::fs::File,
     session: Session<RemoteDesktop>,
     connection: Connection,
     pub stream: EiConvertEventStream,
@@ -67,6 +68,9 @@ pub struct Portal {
 
 impl Portal {
     pub async fn open(edge: Option<Edge>) -> Result<Self> {
+        let dir = crate::config::state_dir()?;
+        let permission_lock = crate::config::lock(&dir, "portal.lock")
+            .context("another input session is already using this profile's Wayland permission")?;
         let portal = tokio::select! {
             result = check() => result?,
             result = crate::lifecycle::shutdown() => {
@@ -79,12 +83,17 @@ impl Portal {
             portal.create_session(CreateSessionOptions::default()),
         )
         .await??;
+        // Restore tokens are single use. Consume the old token before requesting
+        // consent and save its replacement as soon as Start succeeds.
+        let restore_token = take_restore_token(&dir);
         let setup = timeout(Duration::from_secs(120), async {
             portal
                 .select_devices(
                     &session,
                     SelectDevicesOptions::default()
-                        .set_devices(DeviceType::Keyboard | DeviceType::Pointer),
+                        .set_devices(DeviceType::Keyboard | DeviceType::Pointer)
+                        .set_persist_mode(PersistMode::ExplicitlyRevoked)
+                        .set_restore_token(restore_token.as_deref()),
                 )
                 .await?
                 .response()?;
@@ -99,6 +108,9 @@ impl Portal {
                     .contains(DeviceType::Keyboard | DeviceType::Pointer),
                 "the portal did not grant both keyboard and pointer"
             );
+            if let Err(error) = save_restore_token(&dir, granted.restore_token()) {
+                eprintln!("Could not save the Wayland permission for the next session: {error:#}");
+            }
             let fd = portal
                 .connect_to_eis(&session, ConnectToEISOptions::default())
                 .await
@@ -131,6 +143,7 @@ impl Portal {
             }
         };
         let mut result = Self {
+            _permission_lock: permission_lock,
             session,
             connection,
             stream,
@@ -550,6 +563,29 @@ impl Portal {
     }
 }
 
+const RESTORE_FILE: &str = "wayland-restore-token";
+
+fn take_restore_token(dir: &Path) -> Option<String> {
+    use std::io::Read;
+    let path = dir.join(RESTORE_FILE);
+    let file = std::fs::File::open(&path).ok()?;
+    let mut token = String::new();
+    let result = file.take(4097).read_to_string(&mut token);
+    let removed = std::fs::remove_file(&path).is_ok();
+    (removed && result.is_ok() && valid_restore_token(&token)).then_some(token)
+}
+
+fn valid_restore_token(token: &str) -> bool {
+    !token.is_empty() && token.len() <= 4096 && !token.chars().any(char::is_control)
+}
+
+fn save_restore_token(dir: &Path, token: Option<&str>) -> Result<()> {
+    if let Some(token) = token.filter(|token| valid_restore_token(token)) {
+        crate::config::write_atomic(&dir.join(RESTORE_FILE), token)?;
+    }
+    Ok(())
+}
+
 impl super::receiver::Sink for Portal {
     async fn poll(&mut self) -> Result<()> {
         let event = self
@@ -574,5 +610,39 @@ impl super::receiver::Sink for Portal {
 
     fn release(&mut self) -> Result<()> {
         self.release()
+    }
+}
+
+#[cfg(test)]
+mod permission_tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn portal_restore_token_is_private_rotated_and_consumed_once() {
+        let dir = std::env::temp_dir().join(format!("desk-switch-portal-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        save_restore_token(&dir, Some("first-permission")).unwrap();
+        assert_eq!(
+            std::fs::metadata(dir.join(RESTORE_FILE))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+        assert_eq!(
+            take_restore_token(&dir).as_deref(),
+            Some("first-permission")
+        );
+        assert!(take_restore_token(&dir).is_none());
+        save_restore_token(&dir, Some("replacement-permission")).unwrap();
+        assert_eq!(
+            take_restore_token(&dir).as_deref(),
+            Some("replacement-permission")
+        );
+        save_restore_token(&dir, Some("invalid\ntoken")).unwrap();
+        assert!(take_restore_token(&dir).is_none());
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }
