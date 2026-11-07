@@ -14,8 +14,11 @@ mod output;
 mod output;
 mod player;
 mod playout;
+#[cfg(any(target_os = "linux", test))]
+mod pulse;
 mod sender;
 mod stream;
+mod system_volume;
 #[cfg(windows)]
 mod windows_capture;
 
@@ -69,7 +72,7 @@ pub fn run(args: &[&str]) -> Result<()> {
                 volume: 100,
                 muted: false,
             };
-            let mut native = crate::workspace::AudioLevel::default();
+            let mut native = system_volume::Change::default();
             let mut options = options.iter().copied();
             while let Some(option) = options.next() {
                 match option {
@@ -86,9 +89,9 @@ pub fn run(args: &[&str]) -> Result<()> {
                     "--volume" => mix.volume = volume(options.next().unwrap_or_default())?,
                     "--mute" => mix.muted = true,
                     "--native-volume" => {
-                        native.volume = volume(options.next().unwrap_or_default())?
+                        native.volume = Some(volume(options.next().unwrap_or_default())?)
                     }
-                    "--native-mute" => native.muted = true,
+                    "--native-mute" => native.muted = Some(true),
                     _ => bail!("invalid audio option '{option}'\n{USAGE}"),
                 }
             }
