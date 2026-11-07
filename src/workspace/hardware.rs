@@ -1,6 +1,7 @@
 use super::Hardware;
 use crate::{audio::AudioDevice, platform::MonitorInfo};
 use anyhow::Result;
+#[cfg(any(windows, target_os = "linux", test))]
 use sha2::{Digest, Sha256};
 use std::{
     path::PathBuf,
@@ -182,6 +183,7 @@ pub fn audio_score(output: &AudioDevice) -> u8 {
 
 // EDID manufacturer/product + a real serial survive a connector/input change.
 // With no serial, require an exact base block instead of guessing between displays.
+#[cfg(any(windows, target_os = "linux", test))]
 pub fn display_key(edid: &[u8]) -> String {
     if edid.len() < 128 {
         return String::new();
