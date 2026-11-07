@@ -8,11 +8,11 @@ Two computers. One workspace. Share a keyboard, mouse, system audio and micropho
 
 Get the **same version on both PCs** from [Releases](https://github.com/siarheisinelnikau/desk-switch/releases). New releases contain exactly two downloads:
 
-- **Ubuntu 24.04/26.04 x86-64:** [desk-switch-v0.4.10-linux-x86-64.deb](https://github.com/siarheisinelnikau/desk-switch/releases/download/v0.4.10/desk-switch-v0.4.10-linux-x86-64.deb).
-- **Windows x86-64:** [desk-switch-v0.4.10-windows-x86-64.exe](https://github.com/siarheisinelnikau/desk-switch/releases/download/v0.4.10/desk-switch-v0.4.10-windows-x86-64.exe).
+- **Ubuntu 24.04/26.04 x86-64:** [desk-switch-v0.4.11-linux-x86-64.deb](https://github.com/siarheisinelnikau/desk-switch/releases/download/v0.4.11/desk-switch-v0.4.11-linux-x86-64.deb).
+- **Windows x86-64:** [desk-switch-v0.4.11-windows-x86-64.exe](https://github.com/siarheisinelnikau/desk-switch/releases/download/v0.4.11/desk-switch-v0.4.11-windows-x86-64.exe).
 
 ```sh
-sudo apt install ./desk-switch-v0.4.10-linux-x86-64.deb
+sudo apt install ./desk-switch-v0.4.11-linux-x86-64.deb
 ```
 
 Open **Desk Switch** from Ubuntu's application menu or run the Windows executable. New profiles use **English** and **Dark**. Existing language/theme choices are preserved. Russian, German, French, Spanish and Italian are also available. Language and theme changes apply immediately to the window and tray.
@@ -73,11 +73,13 @@ For first-time setup with only one keyboard/mouse, **Switch keyboard and mouse o
 
 ![This computer stays on the left; the central shared monitor shows its active input](docs/shared-monitor.png)
 
-DDC/CI depends on the monitor and firmware. Some LG monitors can show a recurring **Out of range** message after a single standard input-selection command, even when the picture is visible; see [ddcutil issue #102](https://github.com/rockowitz/ddcutil/issues/102). This is not evidence of queued application commands. If the message persists with both applications closed, select the intended input in the monitor's own menu or power-cycle the monitor. The reported LG 27GK750F setup remains unvalidated. Desk Switch does not guess manufacturer-specific commands, scan possible inputs, or change resolution or refresh rate.
+DDC/CI depends on the monitor and firmware. Some LG monitors can show a recurring **Out of range** message after a single standard input-selection command, even when the picture is visible; see [ddcutil issue #102](https://github.com/rockowitz/ddcutil/issues/102). This is not evidence of queued application commands. On the reported **LG 27GK750F**, with Ubuntu on **HDMI1** and Windows on **DisplayPort**, selecting **DisplayPort once using the monitor's joystick** stopped the warning; the user then confirmed that subsequent Desk Switch switches worked without it. This is a confirmed workaround for that setup, not a firmware fix. Persistence after monitor power-off has not been verified. If the warning returns, select DisplayPort in the monitor's own menu again. Desk Switch does not guess manufacturer-specific commands, scan possible inputs, or change resolution or refresh rate.
 
 ## Window, tray and startup
 
-**X** and **Quit application** stop services and exit. **Minimize to tray** is separate. Quit first requests cooperative input release and audio shutdown; an unresponsive child is terminated after six seconds. Closing the GUI command pipe also requests shutdown. Losing the tray brings a hidden window back.
+**X** hides the window in the system tray and keeps sharing active. A left click on the tray icon opens compact controls for the connection, PC switching, sound, microphone, keyboard, mouse and per-PC volume/mute. **Open Desk Switch** opens the full window; right-click the icon for its native menu. The popup closes on Escape or loss of focus. **Quit application** explicitly releases input, stops services and exits; an unresponsive child is terminated after six seconds. If no working tray is available, X exits instead of leaving an inaccessible background process. Closing the GUI command pipe also requests shutdown. Losing the tray brings a hidden window back. On Wayland, the compositor controls the popup's placement.
+
+![Quick controls with synchronized device toggles and system/relative volume, rendered from a connected two-PC preview](docs/quick-controls.png)
 
 Autostart is enabled after the first launch and can be disabled in **Settings**. It starts in the tray using the saved profile and availability choice. Ubuntu needs an AppIndicator/StatusNotifier host for a visible tray icon.
 

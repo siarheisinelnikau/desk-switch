@@ -13,7 +13,7 @@ use std::{
 };
 use windows_sys::{
     Win32::{
-        Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM},
+        Foundation::{HWND, LPARAM, LRESULT, POINT, SIZE, WPARAM},
         Graphics::Gdi::*,
         System::{LibraryLoader::GetModuleHandleW, Threading::GetCurrentThreadId},
         UI::WindowsAndMessaging::*,
@@ -22,7 +22,6 @@ use windows_sys::{
 };
 
 const CLASS: windows_sys::core::PCWSTR = w!("DeskSwitch.PointerOverlay");
-const COLOR_KEY: u32 = 0x00ff00ff;
 
 const REFRESH: u32 = WM_APP + 0x3b;
 
@@ -100,7 +99,10 @@ impl Overlay {
                                     inventory_dirty = false;
                                 }
                                 unsafe {
-                                    window.update(active, physical_mouse);
+                                    if let Err(error) = window.update(active, physical_mouse) {
+                                        eprintln!("Windows pointer fallback failed: {error:#}");
+                                        break;
+                                    }
                                 }
                             } else {
                                 unsafe {
@@ -223,15 +225,6 @@ impl Drop for Notifications {
     }
 }
 
-#[derive(Clone, Copy)]
-struct Drawing {
-    cursor: HCURSOR,
-    brush: HBRUSH,
-}
-#[cfg(test)]
-thread_local! { static PAINT_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) }; }
-thread_local! { static DRAWING: RefCell<Option<Drawing>> = const { RefCell::new(None) }; }
-
 unsafe extern "system" fn procedure(
     hwnd: HWND,
     message: u32,
@@ -241,35 +234,215 @@ unsafe extern "system" fn procedure(
     match message {
         WM_NCHITTEST => HTTRANSPARENT as LRESULT,
         WM_MOUSEACTIVATE => MA_NOACTIVATE as LRESULT,
-        WM_PAINT => {
-            #[cfg(test)]
-            PAINT_COUNT.with(|count| count.set(count.get() + 1));
-            unsafe {
-                let mut paint = PAINTSTRUCT::default();
-                let dc = BeginPaint(hwnd, &mut paint);
-                if !dc.is_null() {
-                    DRAWING.with(|state| {
-                        if let Some(state) = *state.borrow() {
-                            let mut rect = RECT::default();
-                            GetClientRect(hwnd, &mut rect);
-                            FillRect(dc, &rect, state.brush);
-                            if !state.cursor.is_null() {
-                                DrawIconEx(dc, 0, 0, state.cursor, 0, 0, 0, null_mut(), DI_NORMAL);
-                            }
-                        }
-                    });
-                }
-                EndPaint(hwnd, &paint);
-            }
-            0
-        }
         _ => unsafe { DefWindowProcW(hwnd, message, wparam, lparam) },
+    }
+}
+
+/// A top-down premultiplied BGRA bitmap, owned by the pointer thread.
+struct Surface {
+    dc: HDC,
+    bitmap: HBITMAP,
+    previous: HGDIOBJ,
+    bits: *mut u8,
+    size: (i32, i32),
+    xor: Vec<(usize, [u8; 3])>,
+    background: Option<Box<Surface>>,
+    screen: HDC,
+}
+impl Surface {
+    unsafe fn new(size: (i32, i32)) -> Result<Self> {
+        unsafe {
+            ensure!(
+                (1..=512).contains(&size.0) && (1..=512).contains(&size.1),
+                "invalid cursor dimensions"
+            );
+            let mut surface = Self {
+                dc: CreateCompatibleDC(null_mut()),
+                bitmap: null_mut(),
+                previous: null_mut(),
+                bits: null_mut(),
+                size,
+                xor: Vec::new(),
+                background: None,
+                screen: null_mut(),
+            };
+            ensure!(
+                !surface.dc.is_null(),
+                "could not create the cursor bitmap context"
+            );
+            let info = BITMAPINFO {
+                bmiHeader: BITMAPINFOHEADER {
+                    biSize: size_of::<BITMAPINFOHEADER>() as u32,
+                    biWidth: size.0,
+                    biHeight: -size.1,
+                    biPlanes: 1,
+                    biBitCount: 32,
+                    biCompression: BI_RGB,
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            surface.bitmap = CreateDIBSection(
+                surface.dc,
+                &info,
+                DIB_RGB_COLORS,
+                (&mut surface.bits as *mut *mut u8).cast(),
+                null_mut(),
+                0,
+            );
+            ensure!(
+                !surface.bitmap.is_null() && !surface.bits.is_null(),
+                "could not create the cursor bitmap"
+            );
+            let previous = SelectObject(surface.dc, surface.bitmap);
+            ensure!(
+                !previous.is_null() && previous as isize != -1,
+                "could not select the cursor bitmap"
+            );
+            surface.previous = previous;
+            Ok(surface)
+        }
+    }
+    fn bytes(&self) -> &[u8] {
+        unsafe { std::slice::from_raw_parts(self.bits, (self.size.0 * self.size.1 * 4) as usize) }
+    }
+    fn bytes_mut(&mut self) -> &mut [u8] {
+        unsafe {
+            std::slice::from_raw_parts_mut(self.bits, (self.size.0 * self.size.1 * 4) as usize)
+        }
+    }
+    unsafe fn paint(&mut self, cursor: HCURSOR, background: u8) -> Result<()> {
+        for pixel in self.bytes_mut().as_chunks_mut::<4>().0.iter_mut() {
+            pixel.copy_from_slice(&[background, background, background, 255]);
+        }
+        unsafe {
+            ensure!(
+                DrawIconEx(
+                    self.dc,
+                    0,
+                    0,
+                    cursor,
+                    self.size.0,
+                    self.size.1,
+                    0,
+                    null_mut(),
+                    DI_NORMAL
+                ) != 0,
+                "could not draw the system cursor"
+            );
+            GdiFlush();
+        }
+        Ok(())
+    }
+    unsafe fn cursor(cursor: HCURSOR, size: (i32, i32)) -> Result<Self> {
+        unsafe {
+            // Recover coverage from Windows' own rendering on black and white.
+            // This also supports legacy masks which have no stored alpha channel.
+            let mut black = Self::new(size)?;
+            let mut white = Self::new(size)?;
+            black.paint(cursor, 0)?;
+            white.paint(cursor, 255)?;
+            let mut xor = Vec::new();
+            for (index, (pixel, light)) in black
+                .bytes_mut()
+                .as_chunks_mut::<4>()
+                .0
+                .iter_mut()
+                .zip(white.bytes().as_chunks::<4>().0.iter())
+                .enumerate()
+            {
+                if (0..3).any(|channel| light[channel] < pixel[channel]) {
+                    xor.push((index, [pixel[0], pixel[1], pixel[2]]));
+                    pixel[3] = 255;
+                    continue;
+                }
+                let transmission = (0..3)
+                    .map(|i| light[i].saturating_sub(pixel[i]))
+                    .max()
+                    .unwrap();
+                pixel[3] = 255 - transmission;
+                for channel in &mut pixel[..3] {
+                    *channel = (*channel).min(255 - transmission);
+                }
+            }
+            black.xor = xor;
+            Ok(black)
+        }
+    }
+    fn resolve_xor(&mut self, background: &[u8]) {
+        assert_eq!(background.len(), self.bytes().len());
+        for (index, mask) in &self.xor {
+            for channel in 0..3 {
+                unsafe {
+                    self.bits
+                        .add(index * 4 + channel)
+                        .write(background[index * 4 + channel] ^ mask[channel]);
+                }
+            }
+        }
+    }
+    unsafe fn sample_background(&mut self, x: i32, y: i32) -> Result<()> {
+        if self.xor.is_empty() {
+            return Ok(());
+        }
+        unsafe {
+            if self.screen.is_null() {
+                self.screen = GetDC(null_mut());
+            }
+            ensure!(
+                !self.screen.is_null(),
+                "could not read the background behind an inverted cursor"
+            );
+            if self.background.is_none() {
+                self.background = Some(Box::new(Self::new(self.size)?));
+            }
+            let background = self.background.as_mut().unwrap();
+            // SRCCOPY excludes layered windows. Never sample our own pointer.
+            ensure!(
+                BitBlt(
+                    background.dc,
+                    0,
+                    0,
+                    self.size.0,
+                    self.size.1,
+                    self.screen,
+                    x,
+                    y,
+                    SRCCOPY
+                ) != 0,
+                "could not render the background-inverting system cursor"
+            );
+            GdiFlush();
+            let bytes = std::slice::from_raw_parts(background.bits, background.bytes().len());
+            self.resolve_xor(bytes);
+        }
+        Ok(())
+    }
+}
+impl Drop for Surface {
+    fn drop(&mut self) {
+        unsafe {
+            if !self.previous.is_null() {
+                SelectObject(self.dc, self.previous);
+            }
+            if !self.bitmap.is_null() {
+                DeleteObject(self.bitmap);
+            }
+            if !self.dc.is_null() {
+                DeleteDC(self.dc);
+            }
+            if !self.screen.is_null() {
+                ReleaseDC(null_mut(), self.screen);
+            }
+        }
     }
 }
 
 struct Window {
     hwnd: HWND,
-    brush: HBRUSH,
+    surface: Option<Surface>,
+    #[cfg(test)]
+    bitmap_updates: usize,
     cursor: HCURSOR,
     hotspot: (i32, i32),
     size: (i32, i32),
@@ -281,8 +454,6 @@ impl Window {
     unsafe fn create() -> Result<Self> {
         unsafe {
             let module = GetModuleHandleW(null());
-            let brush = CreateSolidBrush(COLOR_KEY);
-            ensure!(!brush.is_null(), "could not create the pointer background");
             let class = WNDCLASSW {
                 lpfnWndProc: Some(procedure),
                 hInstance: module,
@@ -301,7 +472,6 @@ impl Window {
                 }
             });
             if let Err(error) = registered {
-                DeleteObject(brush);
                 anyhow::bail!("could not register the pointer window: {error}");
             }
             let hwnd = CreateWindowExW(
@@ -323,7 +493,6 @@ impl Window {
                 null(),
             );
             if hwnd.is_null() {
-                DeleteObject(brush);
                 anyhow::bail!(
                     "could not create the pointer window: {}",
                     std::io::Error::last_os_error()
@@ -331,32 +500,24 @@ impl Window {
             }
             let window = Self {
                 hwnd,
-                brush,
+                surface: None,
+                #[cfg(test)]
+                bitmap_updates: 0,
                 cursor: null_mut(),
                 hotspot: (0, 0),
                 size: (32, 32),
                 visible: false,
                 position: None,
             };
-            ensure!(
-                SetLayeredWindowAttributes(hwnd, COLOR_KEY, 255, LWA_COLORKEY) != 0,
-                "could not make the pointer window transparent"
-            );
-            DRAWING.with(|state| {
-                *state.borrow_mut() = Some(Drawing {
-                    cursor: null_mut(),
-                    brush,
-                })
-            });
             Ok(window)
         }
     }
 
-    unsafe fn update(&mut self, active: bool, physical_mouse: bool) {
+    unsafe fn update(&mut self, active: bool, physical_mouse: bool) -> Result<()> {
         unsafe {
             if !active {
                 self.hide();
-                return;
+                return Ok(());
             }
             let mut info = CURSORINFO {
                 cbSize: size_of::<CURSORINFO>() as u32,
@@ -371,7 +532,7 @@ impl Window {
                 )
             {
                 self.hide();
-                return;
+                return Ok(());
             }
             if !self.visible {
                 println!(
@@ -383,7 +544,8 @@ impl Window {
             } else {
                 info.hCursor
             };
-            self.render(cursor, info.ptScreenPos.x, info.ptScreenPos.y);
+            self.render(cursor, info.ptScreenPos.x, info.ptScreenPos.y)?;
+            Ok(())
         }
     }
 
@@ -396,46 +558,72 @@ impl Window {
         }
     }
 
-    unsafe fn render(&mut self, cursor: HCURSOR, x: i32, y: i32) {
+    unsafe fn render(&mut self, cursor: HCURSOR, x: i32, y: i32) -> Result<()> {
         unsafe {
             let changed = cursor != self.cursor;
-            let (hotspot, size) = if cursor == self.cursor {
-                (self.hotspot, self.size)
-            } else {
-                geometry(cursor)
-            };
-            self.cursor = cursor;
-            self.hotspot = hotspot;
-            self.size = size;
-            let position = (x - hotspot.0, y - hotspot.1);
-            if changed || self.position != Some(position) || !self.visible {
-                SetWindowPos(
-                    self.hwnd,
-                    HWND_TOPMOST,
-                    position.0,
-                    position.1,
-                    size.0,
-                    size.1,
-                    SWP_NOACTIVATE
-                        | SWP_SHOWWINDOW
-                        | if changed {
-                            0
-                        } else {
-                            SWP_NOSIZE | SWP_NOREDRAW
-                        },
+            if changed {
+                let (hotspot, size) = geometry(cursor);
+                self.surface = Some(Surface::cursor(cursor, size)?);
+                self.cursor = cursor;
+                self.hotspot = hotspot;
+                self.size = size;
+            }
+            let position = (x - self.hotspot.0, y - self.hotspot.1);
+            let moved = self.position != Some(position);
+            let surface = self.surface.as_mut().unwrap();
+            if changed || (moved && !surface.xor.is_empty()) {
+                surface.sample_background(position.0, position.1)?;
+                let destination = POINT {
+                    x: position.0,
+                    y: position.1,
+                };
+                let extent = SIZE {
+                    cx: self.size.0,
+                    cy: self.size.1,
+                };
+                let source = POINT::default();
+                let blend = BLENDFUNCTION {
+                    BlendOp: AC_SRC_OVER as u8,
+                    BlendFlags: 0,
+                    SourceConstantAlpha: 255,
+                    AlphaFormat: AC_SRC_ALPHA as u8,
+                };
+                ensure!(
+                    UpdateLayeredWindow(
+                        self.hwnd,
+                        null_mut(),
+                        &destination,
+                        &extent,
+                        surface.dc,
+                        &source,
+                        0,
+                        &blend,
+                        ULW_ALPHA
+                    ) != 0,
+                    "could not upload the transparent system cursor"
+                );
+                #[cfg(test)]
+                {
+                    self.bitmap_updates += 1;
+                }
+            }
+            if changed || moved || !self.visible {
+                ensure!(
+                    SetWindowPos(
+                        self.hwnd,
+                        HWND_TOPMOST,
+                        position.0,
+                        position.1,
+                        self.size.0,
+                        self.size.1,
+                        SWP_NOACTIVATE | SWP_SHOWWINDOW | SWP_NOSIZE | SWP_NOREDRAW
+                    ) != 0,
+                    "could not position the system cursor"
                 );
                 self.position = Some(position);
                 self.visible = true;
             }
-            if changed {
-                DRAWING.with(|state| {
-                    if let Some(state) = state.borrow_mut().as_mut() {
-                        state.cursor = cursor;
-                    }
-                });
-                InvalidateRect(self.hwnd, null(), 0);
-                UpdateWindow(self.hwnd);
-            }
+            Ok(())
         }
     }
 }
@@ -483,8 +671,6 @@ impl Drop for Window {
     fn drop(&mut self) {
         unsafe {
             DestroyWindow(self.hwnd);
-            DRAWING.with(|state| state.borrow_mut().take());
-            DeleteObject(self.brush);
         }
     }
 }
@@ -492,6 +678,91 @@ impl Drop for Window {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn native_cursor_alpha_matches_windows_rendering_on_light_and_dark_backgrounds() {
+        unsafe {
+            for (name, id) in [
+                ("arrow", IDC_ARROW),
+                ("hand", IDC_HAND),
+                ("ibeam", IDC_IBEAM),
+            ] {
+                let cursor = LoadCursorW(null_mut(), id);
+                let (_, size) = geometry(cursor);
+                let mut rendered = Surface::cursor(cursor, size).unwrap();
+                let mut mismatches = 0;
+                for background in [0, 255] {
+                    let mut reference = Surface::new(size).unwrap();
+                    reference.paint(cursor, background).unwrap();
+                    let backdrop = [background, background, background, 255]
+                        .repeat((size.0 * size.1) as usize);
+                    rendered.resolve_xor(&backdrop);
+                    for (pixel, expected) in rendered
+                        .bytes()
+                        .as_chunks::<4>()
+                        .0
+                        .iter()
+                        .zip(reference.bytes().as_chunks::<4>().0)
+                    {
+                        for channel in 0..3 {
+                            let composite = u16::from(pixel[channel])
+                                + (u16::from(background) * u16::from(255 - pixel[3]) + 127) / 255;
+                            if composite.abs_diff(u16::from(expected[channel])) > 2 {
+                                mismatches += 1;
+                            }
+                        }
+                    }
+                }
+                eprintln!("System cursor {name}: {size:?}, {mismatches} differing channels");
+                if let Some(directory) = std::env::var_os("DESK_SWITCH_CURSOR_CAPTURE") {
+                    let directory = std::path::PathBuf::from(directory);
+                    assert!(directory.is_absolute());
+                    std::fs::create_dir_all(&directory).unwrap();
+                    let rgba = rendered
+                        .bytes()
+                        .as_chunks::<4>()
+                        .0
+                        .iter()
+                        .flat_map(|pixel| {
+                            let unpremultiply = |value: u8| {
+                                if pixel[3] == 0 {
+                                    0
+                                } else {
+                                    ((u32::from(value) * 255 + u32::from(pixel[3]) / 2)
+                                        / u32::from(pixel[3]))
+                                    .min(255) as u8
+                                }
+                            };
+                            [
+                                unpremultiply(pixel[2]),
+                                unpremultiply(pixel[1]),
+                                unpremultiply(pixel[0]),
+                                pixel[3],
+                            ]
+                        })
+                        .collect();
+                    image::RgbaImage::from_raw(size.0 as u32, size.1 as u32, rgba)
+                        .unwrap()
+                        .save(directory.join(format!("cursor-{name}.png")))
+                        .unwrap();
+                    if name == "ibeam" {
+                        let mut timings = Vec::new();
+                        for _ in 0..64 {
+                            let since = std::time::Instant::now();
+                            rendered.sample_background(64, 64).unwrap();
+                            timings.push(since.elapsed().as_micros());
+                        }
+                        timings.sort_unstable();
+                        eprintln!(
+                            "Inverted cursor background sampling: p50 {} us, p95 {} us, max {} us",
+                            timings[32], timings[60], timings[63]
+                        );
+                    }
+                }
+                assert_eq!(mismatches, 0, "system cursor {name} changed appearance");
+            }
+        }
+    }
 
     #[test]
     fn startup_and_disable_do_not_wait_for_native_initialization() {
@@ -534,26 +805,25 @@ mod tests {
             let cursor = LoadCursorW(null_mut(), IDC_ARROW);
             let x = GetSystemMetrics(SM_XVIRTUALSCREEN) - 4096;
             let y = GetSystemMetrics(SM_YVIRTUALSCREEN) - 4096;
-            window.render(cursor, x, y);
-            let initial = PAINT_COUNT.with(|count| count.get());
+            window.render(cursor, x, y).unwrap();
+            let initial = window.bitmap_updates;
             assert!(initial > 0);
             let since = std::time::Instant::now();
             for offset in 0..1000 {
-                window.render(cursor, x - offset, y);
+                window.render(cursor, x - offset, y).unwrap();
             }
             assert_eq!(
-                PAINT_COUNT.with(|count| count.get()),
-                initial,
+                window.bitmap_updates, initial,
                 "moving a cached cursor must not repaint its bitmap"
             );
             assert!(since.elapsed() < std::time::Duration::from_secs(2));
             for _ in 0..1000 {
-                window.render(cursor, x - 999, y);
+                window.render(cursor, x - 999, y).unwrap();
             }
-            assert_eq!(PAINT_COUNT.with(|count| count.get()), initial);
+            assert_eq!(window.bitmap_updates, initial);
             // Hidden state has no timer or queued repaint.
 
-            window.update(false, false);
+            window.update(false, false).unwrap();
             assert_eq!(IsWindowVisible(handle), 0);
             assert_eq!(GetForegroundWindow(), foreground);
             drop(window);
