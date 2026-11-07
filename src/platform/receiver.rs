@@ -31,7 +31,6 @@ struct Transfer {
     edge: Option<u16>,
     stage: Stage,
     deadline: Instant,
-    fallback: bool,
 }
 
 const SWITCH_TIMEOUT: Duration = Duration::from_secs(15);
@@ -50,8 +49,9 @@ async fn disconnect(
     video: Option<&(Inputs, VideoWorker)>,
 ) -> Result<()> {
     let released = sink.release();
-    if transfer.is_some_and(|active| active.mode == Mode::Video)
-        && let Some((inputs, worker)) = video
+    if transfer.is_some_and(|active| {
+        active.mode == Mode::Video && matches!(active.stage, Stage::Active | Stage::Exiting)
+    }) && let Some((inputs, worker)) = video
     {
         eprintln!("Attempting to restore the shared monitor to host.");
         if let Err(error) = worker.recover(*inputs).await {
@@ -165,7 +165,7 @@ async fn session(
                             job = None;
                             match active.stage {
                                 Stage::Selecting => {
-                                    if matches!(result, Ok(VideoResult::Written)) {
+                                    if matches!(result, Ok(VideoResult::Written)) || result.as_ref().is_err_and(crate::video::write_attempted) {
                                         active.stage = Stage::Reading;
                                         next_read = Instant::now() + SETTLE;
                                     } else {
@@ -183,12 +183,7 @@ async fn session(
                                         if let Err(error) = result {
                                             eprintln!("Waiting for receiver-side DDC read: {error:#}");
                                         }
-                                        if !active.fallback {
-                                            active.stage = Stage::AwaitFallback;
-                                            pipe.send(Message::SelectFallback(active.id)).await?;
-                                        } else {
-                                            next_read = Instant::now() + Duration::from_millis(300);
-                                        }
+                                        next_read = Instant::now() + Duration::from_millis(300);
                                     }
                                 }
                                 Stage::Restoring => {
@@ -230,7 +225,7 @@ async fn session(
                         pipe.send(Message::Rejected(id)).await?;
                         continue;
                     }
-                    *transfer = Some(Transfer { id, mode, edge, stage: Stage::Armed, deadline: Instant::now() + SWITCH_TIMEOUT, fallback: false });
+                    *transfer = Some(Transfer { id, mode, edge, stage: Stage::Armed, deadline: Instant::now() + SWITCH_TIMEOUT });
                     pipe.send(Message::Ready(id)).await?;
                     continue;
                 }
@@ -242,7 +237,6 @@ async fn session(
                         job = Some(worker.submit(Job::Select { from: inputs.host, to: inputs.peer })?);
                     }
                     Message::Verify(id) if active.id == id && active.mode == Mode::Video && active.stage == Stage::AwaitFallback => {
-                        active.fallback = true;
                         active.stage = Stage::Reading;
                         next_read = Instant::now() + SETTLE;
                     }

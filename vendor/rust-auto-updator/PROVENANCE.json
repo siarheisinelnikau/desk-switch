@@ -1,7 +1,7 @@
 {
   "source": "../rust-auto-updator/crates/rust-auto-updator",
   "version": "0.4.1",
-  "adjustment": "Workspace-inherited package metadata resolved for standalone vendoring. Sources unchanged.",
+  "adjustment": "Workspace-inherited package metadata resolved for standalone vendoring. Desk Switch adds a Linux installer callback while retaining package validation, installed-version checks, restart and health handling.",
   "files": {
     "src/config.rs": "d8f60cc28ad5ad9dfb8c45761ecfed72542b970dca54937deed952dad830f345",
     "src/controller.rs": "1777a5cff8e892d3efe2a81f3bf6f10a11bdd719999b6365ce72e2a6c341acef",
@@ -14,5 +14,11 @@
     "src/tests.rs": "fce509b2f7989be9a248afdcc57281e5bb7a6c7569d3df120fcdec375a40b39a",
     "src/unsupported_install.rs": "3236f9c2be5a484935d9c1c5a771f7628e8bc54075d3db76e59125bc12928eda",
     "src/verify.rs": "46f2d649628656c41e4d1e2c390f978effecd36acd498ea3b2318b29679cae24"
+  },
+  "local_patches": {
+    "src/linux_install.rs": {
+      "sha256": "79616bcc86eef5b891e752c144c6df43c619f7de2e3b8a59877522a16972bc80",
+      "reason": "Use the installed pinned-signature Desk Switch polkit helper instead of interactive apt authorization."
+    }
   }
 }

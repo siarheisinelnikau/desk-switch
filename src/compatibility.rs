@@ -10,7 +10,7 @@ pub const BUILD_INFO: &str = concat!(
 );
 const MAGIC: &[u8; 8] = b"DESKVER2";
 
-#[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Version {
     pub app: String,

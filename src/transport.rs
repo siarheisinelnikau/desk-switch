@@ -37,8 +37,13 @@ async fn write_record(stream: &mut (impl AsyncWrite + Unpin), record: &[u8]) -> 
         (1..=MAX_RECORD).contains(&record.len()),
         "invalid outgoing record length"
     );
-    stream.write_u8(record.len() as u8).await?;
-    stream.write_all(record).await?;
+    // TCP_NODELAY is enabled. Sending the length separately doubles tiny TCP
+    // writes for every high-rate mouse event and makes the receiver wait for
+    // the second packet before it can authenticate the frame.
+    let mut framed = [0; MAX_RECORD + 1];
+    framed[0] = record.len() as u8;
+    framed[1..record.len() + 1].copy_from_slice(record);
+    stream.write_all(&framed[..record.len() + 1]).await?;
     Ok(())
 }
 
@@ -366,5 +371,42 @@ mod tests {
             );
         };
         tokio::join!(client, server);
+    }
+
+    #[tokio::test]
+    async fn record_header_and_payload_use_one_complete_write() {
+        use std::{
+            pin::Pin,
+            task::{Context, Poll},
+        };
+        #[derive(Default)]
+        struct Writer {
+            writes: usize,
+            bytes: Vec<u8>,
+        }
+        impl AsyncWrite for Writer {
+            fn poll_write(
+                mut self: Pin<&mut Self>,
+                _: &mut Context<'_>,
+                bytes: &[u8],
+            ) -> Poll<std::io::Result<usize>> {
+                self.writes += 1;
+                self.bytes.extend_from_slice(bytes);
+                Poll::Ready(Ok(bytes.len()))
+            }
+            fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+                Poll::Ready(Ok(()))
+            }
+            fn poll_shutdown(
+                self: Pin<&mut Self>,
+                _: &mut Context<'_>,
+            ) -> Poll<std::io::Result<()>> {
+                Poll::Ready(Ok(()))
+            }
+        }
+        let mut writer = Writer::default();
+        write_record(&mut writer, &[7, 8, 9]).await.unwrap();
+        assert_eq!(writer.writes, 1);
+        assert_eq!(writer.bytes, [3, 7, 8, 9]);
     }
 }

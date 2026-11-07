@@ -16,6 +16,36 @@ use wasapi::{
     AudioClient, AudioRenderClient, Device, DeviceEnumerator, DeviceState, Direction, Handle,
     SampleType, StreamMode, WaveFormat,
 };
+use windows_sys::{
+    Win32::{
+        Foundation::HANDLE,
+        System::Threading::{AvRevertMmThreadCharacteristics, AvSetMmThreadCharacteristicsW},
+    },
+    core::w,
+};
+
+struct AudioScheduling(HANDLE);
+impl AudioScheduling {
+    fn new() -> Self {
+        let mut task = 0;
+        let handle = unsafe { AvSetMmThreadCharacteristicsW(w!("Audio"), &mut task) };
+        if handle.is_null() {
+            eprintln!(
+                "WASAPI: multimedia scheduling is unavailable; using the normal event-driven audio thread."
+            );
+        }
+        Self(handle)
+    }
+}
+impl Drop for AudioScheduling {
+    fn drop(&mut self) {
+        if !self.0.is_null() {
+            unsafe {
+                AvRevertMmThreadCharacteristics(self.0);
+            }
+        }
+    }
+}
 
 pub(super) struct Com;
 
@@ -296,6 +326,7 @@ impl Renderer {
                 let result = (|| {
                     let _com = Com::open()?;
                     let mut output = Output::open(output.as_deref(), media)?;
+                    let _scheduling = AudioScheduling::new();
                     if ready_send.send(output.label.clone()).is_ok() {
                         output.run(&stop_flag, &worker_queue, &mix)?;
                     }

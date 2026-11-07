@@ -36,6 +36,15 @@ pub struct Prepared {
 }
 
 impl Prepared {
+    /// Use the host's fixed, independently verified package installer while
+    /// retaining package checks, retry state and the normal restart handoff.
+    pub fn handoff_with_installer(
+        &mut self,
+        install: impl FnOnce(&Path) -> Result<(), String>,
+    ) -> Result<(), String> {
+        handoff_using(self, install)
+    }
+
     pub fn set_restart_args(&mut self, arguments: Vec<String>) -> Result<(), String> {
         if self.handed_off {
             return Err("The update has already been handed off.".into());
@@ -342,6 +351,26 @@ fn package_command(archive: &Path) -> Command {
 /// Blocking system-package install. Call on a worker, keep the host alive on
 /// error/cancel, and close only after success. The restart helper waits for exit.
 pub fn handoff(prepared: &mut Prepared) -> Result<(), String> {
+    handoff_using(prepared, |archive| {
+        let result = package_command(archive)
+            .output()
+            .map_err(|e| format!("Cannot start the system installer: {e}"))?;
+        if !result.status.success() {
+            let details = String::from_utf8_lossy(&result.stderr);
+            return Err(format!(
+                "Package installation was cancelled or failed ({}). The current application remains open. {}",
+                result.status,
+                details.chars().take(4000).collect::<String>()
+            ));
+        }
+        Ok(())
+    })
+}
+
+fn handoff_using(
+    prepared: &mut Prepared,
+    install: impl FnOnce(&Path) -> Result<(), String>,
+) -> Result<(), String> {
     if prepared.handed_off {
         return Err("The update has already been handed off.".into());
     }
@@ -362,17 +391,7 @@ pub fn handoff(prepared: &mut Prepared) -> Result<(), String> {
             &plan.version,
             &plan.architecture,
         )?;
-        let result = package_command(&archive)
-            .output()
-            .map_err(|e| format!("Cannot start the system installer: {e}"))?;
-        if !result.status.success() {
-            let details = String::from_utf8_lossy(&result.stderr);
-            return Err(format!(
-                "Package installation was cancelled or failed ({}). The current application remains open. {}",
-                result.status,
-                details.chars().take(4000).collect::<String>()
-            ));
-        }
+        install(&archive)?;
         if installed_version(&plan.package)? != plan.version {
             return Err("apt finished without installing the expected version. The current application remains open.".into());
         }

@@ -5,6 +5,7 @@ use std::net::SocketAddr;
 
 mod audio;
 mod autostart;
+mod cable;
 mod compatibility;
 mod config;
 mod controller;
@@ -152,13 +153,14 @@ fn run() -> Result<()> {
                 "select keyboard and mouse interfaces first"
             );
             lifecycle::install();
+            updater::require_permission("com.deskswitch.input-access")?;
             runtime()?.block_on(async {
                 let mut child = tokio::process::Command::new("pkexec").arg("/usr/lib/desk-switch/input-access").args(paths)
-                    .kill_on_drop(true).spawn().context("opening the system input access dialog")?;
+                    .kill_on_drop(true).spawn().context("granting selected input access")?;
                 tokio::select! {
                     result = lifecycle::shutdown() => { result?; Ok::<_,anyhow::Error>(()) },
                     status = child.wait() => {
-                        ensure!(status?.success(), "Input access was not granted. Approve the system dialog to share the selected keyboard and mouse.");
+                        ensure!(status?.success(), "Input access was not granted. Reinstall the current .deb and retry in an active desktop session.");
                         Ok(())
                     }
                 }

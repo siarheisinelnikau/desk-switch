@@ -16,6 +16,7 @@ pub struct Peer {
     pub addresses: Vec<SocketAddr>,
     pub public_key: Option<String>,
     pub control_port: Option<u16>,
+    pub control_protocol: Option<u16>,
 }
 impl Peer {
     pub fn compatible(&self) -> bool {
@@ -23,6 +24,12 @@ impl Peer {
             && self.protocol == crate::compatibility::PROTOCOL
             && self.public_key.is_some()
             && self.control_port.is_some()
+    }
+    pub fn manageable(&self) -> bool {
+        self.public_key.is_some()
+            && self.control_port.is_some()
+            && (self.control_protocol == Some(crate::workspace::management::PROTOCOL)
+                || self.control_protocol.is_none() && self.compatible())
     }
 }
 
@@ -61,6 +68,10 @@ impl Discovery {
             ("protocol", crate::compatibility::PROTOCOL.to_string()),
             ("audio-port", crate::workspace::AUDIO_PORT.to_string()),
             ("control-port", control_port.to_string()),
+            (
+                "control-protocol",
+                crate::workspace::management::PROTOCOL.to_string(),
+            ),
             ("key", public_key.to_owned()),
         ];
         let properties = properties
@@ -220,6 +231,9 @@ fn parse(info: &ResolvedService) -> Option<Peer> {
             .get_property_val_str("control-port")
             .and_then(|s| s.parse().ok())
             .filter(|p| *p != 0),
+        control_protocol: info
+            .get_property_val_str("control-protocol")
+            .and_then(|s| s.parse().ok()),
     })
 }
 
