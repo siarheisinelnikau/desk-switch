@@ -335,6 +335,25 @@ impl Plan {
             && a.monitor.fingerprint == b.monitor.fingerprint
     }
 
+    // Local/other mapping is also available when both PCs have their own input
+    // devices and no keyboard forwarding service is needed.
+    pub fn monitor_inputs(a: &Node, b: &Node) -> Option<Inputs> {
+        let shared = if a.shared.revision >= b.shared.revision {
+            &a.shared
+        } else {
+            &b.shared
+        };
+        if !shared.monitor_enabled || !Self::shared_monitor(a, b) {
+            return None;
+        }
+        let (host, peer) = (a.monitor.input?, b.monitor.input?);
+        (host != 0 && peer != 0 && host != peer).then_some(Inputs { host, peer })
+    }
+
+    pub fn monitor_only_available(a: &Node, b: &Node) -> bool {
+        a.hardware.input() && b.hardware.input() && Self::monitor_inputs(a, b).is_some()
+    }
+
     pub fn monitor_owner<'a>(a: &'a Node, b: &'a Node, synced: bool) -> Option<&'a str> {
         if !synced
             || !Self::shared_monitor(a, b)
@@ -496,19 +515,11 @@ impl Plan {
             None
         };
         let monitor = input_source.as_ref().and_then(|source| {
-            let (host, peer) = if source == &a.key {
-                (&a.monitor, &b.monitor)
+            if source == &a.key {
+                Self::monitor_inputs(a, b)
             } else {
-                (&b.monitor, &a.monitor)
-            };
-            (shared.monitor_enabled
-                && host.enabled
-                && peer.enabled
-                && !host.fingerprint.is_empty()
-                && host.fingerprint == peer.fingerprint)
-                .then_some((host.input?, peer.input?))
-                .filter(|(a, b)| a != b)
-                .map(|(host, peer)| Inputs { host, peer })
+                Self::monitor_inputs(b, a)
+            }
         });
         Self {
             purple: purple.key.clone(),
@@ -563,6 +574,37 @@ pub fn pairing_code(handshake: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn shared_monitor_is_available_when_both_pcs_have_their_own_keyboard_and_mouse() {
+        let (mut a, mut b) = (node("a"), node("b"));
+        for (node, input) in [(&mut a, 17), (&mut b, 15)] {
+            node.hardware.keyboard = true;
+            node.hardware.mouse = true;
+            node.monitor.enabled = true;
+            node.monitor.fingerprint = "same-physical-display".into();
+            node.monitor.input = Some(input);
+        }
+        assert_eq!(Plan::build(&a, &b).input_source, None);
+        assert!(Plan::monitor_only_available(&a, &b));
+        b.hardware.keyboard = false;
+        assert!(!Plan::monitor_only_available(&a, &b));
+        b.hardware.keyboard = true;
+        assert_eq!(
+            Plan::monitor_inputs(&a, &b),
+            Some(Inputs { host: 17, peer: 15 })
+        );
+        assert_eq!(
+            Plan::monitor_inputs(&b, &a),
+            Some(Inputs { host: 15, peer: 17 })
+        );
+        b.monitor.input = Some(17);
+        assert_eq!(Plan::monitor_inputs(&a, &b), None);
+        b.monitor.input = Some(0);
+        assert_eq!(Plan::monitor_inputs(&a, &b), None);
+        b.monitor.input = Some(15);
+        b.monitor.fingerprint = "different-display".into();
+        assert_eq!(Plan::monitor_inputs(&a, &b), None);
+    }
     pub fn node(key: &str) -> Node {
         Node {
             key: key.into(),

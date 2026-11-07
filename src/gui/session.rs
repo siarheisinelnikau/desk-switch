@@ -40,13 +40,67 @@ pub(super) struct Pair {
     pub status: String,
     remote_address: Option<SocketAddr>,
     last_dial: Option<Instant>,
+    reconnect: Reconnect,
     input_profile: String,
+    monitor_profile: String,
+    monitor_setup_pending: bool,
     audio_profile: String,
     pub input_failed: bool,
+    pub monitor_failed: bool,
     pub audio_failed: bool,
+    #[cfg(target_os = "linux")]
+    pub input_access_attempts: std::collections::BTreeSet<String>,
     scanned: bool,
     pub monitor_input: Option<u16>,
     last_monitor_check: Option<Instant>,
+}
+
+// The data services have their own authenticated reconnects and a short input
+// lease. Losing the settings channel must not destroy their OS permission.
+const RECONNECT_GRACE: Duration = Duration::from_secs(20);
+
+#[derive(Default)]
+struct Reconnect(Option<Instant>);
+
+impl Reconnect {
+    fn lost(&mut self, now: Instant) {
+        self.0.get_or_insert(now);
+    }
+    fn restored(&mut self) {
+        self.0 = None;
+    }
+    fn expired(&self, now: Instant) -> bool {
+        self.0
+            .is_some_and(|since| now.duration_since(since) >= RECONNECT_GRACE)
+    }
+}
+
+impl Pair {
+    fn connection_restored(&mut self, address: SocketAddr) {
+        self.remote_address = Some(address);
+        self.request = None;
+        self.outgoing = None;
+        self.busy = false;
+        self.waiting_since = None;
+        self.status.clear();
+        // Device failures, refused consent and service profiles survive a
+        // settings reconnect. Only Retry or a changed device plan resets them.
+    }
+
+    fn connection_lost(&mut self, error: String, now: Instant) {
+        self.remote = None;
+        self.plan = None;
+        self.reconnect.lost(now);
+        self.synced = false;
+        self.monitor_input = None;
+        self.last_monitor_check = None;
+        self.request = None;
+        self.outgoing = None;
+        self.busy = false;
+        self.waiting_since = None;
+        self.status = error;
+        self.last_dial = Some(now);
+    }
 }
 
 impl Desktop {
@@ -84,7 +138,10 @@ impl Desktop {
                 .filter(|w| w.running() && !w.stopping && w.monitoring)
             {
                 Some(worker) => worker.monitor_input,
-                None => self.pair.monitor_input,
+                None => match self.monitor.as_ref().filter(|w| w.running() && !w.stopping) {
+                    Some(worker) => worker.monitor_input,
+                    None => self.pair.monitor_input,
+                },
             },
             audio_playing: self
                 .audio
@@ -149,6 +206,7 @@ impl Desktop {
         self.pair.remote = None;
         self.pair.plan = None;
         self.pair.active_plan = None;
+        self.pair.reconnect.restored();
         self.pair.synced = false;
         self.pair.monitor_input = None;
         self.pair.last_monitor_check = None;
@@ -158,10 +216,17 @@ impl Desktop {
         self.pair.waiting_since = None;
         self.pair.scanned = false;
         self.pair.input_profile.clear();
+        self.pair.monitor_profile.clear();
+        self.pair.monitor_setup_pending = false;
         self.pair.audio_profile.clear();
-        for worker in [&mut self.input, &mut self.audio, &mut self.microphone]
-            .into_iter()
-            .flatten()
+        for worker in [
+            &mut self.input,
+            &mut self.monitor,
+            &mut self.audio,
+            &mut self.microphone,
+        ]
+        .into_iter()
+        .flatten()
         {
             worker.stop();
         }
@@ -222,12 +287,11 @@ impl Desktop {
         if let Some(snapshot) = self.pair.probe.as_ref().and_then(Probe::poll) {
             if let Some(error) = snapshot.error {
                 self.pair.status = error;
-            } else {
-                self.pair.hardware = snapshot.hardware;
-                self.pair.inputs = snapshot.inputs;
-                self.pair.devices = snapshot.devices;
-                self.pair.scanned = true;
             }
+            self.pair.scanned = snapshot.hardware.known;
+            self.pair.hardware = snapshot.hardware;
+            self.pair.inputs = snapshot.inputs;
+            self.pair.devices = snapshot.devices;
             self.monitors = snapshot.displays;
             let monitor = &mut self.prefs.workspace.monitor;
             if monitor.id.is_empty() && self.monitors.len() == 1 {
@@ -235,6 +299,16 @@ impl Desktop {
                 monitor.id = found.id.clone();
                 monitor.name = found.name.clone();
                 monitor.fingerprint = found.fingerprint.clone();
+                self.pair.monitor_setup_pending = monitor.enabled;
+            }
+        }
+        if self.pair.monitor_setup_pending {
+            for worker in [&mut self.input, &mut self.monitor].into_iter().flatten() {
+                worker.stop();
+            }
+            if self.query.is_none() && !self.input_running() && !self.monitor_running() {
+                self.pair.monitor_setup_pending = false;
+                self.scan(QueryKind::Monitors);
             }
         }
         let discovery_events = self
@@ -281,16 +355,7 @@ impl Desktop {
                     self.peer_key = key;
                     self.prefs.workspace.peer_name = name;
                     self.prefs.workspace.last_address = address.to_string();
-                    self.pair.remote_address = Some(address);
-                    self.pair.request = None;
-                    self.pair.outgoing = None;
-                    self.pair.busy = false;
-                    self.pair.waiting_since = None;
-                    self.pair.status = String::new();
-                    self.pair.input_failed = false;
-                    self.pair.audio_failed = false;
-                    self.pair.microphone_failed = false;
-                    self.notice = None;
+                    self.pair.connection_restored(address);
                     let _ = self.prefs.save(&self.dir);
                 }
                 Event::State(remote) => {
@@ -302,26 +367,7 @@ impl Desktop {
                 }
                 Event::Forgotten => self.apply_forget(),
                 Event::Closed(error) => {
-                    self.pair.remote = None;
-                    self.pair.plan = None;
-                    self.pair.active_plan = None;
-                    self.pair.synced = false;
-                    self.pair.monitor_input = None;
-                    self.pair.last_monitor_check = None;
-                    self.pair.request = None;
-                    self.pair.outgoing = None;
-                    self.pair.busy = false;
-                    self.pair.waiting_since = None;
-                    self.pair.status = error;
-                    self.pair.last_dial = Some(Instant::now());
-                    for worker in [&mut self.input, &mut self.audio, &mut self.microphone]
-                        .into_iter()
-                        .flatten()
-                    {
-                        worker.stop();
-                    }
-                    self.pair.input_profile.clear();
-                    self.pair.audio_profile.clear();
+                    self.pair.connection_lost(error, Instant::now());
                 }
             }
         }
@@ -381,6 +427,22 @@ impl Desktop {
                 .remote
                 .as_ref()
                 .is_some_and(|r| r.hardware.known && !node.ack.is_empty() && node.ack == r.ack);
+        if self.pair.synced {
+            self.pair.reconnect.restored();
+        } else if self.pair.reconnect.expired(Instant::now()) {
+            for worker in [
+                &mut self.input,
+                &mut self.monitor,
+                &mut self.audio,
+                &mut self.microphone,
+            ]
+            .into_iter()
+            .flatten()
+            {
+                worker.stop();
+            }
+            self.pair.active_plan = None;
+        }
         if let Some(service) = &self.pair.service {
             service.publish(node);
         }
@@ -528,7 +590,9 @@ impl Desktop {
 
     pub(super) fn remember_monitor(&mut self) {
         if self.prefs.workspace.monitor.enabled && !self.prefs.workspace.monitor.id.is_empty() {
-            self.scan(QueryKind::Monitors);
+            self.prefs.workspace.monitor.input = None;
+            self.pair.monitor_input = None;
+            self.pair.monitor_setup_pending = true;
         }
         if let Err(e) = self.prefs.save(&self.dir) {
             self.notice = Some((e.to_string(), true));
@@ -545,9 +609,84 @@ impl Desktop {
             self.notice = None;
         }
         self.pair.input_failed = false;
+        self.pair.monitor_failed = false;
         self.pair.audio_failed = false;
         self.pair.microphone_failed = false;
         self.pair.microphone_capture = None;
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(super) fn request_input_access_if_needed(&mut self) {
+        if self.quitting
+            || self.install_pending
+            || !self.pair.synced
+            || !self.pair.input_failed
+            || self.prefs.role != "host"
+            || self.query.is_some()
+            || self.form.capture_devices.is_empty()
+            || self
+                .pair
+                .input_access_attempts
+                .contains(&self.input_access_selection())
+        {
+            return;
+        }
+        let permission_denied = self.input.as_ref().is_some_and(|worker| {
+            worker.logs.iter().any(|line| {
+                line.contains("Permission denied") || line.contains("grant this desktop user")
+            })
+        });
+        if permission_denied {
+            self.scan(QueryKind::InputAccess);
+        }
+    }
+
+    fn reconcile_monitor(&mut self, plan: &Plan, remote: &Node) {
+        let args = if plan.input_source.is_none()
+            && Plan::monitor_only_available(&self.local_node(), remote)
+        {
+            Plan::monitor_inputs(&self.local_node(), remote).map(|inputs| {
+                vec![
+                    "monitor-service".to_owned(),
+                    self.prefs.workspace.monitor.id.clone(),
+                    format!("{:X}", inputs.host),
+                    format!("{:X}", inputs.peer),
+                ]
+            })
+        } else {
+            None
+        };
+        let profile = args
+            .as_ref()
+            .map(|args| format!("{args:?}"))
+            .unwrap_or_default();
+        if profile != self.pair.monitor_profile {
+            if let Some(worker) = &mut self.monitor {
+                worker.stop();
+            }
+            self.pair.monitor_profile = profile;
+            self.pair.monitor_failed = false;
+        }
+        // Input shutdown includes serialized video recovery. Never open a
+        // second DDC writer while it is still running or releasing devices.
+        if !self.input_running()
+            && !self.monitor_running()
+            && !self.pair.monitor_failed
+            && self.query.is_none()
+            && let Some(args) = args
+        {
+            match Worker::start(Kind::Monitor, &args, &self.dir) {
+                Ok(mut worker) => {
+                    worker.monitoring = true;
+                    self.pair.monitor_input = None;
+                    self.monitor = Some(worker);
+                }
+                Err(error) => {
+                    self.pair.monitor_failed = true;
+                    self.notice = Some((format!("{error:#}"), true));
+                }
+            }
+        }
     }
 
     fn reconcile_services(&mut self) {
@@ -555,6 +694,11 @@ impl Desktop {
             || self.install_pending
             || self.install_job.is_some()
             || !self.prefs.discovery
+            || self.pair.monitor_setup_pending
+            || self
+                .query
+                .as_ref()
+                .is_some_and(|(kind, _)| matches!(kind, QueryKind::Monitors))
         {
             return;
         }
@@ -570,6 +714,9 @@ impl Desktop {
         // A capability/role change first releases the previous input owner.
         // Nothing new starts until both machines acknowledge the same plan.
         if !self.pair.synced {
+            if let Some(worker) = &mut self.monitor {
+                worker.stop();
+            }
             if let Some(active) = &self.pair.active_plan {
                 if (active.input_source != plan.input_source
                     || active.keyboard_enabled != plan.keyboard_enabled
@@ -598,6 +745,8 @@ impl Desktop {
         self.reconcile_microphone(&plan, address);
         if Plan::shared_monitor(&self.local_node(), &remote)
             && plan.monitor.is_none()
+            && !Plan::monitor_only_available(&self.local_node(), &remote)
+            && !self.monitor_running()
             && self
                 .input
                 .as_ref()
@@ -692,7 +841,17 @@ impl Desktop {
             self.pair.input_profile = input_profile.clone();
             self.pair.input_failed = false;
         }
-        if !input_profile.is_empty() && !self.input_running() && !self.pair.input_failed {
+        if !input_profile.is_empty()
+            && self.monitor_running()
+            && let Some(worker) = &mut self.monitor
+        {
+            worker.stop();
+        }
+        if !input_profile.is_empty()
+            && !self.input_running()
+            && !self.monitor_running()
+            && !self.pair.input_failed
+        {
             let result = self.start_input();
             if let Err(error) = result {
                 self.pair.input_failed = true;
@@ -701,6 +860,7 @@ impl Desktop {
                 self.notice = Some((error, true));
             }
         }
+        self.reconcile_monitor(&plan, &remote);
         let mut audio_profile = String::new();
         if let Some(output) = &plan.audio_output {
             let receive = output == &self.public_key;
@@ -922,5 +1082,50 @@ impl Desktop {
                 self.applied_microphone_volume = Some(volume);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod reconnect_tests {
+    use super::*;
+
+    #[test]
+    fn settings_reconnect_does_not_retry_denied_devices_or_invalidate_running_profiles() {
+        let mut pair = Pair {
+            input_failed: true,
+            audio_failed: true,
+            microphone_failed: true,
+            input_profile: "approved-input-session".into(),
+            audio_profile: "running-audio".into(),
+            microphone_profile: "denied-microphone".into(),
+            ..Default::default()
+        };
+        #[cfg(target_os = "linux")]
+        pair.input_access_attempts
+            .insert("already-denied-selection".into());
+        pair.connection_lost("temporary disconnect".into(), Instant::now());
+        pair.connection_restored("127.0.0.1:45878".parse().unwrap());
+        assert!(pair.input_failed && pair.audio_failed && pair.microphone_failed);
+        assert_eq!(pair.input_profile, "approved-input-session");
+        assert_eq!(pair.audio_profile, "running-audio");
+        assert_eq!(pair.microphone_profile, "denied-microphone");
+        #[cfg(target_os = "linux")]
+        assert!(
+            pair.input_access_attempts
+                .contains("already-denied-selection")
+        );
+    }
+
+    #[test]
+    fn reconnect_retains_permission_until_grace_expires_without_extending_on_dial_failures() {
+        let now = Instant::now();
+        let mut reconnect = Reconnect::default();
+        assert!(!reconnect.expired(now));
+        reconnect.lost(now);
+        assert!(!reconnect.expired(now + Duration::from_secs(6)));
+        reconnect.lost(now + Duration::from_secs(16));
+        assert!(reconnect.expired(now + RECONNECT_GRACE));
+        reconnect.restored();
+        assert!(!reconnect.expired(now + Duration::from_secs(60)));
     }
 }
