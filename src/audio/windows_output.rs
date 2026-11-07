@@ -35,6 +35,13 @@ impl Drop for Com {
 }
 
 pub fn devices() -> Result<Vec<super::AudioDevice>> {
+    Ok(all_outputs()?
+        .into_iter()
+        .filter(|d| !is_microphone_bridge(&d.name))
+        .collect())
+}
+
+fn all_outputs() -> Result<Vec<super::AudioDevice>> {
     let _com = Com::open()?;
     let enumerator = DeviceEnumerator::new()?;
     let default = enumerator
@@ -59,6 +66,73 @@ pub fn devices() -> Result<Vec<super::AudioDevice>> {
     Ok(result)
 }
 
+pub fn microphones() -> Result<Vec<super::AudioDevice>> {
+    let _com = Com::open()?;
+    let enumerator = DeviceEnumerator::new()?;
+    let default = enumerator
+        .get_default_device(&Direction::Capture)
+        .and_then(|d| d.get_id())
+        .ok();
+    let mut result = Vec::new();
+    for device in &enumerator.get_device_collection(&Direction::Capture)? {
+        let device = device?;
+        let id = device.get_id()?;
+        let name = device.get_friendlyname()?;
+        if is_cable_recording(&name) {
+            continue;
+        }
+        result.push(super::AudioDevice {
+            default: default.as_ref() == Some(&id),
+            id,
+            name,
+        });
+    }
+    Ok(result)
+}
+
+fn is_cable_recording(name: &str) -> bool {
+    let name = name.to_ascii_lowercase();
+    name.contains("vb-audio")
+        || name.contains("vb-cable")
+        || name.contains("cable output")
+        || name.contains("voicemeeter")
+        || name.contains("desk switch")
+        || name.contains("desk-switch")
+}
+
+pub(super) fn is_microphone_bridge(name: &str) -> bool {
+    let name = name.to_ascii_lowercase();
+    name.contains("cable input") && (name.contains("vb-audio") || name.contains("vb-cable"))
+}
+
+pub fn microphone_bridges() -> Result<Vec<super::AudioDevice>> {
+    // Only known render-to-capture cables are eligible. Keep this list separate
+    // from speakers so system audio can never be routed into the microphone.
+    Ok(all_outputs()?
+        .into_iter()
+        .filter(|d| is_microphone_bridge(&d.name))
+        .collect())
+}
+
+pub(super) fn microphone_device(id: Option<&str>) -> Result<Device> {
+    let enumerator = DeviceEnumerator::new()?;
+    let device = match id {
+        Some(id) => enumerator
+            .get_device(id)
+            .context("the selected Windows microphone is unavailable")?,
+        None => enumerator
+            .get_default_device(&Direction::Capture)
+            .context("no default Windows microphone")?,
+    };
+    ensure!(
+        device.get_direction() == Direction::Capture
+            && device.get_state()? == DeviceState::Active
+            && !is_cable_recording(&device.get_friendlyname()?),
+        "select an active physical microphone"
+    );
+    Ok(device)
+}
+
 pub fn list() -> Result<()> {
     for device in devices()? {
         println!(
@@ -72,6 +146,10 @@ pub fn list() -> Result<()> {
 }
 
 pub(super) fn output_device(id: Option<&str>) -> Result<Device> {
+    render_device(id, false)
+}
+
+fn render_device(id: Option<&str>, microphone: bool) -> Result<Device> {
     let enumerator = DeviceEnumerator::new()?;
     let device = match id {
         Some(id) => enumerator
@@ -84,6 +162,10 @@ pub(super) fn output_device(id: Option<&str>) -> Result<Device> {
     ensure!(
         device.get_direction() == Direction::Render && device.get_state()? == DeviceState::Active,
         "the selected device must be an active Windows playback output"
+    );
+    ensure!(
+        is_microphone_bridge(&device.get_friendlyname()?) == microphone,
+        "Choose regular headphones/speakers for system audio and VB-CABLE only for the microphone"
     );
     Ok(device)
 }
@@ -99,8 +181,8 @@ struct Output {
 }
 
 impl Output {
-    fn open(id: Option<&str>) -> Result<Self> {
-        let device = output_device(id)?;
+    fn open(id: Option<&str>, media: super::Media) -> Result<Self> {
+        let device = render_device(id, media == super::Media::Microphone)?;
         let label = device.get_friendlyname()?;
         let mut audio = device.get_iaudioclient()?;
         let (period, _) = audio.get_device_period()?;
@@ -112,6 +194,11 @@ impl Output {
         audio
             .initialize_client(&format, &Direction::Render, &mode)
             .context("opening shared-mode WASAPI playback")?;
+        let session: windows::Win32::Media::Audio::IAudioSessionControl =
+            unsafe { audio.as_iaudioclient().GetService()? };
+        unsafe {
+            session.SetGroupingParam(&super::SESSION_GROUP, std::ptr::null())?;
+        }
         let event = audio.set_get_eventhandle()?;
         let render = audio.get_audiorenderclient()?;
         let capacity = audio.get_buffer_size()?;
@@ -182,7 +269,21 @@ pub struct Renderer {
 }
 
 impl Renderer {
+    pub fn start_microphone(output: Option<String>, mix: Arc<Mutex<Mix>>) -> Result<Self> {
+        let bridges = microphone_bridges()?;
+        let bridge = crate::workspace::devices::selected(&bridges, output.as_deref())
+            .context("Install VB-CABLE on this PC, then select CABLE Output as microphone in your calling app")?;
+        Self::start_media(Some(bridge.id.clone()), mix, super::Media::Microphone)
+    }
+
     pub fn start(output: Option<String>, mix: Arc<Mutex<Mix>>) -> Result<Self> {
+        Self::start_media(output, mix, super::Media::System)
+    }
+    fn start_media(
+        output: Option<String>,
+        mix: Arc<Mutex<Mix>>,
+        media: super::Media,
+    ) -> Result<Self> {
         let stop = Arc::new(AtomicBool::new(false));
         let queue = Arc::new(Mutex::new(Playout::new()));
         let (ready_send, ready) = oneshot::channel();
@@ -194,7 +295,7 @@ impl Renderer {
             .spawn(move || {
                 let result = (|| {
                     let _com = Com::open()?;
-                    let mut output = Output::open(output.as_deref())?;
+                    let mut output = Output::open(output.as_deref(), media)?;
                     if ready_send.send(output.label.clone()).is_ok() {
                         output.run(&stop_flag, &worker_queue, &mix)?;
                     }
@@ -217,6 +318,24 @@ impl Drop for Renderer {
         self.stop.store(true, Ordering::Release);
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
+        }
+    }
+}
+
+#[cfg(test)]
+mod device_tests {
+    #[test]
+    fn only_the_microphone_cable_is_classified_as_a_bridge() {
+        assert!(super::is_microphone_bridge(
+            "CABLE Input (VB-Audio Virtual Cable)"
+        ));
+        for name in [
+            "Headphones (USB)",
+            "HDMI Speakers",
+            "Microphone (Realtek)",
+            "CABLE Output (VB-Audio)",
+        ] {
+            assert!(!super::is_microphone_bridge(name));
         }
     }
 }

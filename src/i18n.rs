@@ -17,6 +17,7 @@ pub const LANGUAGES: [(&str, &str); 6] = [
 static ACTIVE: AtomicUsize = AtomicUsize::new(0);
 static CATALOGS: LazyLock<Vec<BTreeMap<String, String>>> = LazyLock::new(|| {
     [
+        include_str!("../locales/ru.json"),
         include_str!("../locales/en.json"),
         include_str!("../locales/de.json"),
         include_str!("../locales/fr.json"),
@@ -33,7 +34,7 @@ pub fn set_language(code: &str) {
         LANGUAGES
             .iter()
             .position(|(key, _)| *key == code)
-            .unwrap_or(0),
+            .unwrap_or(1),
         Ordering::Relaxed,
     );
 }
@@ -47,7 +48,7 @@ pub fn tr_language(code: &str, text: &str) -> String {
         LANGUAGES
             .iter()
             .position(|(key, _)| *key == code)
-            .unwrap_or(0),
+            .unwrap_or(1),
         text,
     )
 }
@@ -57,10 +58,7 @@ pub fn tr(text: impl AsRef<str>) -> String {
 }
 
 fn translate(language: usize, text: &str) -> String {
-    if language == 0 {
-        return text.into();
-    }
-    let Some(catalog) = CATALOGS.get(language - 1) else {
+    let Some(catalog) = CATALOGS.get(language) else {
         return text.into();
     };
     if let Some(value) = catalog.get(text) {

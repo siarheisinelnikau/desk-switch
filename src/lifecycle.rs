@@ -9,6 +9,7 @@ use tokio::sync::{broadcast, watch};
 pub enum Command {
     Switch,
     Emergency,
+    MicrophoneVolume(u8),
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Serialize)]
@@ -66,6 +67,13 @@ fn controls() -> &'static Controls {
                         "stop" | "quit" => {
                             stop_send.send_replace(true);
                             return;
+                        }
+                        value if value.starts_with("volume ") => {
+                            if let Ok(volume) = value[7..].trim().parse::<u8>()
+                                && volume <= 100
+                            {
+                                let _ = command_send.send(Command::MicrophoneVolume(volume));
+                            }
                         }
                         _ => {}
                     }

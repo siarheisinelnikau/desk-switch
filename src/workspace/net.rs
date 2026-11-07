@@ -6,7 +6,12 @@ use crate::{
 use anyhow::{Context, Result, bail, ensure};
 use serde::{Deserialize, Serialize};
 use snow::{Builder, TransportState};
-use std::{net::SocketAddr, path::PathBuf, sync::mpsc, time::Duration};
+use std::{
+    net::SocketAddr,
+    path::PathBuf,
+    sync::{Arc, Mutex, mpsc},
+    time::Duration,
+};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
@@ -14,7 +19,7 @@ use tokio::{
     time::{Instant, MissedTickBehavior, interval, timeout},
 };
 
-const LIMIT: usize = 16 * 1024;
+const LIMIT: usize = 60 * 1024;
 const AUTH_TIMEOUT: Duration = Duration::from_secs(4);
 const CONSENT_TIMEOUT: Duration = Duration::from_secs(90);
 
@@ -50,6 +55,7 @@ pub struct Service {
     state: watch::Sender<Node>,
     stop: watch::Sender<bool>,
     events: mpsc::Receiver<Event>,
+    snapshot: Arc<Mutex<Option<Box<Node>>>>,
     pub port: u16,
 }
 impl Service {
@@ -95,9 +101,11 @@ impl Service {
         let (send, commands) = queue::channel(16);
         let (state, local) = watch::channel(node);
         let (stop, stopping) = watch::channel(false);
-        let (events_send, events) = mpsc::sync_channel(64);
+        let (events_send, events) = mpsc::channel();
+        let snapshot = Arc::new(Mutex::new(None));
         let notify = Notifier {
             events: events_send,
+            snapshot: Arc::clone(&snapshot),
             ctx,
         };
         std::thread::Builder::new()
@@ -123,6 +131,7 @@ impl Service {
             state,
             stop,
             events,
+            snapshot,
             port,
         })
     }
@@ -135,6 +144,9 @@ impl Service {
             .try_send(Command::Dial(addresses, key))
             .context("соединение уже устанавливается")?;
         Ok(())
+    }
+    pub fn dial_address(&self, address: SocketAddr) -> Result<()> {
+        self.dial(vec![address], String::new())
     }
     pub fn approve(&self, key: &str, accept: bool) {
         let _ = self.commands.try_send(Command::Approve(key.into(), accept));
@@ -155,7 +167,14 @@ impl Service {
         self.state.send_replace(node);
     }
     pub fn poll(&self) -> impl Iterator<Item = Event> + '_ {
-        self.events.try_iter().take(64)
+        let mut snapshot = self.snapshot.lock().unwrap();
+        let mut events = self.events.try_iter().take(64).collect::<Vec<_>>();
+        if events.len() < 64
+            && let Some(state) = snapshot.take()
+        {
+            events.push(Event::State(state));
+        }
+        events.into_iter()
     }
 }
 impl Drop for Service {
@@ -166,21 +185,30 @@ impl Drop for Service {
 
 #[derive(Clone)]
 struct Notifier {
-    events: mpsc::SyncSender<Event>,
+    // Only low-frequency transitions use the control queue. Repeated state
+    // snapshots coalesce separately, so a hidden/busy GUI cannot lose Closed,
+    // Request or Connected behind stale snapshots.
+    events: mpsc::Sender<Event>,
+    snapshot: Arc<Mutex<Option<Box<Node>>>>,
     ctx: eframe::egui::Context,
 }
 impl Notifier {
     fn send(&self, event: Event) -> bool {
-        let snapshot = matches!(event, Event::State(_));
-        // Bounded: the UI receives at most four snapshots per second.
-        match self.events.try_send(event) {
-            Ok(()) => {
-                self.ctx.request_repaint();
-                true
+        let mut snapshot = self.snapshot.lock().unwrap();
+        let sent = if let Event::State(node) = event {
+            *snapshot = Some(node);
+            true
+        } else {
+            if matches!(
+                event,
+                Event::Closed(_) | Event::Connected { .. } | Event::Forgotten
+            ) {
+                snapshot.take();
             }
-            Err(mpsc::TrySendError::Full(_)) => snapshot,
-            Err(mpsc::TrySendError::Disconnected(_)) => false,
-        }
+            self.events.send(event).is_ok()
+        };
+        self.ctx.request_repaint();
+        sent
     }
 }
 
@@ -331,6 +359,10 @@ async fn send_frame(
     frame: Frame,
 ) -> Result<()> {
     let bytes = serde_json::to_vec(&frame)?;
+    ensure!(
+        bytes.len() + 16 <= LIMIT,
+        "pair state exceeds the frame limit"
+    );
     let mut encrypted = vec![0; LIMIT];
     let len = noise.write_message(&bytes, &mut encrypted)?;
     timeout(AUTH_TIMEOUT, async {
@@ -360,7 +392,14 @@ impl Candidate {
     }
 }
 
+struct Arrival {
+    attempt: Option<u64>,
+    result: Result<Candidate>,
+}
+
 struct Dial {
+    id: u64,
+    addresses: Vec<SocketAddr>,
     key: String,
     intended: bool,
     task: tokio::task::JoinHandle<()>,
@@ -370,22 +409,30 @@ fn start_dial(
     identity: &Identity,
     name: String,
     port: u16,
-    sender: queue::Sender<Result<Candidate>>,
+    sender: queue::Sender<Arrival>,
     addresses: Vec<SocketAddr>,
-    expected: String,
-    intended: bool,
+    target: (String, bool, u64),
 ) -> tokio::task::JoinHandle<()> {
     let identity = Identity {
         private: identity.private,
         public: identity.public,
     };
+    let (expected, intended, attempt) = target;
     tokio::spawn(async move {
         let result = async {
             let mut last = None;
             for address in addresses {
                 let result = timeout(AUTH_TIMEOUT, async {
                     let stream = TcpStream::connect(address).await?;
-                    authenticate(stream, &identity, &name, true, Some(&expected), port).await
+                    authenticate(
+                        stream,
+                        &identity,
+                        &name,
+                        true,
+                        (!expected.is_empty()).then_some(expected.as_str()),
+                        port,
+                    )
+                    .await
                 })
                 .await;
                 match result {
@@ -400,7 +447,12 @@ fn start_dial(
             Err(last.context("Не удалось найти второй ПК")?)
         }
         .await;
-        let _ = sender.send(result).await;
+        let _ = sender
+            .send(Arrival {
+                attempt: Some(attempt),
+                result,
+            })
+            .await;
     })
 }
 
@@ -415,10 +467,11 @@ async fn run(
 ) -> Result<()> {
     let port = listener.local_addr()?.port();
     let listener = TcpListener::from_std(listener)?;
-    let (send_candidates, mut candidates) = queue::channel::<Result<Candidate>>(4);
+    let (send_candidates, mut candidates) = queue::channel::<Arrival>(4);
     let permits = std::sync::Arc::new(tokio::sync::Semaphore::new(4));
     let own = config::hex(&identity.public);
     let mut dial: Option<Dial> = None;
+    let mut sequence = 0u64;
     let mut reverse_wait: Option<Instant> = None;
     loop {
         tokio::select! {
@@ -434,21 +487,29 @@ async fn run(
                 let sender=send_candidates.clone();let identity=Identity {private:identity.private,public:identity.public};let name=local.borrow().name.clone();
                 tokio::spawn(async move {
                     let _permit=permit;
-                    if let Ok(Ok(candidate))=timeout(AUTH_TIMEOUT,authenticate(stream,&identity,&name,false,None,port)).await {let _=sender.try_send(Ok(candidate));}
+                    if let Ok(Ok(candidate))=timeout(AUTH_TIMEOUT,authenticate(stream,&identity,&name,false,None,port)).await {let _=sender.try_send(Arrival { attempt: None, result: Ok(candidate) });}
                 });
             }
             command=commands.recv()=>match command {
-                Some(Command::Dial(addresses,key)) if dial.is_none()=> {
-                    let task=start_dial(&identity,local.borrow().name.clone(),port,send_candidates.clone(),addresses,key.clone(),true);
-                    dial=Some(Dial {key,intended:true,task});
+                Some(Command::Dial(addresses,mut key)) if dial.is_none()=> {
+                    if key.is_empty() && dir.join("peer").exists() { key=config::hex(&config::load_peer(&dir)?); }
+                    sequence += 1;
+                    let task=start_dial(&identity,local.borrow().name.clone(),port,send_candidates.clone(),addresses.clone(),(key.clone(),true,sequence));
+                    dial=Some(Dial {id:sequence,addresses,key,intended:true,task});
                 }
                 None=>break,_=>{},
             },
             candidate=candidates.recv()=> {
-                let Some(candidate)=candidate else{break};
-                let mut candidate=match candidate {Ok(c)=>c,Err(e)=>{notify.send(Event::Closed(format!("{e:#}")));dial=None;reverse_wait=None;continue}};
+                let Some(arrival)=candidate else{break};
+                if arrival.attempt.is_some_and(|id| dial.as_ref().is_none_or(|d| d.id != id)) { continue; }
+                let mut candidate=match arrival.result {Ok(c)=>c,Err(e)=>{notify.send(Event::Closed(format!("{e:#}")));dial=None;reverse_wait=None;continue}};
                 let key=config::hex(&candidate.key);
-                if dial.as_ref().is_some_and(|d|d.intended&&d.key!=key){continue;}
+                if let Some(pending)=dial.as_mut() {
+                    if pending.key.is_empty() {
+                        if !candidate.outgoing && !pending.addresses.contains(&candidate.address) { continue; }
+                        pending.key=key.clone();
+                    } else if pending.intended && pending.key!=key {continue;}
+                }
                 if dir.join("peer").exists() && config::load_peer(&dir)? != candidate.key {continue;}
                 // Exactly one TCP direction is used for a pair, regardless of which
                 // user clicked Link. A higher-key initiator requests a callback;
@@ -461,8 +522,9 @@ async fn run(
                     if !dial.as_ref().is_some_and(|d|d.key==key) {
                         let intended=dial.as_ref().is_some_and(|d|d.key==key&&d.intended);
                         if let Some(old)=dial.take(){old.task.abort();}
-                        let task=start_dial(&identity,local.borrow().name.clone(),port,send_candidates.clone(),vec![candidate.address],key.clone(),intended);
-                        dial=Some(Dial {key,intended,task});
+                        sequence += 1;
+                        let task=start_dial(&identity,local.borrow().name.clone(),port,send_candidates.clone(),vec![candidate.address],(key.clone(),intended,sequence));
+                        dial=Some(Dial {id:sequence,addresses:vec![candidate.address],key,intended,task});
                     }
                     continue;
                 }
@@ -689,12 +751,13 @@ mod tests {
             let deadline = std::time::Instant::now() + Duration::from_secs(6);
             let mut seen = Vec::new();
             loop {
-                if let Ok(event) = self.service.events.recv_timeout(Duration::from_millis(50)) {
+                for event in self.service.poll() {
                     if accept(&event) {
                         return event;
                     }
                     seen.push(format!("{event:?}"));
                 }
+                std::thread::sleep(Duration::from_millis(5));
                 assert!(
                     std::time::Instant::now() < deadline,
                     "event timed out; seen: {seen:?}"
@@ -814,6 +877,91 @@ mod tests {
             a_link_click_and_remote_approval_pin_both_keys_and_reconnect_without_approval();
         }
     }
+    #[test]
+    fn a_paused_gui_keeps_the_latest_snapshot_and_never_loses_disconnect_or_pairing() {
+        let (send, receive) = mpsc::channel();
+        let snapshot = Arc::new(Mutex::new(None));
+        let notify = Notifier {
+            events: send,
+            snapshot: Arc::clone(&snapshot),
+            ctx: Default::default(),
+        };
+        for i in 0..1000 {
+            let mut state = crate::workspace::tests::node("peer");
+            state.name = i.to_string();
+            assert!(notify.send(Event::State(Box::new(state))));
+        }
+        assert_eq!(snapshot.lock().unwrap().as_ref().unwrap().name, "999");
+        assert!(receive.try_recv().is_err());
+        assert!(notify.send(Event::Closed("peer disconnected".into())));
+        assert!(snapshot.lock().unwrap().is_none());
+        assert!(matches!(receive.try_recv().unwrap(), Event::Closed(_)));
+        assert!(notify.send(Event::Request(Request {
+            key: "peer".into(),
+            name: "Peer".into(),
+            code: "123 456".into()
+        })));
+        assert!(matches!(receive.try_recv().unwrap(), Event::Request(_)));
+    }
+
+    #[test]
+    fn manual_ip_pairs_without_discovery_and_preserves_the_existing_pin() {
+        for _ in 0..8 {
+            let a = Fixture::new("manual-a");
+            let b = Fixture::new("manual-b");
+            a.service.dial_address(b.address).unwrap();
+            b.wait(|e| matches!(e, Event::Request(_)));
+            b.service.approve(&a.key, true);
+            a.wait(|e| matches!(e, Event::Connected { .. }));
+            b.wait(|e| matches!(e, Event::Connected { .. }));
+            a.wait(|e| matches!(e, Event::State(_)));
+            b.wait(|e| matches!(e, Event::State(_)));
+        }
+    }
+
+    #[test]
+    fn simultaneous_manual_links_converge_and_either_peer_can_reconnect() {
+        for _ in 0..12 {
+            let mut a = Fixture::new("manual-sim-a");
+            let mut b = Fixture::new("manual-sim-b");
+            a.service.dial_address(b.address).unwrap();
+            b.service.dial_address(a.address).unwrap();
+            a.wait(|e| matches!(e, Event::Connected { .. }));
+            b.wait(|e| matches!(e, Event::Connected { .. }));
+            a.service.disconnect();
+            b.wait(|e| matches!(e, Event::Closed(_)));
+            a.restart();
+            b.service.dial_address(a.address).unwrap();
+            a.wait(|e| {
+                assert!(!matches!(e, Event::Request(_)));
+                matches!(e, Event::Connected { .. })
+            });
+            b.wait(|e| matches!(e, Event::Connected { .. }));
+            b.service.disconnect();
+            a.wait(|e| matches!(e, Event::Closed(_)));
+            b.restart();
+            a.service.dial_address(b.address).unwrap();
+            a.wait(|e| matches!(e, Event::Connected { .. }));
+            b.wait(|e| matches!(e, Event::Connected { .. }));
+        }
+    }
+
+    #[test]
+    fn a_manual_address_cannot_replace_the_pinned_computer() {
+        let mut a = Fixture::new("manual-pin-a");
+        let b = Fixture::new("manual-pin-b");
+        let c = Fixture::new("manual-pin-c");
+        crate::config::pair(&a.dir, &b.key).unwrap();
+        a.restart();
+        a.service.dial_address(c.address).unwrap();
+        a.wait(|e| matches!(e, Event::Closed(_)));
+        assert_eq!(
+            crate::config::hex(&crate::config::load_peer(&a.dir).unwrap()),
+            b.key
+        );
+        assert!(!c.dir.join("peer").exists());
+    }
+
     #[tokio::test]
     async fn initial_key_exchange_authenticates_and_uses_same_confirmation_code() {
         let a = identity();

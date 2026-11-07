@@ -52,11 +52,14 @@ impl Desktop {
                 audio_name: "USB Headphones".into(),
                 ..Default::default()
             },
+            devices: Default::default(),
             monitor: Default::default(),
             shared: Shared::default(),
             input: Some(InputStatus::Here),
             monitor_input: None,
             audio_playing: true,
+            microphone_active: false,
+            microphone_error: None,
             audio_error: None,
             input_error: None,
             ack: String::new(),
@@ -107,6 +110,78 @@ impl Desktop {
             }
             self.prefs.workspace.monitor = local.monitor.clone();
         }
+        for (node, individual) in [(&mut local, true), (&mut remote, false)] {
+            use crate::audio::AudioDevice;
+            node.devices.individual_input = individual;
+            if node.hardware.keyboard {
+                node.devices.keyboards.push(AudioDevice {
+                    id: "usb-keyboard".into(),
+                    name: "USB Keyboard".into(),
+                    default: true,
+                });
+            }
+            if node.hardware.mouse {
+                node.devices.mice.push(AudioDevice {
+                    id: "usb-mouse".into(),
+                    name: "USB Mouse".into(),
+                    default: true,
+                });
+            }
+            node.devices.speakers.push(AudioDevice {
+                id: "usb-headset".into(),
+                name: node.hardware.audio_name.clone(),
+                default: true,
+            });
+            node.devices.speakers.push(AudioDevice {
+                id: "hdmi-output".into(),
+                name: "HDMI Speakers".into(),
+                default: false,
+            });
+            node.devices.microphones.push(AudioDevice {
+                id: "headset-mic".into(),
+                name: "Headset Microphone".into(),
+                default: true,
+            });
+            node.devices.microphones.push(AudioDevice {
+                id: "webcam-mic".into(),
+                name: "Webcam Microphone".into(),
+                default: false,
+            });
+            node.devices.microphone_bridges.push(AudioDevice {
+                id: "virtual-input".into(),
+                name: if individual {
+                    "Desk Switch microphone"
+                } else {
+                    "CABLE Input (VB-Audio Virtual Cable)"
+                }
+                .into(),
+                default: true,
+            });
+            node.hardware.microphone_receive = true;
+        }
+        if case == "shared-microphone" {
+            local.hardware.microphone_score = 80;
+            local.hardware.microphone_name = "Headset Microphone".into();
+            local.shared.microphone_enabled = true;
+            local.shared.microphone_level.volume = 65;
+            local.shared.microphone_binding = Some(crate::workspace::devices::Binding {
+                computer: local.key.clone(),
+                device: "headset-mic".into(),
+            });
+            local.microphone_active = true;
+            remote.microphone_active = true;
+        }
+        if case == "shared-input-access" {
+            local.input_error =
+                Some("Permission denied reading the selected keyboard and mouse".into());
+            self.pair.input_failed = true;
+            self.prefs.role = "host".into();
+            self.form.capture_devices =
+                "/dev/input/fixture-keyboard\n/dev/input/fixture-mouse".into();
+        }
+        if case == "linking" {
+            self.pair.busy = true;
+        }
         let output = Plan::build(&local, &remote).audio_output;
         local
             .shared
@@ -153,7 +228,7 @@ impl Desktop {
                 self.discovered.insert(peer.id.clone(), peer);
             }
         }
-        if ["settings", "light"].contains(&case) {
+        if ["settings", "light", "shared-devices"].contains(&case) {
             self.page = Page::Application;
         }
         self.preview = Some(local);

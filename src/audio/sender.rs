@@ -15,10 +15,25 @@ pub async fn serve(
     peer: Key,
     source: Option<&str>,
 ) -> Result<()> {
+    serve_media(address, identity, peer, source, super::Media::System).await
+}
+
+pub async fn serve_media(
+    address: SocketAddr,
+    identity: Identity,
+    peer: Key,
+    source: Option<&str>,
+    media: super::Media,
+) -> Result<()> {
     let listener = TcpListener::bind(address)
         .await
         .context("binding the audio sender port")?;
-    println!("System audio enabled on {address}. Waiting for the paired receiver.");
+    let label = if media == super::Media::System {
+        "System audio"
+    } else {
+        "Microphone"
+    };
+    println!("{label} enabled on {address}. Waiting for the paired receiver.");
     let shutdown = crate::lifecycle::shutdown();
     tokio::pin!(shutdown);
     loop {
@@ -28,8 +43,8 @@ pub async fn serve(
         };
         tokio::select! {
             result = &mut shutdown => { result?; break; }
-            result = session(socket, &identity, &peer, source) => {
-                if let Err(error) = result { eprintln!("System audio idle. {error:#}"); }
+            result = session(socket, &identity, &peer, source, media) => {
+                if let Err(error) = result { eprintln!("{label} idle. {error:#}"); }
             }
         }
         crate::lifecycle::report(crate::lifecycle::Event::Audio {
@@ -37,7 +52,7 @@ pub async fn serve(
             message: "waiting for the paired receiver".into(),
         });
     }
-    println!("System audio off.");
+    println!("{label} off.");
     Ok(())
 }
 
@@ -46,8 +61,13 @@ async fn session(
     identity: &Identity,
     peer: &Key,
     source: Option<&str>,
+    media: super::Media,
 ) -> Result<()> {
-    let mut link = Link::open(socket, identity, peer, false).await?;
+    let mut link = if media == super::Media::System {
+        Link::open(socket, identity, peer, false).await?
+    } else {
+        Link::open_media(socket, identity, peer, false, media).await?
+    };
     stream::request_start(&mut link).await?;
     let mut incoming = stream::SILENCE;
     let mut capture = tokio::select! {
@@ -56,11 +76,18 @@ async fn session(
             packet?;
             anyhow::bail!("unexpected packet before capture readiness");
         }
-        result = Capture::open(source) => result?,
+        result = async {
+            if media == super::Media::System { Capture::open(source).await } else { Capture::open_media(source, media).await }
+        } => result?,
     };
     crate::lifecycle::report(crate::lifecycle::Event::Audio {
         playing: true,
-        message: "transmitting the selected system mix".into(),
+        message: if media == super::Media::System {
+            "transmitting the selected system mix"
+        } else {
+            "Shared microphone active"
+        }
+        .into(),
     });
     let result = stream::transmit(&mut link, &mut capture).await;
     capture.stop().await?;

@@ -53,6 +53,24 @@ async fn links(windows: &Identity, ubuntu: &Identity) -> (Link, Link) {
     (client.unwrap(), server.unwrap())
 }
 
+#[tokio::test]
+async fn microphone_connections_cannot_authenticate_as_system_audio() {
+    let a = identity();
+    let b = identity();
+    let (client, server) = sockets().await;
+    let (client, server) = tokio::join!(
+        Link::open_media(client, &a, &b.public, true, super::Media::Microphone),
+        Link::open(server, &b, &a.public, false)
+    );
+    assert!(client.is_err() && server.is_err());
+    let (client, server) = sockets().await;
+    let (client, server) = tokio::join!(
+        Link::open_media(client, &a, &b.public, true, super::Media::Microphone),
+        Link::open_media(server, &b, &a.public, false, super::Media::Microphone)
+    );
+    assert!(client.is_ok() && server.is_ok());
+}
+
 fn tone(amplitude: f32) -> Pcm {
     let mut pcm = SILENCE;
     for (index, stereo) in pcm.as_chunks_mut::<4>().0.iter_mut().enumerate() {

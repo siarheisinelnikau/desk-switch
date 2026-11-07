@@ -23,13 +23,20 @@ pub(super) struct Pair {
     probe: Option<Probe>,
     pub remote: Option<Node>,
     pub hardware: Hardware,
-    paths: Vec<std::path::PathBuf>,
+    inputs: Vec<workspace::hardware::InputEndpoint>,
+    pub devices: workspace::devices::Inventory,
+    pub microphone_failed: bool,
+    microphone_profile: String,
+    microphone_capture: Option<String>,
+    microphone_choice: Option<String>,
     pub plan: Option<Plan>,
     active_plan: Option<Plan>,
     pub synced: bool,
     pub request: Option<Request>,
     pub outgoing: Option<Request>,
     pub busy: bool,
+    auto_suspended: bool,
+    pub waiting_since: Option<Instant>,
     pub status: String,
     remote_address: Option<SocketAddr>,
     last_dial: Option<Instant>,
@@ -51,7 +58,19 @@ impl Desktop {
         let mut node = Node {
             key: self.public_key.clone(),
             name: discovery::computer_name(),
-            hardware: self.pair.hardware.clone(),
+            hardware: {
+                let mut choices = self.prefs.workspace.shared.devices_for(&self.public_key);
+                if let Some(binding) = &self.prefs.workspace.shared.microphone_binding
+                    && binding.computer == self.public_key
+                {
+                    choices.microphone = Some(binding.device.clone());
+                }
+                workspace::hardware::hardware(&self.pair.devices, &choices, self.pair.scanned)
+            },
+            devices: workspace::devices::Inventory {
+                individual_input: cfg!(target_os = "linux"),
+                ..self.pair.devices.clone()
+            },
             monitor: self.prefs.workspace.monitor.clone(),
             shared: self.prefs.workspace.shared.clone(),
             input: self
@@ -81,11 +100,24 @@ impl Desktop {
                 .as_ref()
                 .filter(|w| w.exit_ok == Some(false))
                 .and_then(|w| w.logs.back().cloned()),
+            microphone_active: self
+                .microphone
+                .as_ref()
+                .is_some_and(|w| w.running() && !w.stopping && w.audio_playing),
+            microphone_error: self
+                .microphone
+                .as_ref()
+                .filter(|w| w.exit_ok == Some(false))
+                .and_then(|w| w.logs.back().cloned()),
             ack: String::new(),
         };
-        for error in [&mut node.input_error, &mut node.audio_error]
-            .into_iter()
-            .flatten()
+        for error in [
+            &mut node.input_error,
+            &mut node.audio_error,
+            &mut node.microphone_error,
+        ]
+        .into_iter()
+        .flatten()
         {
             error.truncate(error.floor_char_boundary(2048));
         }
@@ -96,6 +128,7 @@ impl Desktop {
     }
 
     pub(super) fn availability_changed(&mut self, ctx: &egui::Context) {
+        self.pair.auto_suspended = false;
         if let Err(error) = self.prefs.save(&self.dir) {
             self.notice = Some((error.to_string(), true));
         }
@@ -122,10 +155,14 @@ impl Desktop {
         self.pair.request = None;
         self.pair.outgoing = None;
         self.pair.busy = false;
+        self.pair.waiting_since = None;
         self.pair.scanned = false;
         self.pair.input_profile.clear();
         self.pair.audio_profile.clear();
-        for worker in [&mut self.input, &mut self.audio].into_iter().flatten() {
+        for worker in [&mut self.input, &mut self.audio, &mut self.microphone]
+            .into_iter()
+            .flatten()
+        {
             worker.stop();
         }
     }
@@ -157,17 +194,25 @@ impl Desktop {
                     ctx.clone(),
                 )?);
                 self.pair.probe = Some(Probe::start(ctx.clone())?);
-                self.discovery = Some(discovery::Discovery::start(
-                    &discovery::computer_name(),
-                    &self.public_key,
-                    self.pair.service.as_ref().unwrap().port,
-                    ctx.clone(),
-                )?);
                 Ok(())
             })();
             if let Err(error) = result {
                 self.stop_pair();
                 self.discovery_error = Some(format!("{error:#}"));
+            }
+        }
+        if let Some(service) = &self.pair.service
+            && self.discovery.is_none()
+            && self.discovery_error.is_none()
+        {
+            match discovery::Discovery::start(
+                &discovery::computer_name(),
+                &self.public_key,
+                service.port,
+                ctx.clone(),
+            ) {
+                Ok(discovery) => self.discovery = Some(discovery),
+                Err(error) => self.discovery_error = Some(format!("{error:#}")),
             }
         }
     }
@@ -179,7 +224,8 @@ impl Desktop {
                 self.pair.status = error;
             } else {
                 self.pair.hardware = snapshot.hardware;
-                self.pair.paths = snapshot.paths;
+                self.pair.inputs = snapshot.inputs;
+                self.pair.devices = snapshot.devices;
                 self.pair.scanned = true;
             }
             self.monitors = snapshot.displays;
@@ -222,12 +268,14 @@ impl Desktop {
                     self.page = super::Page::Overview;
                     self.pair.busy = true;
                     self.pair.request = Some(request);
+                    self.pair.waiting_since = Some(Instant::now());
                     self.pair.status = String::new();
                     self.action(super::Action::Show, ctx);
                 }
                 Event::Pairing(request) => {
                     self.pair.busy = true;
                     self.pair.outgoing = Some(request);
+                    self.pair.waiting_since.get_or_insert_with(Instant::now);
                 }
                 Event::Connected { key, name, address } => {
                     self.peer_key = key;
@@ -237,12 +285,16 @@ impl Desktop {
                     self.pair.request = None;
                     self.pair.outgoing = None;
                     self.pair.busy = false;
+                    self.pair.waiting_since = None;
                     self.pair.status = String::new();
                     self.pair.input_failed = false;
                     self.pair.audio_failed = false;
+                    self.pair.microphone_failed = false;
+                    self.notice = None;
                     let _ = self.prefs.save(&self.dir);
                 }
                 Event::State(remote) => {
+                    self.pair.status.clear();
                     if self.prefs.workspace.shared.merge(&remote.shared) {
                         let _ = self.prefs.save(&self.dir);
                     }
@@ -259,9 +311,13 @@ impl Desktop {
                     self.pair.request = None;
                     self.pair.outgoing = None;
                     self.pair.busy = false;
+                    self.pair.waiting_since = None;
                     self.pair.status = error;
                     self.pair.last_dial = Some(Instant::now());
-                    for worker in [&mut self.input, &mut self.audio].into_iter().flatten() {
+                    for worker in [&mut self.input, &mut self.audio, &mut self.microphone]
+                        .into_iter()
+                        .flatten()
+                    {
                         worker.stop();
                     }
                     self.pair.input_profile.clear();
@@ -277,6 +333,27 @@ impl Desktop {
             if (!keyboard && !shared.keyboard_enabled) || (!mouse && !shared.mouse_enabled) {
                 shared.keyboard_enabled |= !keyboard;
                 shared.mouse_enabled |= !mouse;
+                self.shared_changed();
+            }
+        }
+        let node = self.local_node();
+        let shared = &self.prefs.workspace.shared;
+        if shared.microphone_enabled
+            && !shared.microphone_level.muted
+            && shared.microphone_binding.is_none()
+            && let Some(remote) = &self.pair.remote
+            && Plan::build(&node, remote).microphone_source.as_ref() == Some(&self.public_key)
+        {
+            let choices = shared.devices_for(&self.public_key);
+            if let Some(device) = workspace::devices::selected(
+                &self.pair.devices.microphones,
+                choices.microphone.as_deref(),
+            ) {
+                self.prefs.workspace.shared.microphone_binding =
+                    Some(workspace::devices::Binding {
+                        computer: self.public_key.clone(),
+                        device: device.id.clone(),
+                    });
                 self.shared_changed();
             }
         }
@@ -308,10 +385,10 @@ impl Desktop {
             service.publish(node);
         }
         if self.prefs.auto_connect
+            && !self.pair.auto_suspended
             && self.pair.remote.is_none()
             && !self.pair.busy
             && !self.peer_key.is_empty()
-            && self.public_key < self.peer_key
             && self
                 .pair
                 .last_dial
@@ -328,13 +405,17 @@ impl Desktop {
                 && let Some(service) = &self.pair.service
             {
                 self.pair.last_dial = Some(Instant::now());
-                let _ = service.dial(vec![address], self.peer_key.clone());
+                if service.dial(vec![address], self.peer_key.clone()).is_ok() {
+                    self.pair.busy = true;
+                    self.pair.waiting_since = Some(Instant::now());
+                }
             }
         }
         self.reconcile_services();
     }
 
     pub(super) fn link_peer(&mut self, peer: &discovery::Peer) {
+        self.pair.auto_suspended = false;
         let result: Result<()> = (|| {
             ensure!(
                 peer.compatible(),
@@ -361,10 +442,42 @@ impl Desktop {
         match result {
             Ok(()) => {
                 self.pair.busy = true;
+                self.pair.waiting_since = Some(Instant::now());
                 self.pair.status = "Запрос отправлен. Подтвердите связь на другом ПК.".into();
             }
             Err(e) => self.pair.status = format!("{e:#}"),
         }
+    }
+
+    pub(super) fn link_address(&mut self) {
+        self.pair.auto_suspended = false;
+        let result: Result<()> = (|| {
+            let address = workspace::devices::peer_address(&self.prefs.workspace.manual_address)?;
+            self.pair
+                .service
+                .as_ref()
+                .context("Turn on network availability on both PCs")?
+                .dial_address(address)?;
+            self.prefs.save(&self.dir)?;
+            Ok(())
+        })();
+        self.pair.last_dial = Some(Instant::now());
+        match result {
+            Ok(()) => {
+                self.pair.busy = true;
+                self.pair.waiting_since = Some(Instant::now());
+                self.pair.status = "Запрос отправлен. Подтвердите связь на другом ПК.".into();
+            }
+            Err(error) => self.pair.status = format!("{error:#}"),
+        }
+    }
+
+    pub(super) fn cancel_pairing(&mut self, ctx: &egui::Context) {
+        self.stop_pair();
+        self.pair.last_dial = Some(Instant::now());
+        self.pair.auto_suspended = true;
+        self.pair.status = "Connection cancelled".into();
+        self.sync_pair(ctx);
     }
 
     pub(super) fn approve_pair(&mut self, accept: bool) {
@@ -423,8 +536,18 @@ impl Desktop {
     }
 
     pub(super) fn retry_devices(&mut self) {
+        if let Some((_, error)) = self.device_notice.take()
+            && self
+                .notice
+                .as_ref()
+                .is_some_and(|(message, failed)| *failed && message == &error)
+        {
+            self.notice = None;
+        }
         self.pair.input_failed = false;
         self.pair.audio_failed = false;
+        self.pair.microphone_failed = false;
+        self.pair.microphone_capture = None;
     }
 
     fn reconcile_services(&mut self) {
@@ -458,6 +581,11 @@ impl Desktop {
                 {
                     worker.stop();
                 }
+                if active.microphone_source != plan.microphone_source
+                    && let Some(worker) = &mut self.microphone
+                {
+                    worker.stop();
+                }
                 if active.audio_output != plan.audio_output
                     && let Some(worker) = &mut self.audio
                 {
@@ -467,6 +595,7 @@ impl Desktop {
             return;
         }
         self.pair.active_plan = Some(plan.clone());
+        self.reconcile_microphone(&plan, address);
         if Plan::shared_monitor(&self.local_node(), &remote)
             && plan.monitor.is_none()
             && self
@@ -523,13 +652,32 @@ impl Desktop {
                 "left"
             }
             .into();
+            let choices = self.prefs.workspace.shared.devices_for(&self.public_key);
             self.form.capture_devices = self
                 .pair
-                .paths
+                .inputs
                 .iter()
-                .map(|p| p.to_string_lossy())
+                .filter(|d| {
+                    d.keyboard && choices.keyboard.as_ref().is_none_or(|id| id == &d.info.id)
+                        || d.mouse && choices.mouse.as_ref().is_none_or(|id| id == &d.info.id)
+                })
+                .map(|d| d.path.to_string_lossy())
                 .collect::<Vec<_>>()
                 .join("\n");
+            self.form.capture_keyboard = choices.keyboard.and_then(|id| {
+                self.pair
+                    .inputs
+                    .iter()
+                    .find(|d| d.info.id == id)
+                    .map(|d| d.path.clone())
+            });
+            self.form.capture_mouse = choices.mouse.and_then(|id| {
+                self.pair
+                    .inputs
+                    .iter()
+                    .find(|d| d.info.id == id)
+                    .map(|d| d.path.clone())
+            });
             input_profile = format!(
                 "{}:{}:{}",
                 self.prefs.role,
@@ -548,7 +696,9 @@ impl Desktop {
             let result = self.start_input();
             if let Err(error) = result {
                 self.pair.input_failed = true;
-                self.notice = Some((format!("{error:#}"), true));
+                let error = format!("{error:#}");
+                self.device_notice = Some((Kind::Input, error.clone()));
+                self.notice = Some((error, true));
             }
         }
         let mut audio_profile = String::new();
@@ -566,15 +716,34 @@ impl Desktop {
             }
             self.prefs.audio_address = endpoint.to_string();
             let shared = &self.prefs.workspace.shared;
+            let choices = shared.devices_for(&self.public_key);
+            let speaker = workspace::devices::selected(
+                &self.pair.devices.speakers,
+                choices.speaker.as_deref(),
+            )
+            .map(|d| d.id.clone())
+            .unwrap_or_default();
+            self.prefs.audio_output = speaker.clone();
+            self.prefs.audio_source = speaker;
             let incoming = shared.audio_level(&remote.key);
             let native = shared.audio_level(&self.public_key);
             self.prefs.volume = incoming.volume;
             self.prefs.muted = incoming.muted;
             self.prefs.native_volume = native.volume;
             self.prefs.native_muted = native.muted;
+            let source_choice = self.prefs.workspace.shared.devices_for(&remote.key);
             let output_device = format!(
-                "{}:{}",
-                self.pair.hardware.audio_name, remote.hardware.audio_name
+                "{:?}:{:?}",
+                workspace::devices::selected(
+                    &self.pair.devices.speakers,
+                    choices.speaker.as_deref()
+                )
+                .map(|d| &d.id),
+                workspace::devices::selected(
+                    &remote.devices.speakers,
+                    source_choice.speaker.as_deref()
+                )
+                .map(|d| &d.id)
             );
             audio_profile = format!(
                 "{}:{}:{}:{}:{output_device}",
@@ -608,7 +777,16 @@ impl Desktop {
                 })();
                 if let Err(error) = result {
                     self.pair.audio_failed = true;
-                    self.notice = Some((format!("{error:#}"), true));
+                    let error = format!("{error:#}");
+                    self.device_notice = Some((
+                        if self.prefs.audio_mode == "send" {
+                            Kind::AudioSend
+                        } else {
+                            Kind::AudioReceive
+                        },
+                        error.clone(),
+                    ));
+                    self.notice = Some((error, true));
                 }
             } else if self.prefs.audio_mode == "receive" && self.audio_running() {
                 let shared = &self.prefs.workspace.shared;
@@ -632,6 +810,116 @@ impl Desktop {
                         self.applied_mix = mix;
                     }
                 }
+            }
+        }
+    }
+}
+
+impl Desktop {
+    fn reconcile_microphone(&mut self, plan: &Plan, mut address: SocketAddr) {
+        let choices = self.prefs.workspace.shared.devices_for(&self.public_key);
+        if choices.microphone != self.pair.microphone_choice {
+            self.pair.microphone_capture = None;
+            self.pair.microphone_choice = choices.microphone.clone();
+        }
+        let mut args = Vec::new();
+        if let Some(source) = &plan.microphone_source {
+            let sending = source == &self.public_key;
+            address.set_port(workspace::MICROPHONE_PORT);
+            if sending {
+                address.set_ip(if address.is_ipv4() {
+                    std::net::Ipv4Addr::UNSPECIFIED.into()
+                } else {
+                    std::net::Ipv6Addr::UNSPECIFIED.into()
+                });
+            }
+            args = vec![
+                "microphone".into(),
+                if sending { "serve" } else { "play" }.into(),
+                address.to_string(),
+            ];
+            if sending {
+                self.pair.microphone_capture = self
+                    .prefs
+                    .workspace
+                    .shared
+                    .microphone_binding
+                    .as_ref()
+                    .filter(|binding| binding.computer == self.public_key)
+                    .map(|binding| binding.device.clone());
+                if let Some(id) = &self.pair.microphone_capture {
+                    args.extend(["--source".into(), id.clone()]);
+                } else {
+                    args.clear();
+                }
+            } else {
+                if let Some(bridge) = workspace::devices::selected(
+                    &self.pair.devices.microphone_bridges,
+                    choices.microphone_bridge.as_deref(),
+                ) {
+                    args.extend(["--output".into(), bridge.id.clone()]);
+                }
+                args.extend([
+                    "--volume".into(),
+                    self.prefs
+                        .workspace
+                        .shared
+                        .microphone_level
+                        .volume
+                        .to_string(),
+                ]);
+            }
+        }
+        let profile = serde_json::to_string(if args.get(1).is_some_and(|v| v == "play") {
+            &args[..args.len() - 2]
+        } else {
+            &args
+        })
+        .unwrap();
+        if profile != self.pair.microphone_profile {
+            if let Some(worker) = &mut self.microphone {
+                worker.stop();
+            }
+            self.pair.microphone_profile = profile;
+            self.pair.microphone_failed = false;
+        }
+        if !args.is_empty() && !self.microphone_running() && !self.pair.microphone_failed {
+            let sending = plan.microphone_source.as_ref() == Some(&self.public_key);
+            match Worker::start(
+                if sending {
+                    Kind::MicrophoneSend
+                } else {
+                    Kind::MicrophoneReceive
+                },
+                &args,
+                &self.dir,
+            ) {
+                Ok(worker) => {
+                    self.microphone = Some(worker);
+                    self.applied_microphone_volume = None;
+                }
+                Err(error) => {
+                    self.pair.microphone_failed = true;
+                    let error = format!("{error:#}");
+                    self.device_notice = Some((
+                        if sending {
+                            Kind::MicrophoneSend
+                        } else {
+                            Kind::MicrophoneReceive
+                        },
+                        error.clone(),
+                    ));
+                    self.notice = Some((error, true));
+                }
+            }
+        }
+        if args.get(1).is_some_and(|v| v == "play") && self.microphone_running() {
+            let volume = self.prefs.workspace.shared.microphone_level.volume;
+            if self.applied_microphone_volume != Some(volume)
+                && let Some(worker) = &mut self.microphone
+                && worker.command(&format!("volume {volume}")).is_ok()
+            {
+                self.applied_microphone_volume = Some(volume);
             }
         }
     }

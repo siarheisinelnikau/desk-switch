@@ -34,7 +34,8 @@ const USAGE: &str = "Desk Switch\n\
     portal-check         Ubuntu only; query Wayland portal capabilities\n\
     portal-check --consent  Ubuntu only; open EIS and list edge regions, without injecting input\n\
     run [--role host|receiver] IP:PORT  Select the keyboard host or receiving PC\n\
-    audio help           Opt in to independent system audio between either OS";
+    audio help           Opt in to independent system audio between either OS\n\
+    microphone help      Opt in to a shared physical microphone";
 
 fn main() {
     #[cfg(windows)]
@@ -125,6 +126,26 @@ fn run() -> Result<()> {
             })?;
         }
         ["audio", args @ ..] => audio::run(args)?,
+        ["microphone", args @ ..] => audio::run_microphone(args)?,
+        #[cfg(target_os = "linux")]
+        ["input-access", paths @ ..] => {
+            ensure!(
+                !paths.is_empty() && paths.len() <= 16,
+                "select keyboard and mouse interfaces first"
+            );
+            lifecycle::install();
+            runtime()?.block_on(async {
+                let mut child = tokio::process::Command::new("pkexec").arg("/usr/lib/desk-switch/input-access").args(paths)
+                    .kill_on_drop(true).spawn().context("opening the system input access dialog")?;
+                tokio::select! {
+                    result = lifecycle::shutdown() => { result?; Ok::<_,anyhow::Error>(()) },
+                    status = child.wait() => {
+                        ensure!(status?.success(), "Input access was not granted. Approve the system dialog to share the selected keyboard and mouse.");
+                        Ok(())
+                    }
+                }
+            })?;
+        }
         ["internal-update-apply", dir] => updater::apply(std::path::Path::new(dir))?,
         ["run", address] | ["run", "--role", _, address] => {
             let role = args

@@ -241,6 +241,42 @@ fn headphones(painter: &egui::Painter, center: egui::Pos2, color: Color32) {
     }
 }
 
+fn microphone(painter: &egui::Painter, center: egui::Pos2, color: Color32) {
+    painter.rect_stroke(
+        egui::Rect::from_center_size(center - Vec2::new(0.0, 3.0), Vec2::new(9.0, 17.0)),
+        5,
+        Stroke::new(1.6, color),
+        egui::StrokeKind::Inside,
+    );
+    painter.line_segment(
+        [center + Vec2::new(-9.0, 0.0), center + Vec2::new(-9.0, 5.0)],
+        Stroke::new(1.5, color),
+    );
+    painter.line_segment(
+        [center + Vec2::new(9.0, 0.0), center + Vec2::new(9.0, 5.0)],
+        Stroke::new(1.5, color),
+    );
+    painter.line_segment(
+        [center + Vec2::new(-9.0, 5.0), center + Vec2::new(0.0, 10.0)],
+        Stroke::new(1.5, color),
+    );
+    painter.line_segment(
+        [center + Vec2::new(9.0, 5.0), center + Vec2::new(0.0, 10.0)],
+        Stroke::new(1.5, color),
+    );
+    painter.line_segment(
+        [center + Vec2::new(0.0, 10.0), center + Vec2::new(0.0, 15.0)],
+        Stroke::new(1.5, color),
+    );
+    painter.line_segment(
+        [
+            center + Vec2::new(-5.0, 15.0),
+            center + Vec2::new(5.0, 15.0),
+        ],
+        Stroke::new(1.5, color),
+    );
+}
+
 fn monitor(painter: &egui::Painter, center: egui::Pos2, width: f32, color: Color32, bg: Color32) {
     let screen = egui::Rect::from_center_size(center, Vec2::new(width, 98.0));
     painter.rect_filled(screen.expand(7.0), 12, color.gamma_multiply(0.06));
@@ -271,6 +307,51 @@ fn tower(painter: &egui::Painter, center: egui::Pos2, color: Color32, bg: Color3
         );
     }
     painter.circle_filled(center + Vec2::new(0.0, 33.0), 2.0, color);
+}
+
+fn device_picker(
+    ui: &mut egui::Ui,
+    salt: &str,
+    label: &str,
+    choice: &mut Option<String>,
+    devices: &[crate::audio::AudioDevice],
+    automatic_name: Option<&str>,
+) {
+    ui.horizontal(|ui| {
+        ui.label(crate::i18n::tr(label));
+        let caption = choice
+            .as_ref()
+            .map(|id| {
+                devices
+                    .iter()
+                    .find(|d| &d.id == id)
+                    .map(|d| d.name.clone())
+                    .unwrap_or_else(|| crate::i18n::tr("Selected device unavailable"))
+            })
+            .unwrap_or_else(|| {
+                let automatic = crate::i18n::tr("Автоматически");
+                automatic_name
+                    .map(str::to_owned)
+                    .or_else(|| {
+                        devices
+                            .iter()
+                            .find(|d| d.default)
+                            .or_else(|| (devices.len() == 1).then(|| &devices[0]))
+                            .map(|d| d.name.clone())
+                    })
+                    .map(|name| format!("{automatic} · {name}"))
+                    .unwrap_or(automatic)
+            });
+        egui::ComboBox::from_id_salt(salt)
+            .width(320.0)
+            .selected_text(caption)
+            .show_ui(ui, |ui| {
+                ui.selectable_value(choice, None, crate::i18n::tr("Автоматически"));
+                for device in devices {
+                    ui.selectable_value(choice, Some(device.id.clone()), &device.name);
+                }
+            });
+    });
 }
 
 impl Desktop {
@@ -441,7 +522,7 @@ impl Desktop {
                     }
                 });
             });
-        } else if let Some(request) = &self.pair.outgoing {
+        } else if let Some(request) = self.pair.outgoing.clone() {
             card(ui, |ui| {
                 subheading(ui, "Подтвердите связь на другом ПК");
                 ui.label(crate::i18n::tr(format!(
@@ -449,6 +530,19 @@ impl Desktop {
                     request.code
                 )));
                 ui.spinner();
+                if ui.button(crate::i18n::tr("Cancel connection")).clicked() {
+                    self.cancel_pairing(ui.ctx());
+                }
+            });
+        } else if self.pair.busy {
+            card(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.spinner();
+                    ui.label(crate::i18n::tr("Connecting to the other PC…"));
+                });
+                if ui.button(crate::i18n::tr("Cancel connection")).clicked() {
+                    self.cancel_pairing(ui.ctx());
+                }
             });
         }
         card(ui, |ui| {
@@ -482,19 +576,58 @@ impl Desktop {
                     },
                 );
             }
-            if self.pair.input_failed
-                || self.pair.audio_failed
-                || self
-                    .pair
-                    .remote
-                    .as_ref()
-                    .is_some_and(|r| r.input_error.is_some() || r.audio_error.is_some())
+            if self.pair.remote.is_some()
+                && (self.pair.input_failed
+                    || self.pair.audio_failed
+                    || self.pair.microphone_failed
+                    || self.pair.remote.as_ref().is_some_and(|r| {
+                        r.input_error.is_some()
+                            || r.audio_error.is_some()
+                            || r.microphone_error.is_some()
+                    }))
             {
                 ui.separator();
                 note(
                     ui,
-                    "Устройство не удалось запустить. Подтвердите системный доступ на нужном ПК; подробности — в диагностике.",
+                    "The pair is connected. A device needs attention; see the message below or Diagnostics.",
                 );
+                for node in std::iter::once(self.local_node()).chain(self.pair.remote.clone()) {
+                    if node.input_error.as_deref().is_some_and(|e| {
+                        e.contains("Permission denied") || e.contains("grant this desktop user")
+                    }) {
+                        ui.colored_label(
+                            palette(ui).error,
+                            format!(
+                                "{}: {}",
+                                node.name,
+                                crate::i18n::tr(
+                                    "Keyboard and mouse access is required on this PC."
+                                )
+                            ),
+                        );
+                    }
+                }
+                #[cfg(target_os = "linux")]
+                if self.prefs.role == "host"
+                    && !self.form.capture_devices.is_empty()
+                    && self.local_node().input_error.as_deref().is_some_and(|e| {
+                        e.contains("Permission denied") || e.contains("grant this desktop user")
+                    })
+                {
+                    note(
+                        ui,
+                        "Ubuntu needs permission to read the selected keyboard and mouse. Access lasts until they are unplugged; Wayland may also ask for remote-desktop permission.",
+                    );
+                    if ui
+                        .add_enabled(
+                            self.query.is_none(),
+                            egui::Button::new(crate::i18n::tr("Allow keyboard and mouse access")),
+                        )
+                        .clicked()
+                    {
+                        self.scan(super::QueryKind::InputAccess);
+                    }
+                }
                 if ui
                     .button(crate::i18n::tr("Повторить подключение устройств"))
                     .clicked()
@@ -563,6 +696,21 @@ impl Desktop {
                         });
                     });
                 }
+                ui.separator();
+                egui::CollapsingHeader::new(crate::i18n::tr("Connect by IP address"))
+                    .show(ui, |ui| {
+                        note(ui, "Use the other PC's IP, or IP:port. Network availability must be on at both PCs.");
+                        let mut connect = false;
+                        ui.horizontal(|ui| {
+                            let edit = ui.add(egui::TextEdit::singleline(&mut self.prefs.workspace.manual_address)
+                                .hint_text("192.168.1.20").char_limit(128).desired_width(260.0));
+                            connect = edit.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                            connect |= ui.add_enabled(self.prefs.discovery && !self.pair.busy,
+                                egui::Button::new(crate::i18n::tr("Связать"))).clicked();
+                        });
+                        if connect && self.prefs.discovery && !self.pair.busy { self.link_address(); }
+                        note(ui, "Different subnets need a route or VPN; discovery is optional for this connection.");
+                    });
                 if !self.pair.status.is_empty() {
                     ui.label(crate::i18n::tr(&self.pair.status));
                 }
@@ -643,26 +791,34 @@ impl Desktop {
                             }
                         }
                     };
-                    egui::ComboBox::from_id_salt(id)
-                        .width(260.0)
-                        .selected_text(caption)
-                        .show_ui(ui, |ui| {
-                            ui.selectable_value(
-                                value,
-                                Selection::Auto,
-                                crate::i18n::tr("Автоматически"),
-                            );
-                            ui.selectable_value(
-                                value,
-                                Selection::Computer(local.key.clone()),
-                                &local.name,
-                            );
-                            ui.selectable_value(
-                                value,
-                                Selection::Computer(remote.key.clone()),
-                                &remote.name,
-                            );
-                        });
+                    ui.add_enabled_ui(
+                        id != "input-owner"
+                            || (crate::workspace::Plan::can_disable(&local, &remote, true)
+                                && crate::workspace::Plan::can_disable(&local, &remote, false)
+                                && !crate::workspace::Plan::input_in_use(&local, &remote)),
+                        |ui| {
+                            egui::ComboBox::from_id_salt(id)
+                                .width(260.0)
+                                .selected_text(caption)
+                                .show_ui(ui, |ui| {
+                                    ui.selectable_value(
+                                        value,
+                                        Selection::Auto,
+                                        crate::i18n::tr("Автоматически"),
+                                    );
+                                    ui.selectable_value(
+                                        value,
+                                        Selection::Computer(local.key.clone()),
+                                        &local.name,
+                                    );
+                                    ui.selectable_value(
+                                        value,
+                                        Selection::Computer(remote.key.clone()),
+                                        &remote.name,
+                                    );
+                                });
+                        },
+                    );
                 });
             }
             ui.checkbox(
@@ -714,6 +870,78 @@ impl Desktop {
                 ui,
                 "Каждый ползунок меняет звук своего ПК. Настройки одинаковы на обоих компьютерах и сохраняются при переносе наушников.",
             );
+            ui.separator();
+            let mic_before = (shared.microphone_enabled, shared.microphone.clone());
+            ui.checkbox(
+                &mut shared.microphone_enabled,
+                crate::i18n::tr("Shared microphone"),
+            );
+            if shared.microphone_enabled {
+                ui.horizontal(|ui| {
+                    ui.label(crate::i18n::tr("Microphone source"));
+                    let caption = match &shared.microphone {
+                        Selection::Auto => crate::i18n::tr("Автоматически"),
+                        Selection::Computer(key) => {
+                            if key == &local.key {
+                                local.name.clone()
+                            } else {
+                                remote.name.clone()
+                            }
+                        }
+                    };
+                    egui::ComboBox::from_id_salt("microphone-owner")
+                        .selected_text(caption)
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(
+                                &mut shared.microphone,
+                                Selection::Auto,
+                                crate::i18n::tr("Автоматически"),
+                            );
+                            for node in [&local, &remote] {
+                                ui.selectable_value(
+                                    &mut shared.microphone,
+                                    Selection::Computer(node.key.clone()),
+                                    &node.name,
+                                );
+                            }
+                        });
+                });
+                ui.horizontal(|ui| {
+                    ui.add(
+                        egui::Slider::new(&mut shared.microphone_level.volume, 0..=100)
+                            .suffix(" %"),
+                    );
+                    ui.checkbox(
+                        &mut shared.microphone_level.muted,
+                        crate::i18n::tr("Mute microphone"),
+                    );
+                });
+                note(
+                    ui,
+                    "Select Desk Switch microphone in your calling app. On Windows select the virtual cable's recording endpoint (CABLE Output).",
+                );
+                if self
+                    .pair
+                    .plan
+                    .as_ref()
+                    .is_some_and(|p| p.microphone_source.is_none())
+                    && !shared.microphone_level.muted
+                {
+                    note(
+                        ui,
+                        "Microphone paused: check the selected microphone and the receiving PC's virtual input in Settings.",
+                    );
+                } else if local.microphone_active && remote.microphone_active {
+                    note(ui, "Shared microphone active");
+                }
+                note(
+                    ui,
+                    "Mute stops microphone capture. Local apps can still use their physical microphone.",
+                );
+            }
+            if mic_before != (shared.microphone_enabled, shared.microphone.clone()) {
+                shared.microphone_binding = None;
+            }
             ui.horizontal(|ui| {
                 ui.add_enabled(
                     shared.mouse_enabled,
@@ -956,12 +1184,12 @@ impl Desktop {
                 .unwrap_or_default();
             keyboard(
                 painter,
-                egui::pos2(center.x - 39.0, icon_y),
+                egui::pos2(center.x - 62.0, icon_y),
                 device_color(devices.keyboard),
             );
             mouse(
                 painter,
-                egui::pos2(center.x + 4.0, icon_y),
+                egui::pos2(center.x - 19.0, icon_y),
                 device_color(devices.mouse),
             );
             let audio = synced
@@ -969,13 +1197,28 @@ impl Desktop {
                     .is_some_and(|p| node.is_some_and(|n| p.audio_output.as_ref() == Some(&n.key)));
             headphones(
                 painter,
-                egui::pos2(center.x + 47.0, icon_y),
+                egui::pos2(center.x + 24.0, icon_y),
                 if audio { color } else { muted },
+            );
+            let microphone_origin = if synced {
+                if node.is_some_and(|n| n.microphone_active) {
+                    plan.and_then(|p| p.microphone_source.as_deref())
+                } else {
+                    node.filter(|n| n.hardware.microphone_score > 0)
+                        .map(|n| n.key.as_str())
+                }
+            } else {
+                None
+            };
+            microphone(
+                painter,
+                egui::pos2(center.x + 66.0, icon_y),
+                device_color(microphone_origin),
             );
             if audio && nodes.iter().all(|(n, _, _)| n.audio_playing) {
                 for (offset, origin, color) in [
-                    (41.0, plan.map(|p| p.purple.as_str()), purple),
-                    (52.0, plan.map(|p| p.green.as_str()), green),
+                    (18.0, plan.map(|p| p.purple.as_str()), purple),
+                    (29.0, plan.map(|p| p.green.as_str()), green),
                 ] {
                     let level = self
                         .prefs
@@ -1007,6 +1250,25 @@ impl Desktop {
 
     fn diagnostics(&mut self, ui: &mut egui::Ui) {
         title(ui, "Диагностика", "Состояние служб и последние сообщения.");
+        if ui.button(crate::i18n::tr("Copy diagnostics")).clicked() {
+            let mut report = format!("Desk Switch {} / protocol {}\nPair synchronized: {}\n{}\n",
+                crate::compatibility::VERSION, crate::compatibility::PROTOCOL, self.pair.synced,
+                serde_json::to_string_pretty(&serde_json::json!({"local":self.local_node(),"remote":self.pair.remote,"pair_status":self.pair.status})).unwrap_or_default());
+            for (name, worker) in [
+                ("Input", &self.input),
+                ("Audio", &self.audio),
+                ("Microphone", &self.microphone),
+            ] {
+                report.push_str(&format!("\n{name}:\n"));
+                if let Some(worker) = worker {
+                    for line in &worker.logs {
+                        report.push_str(line);
+                        report.push('\n');
+                    }
+                }
+            }
+            ui.ctx().copy_text(report);
+        }
         card(ui, |ui| {
             subheading(ui, "Профиль этого компьютера");
             ui.label(crate::i18n::ui_text(
@@ -1029,8 +1291,11 @@ impl Desktop {
                 "Wayland: RemoteDesktop v2 + EIS. Монитор: ddcutil и доступ к I²C. Звук: PipeWire и WirePlumber.",
             );
         });
-        for (name, worker) in [("Ввод и монитор", &self.input), ("Звук", &self.audio)]
-        {
+        for (name, worker) in [
+            ("Ввод и монитор", &self.input),
+            ("Звук", &self.audio),
+            ("Shared microphone", &self.microphone),
+        ] {
             card(ui, |ui| {
                 subheading(ui, name);
                 let Some(worker) = worker else {
@@ -1095,6 +1360,7 @@ impl Desktop {
         if appearance != (self.prefs.theme.clone(), self.prefs.language.clone()) {
             self.appearance_changed(ui.ctx());
         }
+        self.device_settings(ui);
         card(ui, |ui| {
             subheading(ui, "При входе в систему");
             let changed = ui
@@ -1194,5 +1460,72 @@ impl Desktop {
                 "Обновления подписаны ключом проекта. Релиз содержит сборки Windows и Ubuntu одной версии.",
             );
         });
+    }
+}
+
+impl Desktop {
+    fn device_settings(&mut self, ui: &mut egui::Ui) {
+        let local = self.local_node();
+        let mut nodes = vec![local.clone()];
+        if let Some(remote) = &self.pair.remote {
+            nodes.push(remote.clone());
+        }
+        let before = self.prefs.workspace.shared.devices.clone();
+        card(ui, |ui| {
+            subheading(ui, "Device selection");
+            note(
+                ui,
+                "Auto is enough for most setups. Device choices synchronize between both PCs.",
+            );
+            if !self.prefs.discovery {
+                note(ui, "Turn on network availability to detect devices.");
+            }
+            for node in nodes {
+                if node.key.is_empty() {
+                    continue;
+                }
+                egui::CollapsingHeader::new(&node.name).id_salt((&node.key,"devices")).default_open(node.key == local.key).show(ui, |ui| {
+                    let mut choices = self.prefs.workspace.shared.devices_for(&node.key);
+                    let original = choices.clone();
+                    let can_change = self.pair.remote.as_ref().is_none_or(|r| crate::workspace::Plan::can_disable(&local,r,true)
+                        && crate::workspace::Plan::can_disable(&local,r,false) && !crate::workspace::Plan::input_in_use(&local,r));
+                    ui.add_enabled_ui(can_change && node.devices.individual_input, |ui| {
+                        device_picker(ui, &format!("{}-keyboard",node.key), "Клавиатура", &mut choices.keyboard, &node.devices.keyboards, None);
+                        device_picker(ui, &format!("{}-mouse",node.key), "Мышь", &mut choices.mouse, &node.devices.mice, None);
+                    });
+                    if !can_change { note(ui, "Return control before changing shared input devices."); }
+                    if !node.devices.individual_input { note(ui, "Windows shares all attached keyboards and mice as a group."); }
+                    device_picker(ui, &format!("{}-speaker",node.key), "Shared speaker / headphones", &mut choices.speaker, &node.devices.speakers, None);
+                    note(ui, "This output receives the other PC's audio. Local apps must use the same output to hear both PCs.");
+                    let microphone_before = choices.microphone.clone();
+                    let automatic_mic = self.prefs.workspace.shared.microphone_binding.as_ref().filter(|b| b.computer == node.key)
+                        .map(|binding| node.devices.microphones.iter().find(|d| d.id == binding.device)
+                            .map(|d| d.name.clone()).unwrap_or_else(|| crate::i18n::tr("Selected device unavailable")));
+                    device_picker(ui, &format!("{}-microphone",node.key), "Microphone", &mut choices.microphone, &node.devices.microphones, automatic_mic.as_deref());
+                    if !node.devices.individual_input {
+                        device_picker(ui, &format!("{}-bridge",node.key), "Virtual microphone input", &mut choices.microphone_bridge, &node.devices.microphone_bridges, None);
+                    }
+                    if microphone_before != choices.microphone
+                        && self.prefs.workspace.shared.microphone_binding.as_ref().is_some_and(|b| b.computer == node.key) {
+                        self.prefs.workspace.shared.microphone_binding = None;
+                    }
+                    if node.hardware.known && !node.devices.individual_input && node.devices.microphone_bridges.is_empty() {
+                        note(ui, "Receiving a microphone on Windows needs a virtual cable. Install VB-CABLE, then select CABLE Output in your calling app.");
+                        ui.hyperlink_to(crate::i18n::tr("VB-CABLE setup"), "https://vb-audio.com/Cable/");
+                    }
+                    if !node.devices.individual_input && node.devices.microphone_bridges.iter().any(|d| d.default) {
+                        note(ui, "Keep your regular headphones as the Windows output; select CABLE Output only as the calling app's microphone.");
+                    }
+                    if choices != original { self.prefs.workspace.shared.devices.insert(node.key.clone(), choices); }
+                });
+            }
+            note(
+                ui,
+                "A missing selected device pauses sharing; another microphone is never opened automatically.",
+            );
+        });
+        if before != self.prefs.workspace.shared.devices {
+            self.shared_changed();
+        }
     }
 }

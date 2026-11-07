@@ -151,6 +151,8 @@ pub struct Form {
     pub edge_screen: String,
     pub edge_side: String,
     pub capture_devices: String,
+    pub capture_keyboard: Option<PathBuf>,
+    pub capture_mouse: Option<PathBuf>,
     pub sharing: config::InputSharing,
 }
 
@@ -193,6 +195,8 @@ impl Form {
                         .join("\n")
                 })
                 .unwrap_or_default(),
+            capture_keyboard: settings.capture.as_ref().and_then(|c| c.keyboard.clone()),
+            capture_mouse: settings.capture.as_ref().and_then(|c| c.mouse.clone()),
             sharing: settings.capture.map(|c| c.sharing).unwrap_or_default(),
         }
     }
@@ -221,6 +225,8 @@ impl Form {
             .collect::<Vec<_>>();
         let capture = Some(CaptureSettings {
             devices,
+            keyboard: self.capture_keyboard.clone(),
+            mouse: self.capture_mouse.clone(),
             sharing: self.sharing,
         });
         Ok(FileSettings {

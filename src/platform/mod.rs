@@ -61,8 +61,7 @@ pub fn run(
                 identity,
                 peer,
                 settings.edge,
-                settings.sharing,
-                settings.capture_devices,
+                settings.capture,
                 video,
             ));
             #[cfg(windows)]
