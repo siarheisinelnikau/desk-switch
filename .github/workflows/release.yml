@@ -18,10 +18,35 @@ permissions:
 
 concurrency:
   group: release-${{ github.ref }}
-  cancel-in-progress: false
+  cancel-in-progress: true
 
 jobs:
+  request:
+    runs-on: ubuntu-24.04
+    outputs:
+      build: ${{ steps.request.outputs.build }}
+      publish: ${{ steps.request.outputs.publish }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - id: request
+        env:
+          REQUESTED_PUBLISH: ${{ github.event_name != 'workflow_dispatch' || inputs.publish }}
+        run: |
+          python3 - <<'PY'
+          import json, os
+          from pathlib import Path
+          request = json.loads(Path('release/publish-request.json').read_text())
+          allowed = not request.get('hold', False)
+          publish = allowed and os.environ['REQUESTED_PUBLISH'] == 'true'
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as out:
+              out.write(f"build={str(allowed).lower()}\npublish={str(publish).lower()}\n")
+          print('Release publication is on hold.' if not allowed else 'Release request accepted.')
+          PY
   build:
+    needs: request
+    if: needs.request.outputs.build == 'true'
     strategy:
       fail-fast: false
       matrix:
@@ -79,6 +104,8 @@ jobs:
           if-no-files-found: error
 
   macos:
+    needs: request
+    if: needs.request.outputs.build == 'true'
     strategy:
       fail-fast: false
       matrix:
@@ -142,8 +169,8 @@ jobs:
           retention-days: 30
 
   publish:
-    if: github.event_name != 'workflow_dispatch' || inputs.publish
-    needs: [build, macos, sign]
+    if: needs.request.outputs.publish == 'true'
+    needs: [request, build, macos, sign]
     runs-on: ubuntu-24.04
     permissions:
       contents: write
