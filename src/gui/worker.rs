@@ -20,6 +20,31 @@ pub enum Kind {
     Query,
 }
 
+#[derive(Default)]
+pub(super) struct OutputLevel {
+    observed: Option<crate::workspace::AudioLevel>,
+    pending: Option<crate::workspace::AudioLevel>,
+    request: u64,
+    pub changed: Option<crate::workspace::AudioLevel>,
+}
+
+impl OutputLevel {
+    fn receive(&mut self, request: u64, level: crate::workspace::AudioLevel) {
+        // A delayed poll result must not undo a newer slider command.
+        if request == self.request && level.volume <= 100 {
+            self.observed = Some(level);
+            self.pending = None;
+            self.changed = Some(level);
+        }
+    }
+
+    fn needs_change(&self, level: crate::workspace::AudioLevel) -> bool {
+        self.observed.is_some()
+            && self.pending != Some(level)
+            && (self.pending.is_some() || self.observed != Some(level))
+    }
+}
+
 pub struct Worker {
     pub kind: Kind,
     child: Option<Child>,
@@ -33,6 +58,7 @@ pub struct Worker {
     pub new_switch_error: Option<String>,
     monitor_required: Option<bool>,
     pub audio_playing: bool,
+    pub(super) output_level: OutputLevel,
     pub peer_version: Option<String>,
     pub version_error: Option<String>,
     pub stopping: bool,
@@ -46,7 +72,12 @@ pub struct Worker {
 }
 
 impl Worker {
-    pub fn start(kind: Kind, args: &[String], dir: &Path) -> Result<Self> {
+    pub fn start(
+        kind: Kind,
+        args: &[String],
+        dir: &Path,
+        ctx: &eframe::egui::Context,
+    ) -> Result<Self> {
         let executable = std::env::current_exe()?;
         let mut command = Command::new(executable);
         command.args(args).env("DESK_SWITCH_STATE", dir);
@@ -56,7 +87,7 @@ impl Worker {
         } else {
             command.env_remove("DESK_SWITCH_MANAGED");
         }
-        let mut worker = Self::spawn(kind, command)?;
+        let mut worker = Self::spawn_waking(kind, command, Some(ctx.clone()))?;
         worker.interactive_query = interactive_query;
         if args
             .first()
@@ -67,7 +98,16 @@ impl Worker {
         Ok(worker)
     }
 
-    fn spawn(kind: Kind, mut command: Command) -> Result<Self> {
+    #[cfg(test)]
+    fn spawn(kind: Kind, command: Command) -> Result<Self> {
+        Self::spawn_waking(kind, command, None)
+    }
+
+    fn spawn_waking(
+        kind: Kind,
+        mut command: Command,
+        ctx: Option<eframe::egui::Context>,
+    ) -> Result<Self> {
         command
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -85,6 +125,7 @@ impl Worker {
             Box::new(child.stderr.take().unwrap()) as Box<dyn std::io::Read + Send>,
         ] {
             let send = send.clone();
+            let ctx = ctx.clone();
             std::thread::Builder::new()
                 .name("Desk Switch service log".into())
                 .spawn(move || {
@@ -95,13 +136,20 @@ impl Worker {
                         if line.len() > limit {
                             line.truncate(line.floor_char_boundary(limit));
                         }
-                        if structured {
+                        let sent = if structured {
                             if send.send(line).is_err() {
                                 break;
                             }
+                            true
                         } else {
-                            let _ = send.try_send(line);
+                            send.try_send(line).is_ok()
+                        };
+                        if sent && let Some(ctx) = &ctx {
+                            ctx.request_repaint();
                         }
+                    }
+                    if let Some(ctx) = &ctx {
+                        ctx.request_repaint();
                     }
                 })?;
         }
@@ -118,6 +166,7 @@ impl Worker {
             new_switch_error: None,
             monitor_required: None,
             audio_playing: false,
+            output_level: OutputLevel::default(),
             peer_version: None,
             version_error: None,
             stopping: false,
@@ -137,6 +186,36 @@ impl Worker {
 
     pub fn running(&self) -> bool {
         self.child.is_some()
+    }
+
+    pub fn needs_poll(&self) -> bool {
+        self.running() && (self.stopping || self.events_closed)
+    }
+
+    pub fn next_poll(&self) -> Duration {
+        if self.needs_poll() {
+            Duration::from_millis(200)
+        } else {
+            self.query_timeout.saturating_sub(self.started.elapsed())
+        }
+    }
+
+    pub fn set_output_level(&mut self, level: crate::workspace::AudioLevel) -> Result<()> {
+        if self.output_level.needs_change(level) {
+            let request = self
+                .output_level
+                .request
+                .checked_add(1)
+                .context("too many system volume changes")?;
+            self.command(&format!(
+                "system-level {request} {} {}",
+                level.volume, level.muted
+            ))?;
+            self.output_level.request = request;
+            self.output_level.pending = Some(level);
+            self.output_level.changed = None;
+        }
+        Ok(())
     }
 
     #[cfg(target_os = "linux")]
@@ -237,6 +316,7 @@ impl Worker {
                     }
                 }
                 Event::Audio { playing, .. } => self.audio_playing = playing && self.running(),
+                Event::OutputLevel { request, level } => self.output_level.receive(request, level),
             }
             return;
         }
@@ -272,6 +352,7 @@ impl Worker {
             }
         }
         if self.kind == Kind::Query
+            && !self.stopping
             && self.started.elapsed() > self.query_timeout
             && let Some(child) = &mut self.child
         {
@@ -282,6 +363,8 @@ impl Worker {
             }
             self.logs
                 .push_back("Проверка устройства превысила время ожидания.".into());
+            self.stopping = true;
+            self.stopping_since = Some(Instant::now());
         }
         if let Some(child) = &mut self.child {
             match child.try_wait() {
@@ -319,6 +402,52 @@ impl Drop for Worker {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn output_feedback_adopts_startup_and_media_keys_but_ignores_stale_commands() {
+        use crate::workspace::AudioLevel;
+        let mut output = OutputLevel::default();
+        let saved = AudioLevel {
+            volume: 100,
+            muted: false,
+        };
+        assert!(!output.needs_change(saved));
+        let actual = AudioLevel {
+            volume: 37,
+            muted: false,
+        };
+        output.receive(0, actual);
+        assert_eq!(output.changed.take(), Some(actual));
+        assert!(!output.needs_change(actual));
+        let desired = AudioLevel {
+            volume: 90,
+            muted: false,
+        };
+        assert!(output.needs_change(desired));
+        output.request = 1;
+        output.pending = Some(desired);
+        assert!(!output.needs_change(desired));
+        output.receive(0, actual);
+        assert_eq!(output.observed, Some(actual));
+        assert!(output.changed.is_none());
+        output.receive(1, desired);
+        assert_eq!(output.changed.take(), Some(desired));
+        let media_key = AudioLevel {
+            volume: 88,
+            muted: true,
+        };
+        output.receive(1, media_key);
+        assert_eq!(output.changed.take(), Some(media_key));
+        assert!(!output.needs_change(media_key));
+        output.receive(
+            1,
+            AudioLevel {
+                volume: 101,
+                muted: false,
+            },
+        );
+        assert_eq!(output.observed, Some(media_key));
+    }
 
     #[test]
     fn service_version_errors_use_the_same_localized_message_as_pairing() {

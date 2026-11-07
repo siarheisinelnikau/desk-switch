@@ -322,6 +322,27 @@ impl Node {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MonitorSetup {
+    Disabled,
+    ThisPcMissing,
+    OtherPcMissing,
+    SameInput,
+    Ready,
+}
+
+impl MonitorSetup {
+    pub fn caption(self) -> &'static str {
+        match self {
+            Self::Disabled => "Shared monitor is off",
+            Self::ThisPcMissing => "Set up this PC",
+            Self::OtherPcMissing => "Set up the other PC",
+            Self::SameInput => "Same input on both PCs",
+            Self::Ready => "Проверяем видеовход…",
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct Plan {
     pub purple: String,
@@ -366,10 +387,26 @@ impl Plan {
     }
 
     pub fn shared_monitor(a: &Node, b: &Node) -> bool {
-        a.monitor.enabled
-            && b.monitor.enabled
-            && !a.monitor.fingerprint.is_empty()
-            && a.monitor.fingerprint == b.monitor.fingerprint
+        Self::common_monitor(a, b) && a.monitor.enabled && b.monitor.enabled
+    }
+
+    pub fn monitor_setup(a: &Node, b: &Node) -> MonitorSetup {
+        if !Self::common_monitor(a, b) {
+            return MonitorSetup::Disabled;
+        }
+        for (node, missing) in [
+            (a, MonitorSetup::ThisPcMissing),
+            (b, MonitorSetup::OtherPcMissing),
+        ] {
+            if !node.monitor.enabled || !node.monitor.input.is_some_and(|input| input != 0) {
+                return missing;
+            }
+        }
+        if a.monitor.input == b.monitor.input {
+            MonitorSetup::SameInput
+        } else {
+            MonitorSetup::Ready
+        }
     }
 
     pub fn common_monitor(a: &Node, b: &Node) -> bool {
@@ -384,12 +421,7 @@ impl Plan {
     // Local/other mapping is also available when both PCs have their own input
     // devices and no keyboard forwarding service is needed.
     pub fn monitor_inputs(a: &Node, b: &Node) -> Option<Inputs> {
-        let shared = if a.shared.revision >= b.shared.revision {
-            &a.shared
-        } else {
-            &b.shared
-        };
-        if !shared.monitor_enabled || !Self::shared_monitor(a, b) {
+        if Self::monitor_setup(a, b) != MonitorSetup::Ready {
             return None;
         }
         let (host, peer) = (a.monitor.input?, b.monitor.input?);
@@ -621,6 +653,59 @@ pub fn pairing_code(handshake: &[u8]) -> String {
 mod tests {
     use super::*;
     #[test]
+    fn shared_checkbox_uses_each_pcs_saved_port_despite_different_display_identities() {
+        let (mut windows, mut ubuntu) = (node("windows"), node("ubuntu"));
+        windows.hardware.keyboard = true;
+        windows.hardware.mouse = true;
+        for (node, id, fingerprint, input) in [
+            (&mut windows, "windows-displayport", "displayport-edid", 15),
+            (&mut ubuntu, "linux-hdmi", "hdmi-edid", 17),
+        ] {
+            node.shared.monitor_enabled = true;
+            node.monitor = Monitor {
+                enabled: true,
+                id: id.into(),
+                fingerprint: fingerprint.into(),
+                name: "Shared display".into(),
+                input: Some(input),
+            };
+        }
+        assert_eq!(Plan::monitor_setup(&windows, &ubuntu), MonitorSetup::Ready);
+        assert_eq!(
+            Plan::monitor_inputs(&windows, &ubuntu),
+            Some(Inputs { host: 15, peer: 17 })
+        );
+        assert_eq!(
+            Plan::monitor_inputs(&ubuntu, &windows),
+            Some(Inputs { host: 17, peer: 15 })
+        );
+        assert_eq!(
+            Plan::build(&windows, &ubuntu).monitor,
+            Some(Inputs { host: 15, peer: 17 })
+        );
+        ubuntu.monitor.fingerprint.clear();
+        assert_eq!(Plan::monitor_setup(&windows, &ubuntu), MonitorSetup::Ready);
+        ubuntu.monitor.input = Some(15);
+        assert_eq!(
+            Plan::monitor_setup(&windows, &ubuntu),
+            MonitorSetup::SameInput
+        );
+        ubuntu.monitor.input = None;
+        assert_eq!(
+            Plan::monitor_setup(&windows, &ubuntu),
+            MonitorSetup::OtherPcMissing
+        );
+        ubuntu.monitor.input = Some(17);
+        windows.shared.monitor_enabled = false;
+        windows.shared.changed(&windows.key);
+        assert_eq!(
+            Plan::monitor_setup(&windows, &ubuntu),
+            MonitorSetup::Disabled
+        );
+        assert!(Plan::monitor_inputs(&windows, &ubuntu).is_none());
+    }
+
+    #[test]
     fn remembering_video_while_input_is_borrowed_does_not_activate_ddc_until_input_returns() {
         let (mut a, mut b) = (node("a"), node("b"));
         a.hardware.keyboard = true;
@@ -705,7 +790,10 @@ mod tests {
         assert_eq!(Plan::monitor_inputs(&a, &b), None);
         b.monitor.input = Some(15);
         b.monitor.fingerprint = "different-display".into();
-        assert_eq!(Plan::monitor_inputs(&a, &b), None);
+        assert_eq!(
+            Plan::monitor_inputs(&a, &b),
+            Some(Inputs { host: 17, peer: 15 })
+        );
     }
     pub fn node(key: &str) -> Node {
         Node {
@@ -899,7 +987,10 @@ mod tests {
             Some(Inputs { host: 15, peer: 17 })
         );
         b.monitor.fingerprint = "different display".into();
-        assert!(Plan::build(&a, &b).monitor.is_none());
+        assert_eq!(
+            Plan::build(&a, &b).monitor,
+            Some(Inputs { host: 15, peer: 17 })
+        );
     }
 
     #[test]
@@ -907,6 +998,7 @@ mod tests {
         let mut a = node("a");
         let mut b = node("b");
         for (node, input) in [(&mut a, 17), (&mut b, 15)] {
+            node.shared.monitor_enabled = true;
             node.monitor.enabled = true;
             node.monitor.fingerprint = "shared display".into();
             node.monitor.input = Some(input);
@@ -931,7 +1023,7 @@ mod tests {
         b.monitor.input = None;
         assert_eq!(Plan::monitor_owner(&a, &b, true), None);
         b.monitor.fingerprint = "another display".into();
-        assert!(!Plan::shared_monitor(&a, &b));
+        assert!(Plan::shared_monitor(&a, &b));
     }
 
     #[test]
