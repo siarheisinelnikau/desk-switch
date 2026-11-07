@@ -208,6 +208,7 @@ fn input_capabilities(key: &str, rel: &str, abs: &str) -> (bool, bool) {
 
 #[cfg(target_os = "linux")]
 pub fn input_devices() -> Result<Vec<InputEndpoint>> {
+    use std::os::unix::fs::MetadataExt;
     let mut result = Vec::new();
     let mut aliases = std::collections::BTreeMap::new();
     for directory in ["/dev/input/by-path", "/dev/input/by-id"] {
@@ -263,6 +264,7 @@ pub fn input_devices() -> Result<Vec<InputEndpoint>> {
                     name: label.trim().chars().take(256).collect(),
                     default: false,
                 },
+                generation: std::fs::metadata(&path).ok().map(|m| (m.dev(), m.ino())),
                 path,
                 keyboard: k,
                 mouse: m,
@@ -468,6 +470,8 @@ pub fn input_devices() -> Result<Vec<InputEndpoint>> {
 pub struct InputEndpoint {
     pub info: AudioDevice,
     pub path: PathBuf,
+    #[cfg(target_os = "linux")]
+    pub generation: Option<(u64, u64)>,
     pub keyboard: bool,
     pub mouse: bool,
 }
