@@ -178,14 +178,14 @@ pub fn run(case: &str, dir: PathBuf) -> Result<()> {
         viewport: egui::ViewportBuilder::default()
             .with_title("Desk Switch")
             .with_active(false)
-            .with_inner_size(if case == "quick-controls" {
+            .with_inner_size(if case.ends_with("quick-controls") {
                 [344.0, 442.0]
             } else if capturing || std::env::var_os("EFRAME_SCREENSHOT_TO").is_some() {
                 [1080.0, 1000.0]
             } else {
                 [1080.0, 760.0]
             })
-            .with_min_inner_size(if case == "quick-controls" {
+            .with_min_inner_size(if case.ends_with("quick-controls") {
                 [344.0, 442.0]
             } else {
                 [880.0, 650.0]
@@ -322,8 +322,8 @@ impl Desktop {
         if let Some(tray) = &self.tray {
             tray.preview_label();
         }
-        self.preview_popup = case == "quick-controls";
-        let case = if self.preview_popup {
+        self.preview_popup = case.ends_with("quick-controls");
+        let case = if case == "quick-controls" {
             "shared-audio"
         } else {
             case
@@ -647,7 +647,10 @@ impl Desktop {
                     });
             }
         }
-        if matches!(case, "shared-four" | "shared-four-settings") {
+        if matches!(
+            case,
+            "shared-four" | "shared-four-settings" | "shared-four-quick-controls"
+        ) {
             let mut members = std::collections::BTreeMap::new();
             for (index, (name, platform, key)) in [
                 ("Studio PC", "windows", self.public_key.clone()),

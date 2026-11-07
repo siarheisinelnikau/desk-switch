@@ -561,5 +561,7 @@
   "Recent service messages from every computer in this workspace.": "Messaggi recenti dei servizi di ogni computer in questo spazio di lavoro.",
   "The copied report includes all computers and workspace settings. Offline computers show the last received diagnostics.": "Il rapporto copiato include tutti i computer e le impostazioni dello spazio di lavoro. Per i computer offline viene mostrata l’ultima diagnostica ricevuta.",
   "Select a monitor": "Seleziona un monitor",
-  "Microphone level": "Livello del microfono"
+  "Microphone level": "Livello del microfono",
+  "Workspace coordinator": "Coordinatore",
+  "Update this computer last to keep workspace management available.": "Aggiorna questo computer per ultimo per mantenere disponibile la gestione dell’area di lavoro."
 }

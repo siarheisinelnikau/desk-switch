@@ -360,7 +360,17 @@ impl Desktop {
                 .filter(|member| member.online)
                 .count()
                 > 1;
-            snapshot.can_switch = snapshot.connected && !workspace.switch_pending();
+            snapshot.can_switch = workspace
+                .members
+                .values()
+                .filter(|member| member.compatible())
+                .count()
+                > 1
+                && !workspace.switch_pending();
+            snapshot.audio = workspace.settings.audio_enabled;
+            snapshot.keyboard = workspace.settings.keyboard_enabled;
+            snapshot.mouse = workspace.settings.mouse_enabled;
+            snapshot.microphone = workspace.settings.microphone_enabled;
             snapshot.monitor = false;
             snapshot.peer = format!(
                 "{} {}",
@@ -590,6 +600,10 @@ fn content(ui: &mut egui::Ui, snapshot: &Snapshot, mut send: impl FnMut(Action))
                         let mut value = value;
                         if ui
                             .add_enabled(enabled, egui::Checkbox::new(&mut value, tr(label)))
+                            .on_disabled_hover_text(format!(
+                                "{} (F11)",
+                                tr("Return control before changing shared input devices.")
+                            ))
                             .changed()
                         {
                             send(Action::Quick(Command::Toggle(device, value)));
@@ -618,22 +632,27 @@ fn content(ui: &mut egui::Ui, snapshot: &Snapshot, mut send: impl FnMut(Action))
                     for row in &snapshot.levels {
                         ui.horizontal(|ui| {
                             ui.add_sized(
-                                [144.0, 18.0],
+                                [120.0, 18.0],
                                 egui::Label::new(RichText::new(&row.name).strong()).truncate(),
                             )
                             .on_hover_text(&row.name);
                             ui.with_layout(
                                 egui::Layout::right_to_left(egui::Align::Center),
                                 |ui| {
-                                    ui.label(
-                                        RichText::new(tr(if row.system {
-                                            "System volume"
-                                        } else {
-                                            "Relative volume"
-                                        }))
-                                        .small()
-                                        .color(ui.visuals().weak_text_color()),
-                                    );
+                                    let caption = tr(if row.system {
+                                        "System volume"
+                                    } else {
+                                        "Relative volume"
+                                    });
+                                    ui.add(
+                                        egui::Label::new(
+                                            RichText::new(&caption)
+                                                .small()
+                                                .color(ui.visuals().weak_text_color()),
+                                        )
+                                        .truncate(),
+                                    )
+                                    .on_hover_text(caption);
                                 },
                             );
                         });
@@ -641,7 +660,23 @@ fn content(ui: &mut egui::Ui, snapshot: &Snapshot, mut send: impl FnMut(Action))
                         let changed = ui
                             .horizontal(|ui| {
                                 let slider = ui
-                                    .add(egui::Slider::new(&mut level.volume, 0..=100).suffix(" %"))
+                                    .scope(|ui| {
+                                        let font = egui::TextStyle::Body.resolve(ui.style());
+                                        let mute_width = ui.fonts_mut(|fonts| {
+                                            fonts
+                                                .layout_no_wrap(tr("Mute"), font, Color32::WHITE)
+                                                .size()
+                                                .x
+                                        });
+                                        ui.spacing_mut().slider_width =
+                                            (ui.available_width() - mute_width - 106.0)
+                                                .clamp(96.0, 175.0);
+                                        ui.add(
+                                            egui::Slider::new(&mut level.volume, 0..=100)
+                                                .suffix(" %"),
+                                        )
+                                    })
+                                    .inner
                                     .changed();
                                 ui.checkbox(&mut level.muted, tr("Mute")).changed() || slider
                             })
