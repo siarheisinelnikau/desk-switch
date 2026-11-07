@@ -6,17 +6,17 @@ Your computers. One workspace. Share a keyboard, mouse, headphones or speakers, 
 
 ## Install
 
-Install the **same version on every computer** from [Releases](https://github.com/siarheisinelnikau/desk-switch/releases). Version 0.5.0 has four native downloads:
+Install the **same version on every computer** from [Releases](https://github.com/siarheisinelnikau/desk-switch/releases). Version 0.5.1 has four native downloads:
 
 | Platform | Download |
 | --- | --- |
-| Ubuntu 24.04/26.04, x86-64 | [desk-switch-v0.5.0-linux-x86-64.deb](https://github.com/siarheisinelnikau/desk-switch/releases/download/v0.5.0/desk-switch-v0.5.0-linux-x86-64.deb) |
-| Windows, x86-64 | [desk-switch-v0.5.0-windows-x86-64.exe](https://github.com/siarheisinelnikau/desk-switch/releases/download/v0.5.0/desk-switch-v0.5.0-windows-x86-64.exe) |
-| macOS 13+, Apple Silicon — experimental | [desk-switch-v0.5.0-macos-arm64.zip](https://github.com/siarheisinelnikau/desk-switch/releases/download/v0.5.0/desk-switch-v0.5.0-macos-arm64.zip) |
-| macOS 13+, Intel — experimental | [desk-switch-v0.5.0-macos-x86-64.zip](https://github.com/siarheisinelnikau/desk-switch/releases/download/v0.5.0/desk-switch-v0.5.0-macos-x86-64.zip) |
+| Ubuntu 24.04/26.04, x86-64 | [desk-switch-v0.5.1-linux-x86-64.deb](https://github.com/siarheisinelnikau/desk-switch/releases/download/v0.5.1/desk-switch-v0.5.1-linux-x86-64.deb) |
+| Windows, x86-64 | [desk-switch-v0.5.1-windows-x86-64.exe](https://github.com/siarheisinelnikau/desk-switch/releases/download/v0.5.1/desk-switch-v0.5.1-windows-x86-64.exe) |
+| macOS 13+, Apple Silicon — experimental | [desk-switch-v0.5.1-macos-arm64.zip](https://github.com/siarheisinelnikau/desk-switch/releases/download/v0.5.1/desk-switch-v0.5.1-macos-arm64.zip) |
+| macOS 13+, Intel — experimental | [desk-switch-v0.5.1-macos-x86-64.zip](https://github.com/siarheisinelnikau/desk-switch/releases/download/v0.5.1/desk-switch-v0.5.1-macos-x86-64.zip) |
 
 ```sh
-sudo apt install ./desk-switch-v0.5.0-linux-x86-64.deb
+sudo apt install ./desk-switch-v0.5.1-linux-x86-64.deb
 ```
 
 Open **Desk Switch** from Ubuntu's application menu, run the Windows executable, or extract the matching macOS application bundle. New profiles use **English** and **Dark**. Existing language and theme choices are preserved. Russian, German, French, Spanish and Italian are also available; changes apply immediately to the window and tray.
@@ -61,7 +61,9 @@ Direct device connections use **45876/TCP** for input and **45877/TCP** for syst
 - **Headphones or speakers:** **Play all sound on** chooses the listening computer. It receives the sound of every other eligible online member, so all computers can be heard through one set of headphones. The listening computer's level is its real output **system volume and mute**. Each other computer has an independent **relative volume and mute** for its forwarded stream. Any member can adjust every level. Disabling **Sound** stops forwarding and leaves the output's current system level in place. Shared sound stays independent of keyboard/mouse switching.
 - **Microphone:** choose one physical source and deliver it to every eligible online computer with a supported virtual microphone. The shared gain and mute apply to all recipients. See [Shared microphone](#shared-microphone) for driver requirements and source binding.
 - **Clipboard:** enable **Shared clipboard** to copy text and images between members. It is off by default; [limits and platform setup](#shared-clipboard) are described below.
-- **Monitor:** enable **Switch the shared monitor** and configure the participating computers' ports. A destination connected to that monitor selects its own saved input once when activated. Computers using separate displays can leave their participation disabled.
+- **Monitor:** enable **Switch the shared monitor** and configure the participating computers' ports. The currently visible computer sends one command selecting the destination's saved input. Computers using separate displays can leave their participation disabled.
+
+The original outline device icons identify keyboards, mice, headphones/speakers and microphones. Their colours follow the source computer across the main cards, shared controls and tray popup. Muted sources keep a subdued colour with a slash. The shared-monitor picture shows the last successful Desk Switch selection, with separate switching, failure and unknown states. It updates when you switch with Desk Switch; manual changes in the monitor's own menu are not detected automatically.
 
 Shared keyboard, mouse, sound, microphone, clipboard and monitor options are independent. Return borrowed input with F11 before changing its source or device bindings. A settings change that would strand borrowed input is rejected, and held keys are released during a valid reconfiguration. Missing explicit devices pause their service rather than silently selecting a replacement. **Settings → Advanced → Retry devices** restarts this computer's failed routes without recreating the workspace; select this computer before retrying.
 
@@ -105,7 +107,11 @@ Files and folders are not transferred in this release. Their implementation is t
 
 Connect a shared physical monitor to its participating computers using different HDMI/DisplayPort inputs. Enable **Switch the shared monitor** in the workspace. In **Settings**, choose each participating computer, enable **This computer uses the shared monitor** and select that computer's actual port. Saved inputs must be distinct. A member using another display should leave this option disabled. You can edit saved ports and request **Read the current input once** for any selected online computer from any member. That explicit request runs on the selected computer; use it while that computer's picture is visible. Reading never selects another input.
 
-When switching to a participating computer, **the destination application sends one VCP `0x60` selection for its own saved port**, then waits briefly before accepting shared input. The global switch and per-computer participation checkboxes determine this behavior. Startup, idle and switch confirmation do not poll DDC/CI. A busy selection cannot accumulate additional commands, and a failed selection does not trigger alternate input codes, retries or a reversal. A monitor error is reported with a manual port-selection/retry action. The application never changes resolution or refresh rate. Enable DDC/CI in the monitor's own menu if access is unavailable; some monitors do not accept commands through an inactive port.
+When switching to a participating computer, **one named writer uses the currently visible monitor connection to send one VCP `0x60` selection for the destination's saved port**. The destination accepts shared input only after that writer reports completion and the settling interval ends. A failure includes bounded command and device context; it never causes a second attempt through the inactive destination or an automatic reversal. An issuance record prevents replaying the same command after a writer restart. A timeout interrupts the request and keeps the switch blocked until the writer confirms cancellation or its bounded job exits; reopen Desk Switch on that writer if it is offline. Startup, idle and confirmation do not poll DDC/CI, and the application never changes resolution or refresh rate.
+
+When no successful monitor selection is known, including migration from the older destination-only implementation, the authenticated requesting PC is used as the visible source. **Start that request from the PC whose picture is currently displayed.** Manual changes in the monitor's own menu cannot be inferred automatically. After an ambiguous write error, select the desired input manually and retry explicitly from the visible PC. DDC/CI must be enabled in the monitor's menu; access through an inactive connection is not assumed.
+
+During a staged upgrade of an existing workspace, **update its other members first and the coordinating computer last**. Updated members continue to accept older state and management messages, but an older snapshot without an explicit monitor command cannot authorize a DDC write. Complete the upgrade on every member before using the new monitor workflow.
 
 DDC/CI depends on the monitor and firmware. Some LG monitors can show a recurring **Out of range** message after a single standard input-selection command, even when the picture is visible; see [ddcutil issue #102](https://github.com/rockowitz/ddcutil/issues/102). This is not evidence of queued application commands. On the reported **LG 27GK750F**, with Ubuntu on **HDMI1** and Windows on **DisplayPort**, selecting **DisplayPort once using the monitor's joystick** stopped the warning; the user then confirmed that subsequent Desk Switch switches worked without it. This is a confirmed workaround for that setup, not a firmware fix. Persistence after monitor power-off has not been verified. If the warning returns, select DisplayPort in the monitor's own menu again. Desk Switch does not guess manufacturer-specific commands or scan possible inputs.
 
@@ -133,7 +139,7 @@ An installed Ubuntu package updates without an application password prompt. Its 
 
 Recent service logs and diagnostics are synchronized over authenticated, encrypted workspace connections. Open **Settings → Advanced → Diagnostics → Copy diagnostics** to collect member state and recent service messages. Offline reports remain labelled as such. Snapshots are bounded and do not reconfigure device services.
 
-For the first upgrade from **0.4.8 or older**, install the current `.deb` or replace the `.exe` once on each computer: those releases do not support the architecture-labelled names and remote management. The saved **0.4.11** partner remains reachable through a limited management/update bridge while upgrading, so it can be updated from the computer already running 0.5.0. Device sharing waits for matching versions. Install **0.5.0 on every intended member** before creating a larger workspace. Portable Linux binaries are no longer distributed; the `.deb` uses its installed launcher and package-owned binary so future system updates work correctly.
+For the first upgrade from **0.4.8 or older**, install the current `.deb` or replace the `.exe` once on each computer: those releases do not support the architecture-labelled names and remote management. The saved **0.4.11** partner remains reachable through a limited management/update bridge while upgrading, so it can be updated from the computer already running 0.5.1. Device sharing waits for matching versions. Install **0.5.1 on every intended member** before creating a larger workspace. Portable Linux binaries are no longer distributed; the `.deb` uses its installed launcher and package-owned binary so future system updates work correctly.
 
 ## Platform access
 
@@ -158,7 +164,7 @@ python3 tools/test_release_assets.py
 python3 tools/test_input_access.py
 cargo build --locked --release
 python3 tools/package_deb.py --binary target/release/desk-switch --out dist
-python3 tools/verify_deb.py dist/desk-switch-v0.5.0-linux-x86-64.deb
+python3 tools/verify_deb.py dist/desk-switch-v0.5.1-linux-x86-64.deb
 ```
 
 Tests use synthetic input/audio/monitor devices and isolated loopback connections. The multi-computer integration test links four encrypted peers, propagates settings, sends member-management requests and checks reconnect behavior, including an explicit pinned-controller connection with automatic connection disabled. Native listener tests authenticate IPv4 and IPv6 peers and exchange PCM without physical audio hardware. Clipboard tests use fake native backends or a private D-Bus with binary text/image payloads; the Node suite evaluates the shipped GNOME companion against a mocked Shell. They never use the user's clipboard or change a real monitor. A four-computer localhost test verifies networking and routing logic, not four physical computers.

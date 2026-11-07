@@ -26,21 +26,27 @@ pub(super) struct Group {
     pub selected: String,
     pub request: Option<Request>,
     pub data: Data,
+    network_log: std::collections::VecDeque<String>,
+    network_reconnecting: std::collections::BTreeSet<String>,
     pub return_pending: bool,
     pub(super) probe: Option<workspace::hardware::Probe>,
     last_node: Option<Node>,
     last_volume: Option<workspace::AudioLevel>,
     last_ready: u64,
-    input_ready: u64,
+    pub(super) input_ready: u64,
     pub(super) monitor_wait: Option<(u64, std::time::Instant)>,
-    monitor_activation: u64,
-    monitor_error: Option<String>,
-    monitor_failed: Option<u64>,
+    pub(super) monitor_error: Option<String>,
+    pub(super) monitor_observed: Option<String>,
+    pub(super) monitor_notice_id: Option<(String, u64)>,
+    pub(super) monitor_history: std::collections::VecDeque<String>,
+    pub(super) monitor_loaded: Option<(String, u64)>,
+    pub(super) monitor_attempt: Option<super::group_monitor::Attempt>,
+    pub(super) monitor_result: Option<(super::group_monitor::Attempt, Option<String>)>,
+    pub(super) monitor_reply_at: Option<std::time::Instant>,
     pub reply_target: Option<String>,
     pub cable_target: Option<String>,
     pub update_target: Option<String>,
     pub monitor_read_reply: Option<(String, u64)>,
-    monitor_seen: Option<Option<String>>,
     pub(super) monitor_job: Option<super::worker::Worker>,
     pub preview: bool,
     pub add_open: bool,
@@ -66,6 +72,23 @@ struct AddPending {
 }
 
 impl Group {
+    fn log_network(&mut self, message: String) {
+        let message = workspace::management::status_text(message, 288);
+        if self.network_log.back() == Some(&message) {
+            return;
+        }
+        if self.network_log.len() == 12 {
+            self.network_log.pop_front();
+        }
+        self.network_log.push_back(message);
+    }
+
+    fn report_network(&self, node: &mut Node) {
+        for message in &self.network_log {
+            node.diagnostics.line("Workspace", message);
+        }
+    }
+
     pub(super) fn monitor_busy(&self) -> bool {
         self.monitor_job.is_some()
             || self.monitor_wait.is_some()
@@ -125,7 +148,25 @@ impl Desktop {
                     } => {
                         let _ = state.set_member(&key, &expected, value);
                     }
-                    Action::Activate { key } => state.active_input = Some(key),
+                    Action::Activate { key } => {
+                        if state.activate(&self.public_key, &key, None).is_ok()
+                            && let Some(command) = state.monitor_command.clone()
+                        {
+                            let _ = state.monitor_result(&command.writer, command.id, None);
+                        }
+                    }
+                    Action::ActivateEdge { key, position } => {
+                        if state
+                            .activate(&self.public_key, &key, Some(position))
+                            .is_ok()
+                            && let Some(command) = state.monitor_command.clone()
+                        {
+                            let _ = state.monitor_result(&command.writer, command.id, None);
+                        }
+                    }
+                    Action::ReturnInput => {
+                        let _ = state.return_input();
+                    }
                     _ => {}
                 }
             }
@@ -264,12 +305,45 @@ impl Desktop {
                     self.action(super::Action::Show, ctx);
                 }
                 Event::Error(error) => {
+                    self.group.log_network(error.clone());
                     if self.group.add_pending.take().is_some() {
                         self.group.add_result = Some((error.clone(), true));
                     }
                     self.notice = Some((error, true));
                 }
+                Event::Reconnecting { key, reason } => {
+                    self.group.network_reconnecting.insert(key.clone());
+                    let name = self
+                        .group
+                        .workspace
+                        .as_ref()
+                        .and_then(|state| state.members.get(&key))
+                        .map(|member| member.node.name.as_str())
+                        .unwrap_or(&key);
+                    self.group.log_network(format!(
+                        "Connection to {name} interrupted; reconnecting: {reason}"
+                    ));
+                }
                 Event::State(state) => {
+                    let restored =
+                        self.group
+                            .network_reconnecting
+                            .iter()
+                            .filter_map(|key| {
+                                state.members.get(key).filter(|member| member.online).map(
+                                    |member| {
+                                        (
+                                            key.clone(),
+                                            format!("Connection to {} restored", member.node.name),
+                                        )
+                                    },
+                                )
+                            })
+                            .collect::<Vec<_>>();
+                    for (key, message) in restored {
+                        self.group.network_reconnecting.remove(&key);
+                        self.group.log_network(message);
+                    }
                     self.prefs.workspace.shared.input = state.settings.input.clone();
                     self.prefs.workspace.shared.audio = state.settings.audio.clone();
                     self.prefs.workspace.shared.audio_enabled = state.settings.audio_enabled;
@@ -457,112 +531,12 @@ impl Desktop {
             if let Some(error) = self.group.data.error.take() {
                 self.notice = Some((error, true));
             }
-            let monitor = state.active_monitor.clone();
-            let here = state.active_input.as_deref() == Some(&self.public_key);
-            let video = here
-                && state.settings.monitor_enabled
-                && state.members[&self.public_key].node.monitor.enabled
-                && monitor.as_deref() == Some(&self.public_key);
-            let changed = self
-                .group
-                .monitor_seen
-                .as_ref()
-                .is_some_and(|previous| previous != &monitor);
-            let retry = self
-                .group
-                .monitor_failed
-                .is_some_and(|failed| failed != state.activation);
-            let requested = !self.quitting
-                && video
-                && state.members[&self.public_key].input_ready < state.activation
-                && (changed || retry);
-            if !video && self.group.monitor_job.is_none() {
-                self.group.monitor_error = None;
-                self.group.monitor_failed = None;
-            }
-            if requested && self.group.monitor_job.is_none() && self.query.is_none() {
-                self.group.input_ready = 0;
-                self.group.monitor_wait = None;
-                self.group.monitor_activation = state.activation;
-                self.group.monitor_error = None;
-                self.group.monitor_failed = None;
-                match state.monitor_input(&self.public_key) {
-                    Ok(input) => {
-                        let args = vec![
-                            "monitor-select".into(),
-                            self.prefs.workspace.monitor.id.clone(),
-                            input.to_string(),
-                        ];
-                        match super::worker::Worker::start(
-                            super::worker::Kind::Query,
-                            &args,
-                            &self.dir,
-                            ctx,
-                        ) {
-                            Ok(worker) => self.group.monitor_job = Some(worker),
-                            Err(error) => {
-                                self.group.monitor_error = Some(error.to_string());
-                                self.group.monitor_failed = Some(state.activation);
-                            }
-                        }
-                    }
-                    Err(error) => {
-                        self.group.monitor_error = Some(error.to_string());
-                        self.group.monitor_failed = Some(state.activation);
-                    }
-                }
-            }
-            if !(requested && self.query.is_some()) {
-                self.group.monitor_seen = Some(monitor);
-            }
-            if let Some(worker) = &mut self.group.monitor_job {
-                worker.poll();
-                if worker.settled() {
-                    if worker.exit_ok == Some(true) {
-                        self.group.monitor_wait = Some((
-                            self.group.monitor_activation,
-                            std::time::Instant::now() + crate::video::SETTLE,
-                        ));
-                    } else {
-                        self.group.monitor_failed = Some(self.group.monitor_activation);
-                        self.group.monitor_error =
-                            Some(worker.logs.back().cloned().unwrap_or_else(|| {
-                                "Monitor selection failed. Select the port manually or retry."
-                                    .into()
-                            }));
-                    }
-                    self.group.monitor_job = None;
-                } else {
-                    ctx.request_repaint_after(worker.next_poll());
-                }
-            }
-            if let Some((activation, until)) = self.group.monitor_wait {
-                if until <= std::time::Instant::now() {
-                    self.group.input_ready = activation;
-                    self.group.monitor_wait = None;
-                } else {
-                    ctx.request_repaint_after(
-                        until.saturating_duration_since(std::time::Instant::now()),
-                    );
-                }
-            }
-            if here
-                && !(requested && self.query.is_some())
-                && (!video
-                    || (self.group.monitor_job.is_none()
-                        && self.group.monitor_wait.is_none()
-                        && self.group.monitor_failed.is_none()))
-            {
-                self.group.input_ready = state.activation;
-            }
-            if self.group.monitor_failed == Some(state.activation) {
-                // Completion acknowledges the attempt; monitor_error keeps
-                // native input disabled when that attempt did not succeed.
-                self.group.input_ready = state.activation;
-            }
+            self.tick_group_monitor(&state, ctx);
         }
         let mut node = self.local_node();
         self.group.data.report(&mut node);
+        self.group.report_network(&mut node);
+        self.report_group_monitor_history(&mut node);
         node.monitor_error = self.group.monitor_error.clone();
         if self.group.last_node.as_ref() != Some(&node)
             || self.group.last_volume != self.group.data.volume
@@ -654,6 +628,17 @@ impl Desktop {
         };
         let plan = state.plan();
         let members = state.members.values().collect::<Vec<_>>();
+        let visual = super::view::WorkspaceVisual::from_workspace(&state);
+        if let Some(monitor) = &visual.monitor {
+            egui::Frame::group(ui.style())
+                .inner_margin(12)
+                .show(ui, |ui| {
+                    ui.set_width(ui.available_width());
+                    super::view::shared_monitor(ui, monitor, false);
+                });
+            ui.add_space(8.0);
+        }
+        ui.weak(tr("Device colour shows which PC it comes from"));
         let columns = if ui.available_width() >= 600.0 { 2 } else { 1 };
         let width = (ui.available_width() - 12.0 * (columns - 1) as f32) / columns as f32;
         for (row_index, row) in members.chunks(columns).enumerate() {
@@ -662,12 +647,7 @@ impl Desktop {
                 for (column, member) in row.iter().enumerate() {
                     let index = row_index * columns + column;
                     let key = &member.node.key;
-                    let accent = [
-                        Color32::from_rgb(76, 211, 163),
-                        Color32::from_rgb(175, 142, 255),
-                        Color32::from_rgb(92, 185, 239),
-                        Color32::from_rgb(244, 176, 103),
-                    ][index % 4];
+                    let accent: Color32 = super::view::peer_color(index);
                     ui.allocate_ui_with_layout(
                         egui::vec2(width, 0.0),
                         egui::Layout::top_down(egui::Align::Min),
@@ -709,6 +689,18 @@ impl Desktop {
                                             "Offline"
                                         })
                                     ));
+                                    let devices = visual.member_devices(&state, key);
+                                    ui.horizontal(|ui| {
+                                        ui.spacing_mut().item_spacing.x = 6.0;
+                                        for icon in super::view::DeviceIcon::ALL {
+                                            super::view::device_icon(
+                                                ui,
+                                                icon,
+                                                devices[icon.index()].as_ref(),
+                                                0.8,
+                                            );
+                                        }
+                                    });
                                     let mut roles = Vec::new();
                                     if key == &state.hub {
                                         roles.push(tr("Workspace coordinator"));
@@ -765,7 +757,11 @@ impl Desktop {
                                         }
                                     });
                                     if let Some(error) = &member.node.monitor_error {
-                                        ui.colored_label(ui.visuals().error_fg_color, tr(error));
+                                        ui.colored_label(
+                                            ui.visuals().error_fg_color,
+                                            tr("Monitor switch failed"),
+                                        )
+                                        .on_hover_text(error);
                                     }
                                 })
                         },
@@ -788,11 +784,11 @@ impl Desktop {
                     .and_then(|clipboard| clipboard.status());
                 if ui.available_width() >= 700.0 {
                     ui.columns(2, |columns| {
-                        sharing_toggles(&mut columns[0], &mut settings, status.as_deref());
+                        sharing_toggles(&mut columns[0], &mut settings, status.as_deref(), &visual);
                         sharing_sources(&mut columns[1], &mut settings, &state);
                     });
                 } else {
-                    sharing_toggles(ui, &mut settings, status.as_deref());
+                    sharing_toggles(ui, &mut settings, status.as_deref(), &visual);
                     sharing_sources(ui, &mut settings, &state);
                 }
                 if settings.microphone != previous {
@@ -805,7 +801,7 @@ impl Desktop {
                     });
                 }
                 ui.separator();
-                for member in &members {
+                for (index, member) in members.iter().enumerate() {
                     let system = plan.audio.as_ref() == Some(&member.node.key);
                     let mut preferences = member.preferences.clone();
                     let mut level = if system {
@@ -818,7 +814,13 @@ impl Desktop {
                     };
                     let before = level;
                     ui.horizontal(|ui| {
-                        ui.add_sized([150.0, 20.0], egui::Label::new(&member.node.name));
+                        ui.add_sized(
+                            [150.0, 20.0],
+                            egui::Label::new(
+                                RichText::new(&member.node.name)
+                                    .color(super::view::peer_color(index)),
+                            ),
+                        );
                         ui.add(egui::Slider::new(&mut level.volume, 0..=100).suffix(" %"));
                         ui.checkbox(&mut level.muted, tr("Mute"));
                         ui.weak(tr(if system {
@@ -1352,17 +1354,40 @@ impl Desktop {
     }
 }
 
-fn sharing_toggles(ui: &mut egui::Ui, settings: &mut model::Settings, status: Option<&str>) {
+fn sharing_toggles(
+    ui: &mut egui::Ui,
+    settings: &mut model::Settings,
+    status: Option<&str>,
+    visual: &super::view::WorkspaceVisual,
+) {
+    use super::view::{DeviceIcon, device_checkbox};
     ui.horizontal_wrapped(|ui| {
-        ui.checkbox(&mut settings.keyboard_enabled, tr("Keyboard"));
-        ui.checkbox(&mut settings.mouse_enabled, tr("Mouse"));
-        ui.checkbox(&mut settings.audio_enabled, tr("Sound"));
-        ui.checkbox(&mut settings.microphone_enabled, tr("Microphone"));
+        for (icon, value, label) in [
+            (
+                DeviceIcon::Keyboard,
+                &mut settings.keyboard_enabled,
+                "Keyboard",
+            ),
+            (DeviceIcon::Mouse, &mut settings.mouse_enabled, "Mouse"),
+            (DeviceIcon::Headphones, &mut settings.audio_enabled, "Sound"),
+            (
+                DeviceIcon::Microphone,
+                &mut settings.microphone_enabled,
+                "Microphone",
+            ),
+        ] {
+            device_checkbox(
+                ui,
+                icon,
+                value,
+                label,
+                visual.devices[icon.index()].as_ref(),
+                true,
+            );
+        }
     });
     ui.checkbox(&mut settings.clipboard_enabled, tr("Shared clipboard"));
-    ui.weak(tr(
-        "Text and images. Files are planned for a later release.",
-    ));
+    ui.weak(tr("Text and images."));
     if let Some(status) = status {
         ui.weak(tr(status));
     }
@@ -1448,6 +1473,8 @@ impl Desktop {
         };
         let mut local = self.local_node();
         self.group.data.report(&mut local);
+        self.group.report_network(&mut local);
+        self.report_group_monitor_history(&mut local);
         local.monitor_error = self.group.monitor_error.clone();
         if let Some(error) = &self.group.data.error {
             local.diagnostics.line("Workspace", error);
@@ -1473,11 +1500,15 @@ impl Desktop {
                 member.node = local.clone();
             }
             let report = format!(
-                "Desk Switch {} / protocol {}\nWorkspace protocol: {}\nLocal computer: {}\n{}\n",
+                "Desk Switch {} / protocol {}\nWorkspace protocol: {}\nLocal computer: {}\nCurrent message: {}\n{}\n",
                 crate::compatibility::VERSION,
                 crate::compatibility::PROTOCOL,
                 model::PROTOCOL,
                 self.public_key,
+                self.notice
+                    .as_ref()
+                    .map(|(message, _)| message.as_str())
+                    .unwrap_or(""),
                 serde_json::to_string_pretty(&snapshot).unwrap_or_default()
             );
             ui.ctx().copy_text(report);

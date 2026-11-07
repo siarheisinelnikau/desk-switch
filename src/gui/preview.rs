@@ -148,8 +148,22 @@ fn render_probe(
                 if state != "visible-idle" {
                     ctx.send_viewport_cmd(egui::ViewportCommand::Visible(state != "hidden"));
                 }
-                // Each visibility transition may paint. Count the settled interval separately.
-                std::thread::sleep(Duration::from_secs(2));
+                // Resize, font uploads and finite scroll-bar animations can outlive
+                // the first frame. Measure only after two seconds without UI work.
+                let warm = Instant::now();
+                let mut quiet = Instant::now();
+                let mut previous = frames.load(Ordering::Relaxed);
+                while warm.elapsed() < Duration::from_secs(8)
+                    && quiet.elapsed() < Duration::from_secs(2)
+                {
+                    std::thread::sleep(Duration::from_millis(100));
+                    let current = frames.load(Ordering::Relaxed);
+                    if current != previous {
+                        previous = current;
+                        quiet = Instant::now();
+                    }
+                }
+                let settled = quiet.elapsed() >= Duration::from_secs(2);
                 let start = frames.load(Ordering::Relaxed);
                 let popup_start = super::popup::FRAMES.load(Ordering::Relaxed);
                 let input_start: u64 = causes.lock().unwrap().iter().filter(|(key, _)| key.starts_with("input:")).map(|(_, count)| count).sum();
@@ -157,6 +171,7 @@ fn render_probe(
                 std::thread::sleep(Duration::from_secs(6));
                 samples.push(serde_json::json!({
                     "state": state, "seconds": since.elapsed().as_secs_f64(),
+                    "settled": settled, "warm_seconds": warm.elapsed().as_secs_f64() - since.elapsed().as_secs_f64(),
                     "ui_frames": frames.load(Ordering::Relaxed) - start,
                     "popup_ui_frames": super::popup::FRAMES.load(Ordering::Relaxed) - popup_start,
                     "input_events": causes.lock().unwrap().iter().filter(|(key, _)| key.starts_with("input:")).map(|(_, count)| count).sum::<u64>() - input_start,
@@ -196,14 +211,16 @@ pub fn run(case: &str, dir: PathBuf) -> Result<()> {
             .with_title("Desk Switch")
             .with_active(false)
             .with_inner_size(if case.ends_with("quick-controls") {
-                [344.0, 442.0]
+                let size = super::popup::preferred_size();
+                [size.x, size.y]
             } else if capturing || std::env::var_os("EFRAME_SCREENSHOT_TO").is_some() {
                 [1080.0, 1000.0]
             } else {
                 [1080.0, 760.0]
             })
             .with_min_inner_size(if case.ends_with("quick-controls") {
-                [344.0, 442.0]
+                let size = super::popup::preferred_size();
+                [size.x, size.y]
             } else {
                 [880.0, 650.0]
             })
@@ -744,6 +761,8 @@ impl Desktop {
                 active_input_entry: None,
                 activation: 1,
                 active_monitor: Some("11".repeat(32)),
+                confirmed_monitor: Some("11".repeat(32)),
+                monitor_command: None,
             };
             state.bind_microphone();
             self.group.workspace = Some(state);
