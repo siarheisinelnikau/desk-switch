@@ -21,7 +21,7 @@ python3 tools/upload-signing-secret.py
 
 Use the absolute script path if the current directory is outside this checkout. The uploader checks the private/public key pair before any upload, fixes the destination to `siarheisinelnikau/desk-switch`, passes the value to `gh secret set` through stdin, and verifies the saved secret name. It does not print the key or put it in command arguments. Existing secrets require an explicit `--replace`; use that only to restore the same verified identity or recover from an interrupted upload.
 
-On 2026-11-07, the `release` environment and its ref restrictions were configured, and `DESK_SWITCH_UPDATE_SIGNING_KEY` was saved through the existing authenticated GitHub browser session. Its presence was confirmed in the environment's secret list without displaying its value. The CLI uploader above remains an optional recovery/replacement path. No real release was run to validate the remote signing job; missing or mismatched credentials deliberately stop publication.
+On 2026-11-07, the `release` environment and its ref restrictions were configured, and `DESK_SWITCH_UPDATE_SIGNING_KEY` was saved through the existing authenticated GitHub browser session. The v0.4.9 release subsequently validated the complete build, signing and stable-promotion workflow. Its public manifest signature and installer digests were independently verified. The CLI uploader above remains an optional recovery/replacement path; missing or mismatched credentials deliberately stop publication.
 
 ## Release behavior
 

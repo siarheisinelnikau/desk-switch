@@ -1,6 +1,13 @@
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
-use std::{sync::mpsc, time::Duration};
+use std::{
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+        mpsc,
+    },
+    time::Duration,
+};
 use tokio::sync::oneshot;
 
 pub const SETTLE: Duration = Duration::from_millis(600);
@@ -45,14 +52,29 @@ pub fn write_attempted(error: &anyhow::Error) -> bool {
     error.is::<WriteAttempted>()
 }
 
+#[derive(Debug)]
+struct NotIssued;
+impl std::fmt::Display for NotIssued {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "no monitor input command was issued")
+    }
+}
+impl std::error::Error for NotIssued {}
+pub fn not_issued(error: anyhow::Error) -> anyhow::Error {
+    error.context(NotIssued)
+}
+
 fn write(monitor: &mut impl Monitor, input: u16) -> Result<()> {
     use std::sync::atomic::{AtomicU64, Ordering};
     static COMMAND: AtomicU64 = AtomicU64::new(1);
     println!(
-        "Monitor input command #{}: select {input:#06x}; subsequent confirmation is read-only.",
+        "Monitor selection request #{}: select {input:#06x}; automatic readback is disabled.",
         COMMAND.fetch_add(1, Ordering::Relaxed)
     );
-    monitor.write(input).context(WriteAttempted)
+    match monitor.write(input) {
+        Err(error) if error.is::<NotIssued>() => Err(error),
+        result => result.context(WriteAttempted),
+    }
 }
 
 fn execute(monitor: &mut impl Monitor, job: Job) -> Result<VideoResult> {
@@ -65,73 +87,83 @@ fn execute(monitor: &mut impl Monitor, job: Job) -> Result<VideoResult> {
     };
     match job {
         Job::Read => Ok(VideoResult::Read(read(monitor)?)),
-        Job::Select { from, to } => {
-            let actual = read(monitor)?;
-            if actual == to {
-                return Ok(VideoResult::Written);
-            }
-            if actual != from {
-                bail!("VCP 0x60 reported {actual:#06x}; expected the source {from:#06x}");
-            }
+        Job::Select { from: _, to } => {
             crate::lifecycle::report(crate::lifecycle::Event::Monitor(None));
             write(monitor, to)?;
+            // This is the accepted selection command, not a readback measurement.
+            crate::lifecycle::report(crate::lifecycle::Event::Monitor(Some(to)));
             Ok(VideoResult::Written)
         }
         Job::Recover(inputs) => {
-            let actual = read(monitor)?;
-            if actual == inputs.peer {
-                crate::lifecycle::report(crate::lifecycle::Event::Monitor(None));
-                write(monitor, inputs.host)?;
-            } else if actual != inputs.host {
-                bail!("recovery saw an unconfigured VCP 0x60 value {actual:#06x}");
-            }
+            crate::lifecycle::report(crate::lifecycle::Event::Monitor(None));
+            write(monitor, inputs.host)?;
+            crate::lifecycle::report(crate::lifecycle::Event::Monitor(Some(inputs.host)));
             Ok(VideoResult::Written)
         }
     }
 }
 
+pub fn read_once(mut monitor: impl Monitor) -> Result<u16> {
+    match execute(&mut monitor, Job::Read)? {
+        VideoResult::Read(value) => Ok(value),
+        _ => bail!("invalid explicit monitor read"),
+    }
+}
+
 type Reply = oneshot::Receiver<Result<VideoResult>>;
 
-pub struct VideoWorker(mpsc::SyncSender<(Job, oneshot::Sender<Result<VideoResult>>)>);
+pub struct VideoWorker {
+    send: mpsc::SyncSender<(Job, oneshot::Sender<Result<VideoResult>>)>,
+    busy: Arc<AtomicBool>,
+}
 
 impl VideoWorker {
     pub fn start(monitor: impl Monitor) -> Result<Self> {
-        Self::start_worker(monitor, false)
+        Self::start_worker(monitor)
     }
 
     pub fn watch(monitor: impl Monitor) -> Result<Self> {
-        Self::start_worker(monitor, true)
+        Self::start_worker(monitor)
     }
 
-    fn start_worker(mut monitor: impl Monitor, read_initial: bool) -> Result<Self> {
+    fn start_worker(mut monitor: impl Monitor) -> Result<Self> {
         let (send, receive) = mpsc::sync_channel::<(Job, oneshot::Sender<_>)>(1);
+        let busy = Arc::new(AtomicBool::new(false));
+        let pending = busy.clone();
         std::thread::Builder::new()
             .name("DDC".into())
             .spawn(move || {
-                if read_initial {
-                    let _ = execute(&mut monitor, Job::Read);
-                }
-                // Inactive DDC ports can stall a graphics driver. Read only at
-                // startup or for an explicit operation, never on an idle timer.
+                // Startup and idle never issue DDC calls. Calibration is explicit.
                 for (job, reply) in receive {
                     if !reply.is_closed() {
-                        let _ = reply.send(execute(&mut monitor, job));
+                        let result = execute(&mut monitor, job);
+                        pending.store(false, Ordering::Release);
+                        let _ = reply.send(result);
+                    } else {
+                        pending.store(false, Ordering::Release);
                     }
                 }
             })?;
-        Ok(Self(send))
+        Ok(Self { send, busy })
     }
 
     pub fn submit(&self, job: Job) -> Result<Reply> {
         let (send, receive) = oneshot::channel();
-        self.0
-            .try_send((job, send))
-            .map_err(|_| anyhow::anyhow!("DDC worker busy or stopped"))?;
+        anyhow::ensure!(
+            self.busy
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok(),
+            "DDC worker already has an input command in flight"
+        );
+        if self.send.try_send((job, send)).is_err() {
+            self.busy.store(false, Ordering::Release);
+            bail!("DDC worker busy or stopped");
+        }
         Ok(receive)
     }
 
     pub async fn recover(&self, inputs: Inputs) -> Result<()> {
-        // The worker serializes recovery after any still-running write.
+        // An unfinished native call must not accumulate another selection.
         self.submit(Job::Recover(inputs))?.await??;
         Ok(())
     }
@@ -198,17 +230,15 @@ mod tests {
         )
         .unwrap();
         assert_eq!(fixture.monitors, [0x11, 0x0f]);
-        assert!(
-            execute(
-                &mut fixture,
-                Job::Select {
-                    from: 0x11,
-                    to: 0x03
-                }
-            )
-            .is_err()
-        );
-        assert_eq!(fixture.monitors, [0x11, 0x0f]);
+        execute(
+            &mut fixture,
+            Job::Select {
+                from: 0x11,
+                to: 0x03,
+            },
+        )
+        .unwrap();
+        assert_eq!(fixture.monitors, [0x11, 0x03]);
     }
 
     #[test]
@@ -218,7 +248,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn status_is_read_once_and_idle_services_do_not_poll_ddc() {
+    async fn startup_and_idle_never_access_ddc_and_calibration_is_explicit() {
         struct Observed {
             input: Arc<AtomicU16>,
             reads: Arc<AtomicUsize>,
@@ -238,25 +268,15 @@ mod tests {
         let input = Arc::new(AtomicU16::new(17));
         let reads = Arc::new(AtomicUsize::new(0));
         let writes = Arc::new(AtomicUsize::new(0));
-        let worker = VideoWorker::start_worker(
-            Observed {
-                input: Arc::clone(&input),
-                reads: Arc::clone(&reads),
-                writes: Arc::clone(&writes),
-            },
-            true,
-        )
-        .unwrap();
-        tokio::time::timeout(Duration::from_secs(2), async {
-            while reads.load(SeqCst) < 1 {
-                tokio::time::sleep(Duration::from_millis(2)).await;
-            }
+        let worker = VideoWorker::start_worker(Observed {
+            input: Arc::clone(&input),
+            reads: Arc::clone(&reads),
+            writes: Arc::clone(&writes),
         })
-        .await
         .unwrap();
-        assert_eq!(writes.load(SeqCst), 0);
         tokio::time::sleep(Duration::from_millis(40)).await;
-        assert_eq!(reads.load(SeqCst), 1);
+        assert_eq!(writes.load(SeqCst), 0);
+        assert_eq!(reads.load(SeqCst), 0);
         input.store(15, SeqCst); // A monitor-menu change, with no programmatic write.
         assert!(matches!(
             worker.submit(Job::Read).unwrap().await.unwrap().unwrap(),
@@ -273,6 +293,70 @@ mod tests {
         assert!(matches!(
             worker.submit(Job::Read).unwrap().await.unwrap().unwrap(),
             VideoResult::Read(17)
+        ));
+    }
+
+    #[tokio::test]
+    async fn cancelled_slow_write_cannot_accumulate_another_monitor_command() {
+        struct Slow {
+            started: mpsc::Sender<()>,
+            finish: mpsc::Receiver<()>,
+            writes: Arc<AtomicUsize>,
+        }
+        impl Monitor for Slow {
+            fn read(&mut self) -> Result<u16> {
+                panic!("an input selection must not read the monitor");
+            }
+            fn write(&mut self, _: u16) -> Result<()> {
+                self.writes.fetch_add(1, SeqCst);
+                self.started.send(())?;
+                self.finish.recv()?;
+                Ok(())
+            }
+        }
+        let (started, receive) = mpsc::channel();
+        let (finish, wait) = mpsc::channel();
+        let writes = Arc::new(AtomicUsize::new(0));
+        let worker = VideoWorker::start(Slow {
+            started,
+            finish: wait,
+            writes: writes.clone(),
+        })
+        .unwrap();
+        let reply = worker.submit(Job::Select { from: 17, to: 15 }).unwrap();
+        receive.recv_timeout(Duration::from_secs(2)).unwrap();
+        drop(reply); // A timed-out or disconnected session abandons its reply.
+        assert!(worker.submit(Job::Select { from: 15, to: 17 }).is_err());
+        assert!(
+            worker
+                .submit(Job::Recover(Inputs { host: 17, peer: 15 }))
+                .is_err()
+        );
+        finish.send(()).unwrap();
+        while worker.busy.load(Ordering::Acquire) {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(writes.load(SeqCst), 1);
+    }
+
+    #[test]
+    fn driver_errors_after_issuance_forbid_a_second_endpoint_attempt() {
+        struct Failing(bool);
+        impl Monitor for Failing {
+            fn read(&mut self) -> Result<u16> {
+                panic!("no automatic monitor reads");
+            }
+            fn write(&mut self, _: u16) -> Result<()> {
+                let error = anyhow::anyhow!("simulated native failure");
+                Err(if self.0 { not_issued(error) } else { error })
+            }
+        }
+        let job = Job::Select { from: 17, to: 15 };
+        assert!(write_attempted(
+            &execute(&mut Failing(false), job).unwrap_err()
+        ));
+        assert!(!write_attempted(
+            &execute(&mut Failing(true), job).unwrap_err()
         ));
     }
 }

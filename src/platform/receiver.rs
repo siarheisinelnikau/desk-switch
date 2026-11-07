@@ -16,9 +16,9 @@ use tokio::{
 enum Stage {
     Armed,
     Selecting,
-    Reading,
-    AwaitFallback,
-    Verified,
+    Settling,
+    RestoreSettling,
+    Ready,
     Active,
     Exiting,
     Restoring,
@@ -55,7 +55,7 @@ async fn disconnect(
     {
         eprintln!("Attempting to restore the shared monitor to host.");
         if let Err(error) = worker.recover(*inputs).await {
-            eprintln!("Automatic video recovery could not be verified: {error:#}");
+            eprintln!("Automatic video recovery command failed: {error:#}");
         }
     }
     released
@@ -137,7 +137,7 @@ async fn session(
 ) -> Result<()> {
     let mut commands = crate::lifecycle::commands();
     let mut lease = Instant::now() + LEASE;
-    let mut next_read = Instant::now();
+    let mut settle_until = Instant::now();
     let mut job: Option<oneshot::Receiver<Result<VideoResult>>> = None;
     let mut tick = interval(Duration::from_millis(25));
     tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
@@ -165,32 +165,22 @@ async fn session(
                             job = None;
                             match active.stage {
                                 Stage::Selecting => {
-                                    if matches!(result, Ok(VideoResult::Written)) || result.as_ref().is_err_and(crate::video::write_attempted) {
-                                        active.stage = Stage::Reading;
-                                        next_read = Instant::now() + SETTLE;
-                                    } else {
-                                        if let Err(error) = result { eprintln!("Target monitor is not accessible on this port: {error:#}"); }
-                                        active.stage = Stage::AwaitFallback;
+                                    result.context("fallback monitor selection failed; no retry was sent")?;
+                                    active.stage = Stage::Settling;
+                                    settle_until = Instant::now() + SETTLE;
+                                },
+                                Stage::Restoring => match result {
+                                    Ok(VideoResult::Written) => {
+                                        active.stage = Stage::RestoreSettling;
+                                        settle_until = Instant::now() + SETTLE;
+                                    },
+                                    Err(error) if !crate::video::write_attempted(&error) => {
+                                        active.stage = Stage::Returned;
                                         pipe.send(Message::SelectFallback(active.id)).await?;
-                                    }
-                                }
-                                Stage::Reading => {
-                                    let (inputs, _) = video.unwrap();
-                                    if matches!(result, Ok(VideoResult::Read(input)) if input == inputs.peer) {
-                                        active.stage = Stage::Verified;
-                                        pipe.send(Message::Observed { id: active.id, input: inputs.peer }).await?;
-                                    } else {
-                                        if let Err(error) = result {
-                                            eprintln!("Waiting for receiver-side DDC read: {error:#}");
-                                        }
-                                        next_read = Instant::now() + Duration::from_millis(300);
-                                    }
-                                }
-                                Stage::Restoring => {
-                                    result.context("receiver could not select the host monitor input")?;
-                                    active.stage = Stage::Returned;
-                                    pipe.send(Message::MonitorRestored(active.id)).await?;
-                                }
+                                    },
+                                    Err(error) => return Err(error.context("monitor return failed after issuance; no retry was sent")),
+                                    _ => bail!("invalid monitor selection result"),
+                                },
                                 _ => bail!("unexpected DDC job result"),
                             }
                         }
@@ -198,8 +188,15 @@ async fn session(
                         Err(oneshot::error::TryRecvError::Closed) => bail!("receiver DDC worker stopped"),
                     }
                 }
-                if active.stage == Stage::Reading && job.is_none() && Instant::now() >= next_read {
-                    job = Some(video.unwrap().1.submit(Job::Read)?);
+                if job.is_none() && Instant::now() >= settle_until {
+                    if active.stage == Stage::Settling {
+                        active.stage = Stage::Ready;
+                        crate::lifecycle::report(crate::lifecycle::Event::Monitor(Some(video.unwrap().0.peer)));
+                        pipe.send(Message::MonitorReady(active.id)).await?;
+                    } else if active.stage == Stage::RestoreSettling {
+                        active.stage = Stage::Returned;
+                        pipe.send(Message::MonitorRestored(active.id)).await?;
+                    }
                 }
             }
             result = sink.poll() => result?,
@@ -236,12 +233,12 @@ async fn session(
                         let (inputs, worker) = video.unwrap();
                         job = Some(worker.submit(Job::Select { from: inputs.host, to: inputs.peer })?);
                     }
-                    Message::Verify(id) if active.id == id && active.mode == Mode::Video && active.stage == Stage::AwaitFallback => {
-                        active.stage = Stage::Reading;
-                        next_read = Instant::now() + SETTLE;
+                    Message::MonitorSelected(id) if active.id == id && active.mode == Mode::Video && active.stage == Stage::Armed => {
+                        active.stage = Stage::Settling;
+                        settle_until = Instant::now() + SETTLE;
                     }
                     Message::Activate(id) if active.id == id && (
-                        active.stage == Stage::Verified || (active.stage == Stage::Armed && active.mode == Mode::Input)
+                        active.stage == Stage::Ready || (active.stage == Stage::Armed && active.mode == Mode::Input)
                     ) => {
                         sink.activate(active.edge, active.mode)?;
                         active.stage = Stage::Active;
@@ -260,8 +257,7 @@ async fn session(
                     Message::Return(id) if active.id == id && matches!(active.stage, Stage::Active | Stage::Exiting) => {
                         sink.release()?;
                         active.deadline = Instant::now() + SWITCH_TIMEOUT;
-                        // Release input before the returning PC activates its own
-                        // remembered port. This side is only a DDC fallback.
+                        // Release input before the active receiver selects the saved host port.
                         active.stage = Stage::Returned;
                         pipe.send(Message::Returning(id)).await?;
                     }
@@ -399,10 +395,7 @@ mod tests {
                 pipe.send(Message::SelectMonitor(1)).await.unwrap();
                 assert_eq!(
                     pipe.messages.recv().await.unwrap().unwrap(),
-                    Message::Observed {
-                        id: 1,
-                        input: INPUTS.peer
-                    }
+                    Message::MonitorReady(1)
                 );
                 assert_eq!(monitor.input.load(SeqCst), INPUTS.peer);
             }
@@ -423,8 +416,7 @@ mod tests {
                     pipe.messages.recv().await.unwrap().unwrap(),
                     Message::Returning(1)
                 );
-                // Returning first asks the destination to select its own input;
-                // this receiver has released the key but has not written video.
+                // The receiver releases the key before selecting the host's input.
                 assert_eq!(monitor.input.load(SeqCst), INPUTS.peer);
                 pipe.send(Message::RestoreMonitor(1)).await.unwrap();
                 assert_eq!(
@@ -472,7 +464,11 @@ mod tests {
         if mode == Mode::Input {
             assert_eq!(monitor.calls.load(SeqCst), 0);
         } else {
-            assert!(monitor.calls.load(SeqCst) >= 3);
+            assert_eq!(
+                monitor.calls.load(SeqCst),
+                2,
+                "one selection and one return/recovery; no readback"
+            );
         }
     }
 

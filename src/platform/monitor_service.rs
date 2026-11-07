@@ -19,9 +19,8 @@ use tokio::{
 enum Stage {
     Armed,
     Selecting,
-    Reading,
-    Fallback,
-    Verified,
+    Settling,
+    Ready,
 }
 enum Exchange {
     Source(Controller),
@@ -32,7 +31,7 @@ struct Session<'a> {
     inputs: Inputs,
     exchange: Option<Exchange>,
     job: Option<oneshot::Receiver<Result<VideoResult>>>,
-    read_after: Instant,
+    settle_until: Instant,
     deadline: Instant,
     sequence: u64,
     peer_sequence: u64,
@@ -46,7 +45,7 @@ impl<'a> Session<'a> {
             inputs,
             exchange: None,
             job: None,
-            read_after: Instant::now(),
+            settle_until: Instant::now(),
             deadline: Instant::now(),
             sequence: 0,
             peer_sequence: 0,
@@ -67,7 +66,7 @@ impl<'a> Session<'a> {
             Effect::Ddc(job @ Job::Select { .. }) => self.job = Some(self.video.submit(job)?),
             Effect::Forward => {
                 self.complete();
-                println!("Shared monitor confirmed on the other PC.");
+                println!("Shared monitor selection completed on the other PC.");
             }
             _ => bail!("unexpected monitor-only effect"),
         }
@@ -126,15 +125,15 @@ impl<'a> Session<'a> {
                     })?);
                     Ok(())
                 }
-                Message::Verify(reply) if reply == *id && *stage == Stage::Fallback => {
-                    *stage = Stage::Reading;
-                    self.read_after = Instant::now() + SETTLE;
+                Message::MonitorSelected(reply) if reply == *id && *stage == Stage::Armed => {
+                    *stage = Stage::Settling;
+                    self.settle_until = Instant::now() + SETTLE;
                     Ok(())
                 }
-                Message::Activate(reply) if reply == *id && *stage == Stage::Verified => {
+                Message::Activate(reply) if reply == *id && *stage == Stage::Ready => {
                     pipe.send(Message::Active(*id)).await?;
                     self.complete();
-                    println!("Shared monitor confirmed on this PC.");
+                    println!("Shared monitor selection completed on this PC.");
                     Ok(())
                 }
                 _ => bail!("unexpected monitor-only command"),
@@ -162,57 +161,36 @@ impl<'a> Session<'a> {
         if let Some(result) = result {
             match &mut self.exchange {
                 Some(Exchange::Source(controller)) => {
-                    if let Err(error) = result
-                        && !crate::video::write_attempted(&error)
-                    {
-                        return Err(error.context(
-                            "the active port could not select the other PC's remembered input",
-                        ));
-                    }
-                    let effect = controller.written()?;
+                    let effect = match result {
+                        Ok(VideoResult::Written) => controller.written()?,
+                        Err(error) if !crate::video::write_attempted(&error) => {
+                            controller.write_failed()?
+                        }
+                        Err(error) => {
+                            return Err(error.context(
+                                "monitor selection failed after issuance; no retry was sent",
+                            ));
+                        }
+                        _ => bail!("unexpected monitor selection result"),
+                    };
                     self.effect(pipe, effect).await?;
                 }
-                Some(Exchange::Target { id, stage }) => {
-                    if *stage == Stage::Selecting
-                        && (matches!(result, Ok(VideoResult::Written))
-                            || result.as_ref().is_err_and(crate::video::write_attempted))
-                    {
-                        *stage = Stage::Reading;
-                        self.read_after = Instant::now() + SETTLE;
-                    } else if *stage == Stage::Reading
-                        && matches!(result, Ok(VideoResult::Read(input)) if input == self.inputs.host)
-                    {
-                        *stage = Stage::Verified;
-                        pipe.send(Message::Observed {
-                            id: *id,
-                            input: self.inputs.host,
-                        })
-                        .await?;
-                    } else {
-                        if let Err(error) = result {
-                            eprintln!("Monitor selection/read: {error:#}");
-                        }
-                        if *stage == Stage::Selecting {
-                            *stage = Stage::Fallback;
-                            pipe.send(Message::SelectFallback(*id)).await?;
-                        } else {
-                            self.read_after = Instant::now() + Duration::from_millis(300);
-                        }
-                    }
+                Some(Exchange::Target { stage, .. }) if *stage == Stage::Selecting => {
+                    result.context("fallback monitor selection failed; no retry was sent")?;
+                    *stage = Stage::Settling;
+                    self.settle_until = Instant::now() + SETTLE;
                 }
-                None => bail!("monitor job without a transaction"),
+                _ => bail!("monitor job without a transaction"),
             }
         }
-        if matches!(
-            self.exchange,
-            Some(Exchange::Target {
-                stage: Stage::Reading,
-                ..
-            })
-        ) && self.job.is_none()
-            && Instant::now() >= self.read_after
+        if let Some(Exchange::Target { id, stage }) = &mut self.exchange
+            && *stage == Stage::Settling
+            && self.job.is_none()
+            && Instant::now() >= self.settle_until
         {
-            self.job = Some(self.video.submit(Job::Read)?);
+            *stage = Stage::Ready;
+            crate::lifecycle::report(crate::lifecycle::Event::Monitor(Some(self.inputs.host)));
+            pipe.send(Message::MonitorReady(*id)).await?;
         }
         Ok(())
     }
@@ -322,33 +300,22 @@ mod tests {
         active_only: bool,
         delayed: bool,
         write_error: bool,
-        pending: Option<(u16, std::time::Instant)>,
     }
     impl Monitor for Display {
         fn read(&mut self) -> Result<u16> {
-            if let Some((input, since)) = self.pending
-                && since.elapsed() >= Duration::from_millis(1100)
-            {
-                self.input.store(input, SeqCst);
-                self.pending = None;
-            }
-            let input = self.input.load(SeqCst);
-            ensure!(!self.active_only || input == self.own, "inactive DDC port");
-            Ok(input)
+            panic!("monitor switching must not perform DDC reads, including startup and recovery");
         }
         fn write(&mut self, input: u16) -> Result<()> {
-            if !self.active_only {
-                ensure!(
-                    input == self.own,
-                    "the destination must select its own saved input"
-                );
+            if self.active_only && self.input.load(SeqCst) != self.own {
+                return Err(crate::video::not_issued(anyhow::anyhow!(
+                    "inactive DDC port"
+                )));
             }
             self.writes.fetch_add(1, SeqCst);
             if self.delayed {
-                self.pending = Some((input, std::time::Instant::now()));
-            } else {
-                self.input.store(input, SeqCst);
+                std::thread::sleep(Duration::from_millis(1100));
             }
+            self.input.store(input, SeqCst);
             ensure!(
                 !self.write_error,
                 "simulated I/O error after accepted DDC write"
@@ -388,7 +355,6 @@ mod tests {
             active_only,
             delayed,
             write_error,
-            pending: None,
         })
         .unwrap();
         let b_video = VideoWorker::start(Display {
@@ -398,7 +364,6 @@ mod tests {
             active_only,
             delayed,
             write_error,
-            pending: None,
         })
         .unwrap();
         let (a_commands, a_receive) = broadcast::channel(8);
@@ -416,6 +381,33 @@ mod tests {
             session(&mut right, &mut state, b_receive).await
         });
         assert_eq!(a_writes.load(SeqCst) + b_writes.load(SeqCst), 0);
+        if write_error {
+            if initial == 17 {
+                a_commands.send(Command::Switch).unwrap();
+            } else {
+                b_commands.send(Command::Switch).unwrap();
+            }
+            assert!(
+                timeout(Duration::from_secs(3), a_task)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .is_err()
+            );
+            assert!(
+                timeout(Duration::from_secs(3), b_task)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .is_err()
+            );
+            assert_eq!(
+                a_writes.load(SeqCst) + b_writes.load(SeqCst),
+                1,
+                "an error after issuance must not resend or reverse the monitor command"
+            );
+            return;
+        }
         for _ in 0..4 {
             let source_is_a = input.load(SeqCst) == 17;
             if source_is_a {
@@ -438,7 +430,7 @@ mod tests {
         let _ = tokio::join!(a_task, b_task);
     }
     #[tokio::test]
-    async fn each_destination_selects_its_own_port_without_input_devices() {
+    async fn active_port_selects_the_destination_once_without_input_devices() {
         fixture(false, 17, false, false).await;
     }
     #[tokio::test]
@@ -446,7 +438,7 @@ mod tests {
         fixture(false, 15, false, false).await;
     }
     #[tokio::test]
-    async fn inactive_ports_fall_back_to_the_active_pc_in_both_directions() {
+    async fn inactive_ports_are_never_probed_in_either_direction() {
         fixture(true, 17, false, false).await;
     }
     #[tokio::test]

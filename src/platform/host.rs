@@ -79,18 +79,12 @@ pub async fn connect<C: Cursor>(
                         error: Some(format!("{error:#}")),
                     });
                 }
-                // A timeout may leave a Win32 DDC call in flight. Never race a new transfer
-                // with the old job or its recovery. The hook remains local while we wait.
-                let recover = handoff.logic.abort();
+                // The active receiver alone may restore video after a lost link.
+                // Two independent recovery writers race and can retrain the display twice.
+                handoff.logic.abort();
                 drop(handoff);
                 if let Some(Err(error)) = &result {
                     eprintln!("host input restored: {error:#}");
-                }
-                if recover && let Some((inputs, worker)) = &io.video {
-                    sleep(SETTLE).await;
-                    if let Err(error) = worker.recover(*inputs).await {
-                        eprintln!("Host-side video recovery could not be verified: {error:#}");
-                    }
                 }
                 if result.is_none() {
                     break;
@@ -118,7 +112,7 @@ struct Handoff {
     deadline: Option<Instant>,
     id: u64,
     job: Option<(Job, oneshot::Receiver<Result<VideoResult>>)>,
-    next_job: Option<(Instant, Job)>,
+    next_send: Option<(Instant, Message)>,
     allow_setup: bool,
     pending_event: Option<(u64, crate::wire::Input)>,
 }
@@ -212,7 +206,7 @@ impl Handoff {
             deadline: None,
             id: 0,
             job: None,
-            next_job: None,
+            next_send: None,
             allow_setup: false,
             pending_event: None,
         }
@@ -273,7 +267,7 @@ impl Handoff {
                     continue;
                 }
                 _ = tick.tick() => {
-                    let Some(effect) = self.poll_job(io)? else { continue };
+                    let Some(effect) = self.poll_job()? else { continue };
                     effect
                 }
                 control = io.controls.recv() => {
@@ -315,6 +309,10 @@ impl Handoff {
                             io.cursor.request_toggle().await?;
                             continue;
                         }
+                        Message::MonitorRestored(_) => {
+                            if let Some((inputs, _)) = &io.video { crate::lifecycle::report(crate::lifecycle::Event::Monitor(Some(inputs.host))); }
+                            self.logic.message(message)?
+                        }
                         Message::Pong(nonce) => {
                             heartbeat.pong(nonce, &io.gate, self.token)?;
                             continue;
@@ -342,12 +340,12 @@ impl Handoff {
         }
     }
 
-    fn poll_job(&mut self, io: &Coordinator<impl Cursor>) -> Result<Option<Effect>> {
-        if let Some((when, job)) = self.next_job
+    fn poll_job(&mut self) -> Result<Option<Effect>> {
+        if let Some((when, message)) = self.next_send
             && Instant::now() >= when
         {
-            self.next_job = None;
-            self.submit(io, job)?;
+            self.next_send = None;
+            return Ok(Some(Effect::Send(message)));
         }
         let Some((job, pending)) = &mut self.job else {
             return Ok(None);
@@ -360,36 +358,28 @@ impl Handoff {
         let job = *job;
         self.job = None;
         match job {
-            Job::Select { .. } => match result {
-                Ok(VideoResult::Written) => Ok(Some(self.logic.written()?)),
-                Err(error) => {
-                    if crate::video::write_attempted(&error) {
-                        eprintln!(
-                            "Monitor command returned an error after issuance; only checking the input: {error:#}"
-                        );
-                        return Ok(Some(self.logic.written()?));
+            Job::Select { .. } => {
+                match result {
+                    Ok(VideoResult::Written) => {
+                        let effect = self.logic.written()?;
+                        if let Effect::Send(message @ Message::Returned(_)) = effect {
+                            self.next_send = Some((Instant::now() + SETTLE, message));
+                            Ok(None)
+                        } else {
+                            Ok(Some(effect))
+                        }
                     }
-                    eprintln!(
-                        "Target-side monitor selection failed; trying the active port: {error:#}"
-                    );
-                    self.logic
-                        .write_failed()
-                        .map(Some)
-                        .with_context(|| format!("monitor selection failed: {error:#}"))
+                    Err(error) if !crate::video::write_attempted(&error) => {
+                        self.logic.write_failed().map(Some).with_context(|| {
+                            format!("monitor selection could not be issued: {error:#}")
+                        })
+                    }
+                    Err(error) => Err(error
+                        .context("Monitor input command failed after issuance; no retry was sent")),
+                    _ => bail!("invalid monitor selection response"),
                 }
-                _ => bail!("invalid monitor selection response"),
-            },
-            Job::Read => {
-                let observed = match result {
-                    Ok(VideoResult::Read(value)) => Some(value),
-                    Err(error) => {
-                        eprintln!("Waiting for Host-side DDC read: {error:#}");
-                        None
-                    }
-                    _ => bail!("invalid host DDC response"),
-                };
-                Ok(Some(self.logic.checked(observed)?))
             }
+            Job::Read => bail!("input switching must not issue DDC readback"),
             Job::Recover(_) => bail!("unexpected recovery job"),
         }
     }
@@ -443,9 +433,6 @@ impl Handoff {
                         println!("Input returned to host.");
                     }
                 }
-            }
-            Effect::Ddc(Job::Read) => {
-                self.next_job = Some((Instant::now() + SETTLE, Job::Read));
             }
             Effect::Ddc(job) => self.submit(io, job)?,
             Effect::Forward => {
@@ -636,17 +623,10 @@ mod tests {
             );
             assert_eq!(input.load(SeqCst), inputs.host);
             pipe.send(Message::Ready(1)).await.unwrap();
-            assert_eq!(next(&mut pipe).await, Message::SelectMonitor(1));
-            pipe.send(Message::SelectFallback(1)).await.unwrap();
-            assert_eq!(next(&mut pipe).await, Message::Verify(1));
+            assert_eq!(next(&mut pipe).await, Message::MonitorSelected(1));
             assert_eq!(input.load(SeqCst), inputs.peer);
             assert!(gate.current().1 == Route::Hold);
-            pipe.send(Message::Observed {
-                id: 1,
-                input: inputs.peer,
-            })
-            .await
-            .unwrap();
+            pipe.send(Message::MonitorReady(1)).await.unwrap();
             assert_eq!(next(&mut pipe).await, Message::Activate(1));
             pipe.send(Message::Active(1)).await.unwrap();
             while gate.current().1 != Route::Remote {
@@ -655,6 +635,9 @@ mod tests {
             pipe.send(Message::SwitchRequested).await.unwrap();
             assert_eq!(next(&mut pipe).await, Message::Return(1));
             pipe.send(Message::Returning(1)).await.unwrap();
+            assert_eq!(next(&mut pipe).await, Message::RestoreMonitor(1));
+            input.store(inputs.host, SeqCst);
+            pipe.send(Message::MonitorRestored(1)).await.unwrap();
             assert_eq!(next(&mut pipe).await, Message::Returned(1));
             while gate.current().1 != Route::Local {
                 sleep(Duration::from_millis(1)).await;
