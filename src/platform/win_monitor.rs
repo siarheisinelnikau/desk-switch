@@ -280,7 +280,11 @@ impl Monitor for Ddc {
     }
 
     fn write(&mut self, input: u16) -> Result<()> {
-        let monitor = select(&self.0)?;
+        let monitor = select(&self.0).map_err(crate::video::not_issued)?;
+        println!(
+            "DDC write issued: process {}, input {input:#06x}; exactly one SetVCPFeature call.",
+            std::process::id()
+        );
         if unsafe { SetVCPFeature(monitor.0.hPhysicalMonitor, 0x60, input.into()) } == 0 {
             return Err(io::Error::last_os_error()).context("Windows DDC/CI VCP 0x60 write failed");
         }
@@ -426,6 +430,6 @@ pub fn read_monitor(id: &str) -> Result<super::MonitorInfo> {
         .into_iter()
         .find(|d| d.id == id)
         .context("Выбранный монитор отключён")?;
-    display.current = Some(read(select(id)?.0.hPhysicalMonitor)?);
+    display.current = Some(crate::video::read_once(Ddc(id.into()))?);
     Ok(display)
 }

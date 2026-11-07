@@ -74,7 +74,23 @@ fn selected_bus(displays: &[Display], id: &str) -> Result<u32> {
 }
 
 fn ddcutil(bus: u32, args: &[&str]) -> Result<String> {
-    let mut child = Command::new("ddcutil")
+    use std::os::unix::process::CommandExt;
+    let parent = std::process::id();
+    let mut command = Command::new("ddcutil");
+    unsafe {
+        command.pre_exec(move || {
+            if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM as libc::c_ulong) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            if libc::getppid() as u32 != parent {
+                libc::raise(libc::SIGTERM);
+                return Err(std::io::Error::from_raw_os_error(libc::ECANCELED));
+            }
+            Ok(())
+        });
+    }
+    let mut child = command
+        .arg("--skip-ddc-checks")
         .arg("--bus")
         .arg(bus.to_string())
         .args(args)
@@ -83,7 +99,15 @@ fn ddcutil(bus: u32, args: &[&str]) -> Result<String> {
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .context("starting ddcutil; install it and check your I²C device access")?;
+        .context("starting ddcutil; install it and check your I²C device access")
+        .map_err(crate::video::not_issued)?;
+    if args.contains(&"setvcp") {
+        println!(
+            "DDC write process {}: input {}; checks, verification and write retries disabled.",
+            child.id(),
+            args.last().unwrap_or(&"unknown")
+        );
+    }
     // Drain both pipes while the process runs, with fixed memory and a bounded child lifetime.
     let stdout = child.stdout.take().unwrap();
     let stderr = child.stderr.take().unwrap();
@@ -165,7 +189,9 @@ impl Monitor for Ddc {
     }
 
     fn write(&mut self, input: u16) -> Result<()> {
-        let bus = selected_bus(&displays()?, &self.0)?;
+        let bus = displays()
+            .and_then(|displays| selected_bus(&displays, &self.0))
+            .map_err(crate::video::not_issued)?;
         ddcutil(
             bus,
             &[
@@ -285,7 +311,7 @@ pub fn read_monitor(id: &str) -> Result<super::MonitorInfo> {
         .iter()
         .find(|d| d.id == id)
         .context("Выбранный монитор отключён")?;
-    let current = read_input(selected_bus(&displays, id)?)?;
+    let current = crate::video::read_once(Ddc(id.into()))?;
     Ok(super::MonitorInfo {
         id: id.into(),
         name: display.connector.clone(),

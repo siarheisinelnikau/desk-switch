@@ -427,21 +427,15 @@ async fn audio_stays_continuous_through_a_video_and_input_round_trip() {
             controller
                 .message(client.messages.recv().await.unwrap().unwrap())
                 .unwrap(),
-            Effect::Send(Message::SelectMonitor(1))
-        );
-        assert_eq!(
-            controller.message(Message::SelectFallback(1)).unwrap(),
             Effect::Ddc(Job::Select { from: 17, to: 15 })
         );
         sleep(Duration::from_millis(25)).await;
         assert_eq!(
             controller.written().unwrap(),
-            Effect::Send(Message::Verify(1))
+            Effect::Send(Message::MonitorSelected(1))
         );
         assert_eq!(
-            controller
-                .message(Message::Observed { id: 1, input: 15 })
-                .unwrap(),
+            controller.message(Message::MonitorReady(1)).unwrap(),
             Effect::Send(Message::Activate(1))
         );
         assert_eq!(
@@ -455,11 +449,10 @@ async fn audio_stays_continuous_through_a_video_and_input_round_trip() {
         sleep(Duration::from_millis(25)).await;
         assert_eq!(
             controller.message(Message::Returning(1)).unwrap(),
-            Effect::Ddc(Job::Select { from: 15, to: 17 })
+            Effect::Send(Message::RestoreMonitor(1))
         );
-        assert_eq!(controller.written().unwrap(), Effect::Ddc(Job::Read));
         assert_eq!(
-            controller.checked(Some(17)).unwrap(),
+            controller.message(Message::MonitorRestored(1)).unwrap(),
             Effect::Send(Message::Returned(1))
         );
         assert_eq!(
