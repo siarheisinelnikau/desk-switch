@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE policyconfig PUBLIC "-//freedesktop//DTD PolicyKit Policy Configuration 1.0//EN" "http://www.freedesktop.org/standards/PolicyKit/1/policyconfig.dtd">
+<policyconfig>
+  <vendor>Desk Switch</vendor>
+  <vendor_url>https://github.com/siarheisinelnikau/desk-switch</vendor_url>
+  <action id="com.deskswitch.input-access">
+    <description>Allow Desk Switch to read selected input devices</description>
+    <message>Authenticate to share the selected keyboard and mouse with your paired PC.</message>
+    <defaults>
+      <allow_any>no</allow_any>
+      <allow_inactive>no</allow_inactive>
+      <allow_active>auth_admin</allow_active>
+    </defaults>
+    <annotate key="org.freedesktop.policykit.exec.path">/usr/lib/desk-switch/input-access</annotate>
+  </action>
+</policyconfig>

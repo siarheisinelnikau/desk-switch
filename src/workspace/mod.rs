@@ -1,3 +1,4 @@
+pub mod devices;
 pub mod hardware;
 pub mod net;
 
@@ -10,6 +11,7 @@ use std::collections::BTreeMap;
 pub const PORT: u16 = 45878;
 pub const INPUT_PORT: u16 = 45876;
 pub const AUDIO_PORT: u16 = 45877;
+pub const MICROPHONE_PORT: u16 = 45879;
 
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(default)]
@@ -19,6 +21,9 @@ pub struct Hardware {
     pub mouse: bool,
     pub audio_score: u8,
     pub audio_name: String,
+    pub microphone_score: u8,
+    pub microphone_name: String,
+    pub microphone_receive: bool,
 }
 impl Hardware {
     pub fn input(&self) -> bool {
@@ -56,6 +61,11 @@ pub struct Shared {
     pub input: Selection,
     pub audio: Selection,
     pub audio_enabled: bool,
+    pub microphone_enabled: bool,
+    pub microphone: Selection,
+    pub microphone_level: AudioLevel,
+    pub microphone_binding: Option<devices::Binding>,
+    pub devices: BTreeMap<String, devices::Choices>,
     pub volume: u8,
     pub muted: bool,
     pub audio_levels: BTreeMap<String, AudioLevel>,
@@ -72,6 +82,11 @@ impl Default for Shared {
             input: Selection::Auto,
             audio: Selection::Auto,
             audio_enabled: true,
+            microphone_enabled: false,
+            microphone: Selection::Auto,
+            microphone_level: AudioLevel::default(),
+            microphone_binding: None,
+            devices: BTreeMap::new(),
             volume: 50,
             muted: false,
             audio_levels: BTreeMap::new(),
@@ -84,6 +99,9 @@ impl Default for Shared {
     }
 }
 impl Shared {
+    pub fn devices_for(&self, key: &str) -> devices::Choices {
+        self.devices.get(key).cloned().unwrap_or_default()
+    }
     pub fn audio_level(&self, source: &str) -> AudioLevel {
         self.audio_levels.get(source).copied().unwrap_or_default()
     }
@@ -142,6 +160,7 @@ pub struct Preferences {
     pub monitor: Monitor,
     pub peer_name: String,
     pub last_address: String,
+    pub manual_address: String,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -149,12 +168,18 @@ pub struct Node {
     pub key: String,
     pub name: String,
     pub hardware: Hardware,
+    #[serde(default)]
+    pub devices: devices::Inventory,
     pub monitor: Monitor,
     pub shared: Shared,
     pub input: Option<InputStatus>,
     #[serde(default)]
     pub monitor_input: Option<u16>,
     pub audio_playing: bool,
+    #[serde(default)]
+    pub microphone_active: bool,
+    #[serde(default)]
+    pub microphone_error: Option<String>,
     pub audio_error: Option<String>,
     pub input_error: Option<String>,
     pub ack: String,
@@ -170,7 +195,10 @@ impl Node {
             "invalid computer name"
         );
         ensure!(
-            self.hardware.audio_score <= 100 && self.hardware.audio_name.len() <= 512,
+            self.hardware.audio_score <= 100
+                && self.hardware.audio_name.len() <= 512
+                && self.hardware.microphone_score <= 100
+                && self.hardware.microphone_name.len() <= 512,
             "invalid audio information"
         );
         ensure!(
@@ -181,6 +209,40 @@ impl Node {
         );
         ensure!(self.monitor.input != Some(0), "invalid monitor input");
         ensure!(self.shared.volume <= 100, "invalid volume");
+        self.devices.validate()?;
+        if let Some(binding) = &self.shared.microphone_binding {
+            ensure!(
+                [own, peer].contains(&binding.computer.as_str())
+                    && !binding.device.is_empty()
+                    && binding.device.len() <= 2048
+                    && !binding.device.chars().any(char::is_control),
+                "invalid microphone binding"
+            );
+        }
+
+        ensure!(
+            self.shared.microphone_level.volume <= 100 && self.shared.devices.len() <= 2,
+            "invalid device settings"
+        );
+        for (key, choice) in &self.shared.devices {
+            ensure!([own, peer].contains(&key.as_str()), "unknown device owner");
+            for id in [
+                &choice.keyboard,
+                &choice.mouse,
+                &choice.speaker,
+                &choice.microphone,
+                &choice.microphone_bridge,
+            ]
+            .into_iter()
+            .flatten()
+            {
+                ensure!(
+                    !id.is_empty() && id.len() <= 2048 && !id.chars().any(char::is_control),
+                    "invalid device selection"
+                );
+            }
+        }
+
         ensure!(
             self.shared.audio_levels.len() <= 2
                 && self
@@ -196,7 +258,11 @@ impl Node {
                     || [own, peer].contains(&self.shared.revision.author.as_str())),
             "invalid settings revision"
         );
-        for choice in [&self.shared.input, &self.shared.audio] {
+        for choice in [
+            &self.shared.input,
+            &self.shared.audio,
+            &self.shared.microphone,
+        ] {
             if let Selection::Computer(key) = choice {
                 ensure!(
                     [own, peer].contains(&key.as_str()),
@@ -209,7 +275,10 @@ impl Node {
                 || (self.ack.len() == 64 && self.ack.bytes().all(|c| c.is_ascii_hexdigit())),
             "invalid synchronization acknowledgement"
         );
-        for error in [&self.audio_error, &self.input_error].into_iter().flatten() {
+        for error in [&self.audio_error, &self.input_error, &self.microphone_error]
+            .into_iter()
+            .flatten()
+        {
             ensure!(error.len() <= 2048, "status is too long");
         }
         Ok(())
@@ -224,6 +293,7 @@ pub struct Plan {
     pub keyboard_enabled: bool,
     pub mouse_enabled: bool,
     pub audio_output: Option<String>,
+    pub microphone_source: Option<String>,
     pub monitor: Option<Inputs>,
     pub edge: bool,
     pub purple_on_left: bool,
@@ -390,6 +460,41 @@ impl Plan {
             }
             .map(|n| n.key.clone())
         };
+        let microphone_source = if shared.microphone_enabled && !shared.microphone_level.muted {
+            let candidates = [purple, green];
+            let source = if let Some(binding) = &shared.microphone_binding {
+                candidates.into_iter().find(|n| {
+                    n.key == binding.computer
+                        && n.hardware.microphone_score > 0
+                        && n.devices.microphones.iter().any(|d| d.id == binding.device)
+                })
+            } else {
+                match &shared.microphone {
+                    Selection::Computer(key) => candidates
+                        .into_iter()
+                        .find(|n| &n.key == key && n.hardware.microphone_score > 0),
+                    Selection::Auto => candidates
+                        .into_iter()
+                        .filter(|n| n.hardware.microphone_score > 0)
+                        .max_by_key(|n| {
+                            (
+                                n.hardware.microphone_score,
+                                audio_output.as_ref() == Some(&n.key),
+                                n.key == purple.key,
+                            )
+                        }),
+                }
+            };
+            source
+                .filter(|source| {
+                    (if source.key == a.key { b } else { a })
+                        .hardware
+                        .microphone_receive
+                })
+                .map(|n| n.key.clone())
+        } else {
+            None
+        };
         let monitor = input_source.as_ref().and_then(|source| {
             let (host, peer) = if source == &a.key {
                 (&a.monitor, &b.monitor)
@@ -412,6 +517,7 @@ impl Plan {
             keyboard_enabled: shared.keyboard_enabled,
             mouse_enabled: shared.mouse_enabled,
             audio_output,
+            microphone_source,
             monitor,
             edge: shared.edge && shared.mouse_enabled,
             purple_on_left: shared.purple_on_left,
@@ -421,8 +527,26 @@ impl Plan {
         let (a, b) = if a.key < b.key { (a, b) } else { (b, a) };
         // Runtime status/volume never reconfigure services. Both sides acknowledge
         // the same physical devices, local monitor mappings and routing decision.
-        let bytes =
-            serde_json::to_vec(&(self, &a.hardware, &b.hardware, &a.monitor, &b.monitor)).unwrap();
+        let bytes = serde_json::to_vec(&(
+            self,
+            &a.hardware,
+            &b.hardware,
+            &a.monitor,
+            &b.monitor,
+            &a.devices,
+            &b.devices,
+            if a.shared.revision >= b.shared.revision {
+                &a.shared.devices
+            } else {
+                &b.shared.devices
+            },
+            if a.shared.revision >= b.shared.revision {
+                &a.shared.microphone_binding
+            } else {
+                &b.shared.microphone_binding
+            },
+        ))
+        .unwrap();
         config::hex(&Sha256::digest(bytes))
     }
 }
@@ -444,16 +568,69 @@ mod tests {
             key: key.into(),
             name: key.into(),
             hardware: Hardware::default(),
+            devices: devices::Inventory::default(),
             monitor: Monitor::default(),
             shared: Shared::default(),
             input: None,
             monitor_input: None,
             audio_playing: false,
+            microphone_active: false,
+            microphone_error: None,
             audio_error: None,
             input_error: None,
             ack: String::new(),
         }
     }
+    #[test]
+    fn microphone_is_opt_in_requires_a_receiver_and_never_rebinds_after_unplug() {
+        let mut a = node("a");
+        let mut b = node("b");
+        a.hardware.microphone_score = 80;
+        b.hardware.microphone_score = 60;
+        a.hardware.microphone_receive = true;
+        a.devices.microphones.push(crate::audio::AudioDevice {
+            id: "headset-mic".into(),
+            name: "Headset".into(),
+            default: true,
+        });
+        b.devices.microphones.push(crate::audio::AudioDevice {
+            id: "webcam-mic".into(),
+            name: "Webcam".into(),
+            default: true,
+        });
+        assert!(Plan::build(&a, &b).microphone_source.is_none());
+        a.shared.microphone_enabled = true;
+        a.shared.changed("a");
+        assert!(
+            Plan::build(&a, &b).microphone_source.is_none(),
+            "Windows needs a virtual capture bridge"
+        );
+        b.hardware.microphone_receive = true;
+        assert_eq!(Plan::build(&a, &b).microphone_source.as_deref(), Some("a"));
+        a.shared.microphone_binding = Some(devices::Binding {
+            computer: "a".into(),
+            device: "headset-mic".into(),
+        });
+        let plan = Plan::build(&a, &b);
+        let digest = plan.digest(&a, &b);
+        a.shared.microphone_level.volume = 37;
+        assert_eq!(
+            Plan::build(&a, &b).digest(&a, &b),
+            digest,
+            "gain updates must not restart input or capture"
+        );
+        a.devices.microphones.clear();
+        a.hardware.microphone_score = 0;
+        assert!(
+            Plan::build(&a, &b).microphone_source.is_none(),
+            "do not switch to the other PC's webcam"
+        );
+        a.shared.microphone_binding = None;
+        assert_eq!(Plan::build(&a, &b).microphone_source.as_deref(), Some("b"));
+        a.shared.microphone_level.muted = true;
+        assert!(Plan::build(&a, &b).microphone_source.is_none());
+    }
+
     #[test]
     fn both_views_agree_on_colours_and_hotplug_roles() {
         let mut a = node("a");

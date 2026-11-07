@@ -63,7 +63,8 @@ impl Backend for Native {
                             return Ok(None);
                         }
                         let control2: IAudioSessionControl2 = control.cast()?;
-                        let ours = control2.GetProcessId()? == std::process::id();
+                        let ours = control2.GetProcessId()? == std::process::id()
+                            || control.GetGroupingParam()? == super::super::SESSION_GROUP;
                         let id = format!(
                             "{endpoint}:{}",
                             take_string(control2.GetSessionInstanceIdentifier()?)?

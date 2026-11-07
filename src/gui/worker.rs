@@ -14,6 +14,8 @@ pub enum Kind {
     Input,
     AudioSend,
     AudioReceive,
+    MicrophoneSend,
+    MicrophoneReceive,
     Query,
 }
 
@@ -36,6 +38,7 @@ pub struct Worker {
     started: Instant,
     events_closed: bool,
     query_timeout: Duration,
+    interactive_query: bool,
 }
 
 impl Worker {
@@ -43,13 +46,18 @@ impl Worker {
         let executable = std::env::current_exe()?;
         let mut command = Command::new(executable);
         command.args(args).env("DESK_SWITCH_STATE", dir);
-        if kind != Kind::Query {
+        let interactive_query = args.first().is_some_and(|arg| arg == "input-access");
+        if kind != Kind::Query || interactive_query {
             command.env("DESK_SWITCH_MANAGED", "1");
         } else {
             command.env_remove("DESK_SWITCH_MANAGED");
         }
         let mut worker = Self::spawn(kind, command)?;
-        if args.first().is_some_and(|arg| arg == "portal-check") {
+        worker.interactive_query = interactive_query;
+        if args
+            .first()
+            .is_some_and(|arg| arg == "portal-check" || arg == "input-access")
+        {
             worker.query_timeout = Duration::from_secs(140);
         }
         Ok(worker)
@@ -112,6 +120,7 @@ impl Worker {
             started: Instant::now(),
             events_closed: false,
             query_timeout: Duration::from_secs(18),
+            interactive_query: false,
         })
     }
 
@@ -232,7 +241,11 @@ impl Worker {
             && self.started.elapsed() > self.query_timeout
             && let Some(child) = &mut self.child
         {
-            let _ = child.kill();
+            if self.interactive_query {
+                self.input.take();
+            } else {
+                let _ = child.kill();
+            }
             self.logs
                 .push_back("Проверка устройства превысила время ожидания.".into());
         }
@@ -260,6 +273,7 @@ impl Drop for Worker {
         // Managed children treat EOF as cooperative shutdown, including GUI crashes.
         self.input.take();
         if self.kind == Kind::Query
+            && !self.interactive_query
             && let Some(child) = &mut self.child
         {
             let _ = child.kill();
