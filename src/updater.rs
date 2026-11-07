@@ -383,14 +383,7 @@ pub fn shared_config(dir: &Path) -> Result<rust_auto_updator::Config> {
     };
     let mut config = config.map_err(anyhow::Error::msg)?;
     config.allow_asset_digest = true;
-    config.legacy_executable_names = vec![
-        if cfg!(windows) {
-            "desk-switch-windows-x86_64.exe"
-        } else {
-            "desk-switch-linux-x86_64.deb"
-        }
-        .into(),
-    ];
+    config.asset_platform = Some(if cfg!(windows) { "windows" } else { "linux" }.into());
     config.max_executable_size = MAX_BINARY;
     config.install.stage_prefix = ".desk-switch-shared-update-".into();
     config.install.helper_name = if cfg!(windows) {
@@ -755,9 +748,9 @@ mod shared_tests {
     fn library_download_must_match_the_pinned_signed_artifact() {
         let config = shared_config(Path::new("/tmp/desk-switch-shared-fixture")).unwrap();
         let filename = if cfg!(windows) {
-            "desk-switch-v99.0.0.exe"
+            "desk-switch-v99.0.0-windows.exe"
         } else {
-            "desk-switch-linux-x86_64.deb"
+            "desk-switch-v99.0.0-linux.deb"
         };
         let key = if cfg!(windows) {
             WINDOWS

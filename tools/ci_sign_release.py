@@ -8,6 +8,8 @@ import sys
 import tempfile
 import tomllib
 
+from release_assets import asset_names
+
 ROOT = Path(__file__).resolve().parents[1]
 
 
@@ -29,7 +31,7 @@ def main():
         subprocess.run([
             sys.executable, str(ROOT / "tools/prepare_release.py"),
             "--windows", str(ROOT / "artifacts/desk-switch.exe"),
-            "--deb", str(ROOT / "artifacts/desk-switch-linux-x86_64.deb"),
+            "--deb", str(ROOT / "artifacts" / asset_names(version)["linux-x86_64-deb"]),
             "--tag", f"v{version}", "--key", str(path),
             "--out", str(ROOT / "dist/signed"),
         ], check=True)

@@ -3,7 +3,7 @@ name: Publish signed release
 on:
   push:
     branches: [main]
-    paths: ["release/manifests/*.json", "tools/promote_release.py", "tools/test_promote_release.py", ".github/workflows/promote-release.yml"]
+    paths: ["release/manifests/*.json", "tools/promote_release.py", "tools/test_promote_release.py", "tools/release_assets.py", "tools/normalize_release_assets.py", "tools/test_normalize_release_assets.py", ".github/workflows/promote-release.yml"]
   workflow_dispatch:
 
 permissions:
@@ -15,7 +15,13 @@ jobs:
     steps:
       - uses: actions/checkout@v7.0.1
       - name: Check signed release metadata repairs
-        run: python3 tools/test_promote_release.py
+        run: |
+          python3 tools/test_promote_release.py
+          python3 tools/test_normalize_release_assets.py
+      - name: Normalize filenames on an existing unsigned release candidate
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 tools/normalize_release_assets.py
       - name: Locate signed metadata for the current version
         id: manifest
         run: |
