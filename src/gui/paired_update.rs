@@ -7,15 +7,69 @@ impl Desktop {
         if self.paired_update.is_some() || self.install_job.is_some() || self.install_pending {
             return;
         }
+        if !self.update_ready {
+            self.start_remote_update(ctx);
+            return;
+        }
         if self.pair.remote.is_some()
             && self.prepared_update.is_some()
             && self.update_version.is_some()
+            && self.pair.remote.as_ref().is_some_and(|remote| {
+                remote.management.is_some()
+                    && remote.version.as_ref().is_some_and(|installed| {
+                        semver::Version::parse(&installed.app).ok()
+                            < self
+                                .update_version
+                                .as_deref()
+                                .and_then(|v| semver::Version::parse(v).ok())
+                    })
+            })
         {
             self.update_confirmation = true;
             self.action(Action::Show, ctx);
         } else {
             self.begin_install_update(ctx);
         }
+    }
+
+    pub(super) fn start_remote_update(&mut self, ctx: &egui::Context) {
+        if self.paired_update.is_some()
+            || self.peer_restart.is_some()
+            || self.install_job.is_some()
+            || self.install_pending
+        {
+            return;
+        }
+        let Some(remote) = self.pair.remote.as_ref().filter(|node| {
+            node.management
+                .as_ref()
+                .is_some_and(|state| state.update.can_install())
+        }) else {
+            self.notice = Some((
+                "Check for updates on the other PC before installing.".into(),
+                true,
+            ));
+            return;
+        };
+        let version = remote
+            .management
+            .as_ref()
+            .unwrap()
+            .update
+            .version
+            .clone()
+            .unwrap();
+        self.paired_update = Some(
+            Coordinator::peer_only(
+                super::management::request_id(),
+                version,
+                remote.diagnostics.platform == "linux",
+            )
+            .without_password(),
+        );
+        self.peer_update_status = None;
+        let message = self.paired_update.as_ref().unwrap().retry().unwrap();
+        self.apply_update_effects(vec![Effect::Send(message)], ctx);
     }
 
     pub(super) fn start_paired_update(&mut self, ctx: &egui::Context) {
@@ -36,12 +90,15 @@ impl Desktop {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_nanos() as u64;
-        self.paired_update = Some(Coordinator::outgoing(
-            id.max(1),
-            version,
-            cfg!(target_os = "linux"),
-            remote.diagnostics.platform == "linux",
-        ));
+        self.paired_update = Some(
+            Coordinator::outgoing(
+                id.max(1),
+                version,
+                cfg!(target_os = "linux"),
+                remote.diagnostics.platform == "linux",
+            )
+            .without_password(),
+        );
         let message = self.paired_update.as_ref().unwrap().retry().unwrap();
         self.apply_update_effects(vec![Effect::Send(message)], ctx);
     }
@@ -53,7 +110,7 @@ impl Desktop {
             let result = if self.install_job.is_some() || self.install_pending || self.quitting {
                 Err(anyhow::anyhow!("This PC is already installing an update"))
             } else {
-                Coordinator::incoming(*id, version.clone(), cfg!(target_os = "linux"))
+                Coordinator::incoming(*id, version.clone(), false)
             };
             match result {
                 Ok(coordinator) => {
@@ -110,6 +167,9 @@ impl Desktop {
 
     pub(super) fn paired_download_ready(&mut self, ctx: &egui::Context) {
         if let Some(coordinator) = &mut self.paired_update {
+            if coordinator.remote_only() {
+                return;
+            }
             let effects = if self.prepared_update.is_some() {
                 coordinator.prepared(self.update_version.as_deref().unwrap_or_default())
             } else {
@@ -130,7 +190,21 @@ impl Desktop {
         }
     }
 
+    pub(super) fn fail_paired_download(&mut self, error: String, ctx: &egui::Context) {
+        if self
+            .paired_update
+            .as_ref()
+            .is_some_and(|update| !update.remote_only())
+        {
+            self.fail_paired_update(error, ctx);
+        }
+    }
+
     pub(super) fn apply_update_effects(&mut self, effects: Vec<Effect>, ctx: &egui::Context) {
+        let remote_only = self
+            .paired_update
+            .as_ref()
+            .is_some_and(Coordinator::remote_only);
         for effect in effects {
             match effect {
                 Effect::Send(message) => {
@@ -159,9 +233,24 @@ impl Desktop {
                 }
                 Effect::Quit => self.action(Action::Quit, ctx),
                 Effect::Error(error) => {
-                    self.update_status = error.clone();
+                    if remote_only {
+                        self.peer_update_status = Some((error.clone(), true));
+                    } else {
+                        self.update_status = error.clone();
+                    }
                     self.notice = Some((error, true));
-                    self.update_ready = self.prepared_update.is_some();
+                    if !remote_only {
+                        self.update_ready = self.prepared_update.is_some();
+                    }
+                }
+                Effect::PeerRestart(version) => {
+                    self.peer_update_status = Some((
+                        format!(
+                            "The other PC is restarting into version {version}. This PC stays running."
+                        ),
+                        false,
+                    ));
+                    self.peer_restart = Some((version, std::time::Instant::now()));
                 }
             }
         }
@@ -169,11 +258,16 @@ impl Desktop {
             self.paired_update = None;
         }
         if let Some(coordinator) = &self.paired_update {
-            self.update_status = format!(
+            let status = format!(
                 "{}: {}",
                 coordinator.version,
                 crate::i18n::tr(coordinator.status())
             );
+            if remote_only {
+                self.peer_update_status = Some((status, false));
+            } else {
+                self.update_status = status;
+            }
         }
     }
 
@@ -193,7 +287,7 @@ impl Desktop {
         egui::Modal::new(egui::Id::new("paired-update-confirmation")).show(ctx, |ui| {
             ui.set_max_width(480.0);
             ui.heading(crate::i18n::tr("Update the linked PC too?"));
-            ui.label(crate::i18n::tr("Both PCs will download and verify the same version. Ubuntu requires its system password on that PC; Windows waits for Ubuntu's installation to succeed."));
+            ui.label(crate::i18n::tr("Both PCs download and verify the same signed version. Windows waits for Ubuntu's package installation to succeed. The installed Ubuntu edition needs no password prompt."));
             ui.add_space(12.0);
             ui.horizontal(|ui| {
                 if ui.button(crate::i18n::tr("Update both PCs")).clicked() { self.update_confirmation = false; self.start_paired_update(ctx); }

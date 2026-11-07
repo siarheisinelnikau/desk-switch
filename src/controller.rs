@@ -43,7 +43,6 @@ pub struct Controller {
     inputs: Option<Inputs>,
     exit: Option<u16>,
     upgrade: bool,
-    restore_fallback: bool,
 }
 
 impl Controller {
@@ -54,7 +53,6 @@ impl Controller {
             inputs,
             exit: None,
             upgrade: false,
-            restore_fallback: false,
         }
     }
 
@@ -181,7 +179,6 @@ impl Controller {
 
     fn restore_on_peer(&mut self) -> Result<Effect> {
         let id = self.transfer.context("missing monitor transfer")?.id;
-        self.restore_fallback = true;
         self.phase = Phase::RestoreFallback;
         Ok(Effect::Send(Message::RestoreMonitor(id)))
     }
@@ -193,8 +190,6 @@ impl Controller {
             .ok_or_else(|| anyhow::anyhow!("unexpected DDC read result"))?;
         if self.inputs.map(|inputs| inputs.host) == observed {
             Ok(Effect::Send(Message::Returned(transfer.id)))
-        } else if !self.restore_fallback {
-            self.restore_on_peer()
         } else {
             Ok(Effect::Ddc(Job::Read))
         }
@@ -216,7 +211,7 @@ impl Controller {
                 mode: Mode::Video,
                 ..
             })
-        ) && !matches!(self.phase, Phase::Local | Phase::Preparing);
+        ) && matches!(self.phase, Phase::Remote | Phase::Returning);
         *self = Self::new(self.inputs);
         recover
     }
@@ -316,15 +311,15 @@ mod tests {
                 .is_err()
         );
         assert!(!controller.is_remote());
-        assert!(controller.abort());
+        assert!(!controller.abort());
         assert!(controller.is_local());
     }
 
     #[test]
-    fn ddc_failure_or_loss_after_start_requests_recovery() {
+    fn an_unconfirmed_selection_is_not_repeated_but_a_lost_active_transfer_can_recover() {
         let mut controller = setup(Mode::Video);
         controller.message(Message::Ready(3)).unwrap();
-        assert!(controller.abort());
+        assert!(!controller.abort());
         assert!(!controller.is_remote());
 
         let mut controller = setup(Mode::Video);
@@ -360,14 +355,7 @@ mod tests {
             Effect::Ddc(Job::Select { from: 15, to: 17 })
         );
         assert_eq!(controller.written().unwrap(), Effect::Ddc(Job::Read));
-        assert_eq!(
-            controller.checked(None).unwrap(),
-            Effect::Send(Message::RestoreMonitor(3))
-        );
-        assert_eq!(
-            controller.message(Message::MonitorRestored(3)).unwrap(),
-            Effect::Ddc(Job::Read)
-        );
+        assert_eq!(controller.checked(None).unwrap(), Effect::Ddc(Job::Read));
         assert_eq!(
             controller.checked(Some(15)).unwrap(),
             Effect::Ddc(Job::Read)

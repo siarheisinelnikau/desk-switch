@@ -23,11 +23,20 @@ impl super::host::Cursor for WindowsCursor {
         Ok(())
     }
     async fn center(&self) -> Result<()> {
-        if self.1 { win_input::center() } else { Ok(()) }
+        if self.1 {
+            tokio::task::spawn_blocking(win_input::center)
+                .await
+                .map_err(|error| anyhow::anyhow!("Windows cursor worker stopped: {error}"))?
+        } else {
+            Ok(())
+        }
     }
     async fn enter(&self, edge: &Edge, position: u16) -> Result<()> {
         if self.1 {
-            win_input::enter(edge, position)
+            let edge = edge.clone();
+            tokio::task::spawn_blocking(move || win_input::enter(&edge, position))
+                .await
+                .map_err(|error| anyhow::anyhow!("Windows cursor worker stopped: {error}"))?
         } else {
             Ok(())
         }

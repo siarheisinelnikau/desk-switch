@@ -34,11 +34,15 @@ def main():
         files = {
             "usr/lib/desk-switch/desk-switch": binary,
             "usr/lib/desk-switch/input-access": ROOT / "packaging/linux/desk-switch-input-access",
+            "usr/lib/desk-switch/update-install": ROOT / "packaging/linux/desk-switch-update-install",
+            "usr/share/desk-switch/update-public-key.hex": ROOT / "release/update-public-key.hex",
             "usr/lib/udev/rules.d/99-desk-switch-input-access.rules": ROOT / "packaging/linux/99-desk-switch-input-access.rules",
             "usr/share/polkit-1/actions/com.deskswitch.input-access.policy": ROOT / "packaging/linux/com.deskswitch.input-access.policy",
+            "usr/share/polkit-1/actions/com.deskswitch.update.policy": ROOT / "packaging/linux/com.deskswitch.update.policy",
             "usr/bin/desk-switch": ROOT / "packaging/linux/desk-switch",
             "usr/share/applications/com.deskswitch.Desktop.desktop": ROOT / "packaging/linux/com.deskswitch.Desktop.desktop",
             "usr/share/icons/hicolor/scalable/apps/com.deskswitch.Desktop.svg": ROOT / "packaging/linux/com.deskswitch.Desktop.svg",
+            "usr/share/doc/desk-switch/VB-CABLE-NOTICE.txt": ROOT / "assets/third-party/vb-cable/NOTICE.txt",
             "usr/share/doc/desk-switch/copyright": ROOT / "LICENSE",
             "usr/share/doc/desk-switch/rust-auto-updator-LICENSE": ROOT / "vendor/rust-auto-updator/LICENSE",
         }
@@ -46,13 +50,13 @@ def main():
             target = stage / name
             target.parent.mkdir(parents=True, exist_ok=True)
             shutil.copyfile(source, target)
-            target.chmod(0o755 if name in {"usr/bin/desk-switch", "usr/lib/desk-switch/desk-switch", "usr/lib/desk-switch/input-access"} else 0o644)
+            target.chmod(0o755 if name in {"usr/bin/desk-switch", "usr/lib/desk-switch/desk-switch", "usr/lib/desk-switch/input-access", "usr/lib/desk-switch/update-install"} else 0o644)
         subprocess.run(["desktop-file-validate", str(stage / "usr/share/applications/com.deskswitch.Desktop.desktop")], check=True)
         (work / "debian").mkdir()
         (work / "debian/control").write_text("Source: desk-switch\n\nPackage: desk-switch\nArchitecture: amd64\nDescription: Share input and audio between PCs\n")
         shlibs = subprocess.check_output(["dpkg-shlibdeps", "-O", "-e", str(binary)], cwd=work, text=True)
         native = next(line.split("=", 1)[1] for line in shlibs.splitlines() if line.startswith("shlibs:Depends="))
-        dependencies = native + ", pkexec, acl, udev, python3, ca-certificates, ddcutil, pipewire-bin, pipewire-pulse, pulseaudio-utils, libx11-6, libx11-xcb1, libxcursor1, libxrandr2, libxi6, libxinerama1, libxkbcommon0, libxkbcommon-x11-0, libwayland-client0, libegl1, libgl1"
+        dependencies = native + ", pkexec, polkitd, openssl, acl, udev, python3, ca-certificates, ddcutil, pipewire-bin, pipewire-pulse, pulseaudio-utils, libx11-6, libx11-xcb1, libxcursor1, libxrandr2, libxi6, libxinerama1, libxkbcommon0, libxkbcommon-x11-0, libwayland-client0, libegl1, libgl1"
         control = stage / "DEBIAN"
         control.mkdir()
         shutil.copyfile(ROOT / "packaging/linux/postinst", control / "postinst")

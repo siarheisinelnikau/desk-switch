@@ -50,6 +50,7 @@ struct Controls {
     stop: watch::Sender<bool>,
     commands: broadcast::Sender<Command>,
     monitor_required: Arc<AtomicBool>,
+    remote_cursor: watch::Sender<bool>,
 }
 
 static CONTROLS: OnceLock<Controls> = OnceLock::new();
@@ -66,6 +67,9 @@ fn controls() -> &'static Controls {
         let command_send = commands.clone();
         let monitor_required = Arc::new(AtomicBool::new(false));
         let required = Arc::clone(&monitor_required);
+        let (remote_cursor, _) =
+            watch::channel(std::env::var("DESK_SWITCH_REMOTE_CURSOR").as_deref() != Ok("off"));
+        let cursor_send = remote_cursor.clone();
         if let Err(error) = std::thread::Builder::new()
             .name("Desk Switch commands".into())
             .spawn(move || {
@@ -80,6 +84,12 @@ fn controls() -> &'static Controls {
                         }
                         "monitor-required on" => required.store(true, Ordering::Release),
                         "monitor-required off" => required.store(false, Ordering::Release),
+                        "remote-cursor on" => {
+                            cursor_send.send_replace(true);
+                        }
+                        "remote-cursor off" => {
+                            cursor_send.send_replace(false);
+                        }
                         "emergency" => {
                             let _ = command_send.send(Command::Emergency);
                         }
@@ -110,6 +120,7 @@ fn controls() -> &'static Controls {
             stop,
             commands,
             monitor_required,
+            remote_cursor,
         }
     })
 }
@@ -124,6 +135,10 @@ pub fn commands() -> broadcast::Receiver<Command> {
 
 pub fn monitor_required() -> bool {
     controls().monitor_required.load(Ordering::Acquire)
+}
+
+pub fn remote_cursor() -> watch::Receiver<bool> {
+    controls().remote_cursor.subscribe()
 }
 
 pub async fn shutdown() -> io::Result<()> {

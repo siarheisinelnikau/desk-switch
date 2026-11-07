@@ -27,6 +27,7 @@ pub struct NativeSink {
     inject: fn(Input) -> Result<()>,
     pointer: Option<super::win_cursor::Overlay>,
     pointer_failed: bool,
+    cursor_setting: tokio::sync::watch::Receiver<bool>,
 }
 
 impl NativeSink {
@@ -55,6 +56,7 @@ impl NativeSink {
             inject,
             pointer: None,
             pointer_failed: false,
+            cursor_setting: crate::lifecycle::remote_cursor(),
         })
     }
 
@@ -84,7 +86,7 @@ impl NativeSink {
 
     fn receiving_mouse(&mut self) {
         // Unit tests use an injected sink and must never create a native window.
-        if cfg!(test) {
+        if cfg!(test) || !*self.cursor_setting.borrow() {
             return;
         }
         if self.pointer.is_none() && !self.pointer_failed {
@@ -98,6 +100,7 @@ impl NativeSink {
         }
         if let Some(pointer) = &self.pointer {
             pointer.active(true);
+            pointer.refresh();
         }
     }
 }
@@ -196,7 +199,18 @@ fn inject(event: Input) -> Result<()> {
 
 impl Sink for NativeSink {
     async fn poll(&mut self) -> Result<()> {
-        std::future::pending().await
+        self.cursor_setting
+            .changed()
+            .await
+            .context("cursor setting channel closed")?;
+        let enabled = *self.cursor_setting.borrow_and_update();
+        if !enabled {
+            self.pointer = None;
+            self.pointer_failed = false;
+        } else if self.active {
+            self.receiving_mouse();
+        }
+        Ok(())
     }
 
     fn prepare(&self, edge: Option<u16>, mode: Mode) -> Result<()> {
@@ -331,6 +345,7 @@ mod tests {
             inject: fake,
             pointer: None,
             pointer_failed: false,
+            cursor_setting: tokio::sync::watch::channel(true).1,
         };
         sink.prepare(None, Mode::Input).unwrap();
         sink.activate(None, Mode::Input).unwrap();

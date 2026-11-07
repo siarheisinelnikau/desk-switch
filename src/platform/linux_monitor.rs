@@ -154,7 +154,7 @@ fn parse_input(output: &str) -> Result<u16> {
 }
 
 fn read_input(bus: u32) -> Result<u16> {
-    parse_input(&ddcutil(bus, &["--terse", "getvcp", "60"])?)
+    parse_input(&ddcutil(bus, &["--mccs=2.2", "--terse", "getvcp", "60"])?)
 }
 
 pub struct Ddc(pub String);
@@ -168,7 +168,14 @@ impl Monitor for Ddc {
         let bus = selected_bus(&displays()?, &self.0)?;
         ddcutil(
             bus,
-            &["--noverify", "setvcp", "60", &format!("0x{input:04x}")],
+            &[
+                "--noverify",
+                "--mccs=2.2",
+                "--maxtries=1,0,0",
+                "setvcp",
+                "60",
+                &format!("0x{input:04x}"),
+            ],
         )?;
         Ok(())
     }
