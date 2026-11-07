@@ -1,0 +1,25 @@
+VB-CABLE Virtual Audio Device — original VB-Audio installer archives
+
+VB-CABLE is developed and distributed by VB-Audio Software.
+Official website: https://www.vb-cable.com/
+Downloads and installation help: https://vb-audio.com/Cable/
+Support VB-Audio and donate: https://vb-audio.com/Donate/index.htm
+
+VB-CABLE is donationware, not part of Desk Switch's MIT-licensed code.
+The ordinary VB-CABLE archives are bundled AS IS, including the original
+installers and readme files, under VB-Audio's redistribution terms:
+https://vb-audio.com/Services/licensing.htm
+The separately licensed VB-CABLE A+B and C+D packages are not included.
+
+Desk Switch extracts these files only at your request. It does not install
+a driver automatically. Follow the original readme for your OS and keep
+your normal headphones as the system output. The macOS archive is a backup
+installer; Desk Switch itself currently supports Windows and Ubuntu.
+
+Downloaded from VB-Audio on 2026-11-07:
+Windows: VBCABLE_Driver_Pack46.zip
+https://download.vb-audio.com/Download_CABLE/VBCABLE_Driver_Pack46.zip
+SHA-256: bc44e8974191a5a2427d6c979e2dab08dbb09925f3f435dfa2f0ba3e45b6eb90
+macOS: VBCable_MACDriver_Pack108.zip
+https://download.vb-audio.com/Download_MAC/VBCable_MACDriver_Pack108.zip
+SHA-256: e46b41c6876995403cb1da37d7c0d566f59edd83aa9fcbcdc3a205eb0b6e05c7

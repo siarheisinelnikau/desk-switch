@@ -1,6 +1,7 @@
 pub mod devices;
 pub mod diagnostics;
 pub mod hardware;
+pub mod management;
 pub mod net;
 pub mod update;
 
@@ -194,6 +195,10 @@ impl Preferences {
 pub struct Node {
     pub key: String,
     pub name: String,
+    #[serde(default)]
+    pub version: Option<crate::compatibility::Version>,
+    #[serde(default)]
+    pub management: Option<management::State>,
     pub hardware: Hardware,
     #[serde(default)]
     pub devices: devices::Inventory,
@@ -218,6 +223,9 @@ pub struct Node {
 impl Node {
     pub fn validate(&self, own: &str, peer: &str) -> Result<()> {
         self.diagnostics.validate()?;
+        if let Some(management) = &self.management {
+            management.validate()?;
+        }
         ensure!(
             self.key == peer && own != peer,
             "unexpected computer identity"
@@ -799,6 +807,8 @@ mod tests {
         Node {
             key: key.into(),
             name: key.into(),
+            version: Some(crate::compatibility::Version::current()),
+            management: None,
             hardware: Hardware::default(),
             devices: devices::Inventory::default(),
             monitor: Monitor::default(),

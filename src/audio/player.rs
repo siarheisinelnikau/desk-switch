@@ -56,11 +56,19 @@ impl Player {
         };
         self.status(format!("paired; waiting for samples on {output}"));
         let mut started = false;
+        let mut reported = super::playout::Stats::default();
+        let mut reported_at = std::time::Instant::now();
         tokio::select! {
             result = stream::receive(&mut link, &renderer.queue, |_| {
                 if !started {
                     self.status(format!("playing on {output}"));
                     started = true;
+                }
+                let stats = renderer.queue.lock().unwrap().stats();
+                if stats != reported && reported_at.elapsed() >= Duration::from_secs(5) {
+                    stats.report();
+                    reported = stats;
+                    reported_at = std::time::Instant::now();
                 }
             }) => result,
             result = &mut renderer.done => {

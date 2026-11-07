@@ -166,6 +166,56 @@ fn choice(ui: &mut egui::Ui, id: &str, value: &mut String, options: &[(&str, &st
     before != *value
 }
 
+fn update_row(
+    ui: &mut egui::Ui,
+    name: &str,
+    version: Option<&crate::compatibility::Version>,
+    update: &crate::workspace::management::Update,
+    enabled: bool,
+) -> bool {
+    ui.horizontal_wrapped(|ui| {
+        ui.label(RichText::new(name).strong());
+        if let Some(version) = version {
+            note(
+                ui,
+                &format!("Version {} · protocol {}", version.app, version.protocol),
+            );
+        }
+    });
+    let status = if update.status.is_empty() {
+        "Check for updates to see the latest signed version."
+    } else {
+        &update.status
+    };
+    if update.failed {
+        ui.colored_label(palette(ui).error, crate::i18n::tr(status));
+    } else {
+        ui.label(crate::i18n::tr(status));
+    }
+    if let Some(progress) = &update.progress {
+        let fraction = progress.downloaded as f32 / progress.total.max(1) as f32;
+        ui.add(egui::ProgressBar::new(fraction).show_percentage());
+    }
+    ui.horizontal(|ui| {
+        let clicked = ui
+            .add_enabled(
+                enabled && update.can_install(),
+                egui::Button::new(crate::i18n::tr("Update & restart")),
+            )
+            .on_disabled_hover_text(crate::i18n::tr(if !enabled {
+                "Reconnect the PC and wait for its current operation to finish."
+            } else {
+                "This PC needs a newer verified installer before it can update."
+            }))
+            .clicked();
+        if update.checking || update.installing {
+            ui.spinner();
+        }
+        clicked
+    })
+    .inner
+}
+
 fn badge(ui: &mut egui::Ui, label: &str, active: bool) {
     let color = if active {
         palette(ui).green
@@ -830,6 +880,8 @@ impl Desktop {
                             ui.label(RichText::new(&peer.name).strong());
                             if peer.compatible() {
                                 note(ui, "Готов к подключению");
+                            } else if peer.manageable() {
+                                note(ui, "Connect to manage settings and updates. Input and audio wait for matching versions.");
                             } else {
                                 ui.colored_label(
                                     palette(ui).error,
@@ -847,7 +899,7 @@ impl Desktop {
                             let already = self.peer_key.is_empty()
                                 || peer.public_key.as_ref() == Some(&self.peer_key);
                             ui.add_enabled_ui(
-                                peer.compatible() && !self.pair.busy && already,
+                                peer.manageable() && !self.pair.busy && already,
                                 |ui| {
                                     if primary(ui, "Связать").clicked() {
                                         self.link_peer(&peer);
@@ -1598,37 +1650,10 @@ impl Desktop {
         title(
             ui,
             "Настройки",
-            "Автозапуск, единая версия на обоих ПК и подписанные обновления.",
+            "Manage both PCs, their application settings and signed updates.",
         );
-        let appearance = (self.prefs.theme.clone(), self.prefs.language.clone());
-        card(ui, |ui| {
-            subheading(ui, "Внешний вид и язык");
-            ui.label(crate::i18n::ui_text("Тема"));
-            choice(
-                ui,
-                "appearance-theme",
-                &mut self.prefs.theme,
-                &[
-                    ("system", "Как в системе"),
-                    ("light", "Светлая"),
-                    ("dark", "Тёмная"),
-                ],
-            );
-            ui.label(crate::i18n::ui_text("Язык интерфейса"));
-            choice(
-                ui,
-                "appearance-language",
-                &mut self.prefs.language,
-                &crate::i18n::LANGUAGES,
-            );
-            note(
-                ui,
-                "Изменения применяются сразу и сохраняются автоматически.",
-            );
-        });
-        if appearance != (self.prefs.theme.clone(), self.prefs.language.clone()) {
-            self.appearance_changed(ui.ctx());
-        }
+        self.update_settings(ui);
+        self.application_settings(ui);
         self.device_settings(ui);
         #[cfg(target_os = "linux")]
         card(ui, |ui| {
@@ -1647,106 +1672,236 @@ impl Desktop {
                 self.scan(super::QueryKind::InputAccess);
             }
         });
+    }
+
+    fn settings_peer_name(&self) -> String {
+        self.pair
+            .remote
+            .as_ref()
+            .or(self.pair.last_remote.as_ref())
+            .map(|node| node.name.clone())
+            .or_else(|| {
+                (!self.prefs.workspace.peer_name.is_empty())
+                    .then(|| self.prefs.workspace.peer_name.clone())
+            })
+            .unwrap_or_else(|| crate::i18n::tr("Other PC"))
+    }
+
+    fn application_settings(&mut self, ui: &mut egui::Ui) {
+        let peer_name = self.settings_peer_name();
+        let peer = self
+            .pair
+            .remote
+            .as_ref()
+            .and_then(|node| node.management.as_ref())
+            .cloned();
         card(ui, |ui| {
-            subheading(ui, "При входе в систему");
-            let changed = ui
-                .checkbox(
-                    &mut self.prefs.autostart,
-                    crate::i18n::tr("Запускать Desk Switch в трее при входе в систему"),
-                )
-                .changed()
-                | ui.checkbox(
-                    &mut self.prefs.auto_connect,
-                    crate::i18n::tr("Подключать настроенную пару при запуске приложения"),
-                )
-                .changed();
-            if changed {
-                self.save_application();
-            }
-            note(
-                ui,
-                "Подключение начинается после сопряжения и настройки. На Ubuntu может потребоваться системное подтверждение доступа.",
-            );
-        });
-        card(ui, |ui| {
-            subheading(ui, "Версии двух компьютеров");
-            ui.label(crate::i18n::ui_text(format!(
-                "Этот компьютер: {} · протокол {}",
-                crate::compatibility::VERSION,
-                crate::compatibility::PROTOCOL
-            )));
-            let peer = self
-                .pair
-                .remote
-                .as_ref()
-                .map(|_| crate::compatibility::VERSION)
-                .or_else(|| {
-                    [&self.input, &self.audio]
-                        .into_iter()
-                        .flatten()
-                        .find_map(|worker| worker.peer_version.as_deref())
+            subheading(ui, "Application settings");
+            ui.horizontal_wrapped(|ui| {
+                ui.selectable_value(&mut self.settings_remote, false, crate::i18n::tr("This PC"));
+                ui.add_enabled_ui(!self.peer_key.is_empty(), |ui| {
+                    ui.selectable_value(&mut self.settings_remote, true, &peer_name);
                 });
-            ui.label(crate::i18n::ui_text(format!(
-                "Другой компьютер: {}",
-                peer.map(str::to_owned)
-                    .unwrap_or_else(|| crate::i18n::tr("версия появится после подключения"))
-            )));
-            if let Some(error) = &self.last_version_error {
-                ui.colored_label(palette(ui).error, crate::i18n::ui_text(error));
+            });
+            let windows = if self.settings_remote {
+                self.pair
+                    .remote
+                    .as_ref()
+                    .is_some_and(|node| node.diagnostics.platform == "windows")
+            } else {
+                cfg!(windows)
+            };
+            let application = if self.settings_remote {
+                self.management_pending
+                    .as_ref()
+                    .and_then(|pending| pending.application.clone())
+                    .or_else(|| peer.as_ref().map(|state| state.application.clone()))
+            } else {
+                Some(self.local_application())
+            };
+            let Some(mut application) = application else {
+                note(
+                    ui,
+                    "Reconnect the other PC to edit its application settings.",
+                );
+                return;
+            };
+            let before = application.clone();
+            let enabled = !self.settings_remote || self.management_pending.is_none();
+            ui.add_enabled_ui(enabled, |ui| {
+                ui.label(crate::i18n::tr("Тема"));
+                choice(
+                    ui,
+                    "managed-theme",
+                    &mut application.theme,
+                    &[
+                        ("system", "Как в системе"),
+                        ("light", "Светлая"),
+                        ("dark", "Тёмная"),
+                    ],
+                );
+                ui.label(crate::i18n::tr("Язык интерфейса"));
+                choice(
+                    ui,
+                    "managed-language",
+                    &mut application.language,
+                    &crate::i18n::LANGUAGES,
+                );
+                ui.checkbox(
+                    &mut application.autostart,
+                    crate::i18n::tr("Запускать Desk Switch в трее при входе в систему"),
+                );
+                ui.checkbox(
+                    &mut application.auto_connect,
+                    crate::i18n::tr("Подключать настроенную пару при запуске приложения"),
+                );
+                ui.checkbox(
+                    &mut application.auto_update,
+                    crate::i18n::tr("Проверять и скачивать обновления автоматически"),
+                );
+                if windows {
+                    ui.checkbox(&mut application.show_remote_cursor, crate::i18n::tr("Show the remote cursor on Windows"));
+                    note(ui, "Adds a pointer only when Windows hides its native cursor while receiving the other PC's mouse. Turn it off to use only the native Windows cursor.");
+                }
+            });
+            if self.settings_remote && self.management_pending.is_some() {
+                note(ui, "Waiting for the other PC to save the change…");
+            } else {
+                note(
+                    ui,
+                    "Changes are saved on the selected PC. Shared device settings apply to the pair.",
+                );
             }
-            note(
-                ui,
-                "Приложения сверяют точную версию и протокол. При несовпадении ввод и звук не передаются.",
-            );
+            ui.separator();
+            if ui.button(crate::i18n::tr("VB-CABLE installers…")).clicked() {
+                self.cable_open = true;
+                self.cable_remote = self.settings_remote;
+            }
+            if application != before {
+                self.request_application(application, ui.ctx());
+            }
         });
+    }
+
+    fn update_settings(&mut self, ui: &mut egui::Ui) {
+        let local = self.local_management().update;
+        let remote = self
+            .pair
+            .remote
+            .as_ref()
+            .or(self.pair.last_remote.as_ref())
+            .cloned();
+        let connected = self.pair.remote.is_some();
+        let busy =
+            self.paired_update.is_some() || self.install_job.is_some() || self.install_pending;
+        let peer_busy = busy || self.peer_restart.is_some() || self.management_pending.is_some();
+        let peer_name = self.settings_peer_name();
+        let mut check = false;
+        let mut install_local = false;
+        let mut install_remote = false;
         card(ui, |ui| {
-            subheading(ui, "Обновления");
-            if ui
-                .checkbox(
-                    &mut self.prefs.auto_update,
-                    crate::i18n::ui_text("Проверять и скачивать обновления автоматически"),
-                )
-                .changed()
-            {
-                let result = self.prefs.save(&self.dir);
-                self.message(result, "Настройка обновлений сохранена.");
-            }
-            note(
-                ui,
-                "Проверяем при запуске и каждые 6 часов. Для установки нажмите «Обновить и перезапустить». На Ubuntu появится системный запрос пароля.",
-            );
-            ui.label(crate::i18n::ui_text(&self.update_status));
-            ui.horizontal(|ui| {
-                if ui
+            ui.horizontal_wrapped(|ui| {
+                subheading(ui, "Обновления");
+                check = ui
                     .add_enabled(
-                        self.update_job.is_none()
-                            && self.paired_update.is_none()
-                            && self.install_job.is_none()
-                            && !self.install_pending,
-                        egui::Button::new(crate::i18n::ui_text("Проверить обновления")),
+                        !busy && self.management_pending.is_none(),
+                        egui::Button::new(crate::i18n::tr("Проверить обновления")),
                     )
-                    .clicked()
-                {
-                    self.check_updates(ui.ctx());
-                }
-                if ui
-                    .add_enabled(
-                        self.update_ready && self.paired_update.is_none(),
-                        egui::Button::new(crate::i18n::ui_text("Обновить и перезапустить")),
-                    )
-                    .clicked()
-                {
-                    self.install_update(ui.ctx());
-                }
-                if self.update_job.is_some() || self.install_job.is_some() || self.install_pending {
-                    ui.spinner();
-                }
+                    .clicked();
             });
             note(
                 ui,
-                "Обновления подписаны ключом проекта. Релиз содержит сборки Windows и Ubuntu одной версии.",
+                "Check both linked PCs here. Each PC downloads and verifies its own installer.",
+            );
+            ui.separator();
+            install_local = update_row(
+                ui,
+                &crate::i18n::tr("This PC"),
+                Some(&crate::compatibility::Version::current()),
+                &local,
+                !busy,
+            );
+            if let Some(remote) = &remote {
+                ui.separator();
+                let mut update = remote
+                    .management
+                    .as_ref()
+                    .map(|state| state.update.clone())
+                    .unwrap_or_default();
+                if let Some((status, failed)) = &self.peer_update_status {
+                    update.status = status.clone();
+                    update.failed = *failed;
+                    update.installing |= self.peer_restart.is_some();
+                } else if !connected {
+                    update.status =
+                        "The other PC is disconnected. Reconnect it to manage updates.".into();
+                }
+                install_remote = update_row(
+                    ui,
+                    &peer_name,
+                    remote.version.as_ref(),
+                    &update,
+                    connected && remote.management.is_some() && !peer_busy,
+                );
+                if remote.management.is_none() {
+                    note(
+                        ui,
+                        "Install a version with remote management on both PCs once to manage future updates from either computer.",
+                    );
+                }
+            } else if !self.peer_key.is_empty() {
+                ui.separator();
+                subheading(ui, &peer_name);
+                if let Some(found) = self
+                    .discovered
+                    .values()
+                    .find(|peer| peer.public_key.as_deref() == Some(&self.peer_key))
+                {
+                    note(ui, &format!("Discovered version: {}", found.version));
+                    if !found.manageable() {
+                        note(
+                            ui,
+                            "Install a version with remote management on both PCs once to manage future updates from either computer.",
+                        );
+                        ui.hyperlink_to(
+                            crate::i18n::tr("Download the current version for the other PC"),
+                            "https://github.com/siarheisinelnikau/desk-switch/releases",
+                        );
+                    } else {
+                        note(ui, "Reconnect the other PC to check and update it here.");
+                    }
+                } else {
+                    note(ui, "Reconnect the other PC to check and update it here.");
+                }
+            }
+            if let Some(error) = &self.last_version_error {
+                ui.colored_label(palette(ui).error, crate::i18n::tr(error));
+                note(
+                    ui,
+                    "Settings and updates remain available while input and audio wait for matching versions.",
+                );
+            }
+            note(
+                ui,
+                "The installed Ubuntu edition updates without a password prompt. Updating only the other PC keeps this one running.",
             );
         });
+        if check {
+            self.check_updates(ui.ctx());
+            if connected
+                && remote
+                    .as_ref()
+                    .is_some_and(|node| node.management.is_some())
+            {
+                self.check_remote_updates(ui.ctx());
+            }
+        }
+        if install_local {
+            self.install_update(ui.ctx());
+        }
+        if install_remote {
+            self.start_remote_update(ui.ctx());
+        }
     }
 }
 
@@ -1798,7 +1953,7 @@ impl Desktop {
                     }
                     if node.hardware.known && !node.devices.individual_input && node.devices.microphone_bridges.is_empty() {
                         note(ui, "Receiving a microphone on Windows needs a virtual cable. Install VB-CABLE, then select CABLE Output in your calling app.");
-                        ui.hyperlink_to(crate::i18n::tr("VB-CABLE setup"), "https://vb-audio.com/Cable/");
+                        if ui.button(crate::i18n::tr("VB-CABLE installers…")).clicked() { self.cable_open = true; self.cable_remote = node.key != local.key; }
                     }
                     if !node.devices.individual_input && node.devices.microphone_bridges.iter().any(|d| d.default) {
                         note(ui, "Keep your regular headphones as the Windows output; select CABLE Output only as the calling app's microphone.");
@@ -1814,5 +1969,56 @@ impl Desktop {
         if before != self.prefs.workspace.shared.devices {
             self.shared_changed();
         }
+    }
+}
+
+impl Desktop {
+    pub(super) fn cable_dialog(&mut self, ctx: &egui::Context) {
+        if !self.cable_open {
+            return;
+        }
+        let mut open = self.cable_open;
+        egui::Window::new(crate::i18n::tr("VB-CABLE installers"))
+            .open(&mut open).collapsible(false).resizable(false).default_width(500.0)
+            .show(ctx, |ui| {
+                note(ui, "VB-CABLE by VB-Audio Software is donationware. Get the latest installer from the official website, or extract the saved original archive without an internet connection.");
+                ui.horizontal_wrapped(|ui| {
+                    ui.hyperlink_to(crate::i18n::tr("Download from VB-Audio"), crate::cable::WEBSITE);
+                    ui.hyperlink_to(crate::i18n::tr("Support VB-Audio"), crate::cable::DONATE);
+                });
+                ui.separator();
+                let busy = self.cable_job.is_some() || self.management_pending.as_ref().is_some_and(|p| p.cable);
+                ui.add_enabled_ui(!busy, |ui| {
+                    ui.horizontal(|ui| {
+                        for platform in [crate::cable::Platform::Windows, crate::cable::Platform::MacOS] {
+                            ui.selectable_value(&mut self.cable_platform, platform, platform.label());
+                        }
+                    });
+                    note(ui, self.cable_platform.archive());
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label(crate::i18n::tr("Extract on:"));
+                        ui.selectable_value(&mut self.cable_remote, false, crate::i18n::tr("This PC"));
+                        ui.add_enabled_ui(self.pair.remote.as_ref().is_some_and(|node| node.management.is_some()), |ui| {
+                            let name = self.settings_peer_name();
+                            ui.selectable_value(&mut self.cable_remote, true, name);
+                        });
+                    });
+                    if ui.button(crate::i18n::tr("Extract saved installer")).clicked() { self.extract_cable(ctx); }
+                });
+                if busy { note(ui, "Extracting the original archive…"); }
+                if self.cable_remote_done { note(ui, "Extracted to Downloads / Desk Switch on the other PC."); }
+                if let Some(result) = &self.cable_result {
+                    match result {
+                        Ok(path) => {
+                            ui.label(path.display().to_string());
+                            if ui.button(crate::i18n::tr("Open folder")).clicked()
+                                && let Err(error) = crate::cable::open_folder(path) { self.notice = Some((error.to_string(), true)); }
+                        },
+                        Err(error) => { ui.colored_label(palette(ui).error, crate::i18n::tr(error)); }
+                    }
+                }
+                note(ui, "Files are saved in Downloads / Desk Switch. The driver is installed manually; follow the included readme. Desk Switch supports Windows and Ubuntu; the macOS installer is provided as a backup.");
+            });
+        self.cable_open = open;
     }
 }

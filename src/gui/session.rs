@@ -130,6 +130,8 @@ impl Desktop {
         let mut node = Node {
             key: self.public_key.clone(),
             name: discovery::computer_name(),
+            version: Some(crate::compatibility::Version::current()),
+            management: Some(self.local_management()),
             hardware: {
                 let mut choices = self.prefs.workspace.shared.devices_for(&self.public_key);
                 if let Some(binding) = &self.prefs.workspace.shared.microphone_binding
@@ -432,6 +434,7 @@ impl Desktop {
                 }
                 Event::Update(message) => self.receive_update(message, ctx),
                 Event::UpdateSent(message) => self.sent_update(&message, ctx),
+                Event::Management(message) => self.receive_management(message, ctx),
                 Event::Forgotten => self.apply_forget(),
                 Event::Closed(error) => {
                     self.pair.connection_lost(error, Instant::now());
@@ -489,11 +492,14 @@ impl Desktop {
             }
         }
         self.pair.synced = self.pair.scanned
-            && self
-                .pair
-                .remote
-                .as_ref()
-                .is_some_and(|r| r.hardware.known && !node.ack.is_empty() && node.ack == r.ack);
+            && self.pair.remote.as_ref().is_some_and(|r| {
+                r.hardware.known
+                    && !node.ack.is_empty()
+                    && node.ack == r.ack
+                    && crate::compatibility::Version::current()
+                        .require(r.version.as_ref())
+                        .is_ok()
+            });
         if self
             .prefs
             .workspace
@@ -536,7 +542,7 @@ impl Desktop {
                 .values()
                 .find(|p| p.public_key.as_ref() == Some(&self.peer_key))
                 .cloned();
-            if let Some(peer) = found.filter(discovery::Peer::compatible) {
+            if let Some(peer) = found.filter(discovery::Peer::manageable) {
                 self.link_peer(&peer);
             } else if let Ok(address) = self.prefs.workspace.last_address.parse::<SocketAddr>()
                 && let Some(service) = &self.pair.service
@@ -576,8 +582,8 @@ impl Desktop {
         self.pair.auto_suspended = false;
         let result: Result<()> = (|| {
             ensure!(
-                peer.compatible(),
-                "Версии не совпадают. Обновите оба компьютера."
+                peer.manageable(),
+                "Install a version with remote management on both PCs once to manage future updates from either computer."
             );
             let service = self
                 .pair
@@ -726,6 +732,7 @@ impl Desktop {
     }
 
     pub(super) fn retry_devices(&mut self) {
+        self.pair.last_monitor_check = None;
         if let Some((_, error)) = self.device_notice.take()
             && self
                 .notice
@@ -859,6 +866,24 @@ impl Desktop {
         let Some(remote) = self.pair.remote.clone() else {
             return;
         };
+        if crate::compatibility::Version::current()
+            .require(remote.version.as_ref())
+            .is_err()
+        {
+            for worker in [
+                &mut self.input,
+                &mut self.monitor,
+                &mut self.audio,
+                &mut self.microphone,
+            ]
+            .into_iter()
+            .flatten()
+            {
+                worker.stop();
+            }
+            self.pair.active_plan = None;
+            return;
+        }
         let Some(address) = self.pair.remote_address else {
             return;
         };
@@ -904,18 +929,10 @@ impl Desktop {
                 .as_ref()
                 .is_none_or(|w| !w.running() || !w.monitoring)
             && self.query.is_none()
+            && self.pair.last_monitor_check.is_none()
         {
-            let remaining = self
-                .pair
-                .last_monitor_check
-                .map(|since| Duration::from_secs(5).saturating_sub(since.elapsed()))
-                .unwrap_or_default();
-            if remaining.is_zero() {
-                self.pair.last_monitor_check = Some(Instant::now());
-                self.scan(QueryKind::MonitorStatus);
-            } else {
-                self.ctx.request_repaint_after(remaining);
-            }
+            self.pair.last_monitor_check = Some(Instant::now());
+            self.scan(QueryKind::MonitorStatus);
         }
         let mut input_profile = String::new();
         if let Some(source) = plan.input_source.as_ref() {

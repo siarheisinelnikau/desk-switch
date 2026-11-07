@@ -47,10 +47,14 @@ pub enum Effect {
     Install,
     Quit,
     Error(String),
+    PeerRestart(String),
 }
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum Side {
-    Initiator { local_first: bool },
+    Initiator {
+        local_first: bool,
+        local_update: bool,
+    },
     Receiver,
 }
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -84,6 +88,7 @@ impl Coordinator {
             version,
             side: Side::Initiator {
                 local_first: local_linux || !remote_linux,
+                local_update: true,
             },
             phase: Phase::AwaitReady,
             authorization: local_linux,
@@ -92,6 +97,28 @@ impl Coordinator {
             progress: Instant::now(),
             peer_lost: None,
         }
+    }
+    pub fn peer_only(id: u64, version: String, remote_linux: bool) -> Self {
+        let mut update = Self::outgoing(id, version, false, remote_linux);
+        update.side = Side::Initiator {
+            local_first: false,
+            local_update: false,
+        };
+        update
+    }
+    pub fn remote_only(&self) -> bool {
+        matches!(
+            self.side,
+            Side::Initiator {
+                local_update: false,
+                ..
+            }
+        )
+    }
+    pub fn without_password(mut self) -> Self {
+        self.authorization = false;
+        self.remote_authorization = false;
+        self
     }
     pub fn incoming(id: u64, version: String, authorization: bool) -> Result<Self> {
         Message::Prepare {
@@ -136,12 +163,18 @@ impl Coordinator {
     }
     pub fn status(&self) -> &'static str {
         match self.phase {
+            Phase::AwaitReady if self.remote_only() => {
+                "Preparing the signed update on the other PC…"
+            }
             Phase::AwaitReady | Phase::Download => "Preparing the same signed update on both PCs…",
             Phase::Ready => "Update verified. Waiting for the other PC…",
             Phase::InstallQueued | Phase::Installing if self.authorization => {
                 "Confirm installation in Ubuntu's system password dialog."
             }
             Phase::InstallQueued | Phase::Installing => "Installing the verified update…",
+            Phase::AwaitRemote if self.remote_authorization && self.remote_only() => {
+                "Confirm installation in the Ubuntu PC's system password dialog. This PC stays running."
+            }
             Phase::AwaitRemote if self.remote_authorization => {
                 "Confirm installation on the Ubuntu PC. This PC will update after Ubuntu accepts the installation."
             }
@@ -156,8 +189,15 @@ impl Coordinator {
         ensure!(message.id() == self.id, "stale update request");
         self.progress = Instant::now();
         match (&self.side, self.phase, message) {
-            (Side::Initiator { local_first }, Phase::AwaitReady, Message::Ready(_)) => {
-                if *local_first {
+            (
+                Side::Initiator {
+                    local_first,
+                    local_update,
+                },
+                Phase::AwaitReady,
+                Message::Ready(_),
+            ) => {
+                if *local_update && *local_first {
                     self.phase = Phase::Installing;
                     Ok(vec![Effect::Install])
                 } else {
@@ -191,6 +231,10 @@ impl Coordinator {
                 Ok(vec![])
             }
             (Side::Initiator { .. }, Phase::AwaitRemote, Message::Handoff(_)) => {
+                if self.remote_only() {
+                    self.phase = Phase::Done;
+                    return Ok(vec![Effect::PeerRestart(self.version.clone())]);
+                }
                 self.phase = Phase::Installing;
                 Ok(vec![Effect::Install])
             }
@@ -253,11 +297,15 @@ impl Coordinator {
                 self.phase = Phase::SendingHandoff;
                 vec![Effect::Send(Message::Handoff(self.id))]
             }
-            Side::Initiator { local_first: true } => {
+            Side::Initiator {
+                local_first: true, ..
+            } => {
                 self.phase = Phase::AwaitRemoteStart;
                 vec![Effect::Send(Message::Commit(self.id))]
             }
-            Side::Initiator { local_first: false } => {
+            Side::Initiator {
+                local_first: false, ..
+            } => {
                 self.phase = Phase::Done;
                 vec![Effect::Quit]
             }
@@ -431,5 +479,57 @@ mod tests {
         assert_eq!(peer.sent(&notice), [Effect::Install]);
         assert_eq!(peer.installed(), [Effect::Send(Message::Handoff(4))]);
         assert_eq!(peer.sent(&Message::Handoff(4)), [Effect::Quit]);
+    }
+
+    #[test]
+    fn updating_only_the_peer_never_installs_or_quits_the_initiator() {
+        for linux in [false, true] {
+            let mut local = Coordinator::peer_only(20, next_version(), linux).without_password();
+            let mut peer = Coordinator::incoming(20, next_version(), false).unwrap();
+            assert!(local.remote_only());
+            assert_eq!(
+                local.receive(Message::Ready(20)).unwrap(),
+                [Effect::Send(Message::Commit(20))]
+            );
+            let installing = Message::Installing {
+                id: 20,
+                authorization: false,
+            };
+            assert_eq!(peer.prepared("99.0.0"), [Effect::Send(Message::Ready(20))]);
+            assert_eq!(
+                peer.receive(Message::Commit(20)).unwrap(),
+                [Effect::Send(installing.clone())]
+            );
+            assert!(local.receive(installing.clone()).unwrap().is_empty());
+            assert_eq!(peer.sent(&installing), [Effect::Install]);
+            assert_eq!(peer.installed(), [Effect::Send(Message::Handoff(20))]);
+            assert_eq!(
+                local.receive(Message::Handoff(20)).unwrap(),
+                [Effect::PeerRestart(next_version())]
+            );
+            for replay in [Message::Ready(20), installing, Message::Handoff(20)] {
+                assert!(local.receive(replay).unwrap().is_empty());
+            }
+            assert!(local.done());
+            assert!(!local.handed_off);
+            assert!(local.installed().is_empty());
+        }
+    }
+    #[test]
+    fn failed_peer_only_update_leaves_the_current_installation_running() {
+        let mut local = Coordinator::peer_only(21, next_version(), true).without_password();
+        local.receive(Message::Ready(21)).unwrap();
+        assert_eq!(
+            local
+                .receive(Message::Failed {
+                    id: 21,
+                    message: "Signature verification failed".into()
+                })
+                .unwrap(),
+            [Effect::Error("Signature verification failed".into())]
+        );
+        assert!(local.done());
+        assert!(local.receive(Message::Handoff(21)).unwrap().is_empty());
+        assert!(local.receive(Message::Ready(22)).is_err());
     }
 }

@@ -1,0 +1,136 @@
+#!/usr/bin/python3 -I
+"""Install only a newer Desk Switch Debian package verified by the pinned project key."""
+import hashlib
+import json
+import os
+from pathlib import Path
+import re
+import stat
+import subprocess
+import sys
+import tempfile
+
+REPOSITORY = 'siarheisinelnikau/desk-switch'
+PUBLIC_KEY = Path('/usr/share/desk-switch/update-public-key.hex')
+OPENSSL = '/usr/bin/openssl'
+ENVIRONMENT = {'PATH': '/usr/sbin:/usr/bin:/sbin:/bin', 'LC_ALL': 'C', 'DEBIAN_FRONTEND': 'noninteractive'}
+MAX_PACKAGE = 128 * 1024 * 1024
+
+
+def owned_file(value, uid, limit):
+    descriptor = os.open(value, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK)
+    try:
+        metadata = os.fstat(descriptor)
+        if not stat.S_ISREG(metadata.st_mode) or metadata.st_uid != uid or not 0 < metadata.st_size <= limit:
+            raise ValueError('The installer and manifest must be regular files owned by the desktop user')
+        return os.fdopen(descriptor, 'rb')
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
+def public_key():
+    metadata = PUBLIC_KEY.lstat()
+    if not stat.S_ISREG(metadata.st_mode) or metadata.st_uid != 0 or metadata.st_mode & 0o022:
+        raise ValueError('The pinned update key must be installed and owned by the administrator')
+    value = PUBLIC_KEY.read_text().strip()
+    if not re.fullmatch('[0-9a-f]{64}', value):
+        raise ValueError('Invalid installed update key')
+    return bytes.fromhex(value)
+
+
+def verified_manifest(data, work, key):
+    envelope = json.loads(data)
+    if not isinstance(envelope, dict) or set(envelope) != {'payload', 'signature'}:
+        raise ValueError('Invalid signed update envelope')
+    payload, signature = envelope['payload'], envelope['signature']
+    if not isinstance(payload, str) or len(payload.encode()) > 64 * 1024 or not isinstance(signature, str) or not re.fullmatch('[0-9a-f]{128}', signature):
+        raise ValueError('Invalid update signature or payload')
+    (work / 'key.der').write_bytes(bytes.fromhex('302a300506032b6570032100') + key)
+    (work / 'payload').write_bytes(payload.encode())
+    (work / 'signature').write_bytes(bytes.fromhex(signature))
+    result = subprocess.run([OPENSSL, 'pkeyutl', '-verify', '-rawin', '-pubin', '-keyform', 'DER',
+                             '-inkey', str(work / 'key.der'), '-sigfile', str(work / 'signature'),
+                             '-in', str(work / 'payload')], capture_output=True, env=ENVIRONMENT, timeout=15)
+    if result.returncode:
+        raise ValueError('The update signature does not match the pinned Desk Switch key')
+    release = json.loads(payload)
+    version = release.get('version', '')
+    if not isinstance(version, str) or not re.fullmatch(r'(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)', version):
+        raise ValueError('Only stable numbered updates are allowed')
+    artifact = release.get('targets', {}).get('linux-x86_64-deb', {})
+    expected = f'https://github.com/{REPOSITORY}/releases/download/v{version}/desk-switch-v{version}-linux-x86-64.deb'
+    if artifact.get('url') != expected or type(artifact.get('size')) is not int or not 0 < artifact['size'] <= MAX_PACKAGE or not re.fullmatch('[0-9a-f]{64}', artifact.get('sha256', '')):
+        raise ValueError('The signature must describe the official Desk Switch amd64 Debian installer')
+    return version, artifact
+
+
+def package_metadata(archive):
+    return {field: subprocess.check_output(['/usr/bin/dpkg-deb', '--field', str(archive), field],
+                text=True, env=ENVIRONMENT, timeout=30).strip() for field in ['Package', 'Version', 'Architecture']}
+
+
+def prepare_verified(archive, envelope, uid, work, key):
+    with owned_file(envelope, uid, 128 * 1024) as stream:
+        data = stream.read(128 * 1024 + 1)
+    if len(data) > 128 * 1024:
+        raise ValueError('Signed update information is too large')
+    version, artifact = verified_manifest(data, work, key)
+    destination = work / 'desk-switch.deb'
+    digest, received = hashlib.sha256(), 0
+    with owned_file(archive, uid, artifact['size']) as source, destination.open('xb') as output:
+        while block := source.read(64 * 1024):
+            received += len(block)
+            if received > artifact['size']:
+                raise ValueError('The installer exceeds its signed size')
+            digest.update(block)
+            output.write(block)
+    if received != artifact['size'] or digest.hexdigest() != artifact['sha256']:
+        raise ValueError('The installer does not match its pinned signature and SHA-256 digest')
+    expected = {'Package': 'desk-switch', 'Version': version, 'Architecture': 'amd64'}
+    if package_metadata(destination) != expected:
+        raise ValueError('The verified installer is not the expected Desk Switch package')
+    return version, destination
+
+
+def require_newer(version):
+    current = subprocess.check_output(['/usr/bin/dpkg-query', '--show', '--showformat=${Version}', 'desk-switch'],
+                                      text=True, env=ENVIRONMENT, timeout=15).strip()
+    newer = subprocess.run(['/usr/bin/dpkg', '--compare-versions', version, 'gt', current], env=ENVIRONMENT, timeout=15)
+    if newer.returncode:
+        raise ValueError('The signed update must be newer than the installed package')
+
+
+def install(archive, envelope):
+    if os.geteuid() != 0:
+        raise ValueError('Use the installed Desk Switch update permission action')
+    value = os.environ.get('PKEXEC_UID', '')
+    if not value.isascii() or not value.isdecimal() or not 0 < int(value) < 2**32:
+        raise ValueError('An authenticated desktop user is required')
+    # Both input files remain untrusted. Only a root-private copy whose pinned
+    # signature, exact bytes and package identity pass every check reaches apt.
+    import fcntl
+    descriptor = os.open('/run/desk-switch-update.lock', os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+    try:
+        metadata = os.fstat(descriptor)
+        if metadata.st_uid != 0 or not stat.S_ISREG(metadata.st_mode):
+            raise ValueError('Untrusted system update lock')
+        fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        with tempfile.TemporaryDirectory(prefix='desk-switch-update-', dir='/var/tmp') as directory:
+            version, package = prepare_verified(archive, envelope, int(value), Path(directory), public_key())
+            require_newer(version)
+            subprocess.run(['/usr/bin/apt-get', '-o', 'DPkg::Lock::Timeout=120', '-o', 'Dpkg::Options::=--force-confold',
+                            '--assume-yes', '--no-remove', 'install', '--', str(package)],
+                           stdin=subprocess.DEVNULL, env=ENVIRONMENT, timeout=600, check=True)
+    finally:
+        os.close(descriptor)
+
+
+if __name__ == '__main__':
+    try:
+        if len(sys.argv) != 3:
+            raise ValueError('Expected exactly one Debian installer and its signed manifest')
+        install(sys.argv[1], sys.argv[2])
+    except Exception as error:
+        print(f'Desk Switch update was not installed: {error}', file=sys.stderr)
+        sys.exit(1)

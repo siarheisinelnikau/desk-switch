@@ -132,6 +132,8 @@ impl Desktop {
         let mut local = Node {
             key: self.public_key.clone(),
             name: "Studio PC".into(),
+            version: Some(crate::compatibility::Version::current()),
+            management: Some(self.local_management()),
             hardware: Hardware {
                 known: true,
                 audio_score: 40,
@@ -348,6 +350,29 @@ impl Desktop {
             remote.monitor.fingerprint = "preview-hdmi-edid".into();
             local.monitor.fingerprint = "preview-displayport-edid".into();
         }
+        if [
+            "shared-managed-settings",
+            "shared-managed-updates",
+            "shared-cable",
+        ]
+        .contains(&case)
+        {
+            self.page = Page::Application;
+            local.diagnostics.platform = if cfg!(windows) { "windows" } else { "linux" }.into();
+            remote.diagnostics.platform = "windows".into();
+            let mut managed = self.local_management();
+            managed.application.autostart = true;
+            managed.update.version = Some("0.5.0".into());
+            managed.update.channel_version = Some("0.5.0".into());
+            managed.update.ready = true;
+            managed.update.status = "Version 0.5.0 is verified and ready to install.".into();
+            remote.management = Some(managed);
+            self.update_status = "Last checked: no newer release was available.".into();
+            self.settings_remote = case == "shared-managed-settings";
+            if case == "shared-cable" {
+                self.cable_open = true;
+            }
+        }
         remote.shared = local.shared.clone();
         self.prefs.workspace.shared = local.shared.clone();
         self.pair.hardware = local.hardware.clone();
@@ -386,6 +411,7 @@ impl Desktop {
                     addresses: vec!["192.0.2.5:45876".parse().unwrap()],
                     public_key: Some(key.repeat(32)),
                     control_port: Some(crate::workspace::PORT),
+                    control_protocol: Some(crate::workspace::management::PROTOCOL),
                 };
                 self.discovered.insert(peer.id.clone(), peer);
             }

@@ -25,11 +25,7 @@ enum Stage {
 }
 enum Exchange {
     Source(Controller),
-    Target {
-        id: u64,
-        stage: Stage,
-        fallback: bool,
-    },
+    Target { id: u64, stage: Stage },
 }
 struct Session<'a> {
     video: &'a VideoWorker,
@@ -112,7 +108,6 @@ impl<'a> Session<'a> {
             self.exchange = Some(Exchange::Target {
                 id,
                 stage: Stage::Armed,
-                fallback: false,
             });
             self.deadline = Instant::now() + Duration::from_secs(15);
             return pipe.send(Message::Ready(id)).await;
@@ -122,11 +117,7 @@ impl<'a> Session<'a> {
                 let effect = controller.message(message)?;
                 self.effect(pipe, effect).await
             }
-            Some(Exchange::Target {
-                id,
-                stage,
-                fallback,
-            }) => match message {
+            Some(Exchange::Target { id, stage }) => match message {
                 Message::SelectMonitor(reply) if reply == *id && *stage == Stage::Armed => {
                     *stage = Stage::Selecting;
                     self.job = Some(self.video.submit(Job::Select {
@@ -137,7 +128,6 @@ impl<'a> Session<'a> {
                 }
                 Message::Verify(reply) if reply == *id && *stage == Stage::Fallback => {
                     *stage = Stage::Reading;
-                    *fallback = true;
                     self.read_after = Instant::now() + SETTLE;
                     Ok(())
                 }
@@ -172,18 +162,21 @@ impl<'a> Session<'a> {
         if let Some(result) = result {
             match &mut self.exchange {
                 Some(Exchange::Source(controller)) => {
-                    result.context(
-                        "the active port could not select the other PC's remembered input",
-                    )?;
+                    if let Err(error) = result
+                        && !crate::video::write_attempted(&error)
+                    {
+                        return Err(error.context(
+                            "the active port could not select the other PC's remembered input",
+                        ));
+                    }
                     let effect = controller.written()?;
                     self.effect(pipe, effect).await?;
                 }
-                Some(Exchange::Target {
-                    id,
-                    stage,
-                    fallback,
-                }) => {
-                    if *stage == Stage::Selecting && matches!(result, Ok(VideoResult::Written)) {
+                Some(Exchange::Target { id, stage }) => {
+                    if *stage == Stage::Selecting
+                        && (matches!(result, Ok(VideoResult::Written))
+                            || result.as_ref().is_err_and(crate::video::write_attempted))
+                    {
                         *stage = Stage::Reading;
                         self.read_after = Instant::now() + SETTLE;
                     } else if *stage == Stage::Reading
@@ -199,7 +192,7 @@ impl<'a> Session<'a> {
                         if let Err(error) = result {
                             eprintln!("Monitor selection/read: {error:#}");
                         }
-                        if !*fallback {
+                        if *stage == Stage::Selecting {
                             *stage = Stage::Fallback;
                             pipe.send(Message::SelectFallback(*id)).await?;
                         } else {
@@ -224,20 +217,10 @@ impl<'a> Session<'a> {
         Ok(())
     }
     async fn recover(&mut self) {
-        let recover = match &mut self.exchange {
-            Some(Exchange::Source(controller)) => controller.abort().then_some(self.inputs),
-            Some(Exchange::Target { stage, .. }) if *stage != Stage::Armed => Some(Inputs {
-                host: self.inputs.peer,
-                peer: self.inputs.host,
-            }),
-            _ => None,
-        };
+        // A failed confirmation must not start another input selection. The
+        // last requested monitor input remains in place until the user retries.
+        self.exchange = None;
         self.job.take();
-        if let Some(inputs) = recover
-            && let Err(error) = self.video.recover(inputs).await
-        {
-            eprintln!("Monitor recovery: {error:#}");
-        }
     }
 }
 
@@ -337,9 +320,18 @@ mod tests {
         writes: Arc<AtomicUsize>,
         own: u16,
         active_only: bool,
+        delayed: bool,
+        write_error: bool,
+        pending: Option<(u16, std::time::Instant)>,
     }
     impl Monitor for Display {
         fn read(&mut self) -> Result<u16> {
+            if let Some((input, since)) = self.pending
+                && since.elapsed() >= Duration::from_millis(1100)
+            {
+                self.input.store(input, SeqCst);
+                self.pending = None;
+            }
             let input = self.input.load(SeqCst);
             ensure!(!self.active_only || input == self.own, "inactive DDC port");
             Ok(input)
@@ -352,7 +344,15 @@ mod tests {
                 );
             }
             self.writes.fetch_add(1, SeqCst);
-            self.input.store(input, SeqCst);
+            if self.delayed {
+                self.pending = Some((input, std::time::Instant::now()));
+            } else {
+                self.input.store(input, SeqCst);
+            }
+            ensure!(
+                !self.write_error,
+                "simulated I/O error after accepted DDC write"
+            );
             Ok(())
         }
     }
@@ -365,7 +365,7 @@ mod tests {
             public: pair.public.try_into().unwrap(),
         }
     }
-    async fn fixture(active_only: bool, initial: u16) {
+    async fn fixture(active_only: bool, initial: u16, delayed: bool, write_error: bool) {
         let a = identity();
         let b = identity();
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -386,6 +386,9 @@ mod tests {
             writes: a_writes.clone(),
             own: 17,
             active_only,
+            delayed,
+            write_error,
+            pending: None,
         })
         .unwrap();
         let b_video = VideoWorker::start(Display {
@@ -393,6 +396,9 @@ mod tests {
             writes: b_writes.clone(),
             own: 15,
             active_only,
+            delayed,
+            write_error,
+            pending: None,
         })
         .unwrap();
         let (a_commands, a_receive) = broadcast::channel(8);
@@ -433,14 +439,22 @@ mod tests {
     }
     #[tokio::test]
     async fn each_destination_selects_its_own_port_without_input_devices() {
-        fixture(false, 17).await;
+        fixture(false, 17, false, false).await;
     }
     #[tokio::test]
     async fn starting_on_the_other_input_still_switches_on_the_first_click() {
-        fixture(false, 15).await;
+        fixture(false, 15, false, false).await;
     }
     #[tokio::test]
     async fn inactive_ports_fall_back_to_the_active_pc_in_both_directions() {
-        fixture(true, 17).await;
+        fixture(true, 17, false, false).await;
+    }
+    #[tokio::test]
+    async fn slow_monitor_confirmation_never_repeats_an_issued_input_write() {
+        fixture(false, 17, true, false).await;
+    }
+    #[tokio::test]
+    async fn error_reported_after_an_accepted_write_does_not_trigger_a_second_write() {
+        fixture(false, 15, true, true).await;
     }
 }
