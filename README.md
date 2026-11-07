@@ -6,10 +6,10 @@ Two computers. One workspace. Share a keyboard, mouse, system audio and micropho
 
 ## Install
 
-Get the **same version on both PCs** from [Releases](https://github.com/siarheisinelnikau/desk-switch/releases/latest). New releases contain exactly two downloads:
+Get the **same version on both PCs** from [Releases](https://github.com/siarheisinelnikau/desk-switch/releases). New releases contain exactly two downloads:
 
-- **Ubuntu 24.04/26.04 x86-64:** `desk-switch-v0.4.8-linux.deb`.
-- **Windows x86-64:** `desk-switch-v0.4.8-windows.exe`.
+- **Ubuntu 24.04/26.04 x86-64:** [desk-switch-v0.4.8-linux.deb](https://github.com/siarheisinelnikau/desk-switch/releases/download/v0.4.8/desk-switch-v0.4.8-linux.deb).
+- **Windows x86-64:** [desk-switch-v0.4.8-windows.exe](https://github.com/siarheisinelnikau/desk-switch/releases/download/v0.4.8/desk-switch-v0.4.8-windows.exe).
 
 ```sh
 sudo apt install ./desk-switch-v0.4.8-linux.deb
