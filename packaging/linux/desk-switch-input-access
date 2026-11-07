@@ -1,71 +1,224 @@
 #!/usr/bin/python3 -I
-"""Grant the invoking desktop user read access to selected physical input nodes."""
+"""Authorize selected physical input interfaces and restore their grants after hotplug."""
+import json
 import os
 from pathlib import Path
+import pwd
 import re
 import stat
 import subprocess
 import sys
+import tempfile
+
+STATE = Path('/etc/desk-switch/input-access')
 
 
 def input_path(value):
     path = Path(value).resolve(strict=True)
-    if not re.fullmatch(r"/dev/input/event[0-9]+", str(path)):
-        raise ValueError("Only /dev/input/event devices can be authorized")
+    if not re.fullmatch(r'/dev/input/event[0-9]+', str(path)):
+        raise ValueError('Only /dev/input/event devices can be authorized')
     return path
 
 
 def supported(path, metadata):
     if not stat.S_ISCHR(metadata.st_mode) or metadata.st_uid != 0:
-        raise ValueError("The selected input must be a root-owned character device")
+        raise ValueError('The selected input must be a root-owned character device')
     major, minor = os.major(metadata.st_rdev), os.minor(metadata.st_rdev)
     if major != 13 or not 64 <= minor < 1024:
-        raise ValueError("The selected device is not an evdev interface")
-    device = Path(f"/sys/dev/char/{major}:{minor}/device")
-    if (device / "id/bustype").read_text().strip() == "0006":
-        raise ValueError("Virtual input devices cannot be authorized")
+        raise ValueError('The selected device is not an evdev interface')
+    device = Path(f'/sys/dev/char/{major}:{minor}/device')
+    bus = (device / 'id/bustype').read_text().strip()
+    if bus == '0006':
+        raise ValueError('Virtual input devices cannot be authorized')
     def bit(name, code):
-        words = (device / f"capabilities/{name}").read_text().split()
+        words = (device / f'capabilities/{name}').read_text().split()
         index = code // 64
         return index < len(words) and bool(int(words[-1-index], 16) & (1 << (code % 64)))
-    if any(bit("abs", axis) for axis in [0, 1, 53, 54]):
-        raise ValueError("Select a relative mouse and keyboard, not an absolute pointer")
-    keyboard = all(bit("key", key) for key in [30, 57, 87, 88])
-    mouse = bit("key", 272) and bit("rel", 0) and bit("rel", 1)
+    if any(bit('abs', axis) for axis in [0, 1, 53, 54]):
+        raise ValueError('Select a relative mouse and keyboard, not an absolute pointer')
+    keyboard = all(bit('key', key) for key in [30, 57, 87, 88])
+    mouse = bit('key', 272) and bit('rel', 0) and bit('rel', 1)
     if not keyboard and not mouse:
-        raise ValueError("The selected device is not a supported keyboard or mouse")
+        raise ValueError('The selected device is not a supported keyboard or mouse')
+    return device, keyboard, mouse
 
 
-def grant(values):
+def identity(device, keyboard, mouse):
+    def text(path):
+        try:
+            return path.read_text().strip()
+        except FileNotFoundError:
+            return ''
+    serial = ''
+    for parent in [device.resolve(), *device.resolve().parents][:12]:
+        if (parent / 'idVendor').is_file() and (parent / 'idProduct').is_file():
+            serial = text(parent / 'serial')
+            break
+    result = {field: text(device / 'id' / field) for field in ['bustype', 'vendor', 'product', 'version']}
+    result.update(name=text(device / 'name'), uniq=text(device / 'uniq'), serial=serial,
+                  keyboard=keyboard, mouse=mouse)
+    validate_identity(result)
+    return result
+
+
+def validate_identity(value):
+    fields = {'bustype', 'vendor', 'product', 'version', 'name', 'uniq', 'serial', 'keyboard', 'mouse'}
+    if not isinstance(value, dict) or set(value) != fields:
+        raise ValueError('Invalid saved input identity')
+    for key in ['bustype', 'vendor', 'product', 'version']:
+        if not isinstance(value[key], str) or not re.fullmatch('[0-9a-fA-F]{4}', value[key]):
+            raise ValueError('Invalid saved hardware identifier')
+    if value['bustype'] in ['0000', '0006'] or not value['name']:
+        raise ValueError('A physical input identity is required')
+    for key in ['name', 'uniq', 'serial']:
+        if not isinstance(value[key], str) or len(value[key]) > 256 or any(ord(c) < 32 or ord(c) == 127 for c in value[key]):
+            raise ValueError('Invalid saved input name or serial')
+    if any(type(value[key]) is not bool for key in ['keyboard', 'mouse']) or not (value['keyboard'] or value['mouse']):
+        raise ValueError('Invalid saved input capabilities')
+
+
+class Store:
+    def __init__(self, directory=STATE, owner=0):
+        self.directory, self.owner = directory, owner
+
+    def trusted(self, path, directory=False):
+        info = path.lstat()
+        if info.st_uid != self.owner or info.st_mode & 0o022 or not (stat.S_ISDIR(info.st_mode) if directory else stat.S_ISREG(info.st_mode)):
+            raise ValueError('Saved input permissions must be owned and writable only by the administrator')
+
+    def read(self, uid):
+        self.trusted(self.directory.parent, True)
+        self.trusted(self.directory, True)
+        path = self.directory / f'{uid}.json'
+        try:
+            descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+        except FileNotFoundError:
+            return None
+        with os.fdopen(descriptor) as file:
+            info = os.fstat(file.fileno())
+            if info.st_uid != self.owner or info.st_mode & 0o022 or not stat.S_ISREG(info.st_mode):
+                raise ValueError('Untrusted input permission file')
+            data = json.loads(file.read(65537))
+        if not isinstance(data, dict) or data.get('version') != 1 or data.get('uid') != uid or not 0 < uid < 2**32:
+            raise ValueError('Invalid saved input permission owner')
+        if data.get('user') != pwd.getpwuid(uid).pw_name:
+            raise ValueError('The saved desktop account has changed')
+        devices = data.get('devices')
+        if not isinstance(devices, list) or not 1 <= len(devices) <= 64:
+            raise ValueError('Invalid saved device list')
+        for device in devices:
+            validate_identity(device)
+        return data
+
+    def save(self, uid, devices):
+        self.directory.parent.mkdir(mode=0o755, exist_ok=True)
+        self.trusted(self.directory.parent, True)
+        self.directory.mkdir(mode=0o700, exist_ok=True)
+        self.trusted(self.directory, True)
+        old = self.read(uid)
+        saved = old['devices'] if old else []
+        for device in devices:
+            validate_identity(device)
+            if device not in saved:
+                saved.append(device)
+        if len(saved) > 64:
+            raise ValueError('Too many saved input devices')
+        data = dict(version=1, uid=uid, user=pwd.getpwuid(uid).pw_name, devices=saved)
+        descriptor, temporary = tempfile.mkstemp(prefix='.permission-', dir=self.directory)
+        try:
+            with os.fdopen(descriptor, 'w') as file:
+                json.dump(data, file, sort_keys=True)
+                file.flush()
+                os.fsync(file.fileno())
+            os.replace(temporary, self.directory / f'{uid}.json')
+        finally:
+            if os.path.exists(temporary):
+                os.unlink(temporary)
+
+    def matching_users(self, device):
+        if not self.directory.exists():
+            return []
+        self.trusted(self.directory.parent, True)
+        self.trusted(self.directory, True)
+        users = []
+        for path in sorted(self.directory.glob('*.json'))[:128]:
+            if not re.fullmatch(r'[1-9][0-9]{0,9}\.json', path.name):
+                continue
+            try:
+                uid = int(path.stem)
+                data = self.read(uid)
+                if data and device in data['devices']:
+                    users.append(uid)
+            except (OSError, ValueError, KeyError, TypeError):
+                continue
+        return users
+
+
+def inspected(path, descriptor):
+    metadata = os.fstat(descriptor)
+    device, keyboard, mouse = supported(path, metadata)
+    result = identity(device, keyboard, mouse)
+    current = path.stat()
+    if (metadata.st_dev, metadata.st_ino, metadata.st_rdev) != (current.st_dev, current.st_ino, current.st_rdev):
+        raise ValueError('The selected device was unplugged during authorization; retry setup')
+    return result
+
+
+def apply(uid, descriptor):
+    subprocess.run(['/usr/bin/setfacl', '--modify', f'u:{uid}:r', f'/proc/self/fd/{descriptor}'],
+                   pass_fds=(descriptor,), check=True, timeout=5,
+                   env={'PATH': '/usr/bin:/bin', 'LC_ALL': 'C'})
+
+
+def grant(values, store=None):
     if os.geteuid() != 0:
-        raise ValueError("Run this helper through the system authorization dialog")
-    uid_text = os.environ.get("PKEXEC_UID", "")
+        raise ValueError('Run this helper through the system authorization dialog')
+    uid_text = os.environ.get('PKEXEC_UID', '')
     if not uid_text.isascii() or not uid_text.isdecimal() or not 0 < int(uid_text) < 2**32:
-        raise ValueError("No unprivileged desktop user was authenticated")
+        raise ValueError('No unprivileged desktop user was authenticated')
     if not 1 <= len(values) <= 16:
-        raise ValueError("Select between one and sixteen input interfaces")
-    descriptors = []
+        raise ValueError('Select between one and sixteen input interfaces')
+    descriptors, devices = [], []
     try:
-        # Validate the entire request before changing any access. Keep each
-        # inode open so unplug/replug cannot redirect setfacl to a new node.
         for value in values:
             path = input_path(value)
             descriptor = os.open(path, os.O_PATH | os.O_NOFOLLOW | os.O_CLOEXEC)
             descriptors.append(descriptor)
-            supported(path, os.fstat(descriptor))
+            devices.append(inspected(path, descriptor))
+        # Validate every interface before persisting a policy or changing an ACL.
+        (store or Store()).save(int(uid_text), devices)
         for descriptor in descriptors:
-            subprocess.run(["/usr/bin/setfacl", "--modify", f"u:{int(uid_text)}:r",
-                            f"/proc/self/fd/{descriptor}"], pass_fds=(descriptor,),
-                           check=True, timeout=5, env={"PATH": "/usr/bin:/bin", "LC_ALL": "C"})
+            apply(int(uid_text), descriptor)
     finally:
         for descriptor in descriptors:
             os.close(descriptor)
 
 
-if __name__ == "__main__":
+def restore(event, store=None):
+    if os.geteuid() != 0 or not re.fullmatch('event[0-9]+', event):
+        raise ValueError('Only the system device manager may restore input permissions')
+    # udev calls this after seat/ACL rules. Use only stored administrator-owned
+    # identities, never PKEXEC_UID or a user-supplied state directory.
+    path = input_path('/dev/input/' + event)
+    descriptor = os.open(path, os.O_PATH | os.O_NOFOLLOW | os.O_CLOEXEC)
     try:
-        grant(sys.argv[1:])
-        print('@desk-switch-data {"input_access":true}')
+        device = inspected(path, descriptor)
+        for uid in (store or Store()).matching_users(device):
+            apply(uid, descriptor)
+    finally:
+        os.close(descriptor)
+
+
+if __name__ == '__main__':
+    try:
+        if len(sys.argv) == 3 and sys.argv[1] == '--restore':
+            restore(sys.argv[2])
+        else:
+            grant(sys.argv[1:])
+            print('@desk-switch-data {"input_access":true,"persistent":true}')
     except Exception as error:
-        print(f"Input access was not granted: {error}", file=sys.stderr)
+        # Most hotplug events are unrelated or intentionally unsupported.
+        if sys.argv[1:2] == ['--restore']:
+            sys.exit(0)
+        print(f'Input access was not granted: {error}', file=sys.stderr)
         sys.exit(1)

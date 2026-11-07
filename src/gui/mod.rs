@@ -425,7 +425,7 @@ impl Desktop {
                 let selection = self.input_access_selection();
                 self.pair.input_access_attempts.insert(selection);
                 let mut args = vec!["input-access".into()];
-                args.extend(self.form.capture_devices.lines().map(str::to_owned));
+                args.extend(self.input_permission_paths());
                 args
             }
             QueryKind::Monitors | QueryKind::MonitorStatus => vec![
@@ -442,9 +442,8 @@ impl Desktop {
     #[cfg(target_os = "linux")]
     fn input_access_selection(&self) -> String {
         use std::os::unix::fs::MetadataExt;
-        self.form
-            .capture_devices
-            .lines()
+        self.input_permission_paths()
+            .iter()
             .map(|path| {
                 let inode = std::fs::metadata(path).map(|m| (m.dev(), m.ino())).ok();
                 format!("{path}:{inode:?}")
@@ -634,6 +633,10 @@ impl Desktop {
                             value["input_access"] == true,
                             "input access was not granted"
                         );
+                        anyhow::ensure!(
+                            value["persistent"] == true,
+                            "Install the current Debian package to enable saved input permissions."
+                        );
                         self.retry_devices();
                     }
                     QueryKind::Monitors => {
@@ -643,9 +646,13 @@ impl Desktop {
                                 monitor.current.is_some_and(|input| input != 0),
                                 "The monitor did not report a usable current input. No input was changed."
                             );
-                            self.prefs.workspace.monitor.input = monitor.current;
+                            let mut saved = self.prefs.workspace.monitor.clone();
+                            saved.input = monitor.current;
+                            saved.fingerprint = monitor.fingerprint;
+                            self.prefs
+                                .workspace
+                                .record_monitor(saved, !self.monitor_setup_is_local());
                             self.pair.monitor_input = monitor.current;
-                            self.prefs.workspace.monitor.fingerprint = monitor.fingerprint;
                             self.prefs.save(&self.dir)?;
                         }
                     }
@@ -667,7 +674,14 @@ impl Desktop {
                     self.pair.monitor_input = None;
                 }
             } else {
-                self.message(result, "Список устройств обновлён.");
+                let success = match kind {
+                    #[cfg(target_os = "linux")]
+                    QueryKind::InputAccess => {
+                        "Keyboard and mouse permission is saved, including after USB reconnection and restart."
+                    }
+                    _ => "Список устройств обновлён.",
+                };
+                self.message(result, success);
             }
         }
         let tray_available = self.tray.as_ref().is_some_and(tray::Tray::available);

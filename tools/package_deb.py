@@ -33,6 +33,7 @@ def main():
         files = {
             "usr/lib/desk-switch/desk-switch": binary,
             "usr/lib/desk-switch/input-access": ROOT / "packaging/linux/desk-switch-input-access",
+            "usr/lib/udev/rules.d/99-desk-switch-input-access.rules": ROOT / "packaging/linux/99-desk-switch-input-access.rules",
             "usr/share/polkit-1/actions/com.deskswitch.input-access.policy": ROOT / "packaging/linux/com.deskswitch.input-access.policy",
             "usr/bin/desk-switch": ROOT / "packaging/linux/desk-switch",
             "usr/share/applications/com.deskswitch.Desktop.desktop": ROOT / "packaging/linux/com.deskswitch.Desktop.desktop",
@@ -50,9 +51,11 @@ def main():
         (work / "debian/control").write_text("Source: desk-switch\n\nPackage: desk-switch\nArchitecture: amd64\nDescription: Share input and audio between PCs\n")
         shlibs = subprocess.check_output(["dpkg-shlibdeps", "-O", "-e", str(binary)], cwd=work, text=True)
         native = next(line.split("=", 1)[1] for line in shlibs.splitlines() if line.startswith("shlibs:Depends="))
-        dependencies = native + ", pkexec, acl, python3, ca-certificates, ddcutil, pipewire-bin, pipewire-pulse, pulseaudio-utils, libx11-6, libx11-xcb1, libxcursor1, libxrandr2, libxi6, libxinerama1, libxkbcommon0, libxkbcommon-x11-0, libwayland-client0, libegl1, libgl1"
+        dependencies = native + ", pkexec, acl, udev, python3, ca-certificates, ddcutil, pipewire-bin, pipewire-pulse, pulseaudio-utils, libx11-6, libx11-xcb1, libxcursor1, libxrandr2, libxi6, libxinerama1, libxkbcommon0, libxkbcommon-x11-0, libwayland-client0, libegl1, libgl1"
         control = stage / "DEBIAN"
         control.mkdir()
+        shutil.copyfile(ROOT / "packaging/linux/postinst", control / "postinst")
+        (control / "postinst").chmod(0o755)
         size = math.ceil(sum(p.stat().st_size for p in stage.rglob("*") if p.is_file()) / 1024)
         (control / "control").write_text(
             f"Package: desk-switch\nVersion: {version}\nArchitecture: amd64\n"
