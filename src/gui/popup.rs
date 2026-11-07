@@ -4,7 +4,10 @@ use eframe::egui::{self, Color32, Pos2, RichText, Vec2};
 use std::sync::{Arc, Mutex, mpsc::Sender};
 
 const WIDTH: f32 = 344.0;
-const HEIGHT: f32 = 442.0;
+const HEIGHT: f32 = 512.0;
+pub(super) fn preferred_size() -> Vec2 {
+    egui::vec2(WIDTH, HEIGHT)
+}
 #[cfg(debug_assertions)]
 pub(super) static FRAMES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 pub fn id() -> egui::ViewportId {
@@ -28,6 +31,7 @@ pub enum Command {
 
 #[derive(Clone, Default, PartialEq)]
 struct Snapshot {
+    visual: super::view::WorkspaceVisual,
     targets: Vec<([u8; 32], String, bool)>,
     connected: bool,
     can_switch: bool,
@@ -51,11 +55,12 @@ struct Level {
     remote: bool,
     system: bool,
     value: AudioLevel,
+    color: Option<Color32>,
 }
 struct State {
     open: bool,
     seen_focus: bool,
-    position: Pos2,
+    placement: egui::Rect,
     snapshot: Snapshot,
 }
 pub struct Popup {
@@ -72,7 +77,7 @@ impl Popup {
             state: Arc::new(Mutex::new(State {
                 open: false,
                 seen_focus: false,
-                position: Pos2::ZERO,
+                placement: egui::Rect::from_min_size(Pos2::ZERO, preferred_size()),
                 snapshot: Snapshot::default(),
             })),
             send,
@@ -88,7 +93,7 @@ impl Popup {
             #[cfg(target_os = "linux")]
             super::linux_activation::request(super::linux_activation::Role::Quick);
             state.seen_focus = false;
-            state.position = position(ctx, x, y);
+            state.placement = position(ctx, x, y);
         }
         ctx.request_repaint_of(eframe::egui::ViewportId::ROOT);
     }
@@ -110,23 +115,20 @@ impl Popup {
     }
 }
 
-fn fitted(anchor: Pos2, bounds: egui::Rect) -> Pos2 {
-    let x = (anchor.x - 24.0).clamp(
-        bounds.left() + 8.0,
-        (bounds.right() - WIDTH - 8.0).max(bounds.left() + 8.0),
-    );
-    let preferred = if anchor.y - bounds.top() > HEIGHT + 16.0 {
-        anchor.y - HEIGHT - 12.0
+fn fitted(anchor: Pos2, bounds: egui::Rect) -> egui::Rect {
+    let margin = egui::vec2(8.0, 8.0).min(bounds.size() * 0.25);
+    let available = egui::Rect::from_min_max(bounds.min + margin, bounds.max - margin);
+    let size = preferred_size().min(available.size());
+    let x = (anchor.x - 24.0).clamp(available.left(), available.right() - size.x);
+    let preferred = if anchor.y - available.top() > size.y + 12.0 {
+        anchor.y - size.y - 12.0
     } else {
         anchor.y + 12.0
     };
-    let y = preferred.clamp(
-        bounds.top() + 8.0,
-        (bounds.bottom() - HEIGHT - 8.0).max(bounds.top() + 8.0),
-    );
-    egui::pos2(x, y)
+    let y = preferred.clamp(available.top(), available.bottom() - size.y);
+    egui::Rect::from_min_size(egui::pos2(x, y), size)
 }
-fn position(ctx: &egui::Context, x: i32, y: i32) -> Pos2 {
+fn position(ctx: &egui::Context, x: i32, y: i32) -> egui::Rect {
     #[cfg(target_os = "macos")]
     if let Some(mtm) = objc2::MainThreadMarker::new() {
         // AppKit points and CoreGraphics screen pixels differ on Retina. Read
@@ -349,11 +351,13 @@ impl Desktop {
                     remote: is_remote,
                     system: output == Some(node.key.as_str()),
                     value: shared.audio_level(&node.key),
+                    color: None,
                 });
             }
         }
         if let Some(workspace) = &self.group.workspace {
             let plan = workspace.plan();
+            snapshot.visual = super::view::WorkspaceVisual::from_workspace(workspace);
             snapshot.connected = workspace
                 .members
                 .values()
@@ -394,7 +398,7 @@ impl Desktop {
                 .map(|member| member.node.hardware.audio_name.clone())
                 .unwrap_or_default();
             snapshot.levels.clear();
-            for member in workspace.members.values() {
+            for (index, member) in workspace.members.values().enumerate() {
                 let Ok(key) = crate::config::key(&member.node.key) else {
                     continue;
                 };
@@ -417,6 +421,7 @@ impl Desktop {
                     } else {
                         member.preferences.audio
                     },
+                    color: Some(super::view::peer_color(index)),
                 });
             }
             snapshot.can_disable_keyboard = workspace
@@ -434,13 +439,13 @@ impl Desktop {
                     plan.input.as_ref() == Some(&member.node.key) || member.node.hardware.mouse
                 });
         }
-        let position = {
+        let placement = {
             let mut state = self.quick.state.lock().unwrap();
             if state.snapshot != snapshot {
                 state.snapshot = snapshot;
                 ctx.request_repaint_of(id());
             }
-            state.position
+            state.placement
         };
         let state = self.quick.state.clone();
         let send = self.quick.send.clone();
@@ -453,8 +458,8 @@ impl Desktop {
             id(),
             egui::ViewportBuilder::default()
                 .with_title("Desk Switch quick controls")
-                .with_inner_size([WIDTH, HEIGHT])
-                .with_position(position)
+                .with_inner_size(placement.size())
+                .with_position(placement.min)
                 .with_decorations(false)
                 .with_resizable(false)
                 .with_taskbar(false)
@@ -502,10 +507,13 @@ impl Desktop {
     }
 }
 
-fn content(ui: &mut egui::Ui, snapshot: &Snapshot, mut send: impl FnMut(Action)) {
+fn content(
+    ui: &mut egui::Ui,
+    snapshot: &Snapshot,
+    mut send: impl FnMut(Action),
+) -> [egui::Rect; 2] {
     #[cfg(debug_assertions)]
     FRAMES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let tr = crate::i18n::tr;
     ui.spacing_mut().item_spacing = egui::vec2(8.0, 4.0);
     ui.spacing_mut().slider_width = 175.0;
     ui.spacing_mut().interact_size.y = 28.0;
@@ -513,7 +521,7 @@ fn content(ui: &mut egui::Ui, snapshot: &Snapshot, mut send: impl FnMut(Action))
         .fill(ui.visuals().window_fill())
         .inner_margin(16)
         .show(ui, |ui| {
-            ui.set_width(WIDTH - 32.0);
+            ui.set_width(ui.available_width());
             ui.horizontal(|ui| {
                 ui.label(RichText::new("Desk Switch").size(19.0).strong());
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -522,198 +530,228 @@ fn content(ui: &mut egui::Ui, snapshot: &Snapshot, mut send: impl FnMut(Action))
                     }
                 });
             });
-            ui.horizontal(|ui| {
-                let color = if snapshot.connected {
-                    Color32::from_rgb(76, 211, 163)
-                } else {
-                    ui.visuals().weak_text_color()
-                };
-                let (rect, _) =
-                    ui.allocate_exact_size(egui::vec2(10.0, 18.0), egui::Sense::hover());
-                ui.painter().circle_filled(rect.center(), 3.0, color);
-                ui.add(egui::Label::new(&snapshot.peer).truncate());
-            });
-            if !snapshot.target.is_empty() {
-                ui.add(
-                    egui::Label::new(
-                        RichText::new(format!("{} · {}", tr("Input"), snapshot.target))
-                            .small()
-                            .color(ui.visuals().weak_text_color()),
-                    )
-                    .truncate(),
-                );
-            }
-            if !snapshot.targets.is_empty() {
-                egui::ComboBox::from_id_salt("quick-input-target")
-                    .width(WIDTH - 64.0)
-                    .selected_text(tr("Switch to computer…"))
-                    .show_ui(ui, |ui| {
-                        for (key, name, enabled) in &snapshot.targets {
-                            if ui.add_enabled(*enabled, egui::Button::new(name)).clicked() {
-                                send(Action::Quick(Command::Target(*key)));
-                            }
-                        }
-                    });
-            }
-            if ui
-                .add_enabled(
-                    snapshot.can_switch,
-                    egui::Button::new(tr(if snapshot.targets.is_empty() {
-                        "Switch to the other PC"
-                    } else {
-                        "Switch to next computer"
-                    }))
-                    .min_size(Vec2::new(WIDTH - 32.0, 34.0)),
-                )
-                .clicked()
-            {
-                send(if snapshot.monitor {
-                    Action::MonitorSwitch
-                } else {
-                    Action::Switch
+            ui.with_layout(egui::Layout::bottom_up(egui::Align::Min), |ui| {
+                let actions = footer(ui, &mut send);
+                ui.separator();
+                ui.with_layout(egui::Layout::top_down(egui::Align::Min), |ui| {
+                    egui::ScrollArea::vertical()
+                        .id_salt("quick-controls-body")
+                        .min_scrolled_height(0.0)
+                        .auto_shrink([false, false])
+                        .show(ui, |ui| body(ui, snapshot, &mut send));
                 });
-            }
-            ui.separator();
-            egui::Grid::new("quick-device-toggles")
-                .num_columns(2)
-                .spacing([22.0, 4.0])
-                .show(ui, |ui| {
-                    for (index, (device, label, value, enabled)) in [
-                        (Device::Audio, "Sound", snapshot.audio, true),
-                        (Device::Microphone, "Microphone", snapshot.microphone, true),
-                        (
-                            Device::Keyboard,
-                            "Keyboard",
-                            snapshot.keyboard,
-                            !snapshot.keyboard || snapshot.can_disable_keyboard,
-                        ),
-                        (
-                            Device::Mouse,
-                            "Mouse",
-                            snapshot.mouse,
-                            !snapshot.mouse || snapshot.can_disable_mouse,
-                        ),
-                    ]
-                    .into_iter()
-                    .enumerate()
-                    {
-                        let mut value = value;
-                        if ui
-                            .add_enabled(enabled, egui::Checkbox::new(&mut value, tr(label)))
-                            .on_disabled_hover_text(format!(
-                                "{} (F11)",
-                                tr("Return control before changing shared input devices.")
-                            ))
-                            .changed()
-                        {
-                            send(Action::Quick(Command::Toggle(device, value)));
-                        }
-                        if index % 2 == 1 {
-                            ui.end_row();
-                        }
+                actions
+            })
+            .inner
+        })
+        .inner
+}
+
+fn body(ui: &mut egui::Ui, snapshot: &Snapshot, send: &mut impl FnMut(Action)) {
+    let tr = crate::i18n::tr;
+    ui.horizontal(|ui| {
+        let color = if snapshot.connected {
+            Color32::from_rgb(76, 211, 163)
+        } else {
+            ui.visuals().weak_text_color()
+        };
+        let (rect, _) = ui.allocate_exact_size(egui::vec2(10.0, 18.0), egui::Sense::hover());
+        ui.painter().circle_filled(rect.center(), 3.0, color);
+        ui.add(egui::Label::new(&snapshot.peer).truncate());
+    });
+    if let Some(monitor) = &snapshot.visual.monitor {
+        super::view::shared_monitor(ui, monitor, true);
+        ui.separator();
+    }
+    if !snapshot.target.is_empty() {
+        ui.add(
+            egui::Label::new(
+                RichText::new(format!("{} · {}", tr("Input"), snapshot.target))
+                    .small()
+                    .color(ui.visuals().weak_text_color()),
+            )
+            .truncate(),
+        );
+    }
+    if !snapshot.targets.is_empty() {
+        egui::ComboBox::from_id_salt("quick-input-target")
+            .width(ui.available_width())
+            .selected_text(tr("Switch to computer…"))
+            .show_ui(ui, |ui| {
+                for (key, name, enabled) in &snapshot.targets {
+                    if ui.add_enabled(*enabled, egui::Button::new(name)).clicked() {
+                        send(Action::Quick(Command::Target(*key)));
                     }
-                });
-            if !snapshot.output.is_empty() {
-                ui.add(
-                    egui::Label::new(
-                        RichText::new(&snapshot.output)
-                            .small()
-                            .color(ui.visuals().weak_text_color()),
-                    )
-                    .truncate(),
-                )
-                .on_hover_text(&snapshot.output);
-            }
-            ui.separator();
-            egui::ScrollArea::vertical()
-                .max_height((ui.available_height() - 50.0).max(80.0))
-                .auto_shrink([false, true])
-                .show(ui, |ui| {
-                    for row in &snapshot.levels {
-                        ui.horizontal(|ui| {
-                            ui.add_sized(
-                                [120.0, 18.0],
-                                egui::Label::new(RichText::new(&row.name).strong()).truncate(),
-                            )
-                            .on_hover_text(&row.name);
-                            ui.with_layout(
-                                egui::Layout::right_to_left(egui::Align::Center),
-                                |ui| {
-                                    let caption = tr(if row.system {
-                                        "System volume"
-                                    } else {
-                                        "Relative volume"
-                                    });
-                                    ui.add(
-                                        egui::Label::new(
-                                            RichText::new(&caption)
-                                                .small()
-                                                .color(ui.visuals().weak_text_color()),
-                                        )
-                                        .truncate(),
-                                    )
-                                    .on_hover_text(caption);
-                                },
-                            );
-                        });
-                        let mut level = row.value;
-                        let changed = ui
-                            .horizontal(|ui| {
-                                let slider = ui
-                                    .scope(|ui| {
-                                        let font = egui::TextStyle::Body.resolve(ui.style());
-                                        let mute_width = ui.fonts_mut(|fonts| {
-                                            fonts
-                                                .layout_no_wrap(tr("Mute"), font, Color32::WHITE)
-                                                .size()
-                                                .x
-                                        });
-                                        ui.spacing_mut().slider_width =
-                                            (ui.available_width() - mute_width - 106.0)
-                                                .clamp(96.0, 175.0);
-                                        ui.add(
-                                            egui::Slider::new(&mut level.volume, 0..=100)
-                                                .suffix(" %"),
-                                        )
-                                    })
-                                    .inner
-                                    .changed();
-                                ui.checkbox(&mut level.muted, tr("Mute")).changed() || slider
-                            })
-                            .inner;
-                        if changed {
-                            send(Action::Quick(if let Some(key) = row.group_key {
-                                Command::GroupLevel { key, level }
-                            } else {
-                                Command::Level {
-                                    remote: row.remote,
-                                    level,
-                                }
-                            }));
-                        }
-                    }
-                });
-            if !snapshot.notice.is_empty() {
-                ui.add(
-                    egui::Label::new(
-                        RichText::new(tr(&snapshot.notice)).color(ui.visuals().error_fg_color),
-                    )
-                    .truncate(),
-                )
-                .on_hover_text(tr(&snapshot.notice));
-            }
-            ui.separator();
-            ui.horizontal(|ui| {
-                if ui.button(tr("Open Desk Switch")).clicked() {
-                    send(Action::Show);
                 }
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.button(tr("Quit application")).clicked() {
-                        send(Action::Quit);
-                    }
+            });
+    }
+    if ui
+        .add_enabled(
+            snapshot.can_switch,
+            egui::Button::new(tr(if snapshot.targets.is_empty() {
+                "Switch to the other PC"
+            } else {
+                "Switch to next computer"
+            }))
+            .min_size(Vec2::new(ui.available_width(), 34.0)),
+        )
+        .clicked()
+    {
+        send(if snapshot.monitor {
+            Action::MonitorSwitch
+        } else {
+            Action::Switch
+        });
+    }
+    ui.separator();
+    egui::Grid::new("quick-device-toggles")
+        .num_columns(2)
+        .spacing([12.0, 4.0])
+        .show(ui, |ui| {
+            for (index, (device, label, value, enabled)) in [
+                (Device::Audio, "Sound", snapshot.audio, true),
+                (Device::Microphone, "Microphone", snapshot.microphone, true),
+                (
+                    Device::Keyboard,
+                    "Keyboard",
+                    snapshot.keyboard,
+                    !snapshot.keyboard || snapshot.can_disable_keyboard,
+                ),
+                (
+                    Device::Mouse,
+                    "Mouse",
+                    snapshot.mouse,
+                    !snapshot.mouse || snapshot.can_disable_mouse,
+                ),
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let mut value = value;
+                let icon = match device {
+                    Device::Audio => super::view::DeviceIcon::Headphones,
+                    Device::Microphone => super::view::DeviceIcon::Microphone,
+                    Device::Keyboard => super::view::DeviceIcon::Keyboard,
+                    Device::Mouse => super::view::DeviceIcon::Mouse,
+                };
+                if super::view::device_checkbox(
+                    ui,
+                    icon,
+                    &mut value,
+                    label,
+                    snapshot.visual.devices[icon.index()].as_ref(),
+                    enabled,
+                )
+                .on_disabled_hover_text(format!(
+                    "{} (F11)",
+                    tr("Return control before changing shared input devices.")
+                ))
+                .changed()
+                {
+                    send(Action::Quick(Command::Toggle(device, value)));
+                }
+                if index % 2 == 1 {
+                    ui.end_row();
+                }
+            }
+        });
+    if !snapshot.output.is_empty() {
+        ui.add(
+            egui::Label::new(
+                RichText::new(&snapshot.output)
+                    .small()
+                    .color(ui.visuals().weak_text_color()),
+            )
+            .truncate(),
+        )
+        .on_hover_text(&snapshot.output);
+    }
+    ui.separator();
+    for row in &snapshot.levels {
+        ui.horizontal(|ui| {
+            ui.add_sized(
+                [120.0, 18.0],
+                egui::Label::new(
+                    RichText::new(&row.name)
+                        .strong()
+                        .color(row.color.unwrap_or(ui.visuals().text_color())),
+                )
+                .truncate(),
+            )
+            .on_hover_text(&row.name);
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let caption = tr(if row.system {
+                    "System volume"
+                } else {
+                    "Relative volume"
                 });
+                ui.add(
+                    egui::Label::new(
+                        RichText::new(&caption)
+                            .small()
+                            .color(ui.visuals().weak_text_color()),
+                    )
+                    .truncate(),
+                )
+                .on_hover_text(caption);
             });
         });
+        let mut level = row.value;
+        let changed = ui
+            .horizontal(|ui| {
+                let slider = ui
+                    .scope(|ui| {
+                        let font = egui::TextStyle::Body.resolve(ui.style());
+                        let mute_width = ui.fonts_mut(|fonts| {
+                            fonts
+                                .layout_no_wrap(tr("Mute"), font, Color32::WHITE)
+                                .size()
+                                .x
+                        });
+                        ui.spacing_mut().slider_width =
+                            (ui.available_width() - mute_width - 106.0).clamp(96.0, 175.0);
+                        ui.add(egui::Slider::new(&mut level.volume, 0..=100).suffix(" %"))
+                    })
+                    .inner
+                    .changed();
+                ui.checkbox(&mut level.muted, tr("Mute")).changed() || slider
+            })
+            .inner;
+        if changed {
+            send(Action::Quick(if let Some(key) = row.group_key {
+                Command::GroupLevel { key, level }
+            } else {
+                Command::Level {
+                    remote: row.remote,
+                    level,
+                }
+            }));
+        }
+    }
+    if !snapshot.notice.is_empty() {
+        ui.add(
+            egui::Label::new(
+                RichText::new(tr(&snapshot.notice)).color(ui.visuals().error_fg_color),
+            )
+            .truncate(),
+        )
+        .on_hover_text(tr(&snapshot.notice));
+    }
+}
+
+fn footer(ui: &mut egui::Ui, send: &mut impl FnMut(Action)) -> [egui::Rect; 2] {
+    ui.horizontal_wrapped(|ui| {
+        let open = ui.button(crate::i18n::tr("Open Desk Switch"));
+        if open.clicked() {
+            send(Action::Show);
+        }
+        let quit = ui.button(crate::i18n::tr("Quit application"));
+        if quit.clicked() {
+            send(Action::Quit);
+        }
+        [open.rect, quit.rect]
+    })
+    .inner
 }
 
 #[cfg(test)]
@@ -778,11 +816,89 @@ mod tests {
             egui::Rect::from_min_size(egui::pos2(-1920.0, 0.0), egui::vec2(1920.0, 1040.0)),
             egui::Rect::from_min_size(egui::pos2(0.0, -1080.0), egui::vec2(1920.0, 1080.0)),
             egui::Rect::from_min_size(Pos2::ZERO, egui::vec2(640.0, 480.0)),
+            egui::Rect::from_min_size(egui::pos2(-320.0, -240.0), egui::vec2(320.0, 240.0)),
         ] {
             for anchor in [bounds.left_top(), bounds.right_bottom(), bounds.center()] {
-                let popup =
-                    egui::Rect::from_min_size(fitted(anchor, bounds), egui::vec2(WIDTH, HEIGHT));
+                let popup = fitted(anchor, bounds);
                 assert!(bounds.contains_rect(popup));
+                assert!(popup.width() <= WIDTH && popup.height() <= HEIGHT);
+                if bounds.height() < HEIGHT {
+                    assert!(popup.height() < HEIGHT);
+                } else {
+                    assert_eq!(popup.size(), preferred_size());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn footer_actions_stay_visible_and_clickable_when_popup_content_overflows() {
+        let snapshot = Snapshot {
+            visual: super::super::view::WorkspaceVisual::from_workspace(
+                &crate::group::model::tests::fixture(4),
+            ),
+            connected: true,
+            can_switch: true,
+            peer: "32 computers connected".into(),
+            output: "USB Headphones".into(),
+            target: "Computer 1".into(),
+            targets: vec![([1; 32], "Computer 1".into(), true)],
+            levels: (0..32)
+                .map(|index| Level {
+                    group_key: Some([index + 1; 32]),
+                    name: format!("Computer {index}"),
+                    remote: true,
+                    system: false,
+                    value: AudioLevel::default(),
+                    color: None,
+                })
+                .collect(),
+            notice: "The selected monitor is unavailable".into(),
+            ..Default::default()
+        };
+        for work_area in [
+            egui::vec2(640.0, 480.0),
+            egui::vec2(320.0, 240.0),
+            egui::vec2(1920.0, 1080.0),
+        ] {
+            let ctx = egui::Context::default();
+            super::super::view::style(&ctx, "dark");
+            let size = fitted(Pos2::ZERO, egui::Rect::from_min_size(Pos2::ZERO, work_area)).size();
+            let bounds = egui::Rect::from_min_size(Pos2::ZERO, size);
+            let input = || egui::RawInput {
+                screen_rect: Some(bounds),
+                ..Default::default()
+            };
+            let mut buttons = [egui::Rect::NOTHING; 2];
+            for _ in 0..3 {
+                let _ = ctx.run_ui(input(), |ui| buttons = content(ui, &snapshot, |_| {}));
+            }
+            for (button, action) in buttons.into_iter().zip([Action::Show, Action::Quit]) {
+                assert!(
+                    bounds.contains_rect(button),
+                    "footer outside {bounds:?}: {button:?}"
+                );
+                assert!(button.is_positive());
+                let mut actions = Vec::new();
+                for pressed in [true, false] {
+                    let mut input = input();
+                    input.events = vec![
+                        egui::Event::PointerMoved(button.center()),
+                        egui::Event::PointerButton {
+                            pos: button.center(),
+                            button: egui::PointerButton::Primary,
+                            pressed,
+                            modifiers: egui::Modifiers::NONE,
+                        },
+                    ];
+                    let _ = ctx.run_ui(input, |ui| {
+                        content(ui, &snapshot, |action| actions.push(action));
+                    });
+                }
+                assert!(
+                    actions == [action],
+                    "visible footer button did not dispatch its action"
+                );
             }
         }
     }

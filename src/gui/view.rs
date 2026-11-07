@@ -245,119 +245,527 @@ fn badge(ui: &mut egui::Ui, label: &str, active: bool) {
         });
 }
 
-fn keyboard(painter: &egui::Painter, center: egui::Pos2, color: Color32) {
-    let rect = egui::Rect::from_center_size(center, Vec2::new(36.0, 22.0));
-    painter.rect_stroke(rect, 4, Stroke::new(1.5, color), egui::StrokeKind::Inside);
-    for y in 0..2 {
-        for x in 0..5 {
-            let p = rect.left_top() + Vec2::new(6.0 + x as f32 * 5.8, 5.5 + y as f32 * 5.0);
-            painter.rect_filled(
-                egui::Rect::from_center_size(p, Vec2::new(2.6, 2.0)),
-                0,
-                color,
-            );
-        }
+#[derive(Clone, Copy, PartialEq)]
+pub(super) enum DeviceIcon {
+    Keyboard,
+    Mouse,
+    Headphones,
+    Microphone,
+}
+impl DeviceIcon {
+    pub(super) const ALL: [Self; 4] = [
+        Self::Keyboard,
+        Self::Mouse,
+        Self::Headphones,
+        Self::Microphone,
+    ];
+    pub(super) fn index(self) -> usize {
+        self as usize
     }
-    painter.line_segment(
-        [center + Vec2::new(-8.0, 6.0), center + Vec2::new(8.0, 6.0)],
-        Stroke::new(1.5, color),
-    );
-}
-fn mouse(painter: &egui::Painter, center: egui::Pos2, color: Color32) {
-    let rect = egui::Rect::from_center_size(center, Vec2::new(17.0, 25.0));
-    painter.rect_stroke(rect, 8, Stroke::new(1.5, color), egui::StrokeKind::Inside);
-    painter.line_segment(
-        [center - Vec2::new(0.0, 10.0), center - Vec2::new(0.0, 2.0)],
-        Stroke::new(1.5, color),
-    );
-    painter.line_segment(
-        [center - Vec2::new(6.0, 2.0), center + Vec2::new(6.0, -2.0)],
-        Stroke::new(1.0, color),
-    );
-}
-fn headphones(painter: &egui::Painter, center: egui::Pos2, color: Color32) {
-    let points = (0..=18)
-        .map(|i| {
-            let angle = std::f32::consts::PI * (i as f32 / 18.0);
-            center + Vec2::new(-angle.cos() * 12.0, -angle.sin() * 12.0)
-        })
-        .collect::<Vec<_>>();
-    painter.add(egui::Shape::line(points, Stroke::new(2.0, color)));
-    for offset in [-11.0, 11.0] {
-        painter.rect_filled(
-            egui::Rect::from_center_size(center + Vec2::new(offset, 4.0), Vec2::new(5.0, 12.0)),
-            2,
-            color,
-        );
+    fn label(self) -> &'static str {
+        match self {
+            Self::Keyboard => "Keyboard",
+            Self::Mouse => "Mouse",
+            Self::Headphones => "Headphones / speakers",
+            Self::Microphone => "Microphone",
+        }
     }
 }
 
+fn paint_device(
+    painter: &egui::Painter,
+    icon: DeviceIcon,
+    center: egui::Pos2,
+    scale: f32,
+    color: Color32,
+) {
+    let point = |x, y| center + Vec2::new(x, y) * scale;
+    let stroke = |width: f32| Stroke::new((width * scale).max(0.8), color);
+    match icon {
+        DeviceIcon::Keyboard => {
+            let rect = egui::Rect::from_center_size(center, Vec2::new(36.0, 22.0) * scale);
+            painter.rect_stroke(rect, 4, stroke(1.5), egui::StrokeKind::Inside);
+            for y in 0..2 {
+                for x in 0..5 {
+                    let p = rect.left_top()
+                        + Vec2::new(6.0 + x as f32 * 5.8, 5.5 + y as f32 * 5.0) * scale;
+                    painter.rect_filled(
+                        egui::Rect::from_center_size(p, Vec2::new(2.6, 2.0) * scale),
+                        0,
+                        color,
+                    );
+                }
+            }
+            painter.line_segment([point(-8.0, 6.0), point(8.0, 6.0)], stroke(1.5));
+        }
+        DeviceIcon::Mouse => {
+            let rect = egui::Rect::from_center_size(center, Vec2::new(17.0, 25.0) * scale);
+            painter.rect_stroke(rect, 8, stroke(1.5), egui::StrokeKind::Inside);
+            painter.line_segment([point(0.0, -10.0), point(0.0, -2.0)], stroke(1.5));
+            painter.line_segment([point(-6.0, -2.0), point(6.0, -2.0)], stroke(1.0));
+        }
+        DeviceIcon::Headphones => {
+            let points = (0..=18)
+                .map(|i| {
+                    let angle = std::f32::consts::PI * (i as f32 / 18.0);
+                    point(-angle.cos() * 12.0, -angle.sin() * 12.0)
+                })
+                .collect::<Vec<_>>();
+            painter.add(egui::Shape::line(points, stroke(2.0)));
+            for offset in [-11.0, 11.0] {
+                painter.rect_filled(
+                    egui::Rect::from_center_size(point(offset, 4.0), Vec2::new(5.0, 12.0) * scale),
+                    2,
+                    color,
+                );
+            }
+        }
+        DeviceIcon::Microphone => {
+            painter.rect_stroke(
+                egui::Rect::from_center_size(point(0.0, -3.0), Vec2::new(9.0, 17.0) * scale),
+                5,
+                stroke(1.6),
+                egui::StrokeKind::Inside,
+            );
+            for (from, to) in [
+                ((-9.0, 0.0), (-9.0, 5.0)),
+                ((9.0, 0.0), (9.0, 5.0)),
+                ((-9.0, 5.0), (0.0, 10.0)),
+                ((9.0, 5.0), (0.0, 10.0)),
+                ((0.0, 10.0), (0.0, 15.0)),
+                ((-5.0, 15.0), (5.0, 15.0)),
+            ] {
+                painter.line_segment([point(from.0, from.1), point(to.0, to.1)], stroke(1.5));
+            }
+        }
+    }
+}
+fn keyboard(painter: &egui::Painter, center: egui::Pos2, color: Color32) {
+    paint_device(painter, DeviceIcon::Keyboard, center, 1.0, color);
+}
+fn mouse(painter: &egui::Painter, center: egui::Pos2, color: Color32) {
+    paint_device(painter, DeviceIcon::Mouse, center, 1.0, color);
+}
+fn headphones(painter: &egui::Painter, center: egui::Pos2, color: Color32) {
+    paint_device(painter, DeviceIcon::Headphones, center, 1.0, color);
+}
 fn microphone(painter: &egui::Painter, center: egui::Pos2, color: Color32) {
-    painter.rect_stroke(
-        egui::Rect::from_center_size(center - Vec2::new(0.0, 3.0), Vec2::new(9.0, 17.0)),
-        5,
-        Stroke::new(1.6, color),
-        egui::StrokeKind::Inside,
-    );
-    painter.line_segment(
-        [center + Vec2::new(-9.0, 0.0), center + Vec2::new(-9.0, 5.0)],
-        Stroke::new(1.5, color),
-    );
-    painter.line_segment(
-        [center + Vec2::new(9.0, 0.0), center + Vec2::new(9.0, 5.0)],
-        Stroke::new(1.5, color),
-    );
-    painter.line_segment(
-        [center + Vec2::new(-9.0, 5.0), center + Vec2::new(0.0, 10.0)],
-        Stroke::new(1.5, color),
-    );
-    painter.line_segment(
-        [center + Vec2::new(9.0, 5.0), center + Vec2::new(0.0, 10.0)],
-        Stroke::new(1.5, color),
-    );
-    painter.line_segment(
-        [center + Vec2::new(0.0, 10.0), center + Vec2::new(0.0, 15.0)],
-        Stroke::new(1.5, color),
-    );
-    painter.line_segment(
-        [
-            center + Vec2::new(-5.0, 15.0),
-            center + Vec2::new(5.0, 15.0),
-        ],
-        Stroke::new(1.5, color),
-    );
+    paint_device(painter, DeviceIcon::Microphone, center, 1.0, color);
 }
 
 fn monitor(painter: &egui::Painter, center: egui::Pos2, width: f32, color: Color32, bg: Color32) {
-    let screen = egui::Rect::from_center_size(center, Vec2::new(width, 98.0));
-    painter.rect_filled(screen.expand(7.0), 12, color.gamma_multiply(0.06));
+    monitor_scaled(painter, center, width, 1.0, color, bg);
+}
+fn monitor_scaled(
+    painter: &egui::Painter,
+    center: egui::Pos2,
+    width: f32,
+    scale: f32,
+    color: Color32,
+    bg: Color32,
+) {
+    let screen = egui::Rect::from_center_size(center, Vec2::new(width, 98.0 * scale));
+    painter.rect_filled(screen.expand(7.0 * scale), 12, color.gamma_multiply(0.06));
     painter.rect_filled(screen, 8, bg);
-    painter.rect_stroke(screen, 8, Stroke::new(2.0, color), egui::StrokeKind::Inside);
+    painter.rect_stroke(
+        screen,
+        8,
+        Stroke::new((2.0 * scale).max(1.0), color),
+        egui::StrokeKind::Inside,
+    );
     painter.rect_filled(
-        egui::Rect::from_center_size(center + Vec2::new(0.0, 55.0), Vec2::new(4.0, 14.0)),
+        egui::Rect::from_center_size(
+            center + Vec2::new(0.0, 55.0) * scale,
+            Vec2::new(4.0, 14.0) * scale,
+        ),
         1,
         color,
     );
     painter.rect_filled(
-        egui::Rect::from_center_size(center + Vec2::new(0.0, 64.0), Vec2::new(44.0, 3.0)),
+        egui::Rect::from_center_size(
+            center + Vec2::new(0.0, 64.0) * scale,
+            Vec2::new(44.0, 3.0) * scale,
+        ),
         2,
         color,
     );
 }
 
 fn tower(painter: &egui::Painter, center: egui::Pos2, color: Color32, bg: Color32) {
-    let case = egui::Rect::from_center_size(center, Vec2::new(64.0, 94.0));
-    painter.rect_filled(case.expand(7.0), 12, color.gamma_multiply(0.06));
+    tower_scaled(painter, center, 1.0, color, bg);
+}
+fn tower_scaled(
+    painter: &egui::Painter,
+    center: egui::Pos2,
+    scale: f32,
+    color: Color32,
+    bg: Color32,
+) {
+    let case = egui::Rect::from_center_size(center, Vec2::new(64.0, 94.0) * scale);
+    painter.rect_filled(case.expand(7.0 * scale), 12, color.gamma_multiply(0.06));
     painter.rect_filled(case, 8, bg);
-    painter.rect_stroke(case, 8, Stroke::new(2.0, color), egui::StrokeKind::Inside);
-    painter.circle_stroke(center + Vec2::new(0.0, -23.0), 5.0, Stroke::new(1.5, color));
+    painter.rect_stroke(
+        case,
+        8,
+        Stroke::new((2.0 * scale).max(1.0), color),
+        egui::StrokeKind::Inside,
+    );
+    painter.circle_stroke(
+        center + Vec2::new(0.0, -23.0) * scale,
+        5.0 * scale,
+        Stroke::new((1.5 * scale).max(0.8), color),
+    );
     for y in [2.0, 10.0, 18.0] {
         painter.line_segment(
-            [center + Vec2::new(-16.0, y), center + Vec2::new(16.0, y)],
-            Stroke::new(1.5, color),
+            [
+                center + Vec2::new(-16.0, y) * scale,
+                center + Vec2::new(16.0, y) * scale,
+            ],
+            Stroke::new((1.5 * scale).max(0.8), color),
         );
     }
-    painter.circle_filled(center + Vec2::new(0.0, 33.0), 2.0, color);
+    painter.circle_filled(center + Vec2::new(0.0, 33.0) * scale, 2.0 * scale, color);
+}
+
+pub(super) fn peer_color(index: usize) -> Color32 {
+    [
+        Color32::from_rgb(76, 211, 163),
+        Color32::from_rgb(175, 142, 255),
+        Color32::from_rgb(92, 185, 239),
+        Color32::from_rgb(244, 176, 103),
+    ][index % 4]
+}
+
+#[derive(Clone, PartialEq)]
+pub(super) struct DeviceSource {
+    key: String,
+    pub(super) name: String,
+    pub(super) color: Color32,
+    muted: bool,
+}
+#[derive(Clone, PartialEq)]
+struct MonitorParticipant {
+    source: DeviceSource,
+    input: Option<u16>,
+    online: bool,
+    selected: bool,
+}
+#[derive(Clone, PartialEq)]
+pub(super) struct SharedMonitorVisual {
+    current: Option<DeviceSource>,
+    requested: Option<DeviceSource>,
+    pending: bool,
+    error: Option<String>,
+    participants: Vec<MonitorParticipant>,
+}
+#[derive(Clone, Default, PartialEq)]
+pub(super) struct WorkspaceVisual {
+    pub(super) devices: [Option<DeviceSource>; 4],
+    pub(super) monitor: Option<SharedMonitorVisual>,
+}
+impl WorkspaceVisual {
+    pub(super) fn from_workspace(state: &crate::group::model::Workspace) -> Self {
+        let plan = state.plan();
+        let sources = state
+            .members
+            .iter()
+            .enumerate()
+            .map(|(index, (key, member))| {
+                (
+                    key.as_str(),
+                    DeviceSource {
+                        key: key.clone(),
+                        name: member.node.name.clone(),
+                        color: peer_color(index),
+                        muted: false,
+                    },
+                )
+            })
+            .collect::<std::collections::BTreeMap<_, _>>();
+        let source = |key: &str, muted| {
+            sources.get(key).map(|source| {
+                let mut source = source.clone();
+                source.muted = muted;
+                source
+            })
+        };
+        let input = plan.input.as_deref().and_then(|key| source(key, false));
+        let audio = plan.audio.as_deref().and_then(|key| {
+            let member = &state.members[key];
+            let level = member
+                .native_output
+                .or(member.preferences.output)
+                .unwrap_or_default();
+            source(key, level.muted || level.volume == 0)
+        });
+        let microphone = plan.microphone.as_ref().and_then(|binding| {
+            source(
+                &binding.computer,
+                state.settings.microphone_level.muted
+                    || state.settings.microphone_level.volume == 0,
+            )
+        });
+        let monitor = state.settings.monitor_enabled.then(|| {
+            let command = state.monitor_command.as_ref();
+            SharedMonitorVisual {
+                current: state
+                    .confirmed_monitor
+                    .as_deref()
+                    .and_then(|key| source(key, false)),
+                requested: command.and_then(|command| source(&command.destination, false)),
+                pending: command.is_some_and(|command| {
+                    command.result.is_none() && command.interrupted.is_none()
+                }),
+                error: command.and_then(|command| {
+                    command
+                        .result
+                        .as_ref()
+                        .and_then(|result| result.error.clone())
+                        .or_else(|| command.interrupted.clone())
+                }),
+                participants: state
+                    .members
+                    .values()
+                    .filter(|member| member.node.monitor.enabled)
+                    .filter_map(|member| {
+                        source(&member.node.key, false).map(|source| MonitorParticipant {
+                            selected: state.confirmed_monitor.as_deref()
+                                == Some(member.node.key.as_str()),
+                            source,
+                            input: member.node.monitor.input,
+                            online: member.online,
+                        })
+                    })
+                    .collect(),
+            }
+        });
+        Self {
+            devices: [
+                state
+                    .settings
+                    .keyboard_enabled
+                    .then(|| input.clone())
+                    .flatten(),
+                state.settings.mouse_enabled.then_some(input).flatten(),
+                audio,
+                microphone,
+            ],
+            monitor,
+        }
+    }
+
+    pub(super) fn member_devices(
+        &self,
+        state: &crate::group::model::Workspace,
+        key: &str,
+    ) -> [Option<DeviceSource>; 4] {
+        let Some(member) = state.members.get(key).filter(|member| member.compatible()) else {
+            return Default::default();
+        };
+        std::array::from_fn(|index| {
+            self.devices[index]
+                .as_ref()
+                .filter(|source| match index {
+                    0 | 1 => state.active_input.as_deref().unwrap_or(&source.key) == key,
+                    2 => source.key == key,
+                    _ => source.key == key || member.node.hardware.microphone_receive,
+                })
+                .cloned()
+        })
+    }
+}
+
+pub(super) fn device_icon(
+    ui: &mut egui::Ui,
+    icon: DeviceIcon,
+    source: Option<&DeviceSource>,
+    scale: f32,
+) -> egui::Response {
+    let (rect, response) =
+        ui.allocate_exact_size(Vec2::new(40.0, 34.0) * scale, egui::Sense::hover());
+    let color = source
+        .map(|source| {
+            if source.muted {
+                source.color.gamma_multiply(0.55)
+            } else {
+                source.color
+            }
+        })
+        .unwrap_or_else(|| ui.visuals().weak_text_color().gamma_multiply(0.5));
+    paint_device(ui.painter(), icon, rect.center(), scale, color);
+    if source.is_some_and(|source| source.muted) {
+        ui.painter().line_segment(
+            [
+                rect.center() + Vec2::new(-15.0, 12.0) * scale,
+                rect.center() + Vec2::new(15.0, -12.0) * scale,
+            ],
+            Stroke::new((1.5 * scale).max(1.0), color),
+        );
+    }
+    response.on_hover_text(format!(
+        "{} · {}{}",
+        crate::i18n::tr(icon.label()),
+        source
+            .map(|source| source.name.clone())
+            .unwrap_or_else(|| crate::i18n::tr("Not shared")),
+        if source.is_some_and(|source| source.muted) {
+            format!(" · {}", crate::i18n::tr("Mute"))
+        } else {
+            String::new()
+        },
+    ))
+}
+
+pub(super) fn device_checkbox(
+    ui: &mut egui::Ui,
+    icon: DeviceIcon,
+    value: &mut bool,
+    label: &str,
+    source: Option<&DeviceSource>,
+    enabled: bool,
+) -> egui::Response {
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 4.0;
+        device_icon(ui, icon, source, 0.65);
+        ui.add_enabled(enabled, egui::Checkbox::new(value, crate::i18n::tr(label)))
+    })
+    .inner
+}
+
+pub(super) fn shared_monitor(ui: &mut egui::Ui, visual: &SharedMonitorVisual, compact: bool) {
+    let colors = palette(ui);
+    let current = visual.current.as_ref();
+    let color = current
+        .map(|source| source.color)
+        .unwrap_or(colors.muted.gamma_multiply(0.55));
+    let status = if visual.error.is_some() {
+        Some(crate::i18n::tr("Monitor switch failed"))
+    } else if visual.pending {
+        Some(format!(
+            "{} · {}",
+            crate::i18n::tr("Switching…"),
+            visual
+                .requested
+                .as_ref()
+                .map(|source| source.name.as_str())
+                .unwrap_or("—")
+        ))
+    } else {
+        None
+    };
+    let name = current
+        .map(|source| source.name.clone())
+        .unwrap_or_else(|| crate::i18n::tr("Monitor input unknown"));
+    let layout = if !compact && ui.available_width() < 560.0 {
+        egui::Layout::top_down(Align::Min)
+    } else {
+        egui::Layout::left_to_right(Align::Center)
+    };
+    ui.allocate_ui_with_layout(Vec2::new(ui.available_width(), 0.0), layout, |ui| {
+        let (size, scale, width) = if compact {
+            (Vec2::new(104.0, 62.0), 0.42, 94.0)
+        } else {
+            (Vec2::new(216.0, 126.0), 0.82, 196.0)
+        };
+        let (rect, response) = ui.allocate_exact_size(size, egui::Sense::hover());
+        let center = egui::pos2(rect.center().x, rect.top() + 50.0 * scale);
+        monitor_scaled(ui.painter(), center, width, scale, color, colors.bg);
+        if !compact {
+            ui.place(
+                egui::Rect::from_center_size(center, Vec2::new(width - 18.0, 28.0)),
+                egui::Label::new(RichText::new(crate::i18n::tr("Shared monitor")).size(14.0))
+                    .truncate(),
+            );
+        }
+        response.on_hover_text(crate::i18n::tr(
+            "The monitor view updates when you switch with Desk Switch.",
+        ));
+        ui.vertical(|ui| {
+            if compact {
+                ui.strong(crate::i18n::tr("Shared monitor"));
+            }
+            ui.add(egui::Label::new(RichText::new(&name).color(color)).truncate())
+                .on_hover_text(&name);
+            if let Some(status) = &status {
+                ui.add(
+                    egui::Label::new(RichText::new(status).small().color(
+                        if visual.error.is_some() {
+                            colors.error
+                        } else {
+                            colors.muted
+                        },
+                    ))
+                    .truncate(),
+                )
+                .on_hover_text(
+                    visual
+                        .error
+                        .as_deref()
+                        .map(crate::i18n::tr)
+                        .unwrap_or_else(|| status.clone()),
+                );
+            }
+            if !compact {
+                ui.horizontal_wrapped(|ui| {
+                    for participant in &visual.participants {
+                        let (rect, response) =
+                            ui.allocate_exact_size(Vec2::new(92.0, 76.0), egui::Sense::hover());
+                        let tower_color = if participant.online {
+                            participant.source.color
+                        } else {
+                            colors.muted.gamma_multiply(0.55)
+                        };
+                        if participant.selected {
+                            ui.painter().rect_filled(
+                                rect.shrink(1.0),
+                                7,
+                                tower_color.gamma_multiply(0.08),
+                            );
+                        }
+                        tower_scaled(
+                            ui.painter(),
+                            egui::pos2(rect.center().x, rect.top() + 26.0),
+                            0.45,
+                            tower_color,
+                            colors.card,
+                        );
+                        ui.place(
+                            egui::Rect::from_min_size(
+                                rect.left_top() + Vec2::new(3.0, 52.0),
+                                Vec2::new(rect.width() - 6.0, 20.0),
+                            ),
+                            egui::Label::new(
+                                RichText::new(&participant.source.name)
+                                    .size(11.0)
+                                    .color(tower_color),
+                            )
+                            .truncate(),
+                        );
+                        let input = participant
+                            .input
+                            .map(|input| match input {
+                                15 => "DisplayPort".into(),
+                                16 => "DisplayPort 2".into(),
+                                17 => "HDMI 1".into(),
+                                18 => "HDMI 2".into(),
+                                _ => format!("0x{input:02x}"),
+                            })
+                            .unwrap_or_else(|| crate::i18n::tr("Monitor port is not configured"));
+                        response.on_hover_text(format!(
+                            "{} · {} · {}",
+                            participant.source.name,
+                            input,
+                            crate::i18n::tr(if participant.online {
+                                "Connected"
+                            } else {
+                                "Offline"
+                            })
+                        ));
+                    }
+                });
+            }
+        });
+    });
 }
 
 fn device_picker(

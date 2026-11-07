@@ -504,7 +504,7 @@
   "Switch the shared monitor": "Переключать общий монитор",
   "Switch to computer…": "Переключиться на компьютер…",
   "Switch to next computer": "На следующий компьютер",
-  "Text and images. Files are planned for a later release.": "Текст и изображения. Передача файлов запланирована на будущий выпуск.",
+  "Text and images.": "Текст и изображения.",
   "This computer uses the shared monitor": "Этот компьютер использует общий монитор",
   "Unavailable": "Недоступен",
   "Virtual microphone": "Виртуальный микрофон",
@@ -573,5 +573,12 @@
   "Nearby computers will appear here. You can also connect by IP address.": "Найденные компьютеры появятся здесь. Также можно подключиться по IP-адресу.",
   "Use an IP address": "Указать IP-адрес",
   "Connection requested. Approve it on the other computer.": "Запрос на подключение отправлен. Подтвердите его на другом компьютере.",
-  "The connection was not approved. Check the address and try again.": "Подключение не подтверждено. Проверьте адрес и повторите попытку."
+  "The connection was not approved. Check the address and try again.": "Подключение не подтверждено. Проверьте адрес и повторите попытку.",
+  "Reconnect the workspace controller before adding another computer.": "Подключитесь к координатору рабочего места перед добавлением другого компьютера.",
+  "Not shared": "Без общего доступа",
+  "Monitor switch failed": "Не удалось переключить монитор",
+  "Monitor input unknown": "Вход монитора неизвестен",
+  "Monitor port is not configured": "Вход монитора не настроен",
+  "The monitor view updates when you switch with Desk Switch.": "Состояние монитора обновляется при переключении через Desk Switch.",
+  "Device colour shows which PC it comes from": "Цвет устройства показывает, с какого оно ПК"
 }

@@ -83,6 +83,11 @@ jobs:
           python3 tools/test_update_install.py
           udevadm verify packaging/linux/99-desk-switch-input-access.rules
       - run: cargo build --locked --release
+      - name: Verify native executable icons and version metadata
+        if: matrix.platform == 'windows'
+        shell: pwsh
+        timeout-minutes: 2
+        run: ./tools/verify_windows_icon.ps1 -Executable target/release/desk-switch.exe -ExpectedIcon assets/desk-switch.ico -PngDirectory target/windows-icon-proof
       - if: runner.os == 'Linux'
         run: /usr/bin/python3 tools/test_portal_restore.py --binary target/release/desk-switch
       - if: matrix.platform == 'linux'
