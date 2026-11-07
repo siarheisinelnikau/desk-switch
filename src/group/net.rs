@@ -50,6 +50,17 @@ const MAX_PACKET: usize = 16 * 1024 * 1024;
 const CHUNK: usize = 60 * 1024;
 const AUTH: Duration = Duration::from_secs(5);
 
+fn canonical_address(address: SocketAddr) -> SocketAddr {
+    if let SocketAddr::V6(value) = address
+        && let Some(ip) = value.ip().to_ipv4_mapped()
+    {
+        SocketAddr::new(ip.into(), value.port())
+    } else {
+        // A genuine IPv6 endpoint keeps its flow information and interface scope.
+        address
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub enum Action {
     Settings {
@@ -519,7 +530,7 @@ async fn setup(
         protocol == model::PROTOCOL && member.node.key == peer,
         "Incompatible workspace handshake"
     );
-    member.address = candidate.address;
+    member.address = canonical_address(candidate.address);
     member.online = true;
     member.validate(&remote_hub)?;
     let requested = if outgoing { intent } else { remote_intent };
@@ -918,6 +929,27 @@ fn local_action(
     internal: &queue::Sender<Incoming>,
     receipts: &mut UpdateReceipts,
 ) -> Result<()> {
+    if state.hub != own
+        && !sessions.contains_key(&state.hub)
+        && let Action::Invite { address, key } = &action
+    {
+        ensure!(
+            key.is_empty() || key == &state.hub,
+            "Reconnect the workspace controller before adding another computer."
+        );
+        // A manual address is a new route to the saved controller, never consent
+        // to replace its authenticated identity or discard the current workspace.
+        dial(
+            identity,
+            &state.members[own],
+            state,
+            canonical_address(*address),
+            state.hub.clone(),
+            Intent::Join,
+            internal.clone(),
+        );
+        return Ok(());
+    }
     let update = if let Action::Update { target, message } = &action {
         message.validate()?;
         ensure!(
@@ -1154,8 +1186,7 @@ async fn run(
                     if sessions.get(&key).is_some_and(|session:&Session| session.generation <= candidate.connection) { continue; }
                     let result = (|| {
                         let mut next = state.clone();
-                        let mut local_address = candidate.stream.local_addr()?;
-                        if let SocketAddr::V6(address) = local_address && let Some(ip) = address.ip().to_ipv4_mapped() {local_address = SocketAddr::new(ip.into(), address.port());}
+                        let mut local_address = canonical_address(candidate.stream.local_addr()?);
                         local_address.set_port(listener.local_addr()?.port());
                         next.members.get_mut(&own).unwrap().address = local_address;
                         if controller {
@@ -1465,6 +1496,184 @@ mod tests {
             reloaded.members[&peer].preferences,
             state.members[&peer].preferences
         );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn mapped_ipv4_members_are_canonical_and_real_ipv6_keeps_its_scope() {
+        let mapped: SocketAddr = "[::ffff:127.0.0.1]:45880".parse().unwrap();
+        assert_eq!(
+            canonical_address(mapped),
+            "127.0.0.1:45880".parse().unwrap()
+        );
+        let scoped = SocketAddr::V6(std::net::SocketAddrV6::new(
+            "fe80::1234".parse().unwrap(),
+            45880,
+            13,
+            17,
+        ));
+        assert_eq!(canonical_address(scoped), scoped);
+    }
+
+    #[test]
+    fn a_saved_workspace_with_auto_connect_disabled_reconnects_its_pinned_controller_by_ip() {
+        let root = std::env::temp_dir().join(format!(
+            "desk-switch-manual-controller-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let fixture = model::tests::fixture(3);
+        let mut members = Vec::new();
+        let mut directories = Vec::new();
+        for (index, template) in fixture.members.values().enumerate() {
+            let dir = root.join(index.to_string());
+            std::fs::create_dir_all(&dir).unwrap();
+            let identity = config::create_identity(&dir).unwrap();
+            let mut member = template.clone();
+            member.node.key = config::hex(&identity.public);
+            member.node.management = Some(workspace::management::State {
+                application: workspace::management::Application {
+                    theme: "dark".into(),
+                    language: "en".into(),
+                    autostart: false,
+                    auto_connect: false,
+                    auto_update: false,
+                    show_remote_cursor: true,
+                },
+                update: Default::default(),
+            });
+            member.preferences.audio.volume = if index == 0 { 41 } else { 23 };
+            member.address = "127.0.0.1:9".parse().unwrap();
+            member.online = false;
+            members.push(member);
+            directories.push(dir);
+        }
+        let keys = members
+            .iter()
+            .map(|member| member.node.key.clone())
+            .collect::<Vec<_>>();
+        let mut stored = fixture;
+        stored.hub = keys[0].clone();
+        stored.members = members[..2]
+            .iter()
+            .map(|member| (member.node.key.clone(), member.clone()))
+            .collect();
+        stored.settings.clipboard_enabled = true;
+        stored.revision = 7;
+        let settings = stored.settings.clone();
+        for index in 0..2 {
+            save(&directories[index], &stored).unwrap();
+            config::pair(&directories[index], &keys[1 - index]).unwrap();
+        }
+        let identity_files = directories[..2]
+            .iter()
+            .map(|dir| std::fs::read(dir.join("identity")).unwrap())
+            .collect::<Vec<_>>();
+        let pin_files = directories[..2]
+            .iter()
+            .map(|dir| std::fs::read(dir.join("peer")).unwrap())
+            .collect::<Vec<_>>();
+        let mut computers = members
+            .into_iter()
+            .zip(directories)
+            .map(|(member, dir)| Computer {
+                service: Service::start(dir.clone(), member.clone(), 0, egui::Context::default())
+                    .unwrap(),
+                state: None,
+                dir,
+                member,
+            })
+            .collect::<Vec<_>>();
+        let mut forwarded = Vec::new();
+        until(&mut computers, &mut forwarded, |computers, _| {
+            computers.iter().all(|computer| computer.state.is_some())
+        });
+        std::thread::sleep(Duration::from_millis(50));
+        pump(&mut computers, &mut forwarded);
+        assert!(!computers[1].state.as_ref().unwrap().members[&keys[0]].online);
+        assert!(!computers[0].state.as_ref().unwrap().members[&keys[1]].online);
+        let other = computers[2].state.as_ref().unwrap().members[&keys[2]].address;
+
+        let before = forwarded.len();
+        computers[1]
+            .service
+            .action(Action::Invite {
+                address: other,
+                key: keys[2].clone(),
+            })
+            .unwrap();
+        until(&mut computers, &mut forwarded, |_, events| {
+            events[before..].iter().any(|(index,event)|*index==1 && matches!(event,Event::Error(error) if error.contains("Reconnect the workspace controller")))
+        });
+        let before = forwarded.len();
+        computers[1]
+            .service
+            .action(Action::Invite {
+                address: other,
+                key: String::new(),
+            })
+            .unwrap();
+        until(&mut computers, &mut forwarded, |_, events| {
+            events[before..]
+                .iter()
+                .any(|(index, event)| *index == 1 && matches!(event, Event::Error(_)))
+        });
+        assert_eq!(computers[1].state.as_ref().unwrap().hub, keys[0]);
+        assert_eq!(computers[1].state.as_ref().unwrap().members.len(), 2);
+        assert_eq!(computers[2].state.as_ref().unwrap().members.len(), 1);
+
+        let controller = computers[0].state.as_ref().unwrap().members[&keys[0]].address;
+        computers[1]
+            .service
+            .action(Action::Invite {
+                address: controller,
+                key: String::new(),
+            })
+            .unwrap();
+        until(&mut computers, &mut forwarded, |computers, _| {
+            computers[..2].iter().all(|computer| {
+                computer.state.as_ref().is_some_and(|state| {
+                    state.members.len() == 2 && state.members.values().all(|member| member.online)
+                })
+            })
+        });
+        for (index, computer) in computers[..2].iter().enumerate() {
+            let state = computer.state.as_ref().unwrap();
+            assert_eq!(state.hub, keys[0]);
+            assert_eq!(state.settings, settings);
+            for key in &keys[..2] {
+                assert_eq!(
+                    state.members[key].preferences,
+                    stored.members[key].preferences
+                );
+                assert!(state.members[key].address.is_ipv4());
+            }
+            assert!(
+                !state.members[&keys[index]]
+                    .node
+                    .management
+                    .as_ref()
+                    .unwrap()
+                    .application
+                    .auto_connect
+            );
+            assert_eq!(
+                std::fs::read(computer.dir.join("identity")).unwrap(),
+                identity_files[index]
+            );
+            assert_eq!(
+                std::fs::read(computer.dir.join("peer")).unwrap(),
+                pin_files[index]
+            );
+        }
+        for computer in &computers {
+            computer.service.stop();
+        }
+        drop(computers);
+        std::thread::sleep(Duration::from_millis(100));
         std::fs::remove_dir_all(root).unwrap();
     }
 

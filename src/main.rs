@@ -19,6 +19,7 @@ mod i18n;
 mod keys;
 mod licenses;
 mod lifecycle;
+mod listen;
 #[cfg(target_os = "macos")]
 mod macos_native;
 #[cfg(any(windows, target_os = "linux", target_os = "macos"))]

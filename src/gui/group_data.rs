@@ -13,7 +13,6 @@ use anyhow::{Context, Result, ensure};
 use eframe::egui;
 use std::{
     collections::BTreeMap,
-    net::SocketAddr,
     path::{Path, PathBuf},
 };
 
@@ -91,7 +90,9 @@ pub(super) struct Data {
 }
 
 fn endpoint(member: &Member, port: u16) -> String {
-    SocketAddr::new(member.address.ip(), port).to_string()
+    let mut address = member.address;
+    address.set_port(port);
+    address.to_string()
 }
 fn microphone_port(state: &Workspace, destination: &str) -> Result<u16> {
     let offset = state
@@ -166,7 +167,7 @@ pub(super) fn desired(
             let address = if host {
                 endpoint(peer, workspace::INPUT_PORT)
             } else {
-                "0.0.0.0:45876".into()
+                "[::]:45876".into()
             };
             let mut spec = blank(
                 "input".into(),
@@ -234,7 +235,7 @@ pub(super) fn desired(
                 result.insert(spec.name.clone(), spec);
             }
         } else {
-            let mut args = vec!["audio".into(), "serve".into(), "0.0.0.0:45877".into()];
+            let mut args = vec!["audio".into(), "serve".into(), "[::]:45877".into()];
             device_arg(&mut args, "--source", &choices.speaker);
             let spec = blank("audio-send".into(), output.clone(), Kind::AudioSend, args);
             result.insert(spec.name.clone(), spec);
@@ -250,7 +251,7 @@ pub(super) fn desired(
                 let args = vec![
                     "microphone".into(),
                     "serve".into(),
-                    format!("0.0.0.0:{}", microphone_port(state, &member.node.key)?),
+                    format!("[::]:{}", microphone_port(state, &member.node.key)?),
                     "--source".into(),
                     binding.device.clone(),
                 ];
@@ -664,6 +665,50 @@ impl Data {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::net::{Ipv6Addr, SocketAddr, SocketAddrV6};
+
+    #[test]
+    fn scoped_ipv6_peers_keep_their_interfaces_for_input_audio_and_microphone_links() {
+        let mut state = crate::group::model::tests::fixture(4);
+        state.settings.microphone_enabled = true;
+        state.bind_microphone();
+        for (index, member) in state.members.values_mut().enumerate() {
+            member.address = SocketAddr::V6(SocketAddrV6::new(
+                "fe80::1".parse::<Ipv6Addr>().unwrap(),
+                46_000 + index as u16,
+                0,
+                11 + index as u32,
+            ));
+        }
+        let source = state.plan().input.unwrap();
+        let output = state.plan().audio.unwrap();
+        state.active_input = Some(output.clone());
+        let inputs = desired(&state, &source, &[], true).unwrap();
+        let target = inputs["input"].args[3].parse::<SocketAddr>().unwrap();
+        assert_eq!(target, {
+            let mut address = state.members[&output].address;
+            address.set_port(workspace::INPUT_PORT);
+            address
+        });
+        let outputs = desired(&state, &output, &[], true).unwrap();
+        for spec in outputs
+            .values()
+            .filter(|spec| spec.kind == Kind::AudioReceive)
+        {
+            let address = spec.args[2].parse::<SocketAddr>().unwrap();
+            assert_eq!(address, {
+                let mut address = state.members[&spec.peer].address;
+                address.set_port(workspace::AUDIO_PORT);
+                address
+            });
+        }
+        let microphone = &inputs["microphone-receive"];
+        assert_eq!(microphone.args[2].parse::<SocketAddr>().unwrap(), {
+            let mut address = state.members[&microphone.peer].address;
+            address.set_port(microphone_port(&state, &source).unwrap());
+            address
+        });
+    }
 
     #[test]
     fn input_targets_wait_for_matching_monitor_generation_and_keep_one_native_link() {
@@ -709,7 +754,7 @@ mod tests {
                 let spec = &receiver["input"];
                 assert_eq!(spec.peer, source);
                 assert_eq!(spec.args[2], "receiver");
-                assert_eq!(spec.args[3], "0.0.0.0:45876");
+                assert_eq!(spec.args[3], "[::]:45876");
                 assert!(!spec.activate && !spec.desired_remote);
             }
             state.activation += 1;
@@ -904,7 +949,7 @@ mod tests {
             let receiver = desired(&state, &member.node.key, &[], true).unwrap();
             let spec = &receiver["microphone-receive"];
             let port = spec.args[2].parse::<SocketAddr>().unwrap().port();
-            assert!(ports.contains(&format!("0.0.0.0:{port}")));
+            assert!(ports.contains(&format!("[::]:{port}")));
         }
     }
 }

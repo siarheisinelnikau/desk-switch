@@ -2,7 +2,7 @@ use super::{link::Link, stream};
 use crate::config::{Identity, Key};
 use anyhow::{Context, Result};
 use std::net::SocketAddr;
-use tokio::net::{TcpListener, TcpStream};
+use tokio::net::TcpStream;
 
 #[cfg(target_os = "linux")]
 use super::linux::Capture;
@@ -27,15 +27,16 @@ pub async fn serve_media(
     source: Option<&str>,
     media: super::Media,
 ) -> Result<()> {
-    let listener = TcpListener::bind(address)
-        .await
-        .context("binding the audio sender port")?;
+    let listener = crate::listen::tcp(address).context("binding the audio sender port")?;
     let label = if media == super::Media::System {
         "System audio"
     } else {
         "Microphone"
     };
-    println!("{label} enabled on {address}. Waiting for the paired receiver.");
+    println!(
+        "{label} enabled on {}. Waiting for the paired receiver.",
+        listener.local_addr()?
+    );
     let shutdown = crate::lifecycle::shutdown();
     tokio::pin!(shutdown);
     loop {

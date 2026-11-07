@@ -563,5 +563,15 @@
   "Select a monitor": "Selecciona un monitor",
   "Microphone level": "Nivel del micrófono",
   "Workspace coordinator": "Coordinador",
-  "Update this computer last to keep workspace management available.": "Actualiza este ordenador al final para mantener disponible la gestión del espacio de trabajo."
+  "Update this computer last to keep workspace management available.": "Actualiza este ordenador al final para mantener disponible la gestión del espacio de trabajo.",
+  "Advanced": "Avanzado",
+  "Select this PC to retry its devices.": "Selecciona este equipo para volver a iniciar sus dispositivos.",
+  "Nearby computers": "Equipos cercanos",
+  "Manual IP": "IP manual",
+  "Connect over your local network or VPN. Approve the request on the other computer.": "Conecta por tu red local o VPN. Aprueba la solicitud en el otro equipo.",
+  "Use IP, IP:port, or [IPv6]:port. Default port: 45880.": "Usa IP, IP:port o [IPv6]:port. Puerto predeterminado: 45880.",
+  "Nearby computers will appear here. You can also connect by IP address.": "Los equipos cercanos aparecerán aquí. También puedes conectarte por dirección IP.",
+  "Use an IP address": "Usar una dirección IP",
+  "Connection requested. Approve it on the other computer.": "Conexión solicitada. Apruébala en el otro equipo.",
+  "The connection was not approved. Check the address and try again.": "La conexión no se ha aprobado. Comprueba la dirección e inténtalo de nuevo."
 }

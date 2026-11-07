@@ -563,5 +563,15 @@
   "Select a monitor": "Выберите монитор",
   "Microphone level": "Уровень микрофона",
   "Workspace coordinator": "Координатор",
-  "Update this computer last to keep workspace management available.": "Обновляйте этот компьютер последним, чтобы управление рабочим местом оставалось доступным."
+  "Update this computer last to keep workspace management available.": "Обновляйте этот компьютер последним, чтобы управление рабочим местом оставалось доступным.",
+  "Advanced": "Дополнительно",
+  "Select this PC to retry its devices.": "Выберите этот ПК, чтобы повторно запустить его устройства.",
+  "Nearby computers": "Компьютеры рядом",
+  "Manual IP": "IP вручную",
+  "Connect over your local network or VPN. Approve the request on the other computer.": "Подключитесь через локальную сеть или VPN. Подтвердите запрос на другом компьютере.",
+  "Use IP, IP:port, or [IPv6]:port. Default port: 45880.": "Введите IP, IP:port или [IPv6]:port. Порт по умолчанию: 45880.",
+  "Nearby computers will appear here. You can also connect by IP address.": "Найденные компьютеры появятся здесь. Также можно подключиться по IP-адресу.",
+  "Use an IP address": "Указать IP-адрес",
+  "Connection requested. Approve it on the other computer.": "Запрос на подключение отправлен. Подтвердите его на другом компьютере.",
+  "The connection was not approved. Check the address and try again.": "Подключение не подтверждено. Проверьте адрес и повторите попытку."
 }

@@ -54,6 +54,85 @@ async fn links(windows: &Identity, ubuntu: &Identity) -> (Link, Link) {
 }
 
 #[tokio::test]
+async fn dual_stack_media_listener_authenticates_and_streams_pcm_over_both_address_families() {
+    use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
+    let receiver = identity();
+    let sender = identity();
+    for media in [super::Media::System, super::Media::Microphone] {
+        let listener = crate::listen::tcp("[::]:0".parse().unwrap()).unwrap();
+        let listening = listener.local_addr().unwrap();
+        let mut endpoints = vec![SocketAddr::from((Ipv4Addr::LOCALHOST, listening.port()))];
+        if listening.is_ipv6() {
+            endpoints.push(SocketAddr::from((Ipv6Addr::LOCALHOST, listening.port())));
+        }
+        for endpoint in endpoints {
+            timeout(Duration::from_secs(3), async {
+                let (receiver_socket, sender_socket) =
+                    tokio::join!(TcpStream::connect(endpoint), listener.accept());
+                let (receiver_link, sender_link) = tokio::join!(
+                    Link::open_media(
+                        receiver_socket.unwrap(),
+                        &receiver,
+                        &sender.public,
+                        true,
+                        media
+                    ),
+                    Link::open_media(
+                        sender_socket.unwrap().0,
+                        &sender,
+                        &receiver.public,
+                        false,
+                        media
+                    ),
+                );
+                let mut receiver_link = receiver_link.unwrap();
+                let mut sender_link = sender_link.unwrap();
+                let mut received = SILENCE;
+                receiver_link.send(Packet::Start, &SILENCE).await.unwrap();
+                assert_eq!(
+                    sender_link.receive(&mut received).await.unwrap(),
+                    Packet::Start
+                );
+                sender_link.send(Packet::Ready, &SILENCE).await.unwrap();
+                assert_eq!(
+                    receiver_link.receive(&mut received).await.unwrap(),
+                    Packet::Ready
+                );
+                receiver_link
+                    .send(Packet::Credit(1), &SILENCE)
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    sender_link.receive(&mut received).await.unwrap(),
+                    Packet::Credit(1)
+                );
+                let pcm = [42; FRAME_BYTES];
+                sender_link
+                    .send(
+                        Packet::Audio {
+                            ticket: 1,
+                            sequence: 0,
+                        },
+                        &pcm,
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    receiver_link.receive(&mut received).await.unwrap(),
+                    Packet::Audio {
+                        ticket: 1,
+                        sequence: 0
+                    }
+                );
+                assert_eq!(received, pcm);
+            })
+            .await
+            .expect("dual-stack media endpoint did not complete its authenticated frame");
+        }
+    }
+}
+
+#[tokio::test]
 async fn microphone_connections_cannot_authenticate_as_system_audio() {
     let a = identity();
     let b = identity();
