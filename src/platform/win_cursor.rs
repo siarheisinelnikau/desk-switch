@@ -1,14 +1,13 @@
 //! A click-through cursor for Windows desktops without an attached physical mouse.
 //! Never changes ShowCursor counters, Mouse Keys, registry or system cursor settings.
-use anyhow::{Context, Result, ensure};
+use anyhow::{Result, ensure};
 use std::{
     cell::RefCell,
     mem::size_of,
     ptr::{null, null_mut},
     sync::{
         Arc,
-        atomic::{AtomicBool, Ordering},
-        mpsc,
+        atomic::{AtomicBool, AtomicU32, Ordering},
     },
     thread::JoinHandle,
 };
@@ -31,13 +30,18 @@ const REFRESH: u32 = WM_APP + 0x3b;
 struct Wake {
     active: Arc<AtomicBool>,
     queued: Arc<AtomicBool>,
-    thread_id: u32,
+    closed: Arc<AtomicBool>,
+    thread_id: Arc<AtomicU32>,
 }
 impl Wake {
     fn refresh(&self) {
+        let thread_id = self.thread_id.load(Ordering::Acquire);
+        if thread_id == 0 || self.closed.load(Ordering::Acquire) {
+            return;
+        }
         // Retain only the latest position, never a backlog of obsolete frames.
         if !self.queued.swap(true, Ordering::AcqRel)
-            && unsafe { PostThreadMessageW(self.thread_id, REFRESH, 0, 0) } == 0
+            && unsafe { PostThreadMessageW(thread_id, REFRESH, 0, 0) } == 0
         {
             self.queued.store(false, Ordering::Release);
         }
@@ -51,27 +55,36 @@ pub struct Overlay {
 }
 impl Overlay {
     pub fn start() -> Result<Self> {
-        let (send, receive) = mpsc::sync_channel(1);
+        Self::start_with(|| unsafe { Window::create() })
+    }
+    fn start_with(create: impl FnOnce() -> Result<Window> + Send + 'static) -> Result<Self> {
+        let wake = Wake {
+            active: Arc::new(AtomicBool::new(false)),
+            queued: Arc::new(AtomicBool::new(false)),
+            closed: Arc::new(AtomicBool::new(false)),
+            thread_id: Arc::new(AtomicU32::new(0)),
+        };
+        let worker = wake.clone();
         let thread = std::thread::Builder::new()
             .name("Desk Switch pointer".into())
             .spawn(move || {
-                let result = unsafe { Window::create() };
+                let wake = worker;
+                let result = create();
                 match result {
                     Ok(mut window) => {
-                        let wake = Wake {
-                            active: Arc::new(AtomicBool::new(false)),
-                            queued: Arc::new(AtomicBool::new(false)),
-                            thread_id: unsafe { GetCurrentThreadId() },
-                        };
+                        // Publish the destination only after its message queue exists.
+                        let mut message = MSG::default();
+                        unsafe { PeekMessageW(&mut message, null_mut(), 0, 0, PM_NOREMOVE) };
+                        wake.thread_id
+                            .store(unsafe { GetCurrentThreadId() }, Ordering::Release);
                         WAKE.with(|state| *state.borrow_mut() = Some(wake.clone()));
                         let _notifications = unsafe { Notifications::start(window.hwnd) };
                         let mut physical_mouse = physical_mouse();
                         let mut inventory_dirty = false;
-                        if send.send(Ok(wake.clone())).is_err() {
-                            return;
-                        }
-                        let mut message = MSG::default();
-                        loop {
+                        // Device enumeration and window creation must never block
+                        // the input/heartbeat task, including first motion and disable.
+                        wake.refresh();
+                        while !wake.closed.load(Ordering::Acquire) {
                             let status = unsafe { GetMessageW(&mut message, null_mut(), 0, 0) };
                             if status <= 0 {
                                 break;
@@ -99,23 +112,16 @@ impl Overlay {
                         WAKE.with(|state| state.borrow_mut().take());
                     }
                     Err(error) => {
-                        let _ = send.send(Err(format!("{error:#}")));
+                        eprintln!("Windows pointer fallback could not start: {error:#}");
                     }
                 }
+                wake.closed.store(true, Ordering::Release);
+                wake.thread_id.store(0, Ordering::Release);
             })?;
-        match receive
-            .recv()
-            .context("starting the Windows pointer window")?
-        {
-            Ok(wake) => Ok(Self {
-                wake,
-                thread: Some(thread),
-            }),
-            Err(error) => {
-                let _ = thread.join();
-                anyhow::bail!("{error}");
-            }
-        }
+        Ok(Self {
+            wake,
+            thread: Some(thread),
+        })
     }
     pub fn active(&self, enabled: bool) {
         if self.wake.active.swap(enabled, Ordering::AcqRel) != enabled {
@@ -129,13 +135,20 @@ impl Overlay {
 impl Drop for Overlay {
     fn drop(&mut self) {
         self.active(false);
+        self.wake.closed.store(true, Ordering::Release);
         if let Some(thread) = self.thread.take() {
             if !thread.is_finished() {
                 unsafe {
-                    PostThreadMessageW(self.wake.thread_id, WM_QUIT, 0, 0);
+                    let thread_id = self.wake.thread_id.load(Ordering::Acquire);
+                    if thread_id != 0 {
+                        PostThreadMessageW(thread_id, WM_QUIT, 0, 0);
+                    }
                 }
+                // The thread owns its window and cleans up after its current
+                // native operation. Input release must not wait for a driver.
+            } else {
+                let _ = thread.join();
             }
-            let _ = thread.join();
         }
     }
 }
@@ -276,12 +289,20 @@ impl Window {
                 lpszClassName: CLASS,
                 ..Default::default()
             };
-            if RegisterClassW(&class) == 0 {
+            // Keep the class for this process. A disabled overlay can finish
+            // asynchronously while a new one is starting on another thread.
+            static REGISTERED: std::sync::OnceLock<std::result::Result<(), String>> =
+                std::sync::OnceLock::new();
+            let registered = REGISTERED.get_or_init(|| {
+                if RegisterClassW(&class) == 0 {
+                    Err(std::io::Error::last_os_error().to_string())
+                } else {
+                    Ok(())
+                }
+            });
+            if let Err(error) = registered {
                 DeleteObject(brush);
-                anyhow::bail!(
-                    "could not register the pointer window: {}",
-                    std::io::Error::last_os_error()
-                );
+                anyhow::bail!("could not register the pointer window: {error}");
             }
             let hwnd = CreateWindowExW(
                 WS_EX_LAYERED
@@ -302,7 +323,6 @@ impl Window {
                 null(),
             );
             if hwnd.is_null() {
-                UnregisterClassW(CLASS, module);
                 DeleteObject(brush);
                 anyhow::bail!(
                     "could not create the pointer window: {}",
@@ -465,7 +485,6 @@ impl Drop for Window {
             DestroyWindow(self.hwnd);
             DRAWING.with(|state| state.borrow_mut().take());
             DeleteObject(self.brush);
-            UnregisterClassW(CLASS, GetModuleHandleW(null()));
         }
     }
 }
@@ -473,6 +492,28 @@ impl Drop for Window {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn startup_and_disable_do_not_wait_for_native_initialization() {
+        let (started, ready) = std::sync::mpsc::sync_channel(1);
+        let (finish, wait) = std::sync::mpsc::sync_channel(1);
+        let overlay = Overlay::start_with(move || {
+            started.send(()).unwrap();
+            wait.recv().unwrap();
+            anyhow::bail!("synthetic cancelled pointer initialization")
+        })
+        .unwrap();
+        ready
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .unwrap();
+        let wake = overlay.wake.clone();
+        overlay.active(true);
+        overlay.refresh();
+        drop(overlay); // Must return while the fake native operation is blocked.
+        assert!(wake.closed.load(Ordering::Acquire));
+        assert_eq!(wake.thread_id.load(Ordering::Acquire), 0);
+        finish.send(()).unwrap();
+    }
 
     #[test]
     fn pointer_window_is_hidden_click_through_and_never_activates() {

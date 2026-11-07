@@ -11,10 +11,7 @@ use windows_sys::Win32::{
     UI::{
         HiDpi::{DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, SetProcessDpiAwarenessContext},
         Input::KeyboardAndMouse::*,
-        WindowsAndMessaging::{
-            GetCursorPos, GetSystemMetrics, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN,
-            SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN,
-        },
+        WindowsAndMessaging::GetCursorPos,
     },
 };
 
@@ -105,15 +102,7 @@ impl NativeSink {
     }
 }
 
-fn normalize(position: i32, origin: i32, extent: i32) -> i32 {
-    ((i64::from(position)
-        .saturating_sub(i64::from(origin))
-        .clamp(0, i64::from(extent - 1))
-        * 65535)
-        / i64::from(extent - 1)) as i32
-}
-
-fn inject(event: Input) -> Result<()> {
+fn encode(event: Input) -> Result<INPUT> {
     let mut input = INPUT::default();
     match event {
         Input::Key { code, down } => {
@@ -138,23 +127,13 @@ fn inject(event: Input) -> Result<()> {
             let mut mouse = MOUSEINPUT::default();
             match event {
                 Input::Move { dx, dy } => {
-                    let mut cursor = POINT::default();
-                    ensure!(
-                        unsafe { GetCursorPos(&mut cursor) } != 0,
-                        "cannot read the Windows cursor"
-                    );
-                    let left = unsafe { GetSystemMetrics(SM_XVIRTUALSCREEN) };
-                    let top = unsafe { GetSystemMetrics(SM_YVIRTUALSCREEN) };
-                    let width = unsafe { GetSystemMetrics(SM_CXVIRTUALSCREEN) };
-                    let height = unsafe { GetSystemMetrics(SM_CYVIRTUALSCREEN) };
-                    ensure!(
-                        width > 1 && height > 1,
-                        "Windows virtual desktop is unavailable"
-                    );
-                    mouse.dx = normalize(cursor.x.saturating_add(dx), left, width);
-                    mouse.dy = normalize(cursor.y.saturating_add(dy), top, height);
-                    mouse.dwFlags =
-                        MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK;
+                    // SendInput queues motion. Reading GetCursorPos for every delta
+                    // can repeatedly observe the same old position and lose distance.
+                    // Native relative motion preserves the complete input stream and
+                    // uses this PC's normal pointer speed and acceleration settings.
+                    mouse.dx = dx;
+                    mouse.dy = dy;
+                    mouse.dwFlags = MOUSEEVENTF_MOVE;
                 }
                 Input::Button { code, down } => {
                     mouse.dwFlags = match (code, down) {
@@ -173,9 +152,7 @@ fn inject(event: Input) -> Result<()> {
                     }
                 }
                 Input::Scroll { dx, dy } => {
-                    if dx != 0 && dy != 0 {
-                        inject(Input::Scroll { dx, dy: 0 })?;
-                    }
+                    ensure!(dx == 0 || dy == 0, "encode each scroll axis separately");
                     if dy != 0 {
                         mouse.dwFlags = MOUSEEVENTF_WHEEL;
                         mouse.mouseData = (-i32::from(dy)) as u32;
@@ -190,6 +167,18 @@ fn inject(event: Input) -> Result<()> {
             input.Anonymous.mi = mouse;
         }
     }
+    Ok(input)
+}
+
+fn inject(event: Input) -> Result<()> {
+    if let Input::Scroll { dx, dy } = event
+        && dx != 0
+        && dy != 0
+    {
+        inject(Input::Scroll { dx, dy: 0 })?;
+        return inject(Input::Scroll { dx: 0, dy });
+    }
+    let input = encode(event)?;
     ensure!(
         unsafe { SendInput(1, &input, size_of::<INPUT>() as i32) } == 1,
         "Windows rejected SendInput; check the interactive desktop and application privileges"
@@ -380,10 +369,38 @@ mod tests {
     }
 
     #[test]
-    fn virtual_desktop_mapping_supports_negative_origins() {
-        assert_eq!(normalize(-1920, -1920, 4480), 0);
-        assert_eq!(normalize(2559, -1920, 4480), 65535);
-        assert_eq!(normalize(-3000, -1920, 4480), 0);
-        assert_eq!(normalize(4000, -1920, 4480), 65535);
+    fn queued_motion_preserves_distance_and_button_order_without_cursor_readback() {
+        let events = [
+            Input::Move { dx: 7, dy: -3 },
+            Input::Move { dx: -2, dy: 5 },
+            Input::Move { dx: 100, dy: 20 },
+            Input::Button {
+                code: 272,
+                down: true,
+            },
+            Input::Move { dx: -10, dy: -8 },
+        ];
+        // Encode the entire burst before the OS applies any event. In the old
+        // path every absolute target could be based on the same stale cursor.
+        let queued = events
+            .into_iter()
+            .map(encode)
+            .collect::<Result<Vec<_>>>()
+            .unwrap();
+        let mut position = (-1920, 50);
+        let mut button_position = None;
+        for input in queued {
+            assert_eq!(input.r#type, INPUT_MOUSE);
+            let mouse = unsafe { input.Anonymous.mi };
+            if mouse.dwFlags & MOUSEEVENTF_MOVE != 0 {
+                assert_eq!(mouse.dwFlags & MOUSEEVENTF_ABSOLUTE, 0);
+                position.0 += mouse.dx;
+                position.1 += mouse.dy;
+            } else if mouse.dwFlags & MOUSEEVENTF_LEFTDOWN != 0 {
+                button_position = Some(position);
+            }
+        }
+        assert_eq!(button_position, Some((-1815, 72)));
+        assert_eq!(position, (-1825, 64));
     }
 }
