@@ -121,6 +121,8 @@ For optimized native UI QA, build with `cargo build --locked --profile diagnosti
 
 Set `release/publish-request.json` to the new version tag to build and test both installers. The isolated signing job requires `DESK_SWITCH_UPDATE_SIGNING_KEY` in the `release` GitHub environment, containing the existing pinned Ed25519 private key (PEM or base64-encoded PEM). CI verifies that key, signs the tested installers, then publishes and verifies the signed stable release using the existing promotion checks. A missing or incorrect key stops publication. The private key is never uploaded as an artifact or committed. See [signing setup and backup](docs/signing.md).
 
+From any computer with GitHub access, open **Actions → Release → Run workflow** on `main`. Leave **Publish a new version after build and signing checks** unchecked to build and verify real signatures without publishing; enable it to publish a prepared, new version. The runners provide the toolchains and signing credentials. Existing published versions must not be reused.
+
 For local signing instead, download the two tested installers, then run:
 
 ```sh
