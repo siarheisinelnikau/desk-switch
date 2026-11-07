@@ -84,6 +84,8 @@ pub fn style(ctx: &egui::Context, preference: &str) {
         }
         style.visuals.panel_fill = colors.bg;
         style.visuals.extreme_bg_color = colors.card;
+        style.visuals.window_fill = colors.card;
+        style.visuals.window_stroke = Stroke::new(1.0, colors.line);
         style.visuals.selection.bg_fill = ACCENT;
         style.visuals.selection.stroke = Stroke::new(1.0, Color32::WHITE);
         style.visuals.widgets.inactive.bg_fill = colors.line;
@@ -1979,7 +1981,7 @@ impl Desktop {
         }
         let mut open = self.cable_open;
         egui::Window::new(crate::i18n::tr("VB-CABLE installers"))
-            .open(&mut open).collapsible(false).resizable(false).default_width(500.0)
+            .open(&mut open).anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0]).collapsible(false).resizable(false).default_width(500.0)
             .show(ctx, |ui| {
                 note(ui, "VB-CABLE by VB-Audio Software is donationware. Get the latest installer from the official website, or extract the saved original archive without an internet connection.");
                 ui.horizontal_wrapped(|ui| {
