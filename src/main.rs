@@ -17,6 +17,7 @@ mod gui;
 mod i18n;
 #[cfg(any(windows, test))]
 mod keys;
+mod licenses;
 mod lifecycle;
 #[cfg(target_os = "macos")]
 mod macos_native;
@@ -30,6 +31,7 @@ mod workspace;
 
 const USAGE: &str = "Desk Switch\n\
     gui [--tray]         Open the desktop window, optionally in the system tray\n\
+    --licenses           Print the bundled open-source license notices\n\
     init                 Create this computer's identity and print its public key\n\
     public-key           Print the existing public key\n\
     pair PUBLIC_KEY      Pin the other computer's public key\n\
@@ -81,6 +83,7 @@ fn run() -> Result<()> {
             gui::run_preview(case, std::path::PathBuf::from(path))?
         }
         ["help" | "--help" | "-h"] => println!("{USAGE}"),
+        ["--licenses" | "licenses"] => print!("{}", licenses::NOTICES),
         ["--build-info"] => println!("{}", compatibility::BUILD_INFO),
         #[cfg(target_os = "macos")]
         ["macos-export-helper", name, destination] => {
