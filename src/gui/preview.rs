@@ -647,7 +647,7 @@ impl Desktop {
                     });
             }
         }
-        if case == "shared-four" {
+        if matches!(case, "shared-four" | "shared-four-settings") {
             let mut members = std::collections::BTreeMap::new();
             for (index, (name, platform, key)) in [
                 ("Studio PC", "windows", self.public_key.clone()),
@@ -681,6 +681,11 @@ impl Desktop {
                 node.hardware.microphone_receive = true;
                 node.monitor.enabled = index < 2;
                 node.monitor.input = Some(if index == 0 { 15 } else { 17 });
+                node.devices.displays = vec![crate::workspace::devices::Display {
+                    id: node.monitor.id.clone(),
+                    name: node.monitor.name.clone(),
+                    fingerprint: node.monitor.fingerprint.clone(),
+                }];
                 node.shared = Default::default();
                 node.ack.clear();
                 if let Some(management) = &mut node.management {
@@ -701,7 +706,7 @@ impl Desktop {
                             muted: false,
                         }),
                         preferences,
-                        input_ready: 0,
+                        input_ready: 1,
                     },
                 );
             }
@@ -724,6 +729,9 @@ impl Desktop {
             self.group.workspace = Some(state);
             self.group.preview = true;
             self.group.selected = self.public_key.clone();
+            if case == "shared-four-settings" {
+                self.page = Page::Application;
+            }
             self.preview_scroll = 0.0;
         }
         self.preview = Some(local);

@@ -11,6 +11,7 @@ use std::{
     collections::BTreeSet,
     io::{BufRead, BufReader, Write},
     net::SocketAddr,
+    os::fd::AsRawFd,
     process::{Child, ChildStdin, Stdio},
     sync::{
         Arc, Mutex,
@@ -37,6 +38,18 @@ impl Process {
                 .take()
                 .context("macOS input pipe is unavailable")?,
         ));
+        // A suspended helper must never block the Rust lease or shutdown
+        // path on a full pipe. Every control message fits in PIPE_BUF.
+        let descriptor = writer.lock().unwrap().as_raw_fd();
+        let nonblocking = unsafe {
+            let flags = libc::fcntl(descriptor, libc::F_GETFL);
+            flags >= 0 && libc::fcntl(descriptor, libc::F_SETFL, flags | libc::O_NONBLOCK) >= 0
+        };
+        if !nonblocking {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(std::io::Error::last_os_error().into());
+        }
         let output = child
             .stdout
             .take()
@@ -82,14 +95,25 @@ impl Process {
 impl Drop for Process {
     fn drop(&mut self) {
         let _ = self.command(serde_json::json!({"kind":"stop"}));
+        // Give the native main loop time to release injected keys/buttons and
+        // restore a hidden source cursor before using a forced process stop.
+        let since = std::time::Instant::now();
+        while since.elapsed() < std::time::Duration::from_millis(300) {
+            if self.child.try_wait().is_ok_and(|status| status.is_some()) {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
         let _ = self.child.kill();
         let _ = self.child.wait();
     }
 }
 fn command(writer: &Arc<Mutex<ChildStdin>>, value: serde_json::Value) -> Result<()> {
+    let mut bytes = serde_json::to_vec(&value)?;
+    bytes.push(b'\n');
+    ensure!(bytes.len() <= 512, "The native input command is too large");
     let mut writer = writer.lock().unwrap();
-    serde_json::to_writer(&mut *writer, &value)?;
-    writer.write_all(b"\n")?;
+    writer.write_all(&bytes)?;
     writer.flush()?;
     Ok(())
 }
@@ -284,7 +308,7 @@ pub struct NativeSink {
     keys: BTreeSet<u16>,
     buttons: BTreeSet<u16>,
     edge: Option<Edge>,
-    geometry: Vec<Screen>,
+    geometry: Arc<Mutex<Vec<Screen>>>,
     position: Point,
     return_edge: bool,
     alive: Arc<AtomicBool>,
@@ -292,32 +316,41 @@ pub struct NativeSink {
     lease: std::time::Instant,
 }
 impl NativeSink {
-    pub fn new(mut edge: Option<Edge>) -> Result<Self> {
-        let geometry = screens()?;
-        if let Some(edge) = &mut edge
-            && edge.screen == "auto"
-        {
-            edge.screen = geometry
-                .first()
-                .context("No macOS screen is available")?
-                .id
-                .clone();
-        }
+    pub fn new(edge: Option<Edge>) -> Result<Self> {
+        let geometry = Arc::new(Mutex::new(screens()?));
         let (process, output) = Process::start("input-playback", &[])?;
         let alive = Arc::new(AtomicBool::new(true));
         let emergency = Arc::new(AtomicBool::new(false));
         let reader_alive = alive.clone();
         let reader_emergency = emergency.clone();
+        let reader_geometry = geometry.clone();
         std::thread::Builder::new()
             .name("Desk Switch macOS input receiver".into())
             .spawn(move || {
                 for line in BufReader::new(output).lines() {
                     let Ok(line) = line else { break };
-                    if line.len() <= 1024
-                        && serde_json::from_str::<serde_json::Value>(&line)
-                            .is_ok_and(|value| value["kind"] == "emergency")
-                    {
-                        reader_emergency.store(true, Ordering::Release);
+                    if line.len() > 64 * 1024 {
+                        continue;
+                    }
+                    if let Ok(value) = serde_json::from_str::<serde_json::Value>(&line) {
+                        if value["kind"] == "emergency" {
+                            reader_emergency.store(true, Ordering::Release);
+                        }
+                        if value["kind"] == "geometry"
+                            && let Ok(screens) =
+                                serde_json::from_value::<Vec<Screen>>(value["screens"].clone())
+                            && screens.len() <= 128
+                            && screens.iter().all(|screen| {
+                                screen.x.is_finite()
+                                    && screen.y.is_finite()
+                                    && screen.width.is_finite()
+                                    && screen.height.is_finite()
+                                    && screen.width > 0.
+                                    && screen.height > 0.
+                            })
+                        {
+                            *reader_geometry.lock().unwrap() = screens;
+                        }
                     }
                 }
                 reader_alive.store(false, Ordering::Release);
@@ -335,6 +368,18 @@ impl NativeSink {
             emergency,
             lease: std::time::Instant::now(),
         })
+    }
+    fn edge_screen(&self) -> Result<crate::edge::Rect> {
+        let geometry = self.geometry.lock().unwrap();
+        let edge = self
+            .edge
+            .as_ref()
+            .context("Configure the macOS return edge")?;
+        geometry
+            .iter()
+            .find(|screen| edge.screen == "auto" || screen.id == edge.screen)
+            .map(Screen::rect)
+            .context("The selected macOS return screen is unavailable")
     }
 }
 impl super::receiver::Sink for NativeSink {
@@ -358,31 +403,27 @@ impl super::receiver::Sink for NativeSink {
     fn prepare(&self, position: Option<u16>, mode: Mode) -> Result<()> {
         if position.is_some() {
             ensure!(
-                self.edge.as_ref().is_some_and(|edge| edge.mode == mode
-                    && self.geometry.iter().any(|screen| screen.id == edge.screen)),
+                self.edge.as_ref().is_some_and(|edge| edge.mode == mode)
+                    && self.edge_screen().is_ok(),
                 "Configure a matching macOS return edge on an available screen before using edge switching"
             );
         }
         Ok(())
     }
     fn activate(&mut self, position: Option<u16>, mode: Mode) -> Result<()> {
-        self.geometry = screens()?;
         self.prepare(position, mode)?;
-        self.position = if let Some(position) = position {
+        if let Some(position) = position {
             let edge = self.edge.as_ref().unwrap();
-            let screen = self
-                .geometry
-                .iter()
-                .find(|screen| screen.id == edge.screen)
-                .unwrap();
-            let (x, y) = edge.entry(screen.rect(), position);
-            Point { x, y }
+            let (x, y) = edge.entry(self.edge_screen()?, position);
+            self.position = Point { x, y };
+            self.process
+                .command(serde_json::json!({"kind":"activate","x":x,"y":y}))?;
         } else {
-            crate::macos_native::query("cursor", &[])?
-        };
-        self.process.command(
-            serde_json::json!({"kind":"activate","x":self.position.x,"y":self.position.y}),
-        )?;
+            // The existing native worker adopts the cursor in place. No
+            // process launch or WindowServer query blocks network heartbeats.
+            self.process
+                .command(serde_json::json!({"kind":"activate"}))?;
+        }
         self.active = true;
         self.return_edge = position.is_some();
         Ok(())
@@ -395,13 +436,8 @@ impl super::receiver::Sink for NativeSink {
         if let Input::Move { dx, dy } = input {
             if self.return_edge && self.keys.is_empty() && self.buttons.is_empty() {
                 let edge = self.edge.as_ref().unwrap();
-                let screen = self
-                    .geometry
-                    .iter()
-                    .find(|screen| screen.id == edge.screen)
-                    .context("The macOS return screen disappeared")?;
                 if let Some(position) = edge.side.crossing(
-                    screen.rect(),
+                    self.edge_screen()?,
                     self.position.x,
                     self.position.y,
                     dx.into(),
@@ -412,23 +448,20 @@ impl super::receiver::Sink for NativeSink {
             }
             self.position.x += f64::from(dx);
             self.position.y += f64::from(dy);
-            let min_x = self
-                .geometry
+            let geometry = self.geometry.lock().unwrap();
+            let min_x = geometry
                 .iter()
                 .map(|screen| screen.x)
                 .fold(f64::INFINITY, f64::min);
-            let min_y = self
-                .geometry
+            let min_y = geometry
                 .iter()
                 .map(|screen| screen.y)
                 .fold(f64::INFINITY, f64::min);
-            let max_x = self
-                .geometry
+            let max_x = geometry
                 .iter()
                 .map(|screen| screen.x + screen.width)
                 .fold(f64::NEG_INFINITY, f64::max);
-            let max_y = self
-                .geometry
+            let max_y = geometry
                 .iter()
                 .map(|screen| screen.y + screen.height)
                 .fold(f64::NEG_INFINITY, f64::max);

@@ -37,7 +37,9 @@ impl Probe {
                         Ok(inputs) => (inputs, None),
                         Err(error) => (Vec::new(), Some(error.to_string())),
                     };
+                    let displays = crate::platform::list_displays().unwrap_or_default();
                     let mut inventory = super::devices::Inventory {
+                        displays: display_inventory(&displays),
                         keyboards: inputs
                             .iter()
                             .filter(|d| d.keyboard)
@@ -99,7 +101,7 @@ impl Probe {
                         hardware,
                         inputs,
                         devices: inventory,
-                        displays: crate::platform::list_displays().unwrap_or_default(),
+                        displays,
                         error,
                     };
                     // Replace a queued scan: a busy GUI must get the newest
@@ -122,6 +124,31 @@ impl Probe {
     pub fn poll(&self) -> Option<Snapshot> {
         self.results.lock().unwrap().take()
     }
+}
+
+fn display_inventory(displays: &[MonitorInfo]) -> Vec<super::devices::Display> {
+    let mut result = Vec::new();
+    for display in displays {
+        let mut name = display.name.clone();
+        name.retain(|character| !character.is_control());
+        name.truncate(name.floor_char_boundary(256));
+        let display = super::devices::Display {
+            id: display.id.clone(),
+            name,
+            fingerprint: display.fingerprint.clone(),
+        };
+        if display.validate().is_ok()
+            && !result
+                .iter()
+                .any(|present: &super::devices::Display| present.id == display.id)
+        {
+            result.push(display);
+            if result.len() == 32 {
+                break;
+            }
+        }
+    }
+    result
 }
 impl Drop for Probe {
     fn drop(&mut self) {
@@ -630,6 +657,39 @@ mod tests {
         assert!(!hardware.keyboard && hardware.mouse);
         assert_eq!(hardware.microphone_score, 0);
         assert_eq!(hardware.audio_score, 40);
+    }
+
+    #[test]
+    fn display_enumeration_publishes_bounded_selection_metadata_without_ddc_readback_fields() {
+        let display = |id: String| MonitorInfo {
+            id,
+            name: format!("\n{}", "ж".repeat(300)),
+            screen: "fixture".into(),
+            current: Some(17),
+            inputs: vec![15, 17],
+            error: None,
+            fingerprint: "ab".repeat(32),
+        };
+        let mut displays = (0..40)
+            .map(|index| display(format!("display-{index}")))
+            .collect::<Vec<_>>();
+        displays.insert(0, display("x".repeat(1025)));
+        displays.insert(1, displays[2].clone());
+        let published = display_inventory(&displays);
+        assert_eq!(published.len(), 32);
+        let inventory = super::super::devices::Inventory {
+            displays: published.clone(),
+            ..Default::default()
+        };
+        inventory.validate().unwrap();
+        assert!(
+            published
+                .iter()
+                .all(|display| display.name.len() <= 256 && !display.name.contains('\n'))
+        );
+        let json = serde_json::to_value(&published[0]).unwrap();
+        assert!(json.get("current").is_none() && json.get("inputs").is_none());
+        assert_eq!(json["fingerprint"], "ab".repeat(32));
     }
     #[test]
     fn serial_identity_survives_port_specific_edid_changes() {

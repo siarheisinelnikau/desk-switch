@@ -67,17 +67,13 @@ fn writable(parent: &Path) -> Result<()> {
     fs::remove_file(probe)?;
     Ok(())
 }
-pub(super) fn download(dir: &Path, mut progress: impl FnMut(u64, u64)) -> Result<Outcome> {
-    let Some(bytes) = fetch_release()? else {
-        return Ok(Outcome::Unpublished);
-    };
-    let envelope = release_envelope(&bytes)?;
-    let release = verified(&envelope, PUBLIC_KEY)?;
-    if semver::Version::parse(&release.version)?
-        <= semver::Version::parse(crate::compatibility::VERSION)?
-    {
-        return Ok(Outcome::Current(release.version));
-    }
+pub(super) fn download(
+    dir: &Path,
+    candidate: &Candidate,
+    mut progress: impl FnMut(u64, u64),
+) -> Result<Outcome> {
+    let envelope = candidate.envelope.clone();
+    let release = &candidate.release;
     let artifact = release
         .targets
         .get(target()?)
@@ -128,11 +124,11 @@ pub(super) fn download(dir: &Path, mut progress: impl FnMut(u64, u64)) -> Result
         result?;
     }
     let validation = updates.join(format!(".macos-validate-{}", unique()));
-    let result = extract(&archive, &validation, &release);
+    let result = extract(&archive, &validation, release);
     let _ = fs::remove_dir_all(&validation);
     result?;
     Ok(Outcome::Prepared(
-        release.version,
+        release.version.clone(),
         super::Prepared {
             macos: Prepared { archive, envelope },
         },
@@ -534,10 +530,7 @@ fn apply_inner(path: &Path, ticket: &Ticket) -> Result<()> {
     let health = path.with_extension("health");
     let executable = ticket.app.join("Contents/MacOS/desk-switch");
     let started = start(&executable, &ticket.state, Some(&health));
-    let mut child = match started {
-        Ok(child) => Some(child),
-        Err(_) => None,
-    };
+    let mut child = started.ok();
     let since = Instant::now();
     let mut healthy = false;
     while let Some(process) = child.as_mut() {
