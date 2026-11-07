@@ -9,6 +9,7 @@ pub(super) struct Pending {
     since: Instant,
     pub application: Option<Application>,
     pub cable: bool,
+    timeout: Duration,
 }
 
 pub(super) fn request_id() -> u64 {
@@ -134,6 +135,16 @@ impl Desktop {
                 message,
                 Message::ExtractCable { .. } | Message::InstallCable { .. }
             ),
+            timeout: if matches!(message, Message::ReadMonitor { .. }) {
+                Duration::from_secs(30)
+            } else if matches!(
+                message,
+                Message::ExtractCable { .. } | Message::InstallCable { .. }
+            ) {
+                Duration::from_secs(300)
+            } else {
+                Duration::from_secs(8)
+            },
         });
         ctx.request_repaint();
         Ok(())
@@ -167,6 +178,25 @@ impl Desktop {
             return;
         }
         let id = message.id();
+        if let Message::ReadMonitor { monitor, .. } = &message {
+            let result = self.start_monitor_read(monitor, ctx);
+            if result.is_ok() {
+                let source = self
+                    .group
+                    .reply_target
+                    .clone()
+                    .unwrap_or_else(|| self.peer_key.clone());
+                self.group.monitor_read_reply = Some((source, id));
+                return;
+            }
+            self.management_reply(Message::Reply {
+                id,
+                error: result
+                    .err()
+                    .map(|error| management::status_text(format!("{error:#}"), 1024)),
+            });
+            return;
+        }
         if let Message::ExtractCable { platform, .. } | Message::InstallCable { platform, .. } =
             &message
         {
@@ -201,6 +231,10 @@ impl Desktop {
                     expected, monitor, ..
                 } => {
                     ensure!(
+                        !self.group.monitor_busy() && self.query.is_none(),
+                        "Wait for the current monitor operation to finish"
+                    );
+                    ensure!(
                         self.prefs.workspace.monitor == expected,
                         "Monitor settings changed. Review the current values and try again."
                     );
@@ -224,6 +258,7 @@ impl Desktop {
                     self.apply_application(&application, ctx)?;
                 }
                 Message::Reply { .. }
+                | Message::ReadMonitor { .. }
                 | Message::ExtractCable { .. }
                 | Message::InstallCable { .. } => unreachable!(),
             }
@@ -239,8 +274,7 @@ impl Desktop {
     }
     pub(super) fn tick_management(&mut self, ctx: &egui::Context) {
         if let Some(pending) = &self.management_pending {
-            let remaining = Duration::from_secs(if pending.cable { 300 } else { 8 })
-                .saturating_sub(pending.since.elapsed());
+            let remaining = pending.timeout.saturating_sub(pending.since.elapsed());
             if remaining.is_zero() || self.pair.remote.is_none() {
                 self.management_pending = None;
                 self.notice = Some((
@@ -265,6 +299,7 @@ impl Desktop {
                     false,
                 ));
                 self.peer_restart = None;
+                self.group.update_target = None;
             } else if remaining.is_zero() {
                 self.peer_update_status = Some((
                     "The other PC has not reconnected after installation. Check it and reconnect."
@@ -272,6 +307,7 @@ impl Desktop {
                     true,
                 ));
                 self.peer_restart = None;
+                self.group.update_target = None;
             } else {
                 ctx.request_repaint_after(remaining);
             }
@@ -280,6 +316,53 @@ impl Desktop {
 }
 
 impl Desktop {
+    pub(super) fn start_monitor_read(&mut self, monitor: &str, ctx: &egui::Context) -> Result<()> {
+        ensure!(
+            !self.quitting && !self.install_pending && self.install_job.is_none(),
+            "This PC is installing an update"
+        );
+        let busy = self.query.is_some()
+            || self.group.monitor_busy()
+            || self.monitor_running()
+            || self
+                .input
+                .as_ref()
+                .is_some_and(|worker| worker.running() && worker.monitoring);
+        validate_monitor_read(
+            &self.monitors,
+            &self.prefs.workspace.monitor.id,
+            monitor,
+            busy,
+        )?;
+        self.scan(super::QueryKind::Monitors);
+        ensure!(
+            self.query
+                .as_ref()
+                .is_some_and(|(kind, _)| matches!(kind, super::QueryKind::Monitors)),
+            "Could not start the monitor read"
+        );
+        ctx.request_repaint();
+        Ok(())
+    }
+
+    pub(super) fn finish_monitor_read(&mut self, result: &Result<()>, ctx: &egui::Context) {
+        if let Some((target, id)) = self.group.monitor_read_reply.take() {
+            let reply = Message::Reply {
+                id,
+                error: result
+                    .as_ref()
+                    .err()
+                    .map(|error| management::status_text(format!("{error:#}"), 1024)),
+            };
+            if let Err(error) = self.management_send_to(&target, reply) {
+                self.notice = Some((error.to_string(), true));
+            }
+        }
+        // Publish the recorded input on the next group tick, after the query's
+        // result has been applied to preferences in this tick.
+        ctx.request_repaint();
+    }
+
     fn start_cable_job(
         &mut self,
         platform: crate::cable::Platform,
@@ -356,5 +439,47 @@ impl Desktop {
             }
             self.cable_result = Some(result);
         }
+    }
+}
+
+fn validate_monitor_read(
+    monitors: &[crate::platform::MonitorInfo],
+    selected: &str,
+    requested: &str,
+    busy: bool,
+) -> Result<()> {
+    ensure!(!busy, "Wait for the current monitor operation to finish");
+    ensure!(
+        selected == requested && !requested.is_empty(),
+        "Monitor settings changed. Review the selected monitor and try again."
+    );
+    ensure!(
+        monitors.iter().any(|monitor| monitor.id == requested),
+        "The selected monitor is unavailable"
+    );
+    Ok(())
+}
+
+#[cfg(test)]
+mod monitor_read_tests {
+    use super::*;
+
+    #[test]
+    fn manual_read_requires_the_saved_available_monitor_and_no_active_ddc_operation() {
+        let monitor = |id: &str| crate::platform::MonitorInfo {
+            id: id.into(),
+            name: id.into(),
+            screen: "fixture".into(),
+            current: None,
+            inputs: Vec::new(),
+            error: None,
+            fingerprint: String::new(),
+        };
+        let displays = vec![monitor("first"), monitor("second")];
+        validate_monitor_read(&displays, "first", "first", false).unwrap();
+        assert!(validate_monitor_read(&displays, "first", "first", true).is_err());
+        assert!(validate_monitor_read(&displays, "first", "second", false).is_err());
+        assert!(validate_monitor_read(&displays, "missing", "missing", false).is_err());
+        assert!(validate_monitor_read(&[], "first", "first", false).is_err());
     }
 }

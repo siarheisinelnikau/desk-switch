@@ -4,14 +4,24 @@ use anyhow::{Context, Result, ensure};
 use serde::Deserialize;
 use std::process::Stdio;
 
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize)]
 pub(super) struct Devices {
     pub speakers: Vec<AudioDevice>,
     pub microphones: Vec<AudioDevice>,
     pub bridges: Vec<AudioDevice>,
 }
 pub(super) fn devices() -> Result<Devices> {
-    crate::macos_native::query("devices", &[])
+    static CACHE: std::sync::Mutex<Option<(std::time::Instant, Devices)>> =
+        std::sync::Mutex::new(None);
+    let mut cache = CACHE.lock().unwrap();
+    if let Some((time, devices)) = cache.as_ref()
+        && time.elapsed() < std::time::Duration::from_millis(500)
+    {
+        return Ok(devices.clone());
+    }
+    let devices: Devices = crate::macos_native::query("devices", &[])?;
+    *cache = Some((std::time::Instant::now(), devices.clone()));
+    Ok(devices)
 }
 pub struct Capture {
     child: tokio::process::Child,

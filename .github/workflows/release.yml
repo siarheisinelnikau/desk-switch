@@ -50,6 +50,7 @@ jobs:
       - run: cargo test --locked
       - if: runner.os == 'Linux'
         run: |
+          node tools/test_gnome_companion.mjs
           python3 tools/test_release_assets.py
           python3 tools/test_promote_release.py
           python3 tools/test_normalize_release_assets.py

@@ -47,6 +47,7 @@ func deviceIDs() throws -> [AudioDeviceID] {
     try checked(AudioObjectGetPropertyDataSize(AudioObjectID(kAudioObjectSystemObject), &address, 0, nil, &size), "Listing audio devices")
     guard size <= 16384 else { throw fail("Too many CoreAudio devices") }
     var values = [AudioDeviceID](repeating: 0, count: Int(size) / MemoryLayout<AudioDeviceID>.size)
+    if values.isEmpty {return []}
     try values.withUnsafeMutableBytes { bytes in
         try checked(AudioObjectGetPropertyData(AudioObjectID(kAudioObjectSystemObject), &address, 0, nil, &size, bytes.baseAddress!), "Listing audio devices")
     }
@@ -124,6 +125,7 @@ func volume(_ uid: String?, set: [String]) throws {
         guard ["true", "false"].contains(set[1]), var address = volumeAddress(id, kAudioDevicePropertyMute) else { throw fail("This output has no macOS mute control") }
         var value = UInt32(set[1] == "true" ? 1 : 0)
         try checked(AudioObjectSetPropertyData(id, &address, 0, nil, UInt32(MemoryLayout<UInt32>.size), &value), "Setting output mute")
+        if address.mElement==1 {address.mElement=2;if AudioObjectHasProperty(id,&address){try checked(AudioObjectSetPropertyData(id,&address,0,nil,UInt32(MemoryLayout<UInt32>.size),&value),"Setting the right output mute")}}
     }
     var level = Float32(1), muted = UInt32(0)
     let fixed = volumeAddress(id, kAudioDevicePropertyVolumeScalar) == nil
@@ -153,12 +155,12 @@ func displays() throws {
     json(result)
 }
 
-func screenGeometry() throws {
+func screenGeometryValue() throws -> [[String:Any]] {
     var count=UInt32(0)
     guard CGGetActiveDisplayList(0,nil,&count) == .success, count<=128 else {throw fail("Cannot read macOS screen geometry")}
     var displays=[CGDirectDisplayID](repeating:0,count:Int(count))
     guard CGGetActiveDisplayList(count,&displays,&count) == .success else {throw fail("Cannot read macOS screen geometry")}
-    json(displays.map {id -> [String:Any] in let bounds=CGDisplayBounds(id);return ["id":String(id),"x":bounds.minX,"y":bounds.minY,"width":bounds.width,"height":bounds.height]})
+    return displays.map {id -> [String:Any] in let bounds=CGDisplayBounds(id);return ["id":String(id),"x":bounds.minX,"y":bounds.minY,"width":bounds.width,"height":bounds.height]}
 }
 func edgePoint(_ display:CGDirectDisplayID,_ side:String,_ position:Int)->CGPoint {
     let bounds=CGDisplayBounds(display), fraction=Double(position)/65535
@@ -223,7 +225,7 @@ final class SystemCapture: NSObject, SCStreamOutput, SCStreamDelegate {
         // An allow-list keeps later-started Desk Switch playback workers out
         // of system capture too, including the virtual microphone feed.
         let allowed=applications(content);included=Set(allowed.map(\.processID))
-        let filter = SCContentFilter(display: display, includingApplications: allowed, exceptingWindows: [])
+        let filter = SCContentFilter(display: display, including: allowed, exceptingWindows: [])
         let config = SCStreamConfiguration()
         config.width = 2; config.height = 2; config.minimumFrameInterval = CMTime(value: 1, timescale: 1)
         config.showsCursor = false; config.queueDepth = 3
@@ -240,7 +242,7 @@ final class SystemCapture: NSObject, SCStreamOutput, SCStreamDelegate {
                     let content=try await SCShareableContent.excludingDesktopWindows(false,onScreenWindowsOnly:false)
                     let allowed=self.applications(content), ids=Set(allowed.map(\.processID))
                     if ids != self.included, let display=content.displays.first {
-                        try await stream.updateContentFilter(SCContentFilter(display:display,includingApplications:allowed,exceptingWindows:[]))
+                        try await stream.updateContentFilter(SCContentFilter(display:display,including:allowed,exceptingWindows:[]))
                         self.included=ids
                     }
                 } catch {FileHandle.standardError.write(Data("Updating the macOS application audio filter: \(error.localizedDescription)\n".utf8))}
@@ -322,7 +324,7 @@ final class InputCapture {
     var tap: CFMachPort?
     var mode = "local", deadline = CFAbsoluteTimeGetCurrent(), hidden = false
     var keyboard = true, mouse = true
-    var edgeDisplay: CGDirectDisplayID?, edgeSide="right"
+    var edgeDisplay: CGDirectDisplayID?, edgeSide="right", edgeAutomatic=false
     var keys = [Int64: Bool](), buttons = [Int64: Bool]()
     func setMode(_ value: String) {
         mode = value; deadline = CFAbsoluteTimeGetCurrent() + 0.25
@@ -367,7 +369,7 @@ final class InputCapture {
             return owner ? nil : Unmanaged.passUnretained(event)
         case .mouseMoved, .leftMouseDragged, .rightMouseDragged, .otherMouseDragged:
             if remote && mouse { json(["kind": "move", "dx": event.getIntegerValueField(.mouseEventDeltaX), "dy": event.getIntegerValueField(.mouseEventDeltaY), "remote": true]); return nil }
-            if mouse && keys.isEmpty && buttons.isEmpty, let display=edgeDisplay, CGDisplayIsActive(display) != 0 {
+            if mouse && keys.isEmpty && buttons.isEmpty, let display=edgeAutomatic ? CGMainDisplayID() : edgeDisplay, CGDisplayIsActive(display) != 0 {
                 let bounds=CGDisplayBounds(display), p=event.location
                 let dx=event.getIntegerValueField(.mouseEventDeltaX), dy=event.getIntegerValueField(.mouseEventDeltaY)
                 let crossing=bounds.contains(p) && ((edgeSide=="left" && dx<0 && p.x<=bounds.minX+1) || (edgeSide=="right" && dx>0 && p.x>=bounds.maxX-2) || (edgeSide=="top" && dy<0 && p.y<=bounds.minY+1) || (edgeSide=="bottom" && dy>0 && p.y>=bounds.maxY-2))
@@ -396,7 +398,7 @@ final class InputCapture {
     }
     func run(_ sharing: [String]) throws {
         keyboard = sharing.first != "false"; mouse = sharing.dropFirst().first != "false"
-        if sharing.count>=4 && mouse {edgeDisplay=sharing[2]=="auto" ? CGMainDisplayID() : UInt32(sharing[2]);edgeSide=sharing[3];guard let display=edgeDisplay, CGDisplayIsActive(display) != 0 else {throw fail("The selected macOS edge screen is unavailable")}}
+        if sharing.count>=4 && mouse {edgeAutomatic=sharing[2]=="auto";edgeDisplay=edgeAutomatic ? CGMainDisplayID() : UInt32(sharing[2]);edgeSide=sharing[3];guard let display=edgeDisplay, CGDisplayIsActive(display) != 0 else {throw fail("The selected macOS edge screen is unavailable")}}
         let options = [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true] as CFDictionary
         guard AXIsProcessTrustedWithOptions(options) else { throw fail("Allow Desk Switch in System Settings → Privacy & Security → Accessibility, then retry input sharing") }
         guard CGPreflightListenEventAccess() || CGRequestListenEventAccess() else { throw fail("Allow Desk Switch in System Settings → Privacy & Security → Input Monitoring, then retry input sharing") }
@@ -487,6 +489,15 @@ final class InputPlayback {
             return Unmanaged.passUnretained(event)
         },userInfo:Unmanaged.passUnretained(self).toOpaque())
         if let tap=tap {CFRunLoopAddSource(CFRunLoopGetMain(),CFMachPortCreateRunLoopSource(nil,tap,0),.commonModes);CGEvent.tapEnable(tap:tap,enable:true)}
+        let context=Unmanaged.passUnretained(self).toOpaque()
+        CGDisplayRegisterReconfigurationCallback({_,flags,context in
+            if !flags.contains(.beginConfigurationFlag),let context=context {
+                let receiver=Unmanaged<InputPlayback>.fromOpaque(context).takeUnretainedValue()
+                DispatchQueue.main.async{
+                    if let screens=try? screenGeometryValue(){json(["kind":"geometry","screens":screens])}else{receiver.release();json(["kind":"emergency"])}
+                }
+            }
+        },context)
         let timer=CFRunLoopTimerCreateWithHandler(nil,CFAbsoluteTimeGetCurrent(),0.05,0,0){[self] _ in
             if active && CFAbsoluteTimeGetCurrent()>=deadline {release();json(["kind":"emergency"])}
             if getppid()==1 {release();exit(0)}
@@ -523,7 +534,7 @@ final class InputPlayback {
             case "devices": try devices()
             case "input-devices": try inputDevices()
             case "displays": try displays()
-            case "screen-geometry":try screenGeometry()
+            case "screen-geometry":json(try screenGeometryValue())
             case "cursor":let point=CGEvent(source:nil)?.location ?? .zero;json(["x":point.x,"y":point.y])
             case "volume": try volume(args.count > 1 && args[1] != "-" ? args[1] : nil, set: Array(args.dropFirst(2)))
             case "volume-server":

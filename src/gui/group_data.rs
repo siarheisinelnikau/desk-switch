@@ -180,7 +180,9 @@ pub(super) fn desired(
                 ],
             );
             spec.desired_remote = host && state.active_input.as_ref() == Some(&peer.node.key);
-            spec.activate = spec.desired_remote && peer.input_ready == state.activation;
+            spec.activate = spec.desired_remote
+                && peer.input_ready == state.activation
+                && peer.node.monitor_error.is_none();
             spec.entry = host.then_some(state.active_input_entry).flatten();
             for input in inputs {
                 let keyboard = input.keyboard
@@ -357,6 +359,17 @@ fn migrate_portal_token(root: &Path, dir: &Path) -> Result<()> {
     Ok(())
 }
 impl Data {
+    pub fn emergency(&mut self) -> Result<()> {
+        let mut result = Ok(());
+        for task in self.tasks.values_mut().filter(|task| {
+            task.spec.kind == Kind::Input && task.worker.running() && !task.worker.stopping
+        }) {
+            if let Err(error) = task.worker.command("emergency") {
+                result = Err(error);
+            }
+        }
+        result
+    }
     pub fn report(&self, node: &mut workspace::Node) {
         node.input = self.input;
         node.audio_playing = self.audio_playing;
@@ -431,6 +444,21 @@ impl Data {
                     .logs
                     .iter()
                     .any(|line| super::input_permission_error(line))
+        })
+    }
+    #[cfg(target_os = "linux")]
+    pub fn permission_retry_after(&self) -> Option<std::time::Duration> {
+        self.tasks.values().find_map(|task| {
+            let delay = std::time::Duration::from_secs(2);
+            (task.spec.kind == Kind::Input
+                && task.spec.args.get(2).is_some_and(|role| role == "host")
+                && task.worker.age() < delay
+                && task
+                    .worker
+                    .logs
+                    .iter()
+                    .any(|line| super::input_permission_error(line)))
+            .then(|| delay.saturating_sub(task.worker.age()))
         })
     }
     #[cfg(target_os = "linux")]
@@ -665,6 +693,13 @@ mod tests {
             let ready = desired(&state, &source, &[], true).unwrap();
             assert!(ready["input"].activate);
             assert!(equivalent(spec, &ready["input"]));
+            state.members.get_mut(&target).unwrap().node.monitor_error =
+                Some("DDC command failed".into());
+            assert!(
+                !desired(&state, &source, &[], true).unwrap()["input"].activate,
+                "a terminal monitor failure acknowledges completion without granting remote input"
+            );
+            state.members.get_mut(&target).unwrap().node.monitor_error = None;
             for member in state
                 .members
                 .values()

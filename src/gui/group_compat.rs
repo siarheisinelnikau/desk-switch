@@ -525,6 +525,12 @@ mod tests {
             &management::Message::CheckUpdates { id: 1 }
         ));
         assert!(!legacy_management_message(
+            &management::Message::ReadMonitor {
+                id: 3,
+                monitor: "display-1".into()
+            }
+        ));
+        assert!(!legacy_management_message(
             &management::Message::InstallCable {
                 id: 2,
                 platform: crate::cable::Platform::Windows

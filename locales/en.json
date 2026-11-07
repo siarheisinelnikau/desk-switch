@@ -318,7 +318,6 @@
   "Управление компьютерами": "Computer control",
   "Управление на другом ПК": "Control is on the other PC",
   "Управление на этом ПК": "Control is on this PC",
-  "Устанавливаем обновление. На Ubuntu подтвердите системный запрос пароля.": "Installing update. On Ubuntu, approve the system password prompt.",
   "Установка отменена или не удалась: {error}": "Installation cancelled or failed: {error}",
   "Установлена актуальная версия.": "You are up to date.",
   "Устройства не ответили. Проверьте системные зависимости.": "Devices did not respond. Check the system dependencies.",
@@ -543,5 +542,17 @@
   "Move between computers at the screen edge": "Move between computers at the screen edge",
   "The saved partner's management connection is offline": "The saved partner's management connection is offline",
   "The saved partner's management connection is unavailable": "The saved partner's management connection is unavailable",
-  "Update Desk Switch on the saved partner before using this action": "Update Desk Switch on the saved partner before using this action"
+  "Update Desk Switch on the saved partner before using this action": "Update Desk Switch on the saved partner before using this action",
+  "Retry switch": "Retry switch",
+  "Switching…": "Switching…",
+  "A monitor switch is still finishing. Wait for it to complete.": "A monitor switch is still finishing. Wait for it to complete.",
+  "The previous switch is still finishing. Wait for the monitor before switching again.": "The previous switch is still finishing. Wait for the monitor before switching again.",
+  "Installing the update…": "Installing the update…",
+  "Monitor selection failed. Select the port manually or retry.": "Monitor selection failed. Select the port manually or retry.",
+  "Checking the signed release…": "Checking the signed release…",
+  "Downloading and verifying the signed update…": "Downloading and verifying the signed update…",
+  "Another update operation is already in progress.": "Another update operation is already in progress.",
+  "Reconnect the selected computer before updating it.": "Reconnect the selected computer before updating it.",
+  "Paired installation requires the installed application edition.": "Paired installation requires the installed application edition.",
+  "Version {version} is available. Choose Download and install to update.": "Version {version} is available. Choose Download and install to update."
 }

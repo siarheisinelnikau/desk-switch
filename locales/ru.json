@@ -318,7 +318,6 @@
   "Управление компьютерами": "Управление компьютерами",
   "Управление на другом ПК": "Управление на другом ПК",
   "Управление на этом ПК": "Управление на этом ПК",
-  "Устанавливаем обновление. На Ubuntu подтвердите системный запрос пароля.": "Устанавливаем обновление. На Ubuntu подтвердите системный запрос пароля.",
   "Установка отменена или не удалась: {error}": "Установка отменена или не удалась: {error}",
   "Установлена актуальная версия.": "Установлена актуальная версия.",
   "Устройства не ответили. Проверьте системные зависимости.": "Устройства не ответили. Проверьте системные зависимости.",
@@ -543,5 +542,17 @@
   "Move between computers at the screen edge": "Переключаться между компьютерами у края экрана",
   "The saved partner's management connection is offline": "Соединение управления с сохранённым партнёром отключено",
   "The saved partner's management connection is unavailable": "Соединение управления с сохранённым партнёром недоступно",
-  "Update Desk Switch on the saved partner before using this action": "Обновите Desk Switch на сохранённом партнёре перед этим действием"
+  "Update Desk Switch on the saved partner before using this action": "Обновите Desk Switch на сохранённом партнёре перед этим действием",
+  "Retry switch": "Повторить переключение",
+  "Switching…": "Переключение…",
+  "A monitor switch is still finishing. Wait for it to complete.": "Монитор ещё переключается. Дождитесь завершения.",
+  "The previous switch is still finishing. Wait for the monitor before switching again.": "Предыдущее переключение ещё не завершено. Дождитесь готовности монитора перед следующим переключением.",
+  "Installing the update…": "Установка обновления…",
+  "Monitor selection failed. Select the port manually or retry.": "Не удалось переключить монитор. Выберите вход вручную или повторите.",
+  "Checking the signed release…": "Проверка подписанного релиза…",
+  "Downloading and verifying the signed update…": "Скачивание и проверка подписанного обновления…",
+  "Another update operation is already in progress.": "Другая операция обновления уже выполняется.",
+  "Reconnect the selected computer before updating it.": "Перед обновлением восстановите соединение с выбранным компьютером.",
+  "Paired installation requires the installed application edition.": "Для совместной установки нужна установленная версия приложения.",
+  "Version {version} is available. Choose Download and install to update.": "Доступна версия {version}. Нажмите «Скачать и установить» для обновления."
 }

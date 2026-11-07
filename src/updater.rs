@@ -59,8 +59,23 @@ struct Pending {
 pub enum Outcome {
     Current(String),
     Unpublished,
+    Available(Candidate),
     Ready(String),
     Prepared(String, Prepared),
+}
+
+/// Signed release metadata retained between a check and an explicit download.
+#[derive(Clone)]
+pub struct Candidate {
+    #[cfg(not(target_os = "macos"))]
+    bytes: Vec<u8>,
+    envelope: Envelope,
+    release: Release,
+}
+impl Candidate {
+    pub fn version(&self) -> &str {
+        &self.release.version
+    }
 }
 
 pub struct Prepared {
@@ -206,12 +221,6 @@ fn fetch_release() -> Result<Option<Vec<u8>>> {
     Ok(Some(bytes))
 }
 
-fn fetch_envelope() -> Result<Option<Envelope>> {
-    fetch_release()?
-        .map(|bytes| release_envelope(&bytes))
-        .transpose()
-}
-
 fn sibling(executable: &Path, suffix: &str) -> Result<PathBuf> {
     let mut name = executable
         .file_name()
@@ -287,17 +296,11 @@ fn binary_version(path: &Path, release: &Release) -> Result<()> {
     Ok(())
 }
 
-pub fn check_and_stage(dir: &Path, executable: &Path) -> Result<Outcome> {
+fn stage_candidate(dir: &Path, executable: &Path, candidate: Candidate) -> Result<Outcome> {
     let http = client()?;
-    let Some(envelope) = fetch_envelope()? else {
-        return Ok(Outcome::Unpublished);
-    };
-    let release = verified(&envelope, PUBLIC_KEY)?;
-    if semver::Version::parse(&release.version)?
-        <= semver::Version::parse(crate::compatibility::VERSION)?
-    {
-        return Ok(Outcome::Current(release.version));
-    }
+    let Candidate {
+        envelope, release, ..
+    } = candidate;
     let artifact = release
         .targets
         .get(target()?)
@@ -374,24 +377,63 @@ pub struct Job {
     result: Receiver<Result<Outcome>>,
     progress: std::sync::Arc<std::sync::Mutex<Option<Progress>>>,
 }
+enum Operation {
+    Check,
+    Prepare {
+        expected: String,
+        candidate: Option<Candidate>,
+    },
+}
 impl Job {
     pub fn start(dir: PathBuf, executable: PathBuf, ctx: eframe::egui::Context) -> Result<Self> {
+        Self::spawn(Operation::Check, dir, executable, ctx)
+    }
+    pub fn prepare(
+        dir: PathBuf,
+        executable: PathBuf,
+        expected: String,
+        candidate: Option<Candidate>,
+        ctx: eframe::egui::Context,
+    ) -> Result<Self> {
+        Self::spawn(
+            Operation::Prepare {
+                expected,
+                candidate,
+            },
+            dir,
+            executable,
+            ctx,
+        )
+    }
+    fn spawn(
+        operation: Operation,
+        dir: PathBuf,
+        executable: PathBuf,
+        ctx: eframe::egui::Context,
+    ) -> Result<Self> {
         let (send, result) = mpsc::channel();
         let progress = std::sync::Arc::new(std::sync::Mutex::new(None));
         let progress_send = progress.clone();
         std::thread::Builder::new()
             .name("Desk Switch updates".into())
             .spawn(move || {
-                let result = if shared_managed(&executable) {
-                    shared_download(&dir, |downloaded, total| {
-                        *progress_send.lock().unwrap() = Some(Progress { downloaded, total });
-                        ctx.request_repaint();
-                    })
-                } else {
-                    check_and_stage(&dir, &executable)
-                };
+                let result = run_operation(
+                    operation,
+                    || check_latest(&dir, &executable),
+                    |candidate| {
+                        if shared_managed(&executable) {
+                            shared_download(&dir, &candidate, |downloaded, total| {
+                                *progress_send.lock().unwrap() =
+                                    Some(Progress { downloaded, total });
+                                ctx.request_repaint_of(eframe::egui::ViewportId::ROOT);
+                            })
+                        } else {
+                            stage_candidate(&dir, &executable, candidate)
+                        }
+                    },
+                );
                 let _ = send.send(result);
-                ctx.request_repaint();
+                ctx.request_repaint_of(eframe::egui::ViewportId::ROOT);
             })?;
         Ok(Self { result, progress })
     }
@@ -401,6 +443,78 @@ impl Job {
     pub fn progress(&self) -> Option<Progress> {
         self.progress.lock().unwrap().clone()
     }
+}
+
+fn run_operation(
+    operation: Operation,
+    check: impl FnOnce() -> Result<Outcome>,
+    prepare: impl FnOnce(Candidate) -> Result<Outcome>,
+) -> Result<Outcome> {
+    let Operation::Prepare {
+        expected,
+        candidate,
+    } = operation
+    else {
+        return check();
+    };
+    let candidate = match candidate {
+        Some(candidate) => candidate,
+        None => match check()? {
+            Outcome::Available(candidate) => candidate,
+            _ => bail!("The requested signed update is not available on this PC."),
+        },
+    };
+    ensure!(
+        candidate.version() == expected,
+        "The signed release changed from version {expected} to {}. Check for updates again.",
+        candidate.version()
+    );
+    prepare(candidate)
+}
+
+fn check_latest(dir: &Path, executable: &Path) -> Result<Outcome> {
+    let Some(bytes) = fetch_release()? else {
+        return Ok(Outcome::Unpublished);
+    };
+    metadata_outcome(bytes, dir, executable, PUBLIC_KEY)
+}
+
+fn metadata_outcome(
+    bytes: Vec<u8>,
+    _dir: &Path,
+    executable: &Path,
+    public_key: &str,
+) -> Result<Outcome> {
+    let envelope = release_envelope(&bytes)?;
+    let release = verified(&envelope, public_key)?;
+    if semver::Version::parse(&release.version)?
+        <= semver::Version::parse(crate::compatibility::VERSION)?
+    {
+        return Ok(Outcome::Current(release.version));
+    }
+    let candidate = Candidate {
+        #[cfg(not(target_os = "macos"))]
+        bytes,
+        envelope,
+        release,
+    };
+    if shared_managed(executable) {
+        #[cfg(not(target_os = "macos"))]
+        shared_release(_dir, &candidate)?;
+        #[cfg(target_os = "macos")]
+        candidate
+            .release
+            .targets
+            .get(target()?)
+            .context("This release has no signed application for this Mac architecture")?;
+    } else {
+        candidate
+            .release
+            .targets
+            .get(target()?)
+            .context("Install the latest .deb from GitHub once to enable package updates")?;
+    }
+    Ok(Outcome::Available(candidate))
 }
 
 pub fn shared_managed(executable: &Path) -> bool {
@@ -460,23 +574,17 @@ pub fn shared_config(dir: &Path) -> Result<rust_auto_updator::Config> {
 }
 
 #[cfg(target_os = "macos")]
-fn shared_download(dir: &Path, progress: impl FnMut(u64, u64)) -> Result<Outcome> {
-    macos::download(dir, progress)
+fn shared_download(
+    dir: &Path,
+    candidate: &Candidate,
+    progress: impl FnMut(u64, u64),
+) -> Result<Outcome> {
+    macos::download(dir, candidate, progress)
 }
 #[cfg(not(target_os = "macos"))]
-fn shared_download(dir: &Path, progress: impl FnMut(u64, u64)) -> Result<Outcome> {
+fn shared_release(dir: &Path, candidate: &Candidate) -> Result<rust_auto_updator::Release> {
     let config = shared_config(dir)?;
-    let Some(bytes) = fetch_release()? else {
-        return Ok(Outcome::Unpublished);
-    };
-    // Select the installer and verify its pinned signature from one API snapshot.
-    // Two independent requests could straddle a newly published release.
-    let envelope = release_envelope(&bytes)?;
-    let signed = verified(&envelope, PUBLIC_KEY)?;
-    if semver::Version::parse(&signed.version)? <= config.current_version {
-        return Ok(Outcome::Current(signed.version));
-    }
-    let latest = rust_auto_updator::parse_release(std::str::from_utf8(&bytes)?, &config)
+    let latest = rust_auto_updator::parse_release(std::str::from_utf8(&candidate.bytes)?, &config)
         .map_err(anyhow::Error::msg)?
         .context("signed installer is unavailable")?;
     let key = if cfg!(windows) {
@@ -484,15 +592,25 @@ fn shared_download(dir: &Path, progress: impl FnMut(u64, u64)) -> Result<Outcome
     } else {
         "linux-x86_64-deb"
     };
-    verify_shared_asset(&signed, &latest, key)?;
+    verify_shared_asset(&candidate.release, &latest, key)?;
+    Ok(latest)
+}
+#[cfg(not(target_os = "macos"))]
+fn shared_download(
+    dir: &Path,
+    candidate: &Candidate,
+    progress: impl FnMut(u64, u64),
+) -> Result<Outcome> {
+    let config = shared_config(dir)?;
+    let latest = shared_release(dir, candidate)?;
     let prepared = rust_auto_updator::prepare_download(&latest, &config, progress)
         .map_err(anyhow::Error::msg)?;
     Ok(Outcome::Prepared(
-        signed.version,
+        candidate.version().to_owned(),
         Prepared {
             inner: prepared,
             #[cfg(target_os = "linux")]
-            envelope,
+            envelope: candidate.envelope.clone(),
         },
     ))
 }
@@ -843,6 +961,148 @@ mod tests {
             Envelope { payload, signature },
             crate::config::hex(key.verifying_key().as_bytes()),
         )
+    }
+    fn available_fixture() -> (Vec<u8>, String) {
+        let key = SigningKey::from_bytes(&[57; 32]);
+        let mut targets = BTreeMap::new();
+        let mut assets = Vec::new();
+        for (target, filename) in [
+            (WINDOWS, "desk-switch-v99.0.0-windows-x86-64.exe"),
+            (LINUX, "desk-switch-v99.0.0-linux-x86-64"),
+            ("linux-x86_64-deb", "desk-switch-v99.0.0-linux-x86-64.deb"),
+            ("macos-arm64-app", "desk-switch-v99.0.0-macos-arm64.zip"),
+            ("macos-x86_64-app", "desk-switch-v99.0.0-macos-x86-64.zip"),
+        ] {
+            let url = format!(
+                "https://github.com/siarheisinelnikau/desk-switch/releases/download/v99.0.0/{filename}"
+            );
+            let hash = "11".repeat(32);
+            targets.insert(
+                target.into(),
+                Artifact {
+                    url: url.clone(),
+                    sha256: hash.clone(),
+                    size: 1024,
+                },
+            );
+            assets.push(serde_json::json!({"name":filename,"browser_download_url":url,"size":1024,"digest":format!("sha256:{hash}")}));
+        }
+        let payload = serde_json::to_string(&Release {
+            version: "99.0.0".into(),
+            protocol: crate::compatibility::PROTOCOL,
+            targets,
+        })
+        .unwrap();
+        let envelope = Envelope {
+            signature: crate::config::hex(&key.sign(payload.as_bytes()).to_bytes()),
+            payload,
+        };
+        let body = format!(
+            "Release notes\n{SIGNED_START}\n{}\n{SIGNED_END}",
+            serde_json::to_string(&envelope).unwrap()
+        );
+        let api = serde_json::json!({"tag_name":"v99.0.0","html_url":"https://github.com/siarheisinelnikau/desk-switch/releases/tag/v99.0.0","draft":false,"prerelease":false,"body":body,"assets":assets});
+        (
+            serde_json::to_vec(&api).unwrap(),
+            crate::config::hex(key.verifying_key().as_bytes()),
+        )
+    }
+    fn available_candidate() -> Candidate {
+        let (bytes, key) = available_fixture();
+        let executable = if cfg!(target_os = "linux") {
+            Path::new("/usr/lib/desk-switch/desk-switch")
+        } else {
+            Path::new("/not-created/Desk Switch")
+        };
+        let Outcome::Available(candidate) =
+            metadata_outcome(bytes, &std::env::temp_dir(), executable, &key).unwrap()
+        else {
+            panic!("the newer signed fixture should be available");
+        };
+        candidate
+    }
+    #[test]
+    fn metadata_check_never_prepares_a_payload_or_creates_update_state() {
+        let (bytes, key) = available_fixture();
+        let state = std::env::temp_dir().join(format!(
+            "desk-switch-check-only-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let executable = if cfg!(target_os = "linux") {
+            Path::new("/usr/lib/desk-switch/desk-switch")
+        } else {
+            Path::new("/not-created/Desk Switch")
+        };
+        let outcome = run_operation(
+            Operation::Check,
+            || metadata_outcome(bytes, &state, executable, &key),
+            |_| panic!("a metadata check must never prepare or download a payload"),
+        )
+        .unwrap();
+        assert!(
+            matches!(outcome, Outcome::Available(candidate) if candidate.version() == "99.0.0")
+        );
+        assert!(!state.exists());
+    }
+    #[test]
+    fn an_explicit_download_retains_the_checked_signed_snapshot() {
+        let candidate = available_candidate();
+        let signature = candidate.envelope.signature.clone();
+        let outcome = run_operation(
+            Operation::Prepare {
+                expected: "99.0.0".into(),
+                candidate: Some(candidate),
+            },
+            || panic!("an explicit download must use the already checked release snapshot"),
+            |candidate| {
+                assert_eq!(candidate.envelope.signature, signature);
+                assert_eq!(candidate.version(), "99.0.0");
+                Ok(Outcome::Ready(candidate.version().to_owned()))
+            },
+        )
+        .unwrap();
+        assert!(matches!(outcome, Outcome::Ready(version) if version == "99.0.0"));
+    }
+    #[test]
+    fn a_remote_prepare_rejects_release_drift_before_downloading() {
+        let error = run_operation(
+            Operation::Prepare {
+                expected: "98.0.0".into(),
+                candidate: None,
+            },
+            || Ok(Outcome::Available(available_candidate())),
+            |_| panic!("a different version must never be downloaded for this request"),
+        )
+        .err()
+        .unwrap();
+        assert!(
+            error
+                .to_string()
+                .contains("changed from version 98.0.0 to 99.0.0")
+        );
+    }
+    #[test]
+    fn a_remote_prepare_without_a_newer_signed_release_never_downloads() {
+        for outcome in [
+            Outcome::Current(crate::compatibility::VERSION.into()),
+            Outcome::Unpublished,
+        ] {
+            assert!(
+                run_operation(
+                    Operation::Prepare {
+                        expected: "99.0.0".into(),
+                        candidate: None
+                    },
+                    || Ok(outcome),
+                    |_| panic!("a missing signed update must never start a payload download"),
+                )
+                .is_err()
+            );
+        }
     }
     #[test]
     fn verifies_the_exact_manifest_and_rejects_tampering_and_wrong_signer() {
