@@ -680,7 +680,7 @@ impl Desktop {
                 );
                 for node in std::iter::once(self.local_node()).chain(self.pair.remote.clone()) {
                     if node.input_error.as_deref().is_some_and(|e| {
-                        e.contains("Permission denied") || e.contains("grant this desktop user")
+                        e.contains("Permission denied") || e.contains("os error 13")
                     }) {
                         ui.colored_label(
                             palette(ui).error,
@@ -698,7 +698,7 @@ impl Desktop {
                 if self.prefs.role == "host"
                     && !self.form.capture_devices.is_empty()
                     && self.local_node().input_error.as_deref().is_some_and(|e| {
-                        e.contains("Permission denied") || e.contains("grant this desktop user")
+                        e.contains("Permission denied") || e.contains("os error 13")
                     })
                 {
                     note(

@@ -441,15 +441,7 @@ impl Desktop {
 
     #[cfg(target_os = "linux")]
     fn input_access_selection(&self) -> String {
-        use std::os::unix::fs::MetadataExt;
-        self.input_permission_paths()
-            .iter()
-            .map(|path| {
-                let inode = std::fs::metadata(path).map(|m| (m.dev(), m.ino())).ok();
-                format!("{path}:{inode:?}")
-            })
-            .collect::<Vec<_>>()
-            .join("\n")
+        input_generation(&self.input_permission_paths())
     }
 
     fn tick(&mut self, ctx: &egui::Context) {
@@ -829,6 +821,59 @@ impl Desktop {
             }
             Err(error) => self.notice = Some((format!("{error:#}"), true)),
         }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn input_permission_error(line: &str) -> bool {
+    line.contains("Permission denied") || line.contains("os error 13")
+}
+
+#[cfg(target_os = "linux")]
+fn input_generation(paths: &[String]) -> String {
+    use std::os::unix::fs::MetadataExt;
+    paths
+        .iter()
+        .map(|path| {
+            let inode = std::fs::metadata(path).map(|m| (m.dev(), m.ino())).ok();
+            format!("{path}:{inode:?}")
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod hotplug_tests {
+    use super::*;
+    #[test]
+    fn an_unplugged_device_does_not_request_administrator_permission() {
+        let context = "opening /dev/input/event2; grant this desktop user access to this selected event device during setup: ";
+        assert!(!input_permission_error(&format!(
+            "{context}No such file or directory (os error 2)"
+        )));
+        assert!(!input_permission_error(&format!(
+            "{context}No such device (os error 19)"
+        )));
+        assert!(input_permission_error(&format!(
+            "{context}Permission denied (os error 13)"
+        )));
+        assert!(input_permission_error("localized error text (os error 13)"));
+    }
+    #[test]
+    fn a_recreated_event_path_is_a_new_input_generation_even_with_the_same_name() {
+        let dir =
+            std::env::temp_dir().join(format!("desk-switch-generation-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("event2");
+        let replacement = dir.join("new-event");
+        std::fs::write(&path, "old device").unwrap();
+        let paths = [path.to_string_lossy().into_owned()];
+        let old = input_generation(&paths);
+        assert_eq!(old, input_generation(&paths));
+        std::fs::write(&replacement, "replugged device").unwrap();
+        std::fs::rename(replacement, &path).unwrap();
+        assert_ne!(old, input_generation(&paths));
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }
 
