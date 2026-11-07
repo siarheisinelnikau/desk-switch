@@ -9,8 +9,9 @@ def asset_names(version):
         "windows-x86_64": f"desk-switch-v{version}-windows-x86-64.exe",
         "linux-x86_64-deb": f"desk-switch-v{version}-linux-x86-64.deb",
     }
-    # Earlier stable releases retain their original two-platform manifest.
-    if tuple(map(int, version.split("."))) >= (0, 5, 0):
+    # Only 0.5.0 published experimental macOS archives. Preserve that signed
+    # historical matrix; current releases ship Windows and Ubuntu only.
+    if version == "0.5.0":
         names.update({
             "macos-arm64-app": f"desk-switch-v{version}-macos-arm64.zip",
             "macos-x86_64-app": f"desk-switch-v{version}-macos-x86-64.zip",
