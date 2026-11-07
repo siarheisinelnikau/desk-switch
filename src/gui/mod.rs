@@ -45,7 +45,6 @@ enum Page {
 #[derive(Clone, Copy)]
 enum QueryKind {
     Monitors,
-    MonitorStatus,
     #[cfg(target_os = "linux")]
     InputAccess,
 }
@@ -363,7 +362,7 @@ impl Desktop {
             return false;
         }
         let local = self.local_node();
-        let Some(inputs) = self
+        let Some(_inputs) = self
             .pair
             .remote
             .as_ref()
@@ -386,11 +385,11 @@ impl Desktop {
             }
             #[cfg(debug_assertions)]
             if self.preview.is_some() {
-                return local.monitor_input == Some(inputs.host);
+                return true;
             }
-            self.monitor.as_ref().is_some_and(|worker| {
-                worker.connected() && worker.monitor_input == Some(inputs.host)
-            })
+            self.monitor
+                .as_ref()
+                .is_some_and(|worker| worker.connected())
         }
     }
 
@@ -519,7 +518,7 @@ impl Desktop {
                 args.extend(self.input_permission_paths());
                 args
             }
-            QueryKind::Monitors | QueryKind::MonitorStatus => vec![
+            QueryKind::Monitors => vec![
                 "monitor-read".into(),
                 self.prefs.workspace.monitor.id.clone(),
             ],
@@ -800,24 +799,10 @@ impl Desktop {
                             self.prefs.save(&self.dir)?;
                         }
                     }
-                    QueryKind::MonitorStatus => {
-                        let monitor: MonitorInfo = serde_json::from_value(value)?;
-                        if monitor.id == self.prefs.workspace.monitor.id
-                            && monitor.fingerprint == self.prefs.workspace.monitor.fingerprint
-                        {
-                            self.pair.monitor_input = monitor.current;
-                        } else {
-                            self.pair.monitor_input = None;
-                        }
-                    }
                 }
                 Ok(())
             })();
-            if matches!(kind, QueryKind::MonitorStatus) {
-                if result.is_err() {
-                    self.pair.monitor_input = None;
-                }
-            } else {
+            {
                 let success = match kind {
                     #[cfg(target_os = "linux")]
                     QueryKind::InputAccess => {

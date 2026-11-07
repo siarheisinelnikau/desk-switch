@@ -53,7 +53,6 @@ pub(super) struct Pair {
     pub input_access_attempts: std::collections::BTreeSet<String>,
     scanned: bool,
     pub monitor_input: Option<u16>,
-    last_monitor_check: Option<Instant>,
 }
 
 // The data services have their own authenticated reconnects and a short input
@@ -96,7 +95,6 @@ impl Pair {
         self.reconnect.lost(now);
         self.synced = false;
         self.monitor_input = None;
-        self.last_monitor_check = None;
         self.request = None;
         self.outgoing = None;
         self.busy = false;
@@ -262,7 +260,6 @@ impl Desktop {
         self.pair.reconnect.restored();
         self.pair.synced = false;
         self.pair.monitor_input = None;
-        self.pair.last_monitor_check = None;
         self.pair.request = None;
         self.pair.outgoing = None;
         self.pair.busy = false;
@@ -732,7 +729,6 @@ impl Desktop {
     }
 
     pub(super) fn retry_devices(&mut self) {
-        self.pair.last_monitor_check = None;
         if let Some((_, error)) = self.device_notice.take()
             && self
                 .notice
@@ -919,21 +915,6 @@ impl Desktop {
         }
         self.pair.active_plan = Some(plan.clone());
         self.reconcile_microphone(&plan, address);
-        if Plan::common_monitor(&self.local_node(), &remote)
-            && Plan::shared_monitor(&self.local_node(), &remote)
-            && plan.monitor.is_none()
-            && !Plan::monitor_only_available(&self.local_node(), &remote)
-            && !self.monitor_running()
-            && self
-                .input
-                .as_ref()
-                .is_none_or(|w| !w.running() || !w.monitoring)
-            && self.query.is_none()
-            && self.pair.last_monitor_check.is_none()
-        {
-            self.pair.last_monitor_check = Some(Instant::now());
-            self.scan(QueryKind::MonitorStatus);
-        }
         let mut input_profile = String::new();
         if let Some(source) = plan.input_source.as_ref() {
             let host = source == &self.public_key;

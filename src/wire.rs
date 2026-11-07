@@ -38,11 +38,8 @@ pub enum Message {
     Ready(u64),
     SelectMonitor(u64),
     SelectFallback(u64),
-    Verify(u64),
-    Observed {
-        id: u64,
-        input: u16,
-    },
+    MonitorSelected(u64),
+    MonitorReady(u64),
     Activate(u64),
     Active(u64),
     Event(Input),
