@@ -50,13 +50,13 @@ thread_local! {
 impl HookData {
     fn emit(&self, token: u64, input: Input) {
         if self.input.try_send((token, input)).is_err() {
-            self.gate.local(token);
+            self.gate.input_overflow(token);
         }
     }
 
     fn control(&self, token: u64, control: Control) {
         if self.control.try_send(control).is_err() {
-            self.gate.local(token);
+            self.gate.control_overflow(token);
         }
     }
 

@@ -21,9 +21,9 @@ class CandidateRenameTests(unittest.TestCase):
     def test_partial_rename_can_resume_without_replacing_assets(self):
         before = candidate()
         partial = copy.deepcopy(before)
-        partial["assets"][0]["name"] = "desk-switch-v0.4.8-linux.deb"
-        self.assertEqual(candidate_updates(partial, "0.4.8"), [{"id": 1, "name": "desk-switch-v0.4.8-windows.exe"}])
-        partial["assets"][1]["name"] = "desk-switch-v0.4.8-windows.exe"
+        partial["assets"][0]["name"] = "desk-switch-v0.4.8-linux-x86-64.deb"
+        self.assertEqual(candidate_updates(partial, "0.4.8"), [{"id": 1, "name": "desk-switch-v0.4.8-windows-x86-64.exe"}])
+        partial["assets"][1]["name"] = "desk-switch-v0.4.8-windows-x86-64.exe"
         self.assertEqual(candidate_updates(partial, "0.4.8"), [])
         verify_result(before, partial, "0.4.8", "Notes")
 

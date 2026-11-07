@@ -1,6 +1,6 @@
 use crate::transport::LEASE;
 use std::{
-    sync::atomic::{AtomicU64, Ordering::SeqCst},
+    sync::atomic::{AtomicU8, AtomicU64, Ordering::SeqCst},
     time::Instant,
 };
 
@@ -15,6 +15,7 @@ pub struct Gate {
     state: AtomicU64,
     deadline: AtomicU64,
     origin: Instant,
+    reason: AtomicU8,
 }
 
 impl Gate {
@@ -23,6 +24,7 @@ impl Gate {
             state: AtomicU64::new(0),
             deadline: AtomicU64::new(0),
             origin: Instant::now(),
+            reason: AtomicU8::new(0),
         }
     }
 
@@ -49,6 +51,7 @@ impl Gate {
             if self.now() < self.deadline.load(SeqCst) {
                 return (token, route);
             }
+            self.reason.store(1, SeqCst);
             self.local(token);
         }
     }
@@ -60,8 +63,12 @@ impl Gate {
         }
         self.deadline
             .store(self.now() + LEASE.as_millis() as u64, SeqCst);
-        self.set(token, Route::Local, token + 1, Route::Hold)
-            .then_some(token + 1)
+        if self.set(token, Route::Local, token + 1, Route::Hold) {
+            self.reason.store(0, SeqCst);
+            Some(token + 1)
+        } else {
+            None
+        }
     }
 
     fn set(&self, from_token: u64, from: Route, to_token: u64, to: Route) -> bool {
@@ -96,7 +103,25 @@ impl Gate {
     }
 
     pub fn emergency(&self) {
+        self.reason.store(2, SeqCst);
         self.local(self.state.load(SeqCst) >> 2);
+    }
+    pub fn input_overflow(&self, token: u64) {
+        self.reason.store(3, SeqCst);
+        self.local(token);
+    }
+    pub fn control_overflow(&self, token: u64) {
+        self.reason.store(4, SeqCst);
+        self.local(token);
+    }
+    pub fn reason(&self) -> &'static str {
+        match self.reason.load(SeqCst) {
+            1 => "the input heartbeat lease expired",
+            2 => "the emergency key was pressed",
+            3 => "the input event queue overflowed",
+            4 => "the input control queue overflowed",
+            _ => "the input route changed",
+        }
     }
 }
 

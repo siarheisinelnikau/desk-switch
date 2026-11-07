@@ -1,4 +1,4 @@
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use std::{sync::mpsc, time::Duration};
 use tokio::sync::oneshot;
@@ -29,6 +29,32 @@ pub enum VideoResult {
     Written,
 }
 
+#[derive(Debug)]
+struct WriteAttempted;
+impl std::fmt::Display for WriteAttempted {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "a monitor input command was issued; verification will not resend it"
+        )
+    }
+}
+impl std::error::Error for WriteAttempted {}
+
+pub fn write_attempted(error: &anyhow::Error) -> bool {
+    error.is::<WriteAttempted>()
+}
+
+fn write(monitor: &mut impl Monitor, input: u16) -> Result<()> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COMMAND: AtomicU64 = AtomicU64::new(1);
+    println!(
+        "Monitor input command #{}: select {input:#06x}; subsequent confirmation is read-only.",
+        COMMAND.fetch_add(1, Ordering::Relaxed)
+    );
+    monitor.write(input).context(WriteAttempted)
+}
+
 fn execute(monitor: &mut impl Monitor, job: Job) -> Result<VideoResult> {
     let read = |monitor: &mut _| {
         let result = Monitor::read(monitor);
@@ -48,14 +74,14 @@ fn execute(monitor: &mut impl Monitor, job: Job) -> Result<VideoResult> {
                 bail!("VCP 0x60 reported {actual:#06x}; expected the source {from:#06x}");
             }
             crate::lifecycle::report(crate::lifecycle::Event::Monitor(None));
-            monitor.write(to)?;
+            write(monitor, to)?;
             Ok(VideoResult::Written)
         }
         Job::Recover(inputs) => {
             let actual = read(monitor)?;
             if actual == inputs.peer {
                 crate::lifecycle::report(crate::lifecycle::Event::Monitor(None));
-                monitor.write(inputs.host)?;
+                write(monitor, inputs.host)?;
             } else if actual != inputs.host {
                 bail!("recovery saw an unconfigured VCP 0x60 value {actual:#06x}");
             }
@@ -70,40 +96,26 @@ pub struct VideoWorker(mpsc::SyncSender<(Job, oneshot::Sender<Result<VideoResult
 
 impl VideoWorker {
     pub fn start(monitor: impl Monitor) -> Result<Self> {
-        Self::start_worker(monitor, None)
+        Self::start_worker(monitor, false)
     }
 
     pub fn watch(monitor: impl Monitor) -> Result<Self> {
-        Self::start_worker(monitor, Some(Duration::from_secs(5)))
+        Self::start_worker(monitor, true)
     }
 
-    fn start_worker(mut monitor: impl Monitor, status_interval: Option<Duration>) -> Result<Self> {
+    fn start_worker(mut monitor: impl Monitor, read_initial: bool) -> Result<Self> {
         let (send, receive) = mpsc::sync_channel::<(Job, oneshot::Sender<_>)>(1);
         std::thread::Builder::new()
             .name("DDC".into())
             .spawn(move || {
-                if status_interval.is_some() {
+                if read_initial {
                     let _ = execute(&mut monitor, Job::Read);
                 }
-                loop {
-                    let job = match status_interval {
-                        Some(interval) => receive.recv_timeout(interval),
-                        None => receive
-                            .recv()
-                            .map_err(|_| mpsc::RecvTimeoutError::Disconnected),
-                    };
-                    match job {
-                        Ok((job, reply)) => {
-                            if !reply.is_closed() {
-                                let _ = reply.send(execute(&mut monitor, job));
-                            }
-                        }
-                        // Keep the diagram accurate after a monitor-menu change.
-                        // All reads and writes still use this one serialized worker.
-                        Err(mpsc::RecvTimeoutError::Timeout) => {
-                            let _ = execute(&mut monitor, Job::Read);
-                        }
-                        Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                // Inactive DDC ports can stall a graphics driver. Read only at
+                // startup or for an explicit operation, never on an idle timer.
+                for (job, reply) in receive {
+                    if !reply.is_closed() {
+                        let _ = reply.send(execute(&mut monitor, job));
                     }
                 }
             })?;
@@ -206,7 +218,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn status_watcher_only_reads_until_an_explicit_switch_job() {
+    async fn status_is_read_once_and_idle_services_do_not_poll_ddc() {
         struct Observed {
             input: Arc<AtomicU16>,
             reads: Arc<AtomicUsize>,
@@ -232,17 +244,19 @@ mod tests {
                 reads: Arc::clone(&reads),
                 writes: Arc::clone(&writes),
             },
-            Some(Duration::from_millis(10)),
+            true,
         )
         .unwrap();
         tokio::time::timeout(Duration::from_secs(2), async {
-            while reads.load(SeqCst) < 2 {
+            while reads.load(SeqCst) < 1 {
                 tokio::time::sleep(Duration::from_millis(2)).await;
             }
         })
         .await
         .unwrap();
         assert_eq!(writes.load(SeqCst), 0);
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        assert_eq!(reads.load(SeqCst), 1);
         input.store(15, SeqCst); // A monitor-menu change, with no programmatic write.
         assert!(matches!(
             worker.submit(Job::Read).unwrap().await.unwrap().unwrap(),

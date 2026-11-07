@@ -408,7 +408,7 @@ async fn capture(
                         if let Some(control) = routing.toggle()
                             && controls.try_send(control).is_err()
                         {
-                            gate.emergency();
+                            gate.control_overflow(gate.current().0);
                         }
                         if gate.current().1 != Route::Local && local_active && !sharing.needs_local() {
                             portal.release()?;
@@ -455,7 +455,7 @@ async fn capture(
                         if let Some(control) = control
                             && controls.try_send(control).is_err()
                         {
-                            gate.emergency();
+                            gate.control_overflow(gate.current().0);
                         }
                         if let Some((owner, input)) = input {
                             route(portal, &routing, owner, input, &events, &controls)?;
@@ -504,7 +504,7 @@ fn route(
                     .try_send(Control::Edge { token, position })
                     .is_err()
             {
-                routing.gate.local(token);
+                routing.gate.control_overflow(token);
             }
         }
         Owner::Remote(owned)
@@ -512,7 +512,7 @@ fn route(
                 && active == Route::Remote
                 && events.try_send((token, input)).is_err() =>
         {
-            routing.gate.local(token);
+            routing.gate.input_overflow(token);
         }
         _ => {}
     }

@@ -8,6 +8,7 @@ import re
 import subprocess
 import tempfile
 import tomllib
+import xml.etree.ElementTree as ET
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -18,7 +19,7 @@ def check(package):
         actual = subprocess.check_output(["dpkg-deb", "--field", str(package), field], text=True).strip()
         assert actual == expected, (field, actual)
     dependencies = subprocess.check_output(["dpkg-deb", "--field", str(package), "Depends"], text=True)
-    for required in ["ddcutil", "pipewire-bin", "pipewire-pulse", "pulseaudio-utils", "acl", "udev", "python3"]:
+    for required in ["ddcutil", "pipewire-bin", "pipewire-pulse", "pulseaudio-utils", "acl", "udev", "python3", "pkexec", "polkitd", "openssl"]:
         assert any(re.fullmatch(r"\s*" + re.escape(required) + r"(?:\s*\([^)]*\))?\s*", dependency)
                    for dependency in dependencies.split(",")), f"{required} must be a required runtime dependency"
     with tempfile.TemporaryDirectory(prefix="desk-switch-deb-check-") as temporary:
@@ -37,7 +38,16 @@ def check(package):
         assert os.access(postinst, os.X_OK) and "--reload-rules" in postinst.read_text()
         assert "trigger" not in postinst.read_text(), "installation must not trigger real input devices"
         subprocess.run(["sh", "-n", str(postinst)], check=True)
-        assert (extracted / "usr/share/polkit-1/actions/com.deskswitch.input-access.policy").is_file()
+        for action, executable in [("input-access", "input-access"), ("update", "update-install")]:
+            helper_path = extracted / f"usr/lib/desk-switch/{executable}"
+            assert helper_path.is_file() and os.access(helper_path, os.X_OK)
+            assert helper_path.read_text().startswith("#!/usr/bin/python3 -I")
+            policy = ET.parse(extracted / f"usr/share/polkit-1/actions/com.deskswitch.{action}.policy").getroot().find("action")
+            assert policy.findtext("defaults/allow_active") == "yes"
+            assert policy.findtext("defaults/allow_any") == policy.findtext("defaults/allow_inactive") == "no"
+            assert policy.find("annotate[@key='org.freedesktop.policykit.exec.path']").text == f"/usr/lib/desk-switch/{executable}"
+        assert (extracted / "usr/share/desk-switch/update-public-key.hex").read_bytes() == (ROOT / "release/update-public-key.hex").read_bytes()
+        assert (extracted / "usr/share/doc/desk-switch/VB-CABLE-NOTICE.txt").is_file()
         launcher = extracted / "usr/bin/desk-switch"
         result = subprocess.check_output([str(launcher), "--build-info"], env=environment, text=True).strip()
         stamp = json.loads(result.removeprefix("DESK-SWITCH-BUILD:"))
@@ -48,7 +58,7 @@ def check(package):
         assert bundled.read_bytes() == original, "launcher must not mutate the package-owned executable"
         assert not (work / "user data/desk-switch/application/desk-switch").exists()
         assert (extracted / "usr/share/doc/desk-switch/rust-auto-updator-LICENSE").is_file()
-        print("PASS: Debian metadata, required monitor/audio utilities, menu icon, launcher, package-owned binary and updater license")
+        print("PASS: Debian metadata, required utilities, fixed password-free policies, pinned update key, menu icon, launcher, package-owned binary and third-party notices")
 
 
 if __name__ == "__main__":

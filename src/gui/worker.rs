@@ -81,6 +81,17 @@ impl Worker {
         let executable = std::env::current_exe()?;
         let mut command = Command::new(executable);
         command.args(args).env("DESK_SWITCH_STATE", dir);
+        if kind == Kind::Input {
+            let prefs = super::model::Preferences::load(dir)?;
+            command.env(
+                "DESK_SWITCH_REMOTE_CURSOR",
+                if prefs.show_remote_cursor {
+                    "on"
+                } else {
+                    "off"
+                },
+            );
+        }
         let interactive_query = args.first().is_some_and(|arg| arg == "input-access");
         if kind != Kind::Query || interactive_query {
             command.env("DESK_SWITCH_MANAGED", "1");

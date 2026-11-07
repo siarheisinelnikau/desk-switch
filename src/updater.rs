@@ -54,10 +54,16 @@ struct Pending {
 }
 
 pub enum Outcome {
-    Current,
+    Current(String),
     Unpublished,
     Ready(String),
-    Prepared(String, rust_auto_updator::Prepared),
+    Prepared(String, Prepared),
+}
+
+pub struct Prepared {
+    inner: rust_auto_updator::Prepared,
+    #[cfg(target_os = "linux")]
+    envelope: Envelope,
 }
 
 fn hex<const N: usize>(value: &str) -> Result<[u8; N]> {
@@ -165,7 +171,7 @@ fn release_envelope(bytes: &[u8]) -> Result<Envelope> {
     Ok(envelope)
 }
 
-fn fetch_envelope() -> Result<Option<Envelope>> {
+fn fetch_release() -> Result<Option<Vec<u8>>> {
     let response = client()?
         .get(https(CHANNEL)?)
         .timeout(Duration::from_secs(15))
@@ -182,7 +188,13 @@ fn fetch_envelope() -> Result<Option<Envelope>> {
         bytes.len() <= MAX_MANIFEST as usize * 4,
         "release information is too large"
     );
-    Ok(Some(release_envelope(&bytes)?))
+    Ok(Some(bytes))
+}
+
+fn fetch_envelope() -> Result<Option<Envelope>> {
+    fetch_release()?
+        .map(|bytes| release_envelope(&bytes))
+        .transpose()
 }
 
 fn sibling(executable: &Path, suffix: &str) -> Result<PathBuf> {
@@ -269,7 +281,7 @@ pub fn check_and_stage(dir: &Path, executable: &Path) -> Result<Outcome> {
     if semver::Version::parse(&release.version)?
         <= semver::Version::parse(crate::compatibility::VERSION)?
     {
-        return Ok(Outcome::Current);
+        return Ok(Outcome::Current(release.version));
     }
     let artifact = release
         .targets
@@ -337,27 +349,42 @@ pub fn check_and_stage(dir: &Path, executable: &Path) -> Result<Outcome> {
     result
 }
 
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct Progress {
+    pub downloaded: u64,
+    pub total: u64,
+}
+
 pub struct Job {
     result: Receiver<Result<Outcome>>,
+    progress: std::sync::Arc<std::sync::Mutex<Option<Progress>>>,
 }
 impl Job {
     pub fn start(dir: PathBuf, executable: PathBuf, ctx: eframe::egui::Context) -> Result<Self> {
         let (send, result) = mpsc::channel();
+        let progress = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let progress_send = progress.clone();
         std::thread::Builder::new()
             .name("Desk Switch updates".into())
             .spawn(move || {
                 let result = if shared_managed(&executable) {
-                    shared_download(&dir, &ctx)
+                    shared_download(&dir, |downloaded, total| {
+                        *progress_send.lock().unwrap() = Some(Progress { downloaded, total });
+                        ctx.request_repaint();
+                    })
                 } else {
                     check_and_stage(&dir, &executable)
                 };
                 let _ = send.send(result);
                 ctx.request_repaint();
             })?;
-        Ok(Self { result })
+        Ok(Self { result, progress })
     }
     pub fn poll(&self) -> Option<Result<Outcome>> {
         self.result.try_recv().ok()
+    }
+    pub fn progress(&self) -> Option<Progress> {
+        self.progress.lock().unwrap().clone()
     }
 }
 
@@ -384,6 +411,14 @@ pub fn shared_config(dir: &Path) -> Result<rust_auto_updator::Config> {
     let mut config = config.map_err(anyhow::Error::msg)?;
     config.allow_asset_digest = true;
     config.asset_platform = Some(if cfg!(windows) { "windows" } else { "linux" }.into());
+    config.legacy_executable_names = vec![
+        if cfg!(windows) {
+            "desk-switch-v{version}-windows-x86-64.exe"
+        } else {
+            "desk-switch-v{version}-linux-x86-64.deb"
+        }
+        .into(),
+    ];
     config.max_executable_size = MAX_BINARY;
     config.install.stage_prefix = ".desk-switch-shared-update-".into();
     config.install.helper_name = if cfg!(windows) {
@@ -407,25 +442,37 @@ pub fn shared_config(dir: &Path) -> Result<rust_auto_updator::Config> {
     Ok(config)
 }
 
-fn shared_download(dir: &Path, ctx: &eframe::egui::Context) -> Result<Outcome> {
+fn shared_download(dir: &Path, progress: impl FnMut(u64, u64)) -> Result<Outcome> {
     let config = shared_config(dir)?;
-    let Some(latest) = rust_auto_updator::check_latest(&config).map_err(anyhow::Error::msg)? else {
-        return Ok(Outcome::Current);
+    let Some(bytes) = fetch_release()? else {
+        return Ok(Outcome::Unpublished);
     };
-    // The shared library checks HTTPS, package/PE metadata and hashes. Bind its
-    // selected asset to our pinned Ed25519 key before allowing any download.
-    let envelope = fetch_envelope()?.context("signed release is unavailable")?;
+    // Select the installer and verify its pinned signature from one API snapshot.
+    // Two independent requests could straddle a newly published release.
+    let envelope = release_envelope(&bytes)?;
     let signed = verified(&envelope, PUBLIC_KEY)?;
+    if semver::Version::parse(&signed.version)? <= config.current_version {
+        return Ok(Outcome::Current(signed.version));
+    }
+    let latest = rust_auto_updator::parse_release(std::str::from_utf8(&bytes)?, &config)
+        .map_err(anyhow::Error::msg)?
+        .context("signed installer is unavailable")?;
     let key = if cfg!(windows) {
         WINDOWS
     } else {
         "linux-x86_64-deb"
     };
     verify_shared_asset(&signed, &latest, key)?;
-    let prepared =
-        rust_auto_updator::prepare_download(&latest, &config, |_, _| ctx.request_repaint())
-            .map_err(anyhow::Error::msg)?;
-    Ok(Outcome::Prepared(signed.version, prepared))
+    let prepared = rust_auto_updator::prepare_download(&latest, &config, progress)
+        .map_err(anyhow::Error::msg)?;
+    Ok(Outcome::Prepared(
+        signed.version,
+        Prepared {
+            inner: prepared,
+            #[cfg(target_os = "linux")]
+            envelope,
+        },
+    ))
 }
 
 fn verify_shared_asset(
@@ -478,31 +525,87 @@ pub fn acknowledge_shared_start(dir: &Path) {
 }
 
 pub struct InstallJob {
-    result: Receiver<(rust_auto_updator::Prepared, Result<(), String>)>,
+    result: Receiver<(Prepared, Result<(), String>)>,
 }
 
 impl InstallJob {
-    pub fn start(
-        mut prepared: rust_auto_updator::Prepared,
-        dir: &Path,
-        ctx: eframe::egui::Context,
-    ) -> Result<Self> {
+    pub fn start(mut prepared: Prepared, dir: &Path, ctx: eframe::egui::Context) -> Result<Self> {
         prepared
+            .inner
             .set_restart_args(shared_config(dir)?.install.restart_args)
             .map_err(anyhow::Error::msg)?;
         let (send, result) = mpsc::channel();
+        #[cfg(target_os = "linux")]
+        let envelope = {
+            let path = dir.join("updates/install-envelope.json");
+            crate::config::write_atomic(&path, &serde_json::to_string(&prepared.envelope)?)?;
+            path
+        };
         std::thread::Builder::new()
             .name("Desk Switch install".into())
             .spawn(move || {
-                let installed = rust_auto_updator::handoff(&mut prepared);
+                #[cfg(target_os = "linux")]
+                let installed = prepared.inner.handoff_with_installer(|archive| {
+                    install_signed_package(archive, &envelope).map_err(|error| error.to_string())
+                });
+                #[cfg(not(target_os = "linux"))]
+                let installed = rust_auto_updator::handoff(&mut prepared.inner);
                 let _ = send.send((prepared, installed));
                 ctx.request_repaint();
             })?;
         Ok(Self { result })
     }
-    pub fn poll(&self) -> Option<(rust_auto_updator::Prepared, Result<(), String>)> {
+    pub fn poll(&self) -> Option<(Prepared, Result<(), String>)> {
         self.result.try_recv().ok()
     }
+}
+
+#[cfg(target_os = "linux")]
+fn install_signed_package(archive: &Path, envelope: &Path) -> Result<()> {
+    use std::os::unix::process::CommandExt;
+    let helper = Path::new("/usr/lib/desk-switch/update-install");
+    ensure!(
+        helper.is_file(),
+        "Install the current .deb once to enable password-free signed updates"
+    );
+    require_permission("com.deskswitch.update")?;
+    let mut command = Command::new("/usr/bin/pkexec");
+    command
+        .arg(helper)
+        .arg(archive)
+        .arg(envelope)
+        .stdin(Stdio::null());
+    // Older pkexec versions close inherited descriptors one by one. Bound the
+    // child-only descriptor limit, as the generic Debian installer does.
+    unsafe {
+        command.pre_exec(|| {
+            let mut limits = libc::rlimit {
+                rlim_cur: 0,
+                rlim_max: 0,
+            };
+            if libc::getrlimit(libc::RLIMIT_NOFILE, &mut limits) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            limits.rlim_cur = limits.rlim_cur.min(4096);
+            limits.rlim_max = limits.rlim_max.min(4096);
+            if libc::setrlimit(libc::RLIMIT_NOFILE, &limits) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let result = command
+        .output()
+        .context("starting the signed package installer")?;
+    ensure!(
+        result.status.success(),
+        "Signed package installation failed. {}",
+        String::from_utf8_lossy(&result.stderr)
+            .chars()
+            .take(4000)
+            .collect::<String>()
+    );
+    Ok(())
 }
 
 fn no_console(command: &mut Command) {
@@ -538,6 +641,31 @@ fn pending(dir: &Path) -> Result<(Pending, Release)> {
     checksum(&pending.payload, &release.targets[target()?])?;
     binary_version(&pending.payload, &release)?;
     Ok((pending, release))
+}
+
+#[cfg(target_os = "linux")]
+pub fn require_permission(action: &str) -> Result<()> {
+    ensure!(
+        ["com.deskswitch.update", "com.deskswitch.input-access"].contains(&action),
+        "unsupported Desk Switch permission"
+    );
+    // Without --allow-user-interaction, pkcheck can only grant or fail. It
+    // cannot show an authentication prompt or fall back to a password dialog.
+    let result = Command::new("/usr/bin/pkcheck")
+        .args([
+            "--action-id",
+            action,
+            "--process",
+            &std::process::id().to_string(),
+        ])
+        .stdin(Stdio::null())
+        .output()
+        .context("checking the installed Desk Switch permission")?;
+    ensure!(
+        result.status.success(),
+        "Desk Switch's password-free permission is unavailable. Install the current .deb once and run it in an active local desktop session."
+    );
+    Ok(())
 }
 
 pub fn launch_apply(dir: &Path) -> Result<()> {
@@ -748,9 +876,9 @@ mod shared_tests {
     fn library_download_must_match_the_pinned_signed_artifact() {
         let config = shared_config(Path::new("/tmp/desk-switch-shared-fixture")).unwrap();
         let filename = if cfg!(windows) {
-            "desk-switch-v99.0.0-windows.exe"
+            "desk-switch-v99.0.0-windows-x86-64.exe"
         } else {
-            "desk-switch-v99.0.0-linux.deb"
+            "desk-switch-v99.0.0-linux-x86-64.deb"
         };
         let key = if cfg!(windows) {
             WINDOWS

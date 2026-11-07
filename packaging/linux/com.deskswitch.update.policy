@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE policyconfig PUBLIC "-//freedesktop//DTD PolicyKit Policy Configuration 1.0//EN" "http://www.freedesktop.org/standards/PolicyKit/1/policyconfig.dtd">
+<policyconfig>
+  <vendor>Desk Switch</vendor>
+  <vendor_url>https://github.com/siarheisinelnikau/desk-switch</vendor_url>
+  <action id="com.deskswitch.update">
+    <description>Install a signed Desk Switch update</description>
+    <message>Install a newer Desk Switch package verified by the pinned project key.</message>
+    <defaults>
+      <allow_any>no</allow_any>
+      <allow_inactive>no</allow_inactive>
+      <allow_active>yes</allow_active>
+    </defaults>
+    <annotate key="org.freedesktop.policykit.exec.path">/usr/lib/desk-switch/update-install</annotate>
+  </action>
+</policyconfig>

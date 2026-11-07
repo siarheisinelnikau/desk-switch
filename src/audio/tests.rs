@@ -187,7 +187,10 @@ async fn user_off_releases_capture_and_reconnects_without_old_audio() {
     first.frame().await;
     first.frame().await;
     first.frame().await;
-    assert_eq!(first.render(), pcm);
+    assert!(
+        first.render()[384..] == pcm[384..],
+        "only the initial 2 ms fade may differ"
+    );
     first.off().await;
 
     let mut after_off = [1; FRAME_BYTES];
@@ -199,7 +202,10 @@ async fn user_off_releases_capture_and_reconnects_without_old_audio() {
         },
         Instant::now(),
     );
-    assert_eq!(after_off, SILENCE);
+    assert!(
+        after_off[384..] == SILENCE[384..],
+        "off must become silent after the bounded 2 ms fade"
+    );
 
     let fresh = tone(800.0);
     let mut second = Fixture::start(&windows, &ubuntu, queue, fresh).await;
@@ -207,7 +213,10 @@ async fn user_off_releases_capture_and_reconnects_without_old_audio() {
     second.frame().await;
     second.frame().await;
     second.frame().await;
-    assert_eq!(second.render(), fresh);
+    assert!(
+        second.render()[384..] == fresh[384..],
+        "reconnection must play fresh audio after the 2 ms fade"
+    );
     second.off().await;
 }
 
@@ -370,7 +379,10 @@ async fn delayed_audio_renews_credits_and_recovers_on_the_same_connection() {
         },
         Instant::now(),
     );
-    assert_eq!(output, fresh);
+    assert!(
+        output[384..] == fresh[384..],
+        "late frames must be discarded before fresh audio resumes"
+    );
     drop(server);
     assert!(
         timeout(Duration::from_secs(1), player)

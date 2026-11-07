@@ -120,6 +120,88 @@ struct Handoff {
     job: Option<(Job, oneshot::Receiver<Result<VideoResult>>)>,
     next_job: Option<(Instant, Job)>,
     allow_setup: bool,
+    pending_event: Option<(u64, crate::wire::Input)>,
+}
+
+struct Heartbeat {
+    sent: u64,
+    received: u64,
+    lease: Instant,
+    last_reply: Instant,
+    pending: std::collections::VecDeque<Message>,
+}
+impl Heartbeat {
+    fn new() -> Self {
+        Self {
+            sent: 0,
+            received: 0,
+            lease: Instant::now() + LEASE,
+            last_reply: Instant::now(),
+            pending: Default::default(),
+        }
+    }
+    fn check(&self) -> Result<()> {
+        ensure!(
+            Instant::now() < self.lease,
+            "peer heartbeat timed out (last reply {} ms ago)",
+            self.last_reply.elapsed().as_millis()
+        );
+        Ok(())
+    }
+    async fn ping(&mut self, pipe: &mut Pipe) -> Result<()> {
+        self.sent += 1;
+        pipe.send(Message::Ping(self.sent)).await
+    }
+    fn pong(&mut self, nonce: u64, gate: &Gate, token: Option<u64>) -> Result<()> {
+        ensure!(
+            nonce > self.received && nonce <= self.sent,
+            "invalid heartbeat reply"
+        );
+        self.received = nonce;
+        self.last_reply = Instant::now();
+        self.lease = self.last_reply + LEASE;
+        if let Some(token) = token {
+            gate.renew(token);
+        }
+        Ok(())
+    }
+    async fn cursor(
+        &mut self,
+        operation: impl std::future::Future<Output = Result<()>>,
+        pipe: &mut Pipe,
+        gate: &Gate,
+        token: u64,
+    ) -> Result<()> {
+        let mut ping = interval(PING_PERIOD);
+        ping.set_missed_tick_behavior(MissedTickBehavior::Skip);
+        let deadline = tokio::time::sleep(SWITCH_TIMEOUT);
+        tokio::pin!(operation, deadline);
+        loop {
+            self.check()?;
+            tokio::select! {
+                result = &mut operation => return result,
+                _ = &mut deadline => bail!("Windows/Wayland cursor operation timed out while the peer remained connected"),
+                _ = ping.tick() => self.ping(pipe).await?,
+                message = pipe.messages.recv() => match message.context("peer disconnected during cursor positioning")?? {
+                    Message::Pong(nonce) => self.pong(nonce, gate, Some(token))?,
+                    message => {
+                        ensure!(self.pending.len() < 16, "too many control messages during cursor positioning");
+                        self.pending.push_back(message);
+                    }
+                }
+            }
+        }
+    }
+}
+
+async fn next_message(
+    pending: &mut std::collections::VecDeque<Message>,
+    messages: &mut mpsc::Receiver<Result<Message>>,
+) -> Option<Result<Message>> {
+    match pending.pop_front() {
+        Some(message) => Some(Ok(message)),
+        None => messages.recv().await,
+    }
 }
 
 impl Handoff {
@@ -132,6 +214,7 @@ impl Handoff {
             job: None,
             next_job: None,
             allow_setup: false,
+            pending_event: None,
         }
     }
 
@@ -161,11 +244,9 @@ impl Handoff {
             crate::lifecycle::InputStatus::Here,
         ));
         let mut commands = crate::lifecycle::commands();
-        let mut last_ping = 0;
-        let mut last_pong = 0;
-        let mut lease = Instant::now() + LEASE;
+        let mut heartbeat = Heartbeat::new();
         loop {
-            ensure!(Instant::now() < lease, "peer heartbeat timed out");
+            heartbeat.check()?;
             ensure!(
                 self.deadline.is_none_or(|time| Instant::now() < time),
                 "switch confirmation timed out"
@@ -173,7 +254,8 @@ impl Handoff {
             if let Some(token) = self.token {
                 ensure!(
                     io.gate.current().0 == token,
-                    "emergency key, input overflow or local lease expired"
+                    "host input route was revoked: {}",
+                    io.gate.reason()
                 );
             }
             let effect = tokio::select! {
@@ -187,8 +269,7 @@ impl Handoff {
                     continue;
                 }
                 _ = ping.tick() => {
-                    last_ping += 1;
-                    pipe.send(Message::Ping(last_ping)).await?;
+                    heartbeat.ping(pipe).await?;
                     continue;
                 }
                 _ = tick.tick() => {
@@ -222,7 +303,7 @@ impl Handoff {
                         _ => continue,
                     }
                 }
-                message = pipe.messages.recv() => {
+                message = next_message(&mut heartbeat.pending, &mut pipe.messages) => {
                     let message = message.context("peer disconnected")??;
                     match message {
                         Message::SwitchRequested => {
@@ -235,12 +316,7 @@ impl Handoff {
                             continue;
                         }
                         Message::Pong(nonce) => {
-                            ensure!(nonce > last_pong && nonce <= last_ping, "invalid heartbeat reply");
-                            last_pong = nonce;
-                            lease = Instant::now() + LEASE;
-                            if let Some(token) = self.token {
-                                io.gate.renew(token);
-                            }
+                            heartbeat.pong(nonce, &io.gate, self.token)?;
                             continue;
                         }
                         Message::ExitEdge { id, position } if self.logic.is_remote() && self.logic.id() == Some(id) => {
@@ -253,15 +329,16 @@ impl Handoff {
                         _ => self.logic.message(message)?,
                     }
                 }
-                event = io.events.recv() => {
+                event = next_event(&mut self.pending_event, &mut io.events) => {
                     let (token, event) = event.context("host input hook stopped")?;
                     if self.logic.is_remote() && self.token == Some(token) && io.gate.current() == (token, Route::Remote) {
+                        let event = coalesce_motion(token, event, &mut io.events, &mut self.pending_event);
                         pipe.send(Message::Event(event)).await?;
                     }
                     continue;
                 }
             };
-            self.apply(effect, pipe, io).await?;
+            self.apply(effect, pipe, io, &mut heartbeat).await?;
         }
     }
 
@@ -286,6 +363,12 @@ impl Handoff {
             Job::Select { .. } => match result {
                 Ok(VideoResult::Written) => Ok(Some(self.logic.written()?)),
                 Err(error) => {
+                    if crate::video::write_attempted(&error) {
+                        eprintln!(
+                            "Monitor command returned an error after issuance; only checking the input: {error:#}"
+                        );
+                        return Ok(Some(self.logic.written()?));
+                    }
                     eprintln!(
                         "Target-side monitor selection failed; trying the active port: {error:#}"
                     );
@@ -325,6 +408,7 @@ impl Handoff {
         effect: Effect,
         pipe: &mut Pipe,
         io: &Coordinator<impl Cursor>,
+        heartbeat: &mut Heartbeat,
     ) -> Result<()> {
         let token = self.token.context("missing host route token")?;
         ensure!(io.gate.current().0 == token, "host route was revoked");
@@ -342,9 +426,13 @@ impl Handoff {
                         pipe.send(prepare).await?;
                     } else {
                         if let (Some(position), Some(edge)) = (position, &io.edge) {
-                            io.cursor.enter(edge, position).await?;
+                            heartbeat
+                                .cursor(io.cursor.enter(edge, position), pipe, &io.gate, token)
+                                .await?;
                         } else {
-                            io.cursor.resume().await?;
+                            heartbeat
+                                .cursor(io.cursor.resume(), pipe, &io.gate, token)
+                                .await?;
                         }
                         io.gate.local(token);
                         self.token = None;
@@ -361,7 +449,9 @@ impl Handoff {
             }
             Effect::Ddc(job) => self.submit(io, job)?,
             Effect::Forward => {
-                io.cursor.center().await?;
+                heartbeat
+                    .cursor(io.cursor.center(), pipe, &io.gate, token)
+                    .await?;
                 ensure!(
                     io.gate.forward(token),
                     "host route was revoked before activation"
@@ -376,6 +466,47 @@ impl Handoff {
         }
         Ok(())
     }
+}
+
+async fn next_event(
+    pending: &mut Option<(u64, crate::wire::Input)>,
+    events: &mut mpsc::Receiver<(u64, crate::wire::Input)>,
+) -> Option<(u64, crate::wire::Input)> {
+    match pending.take() {
+        Some(event) => Some(event),
+        None => events.recv().await,
+    }
+}
+
+fn coalesce_motion(
+    token: u64,
+    event: crate::wire::Input,
+    events: &mut mpsc::Receiver<(u64, crate::wire::Input)>,
+    pending: &mut Option<(u64, crate::wire::Input)>,
+) -> crate::wire::Input {
+    use crate::wire::Input;
+    let Input::Move { mut dx, mut dy } = event else {
+        return event;
+    };
+    // Do not wait for more input or cross a key/button boundary. Only collapse
+    // motion already queued, preserving distance and discrete-event order.
+    for _ in 0..63 {
+        let Ok(next) = events.try_recv() else {
+            break;
+        };
+        if let (next_token, Input::Move { dx: x, dy: y }) = next
+            && next_token == token
+            && let (Some(x), Some(y)) = (dx.checked_add(x), dy.checked_add(y))
+            && (Input::Move { dx: x, dy: y }).valid()
+        {
+            dx = x;
+            dy = y;
+        } else {
+            *pending = Some(next);
+            break;
+        }
+    }
+    Input::Move { dx, dy }
 }
 
 #[cfg(test)]
@@ -619,5 +750,85 @@ mod tests {
         .unwrap();
         assert!(gate.current().1 == Route::Local);
         assert_eq!(toggles.load(SeqCst), 3);
+    }
+
+    #[test]
+    fn queued_motion_preserves_distance_button_order_and_session_boundaries() {
+        let (send, mut events) = mpsc::channel(128);
+        let mut pending = None;
+        for _ in 0..50 {
+            send.try_send((7, Input::Move { dx: 3, dy: -2 })).unwrap();
+        }
+        let boundary = Input::Button {
+            code: 272,
+            down: true,
+        };
+        send.try_send((7, boundary)).unwrap();
+        send.try_send((8, Input::Move { dx: 2, dy: 2 })).unwrap();
+        assert_eq!(
+            coalesce_motion(7, Input::Move { dx: 1, dy: 1 }, &mut events, &mut pending),
+            Input::Move { dx: 151, dy: -99 }
+        );
+        assert_eq!(pending.take(), Some((7, boundary)));
+        assert_eq!(
+            events.try_recv().unwrap(),
+            (8, Input::Move { dx: 2, dy: 2 })
+        );
+        send.try_send((7, Input::Move { dx: 16000, dy: 0 }))
+            .unwrap();
+        assert_eq!(
+            coalesce_motion(
+                7,
+                Input::Move { dx: 1000, dy: 0 },
+                &mut events,
+                &mut pending
+            ),
+            Input::Move { dx: 1000, dy: 0 }
+        );
+        assert_eq!(pending, Some((7, Input::Move { dx: 16000, dy: 0 })));
+    }
+    #[tokio::test]
+    async fn slow_native_cursor_operation_keeps_the_existing_input_lease_alive() {
+        let a = identity();
+        let b = identity();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let (a_stream, b_stream) = tokio::join!(
+            TcpStream::connect(listener.local_addr().unwrap()),
+            listener.accept()
+        );
+        let (a_pipe, b_pipe) = tokio::join!(
+            Pipe::connect(a_stream.unwrap(), &a, &b.public, true),
+            Pipe::connect(b_stream.unwrap().0, &b, &a.public, false)
+        );
+        let mut local = a_pipe.unwrap();
+        let mut remote = b_pipe.unwrap();
+        let gate = Gate::new();
+        let token = gate.begin().unwrap();
+        let source = async {
+            let mut heartbeat = Heartbeat::new();
+            heartbeat
+                .cursor(
+                    async {
+                        sleep(LEASE + Duration::from_millis(400)).await;
+                        Ok(())
+                    },
+                    &mut local,
+                    &gate,
+                    token,
+                )
+                .await
+                .unwrap();
+            assert!(heartbeat.received >= 5);
+            assert!(gate.current() == (token, Route::Hold));
+            assert!(gate.forward(token));
+        };
+        let peer = async {
+            while let Some(Ok(message)) = remote.messages.recv().await {
+                if let Message::Ping(nonce) = message {
+                    remote.send(Message::Pong(nonce)).await.unwrap();
+                }
+            }
+        };
+        tokio::select! { _ = source => {}, _ = peer => panic!("peer closed early") }
     }
 }

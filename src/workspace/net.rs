@@ -47,6 +47,7 @@ pub enum Event {
     Forgotten,
     Update(super::update::Message),
     UpdateSent(super::update::Message),
+    Management(super::management::Message),
 }
 enum Command {
     Dial(Vec<SocketAddr>, String),
@@ -54,6 +55,7 @@ enum Command {
     Disconnect,
     Forget,
     Update(super::update::Message),
+    Management(super::management::Message),
 }
 
 pub struct Service {
@@ -112,6 +114,7 @@ impl Service {
         let notify = Notifier {
             events: events_send,
             snapshot: Arc::clone(&snapshot),
+            last_state: Arc::new(Mutex::new(None)),
             ctx,
         };
         std::thread::Builder::new()
@@ -179,6 +182,13 @@ impl Service {
             .context("The paired update command could not be queued")?;
         Ok(())
     }
+    pub fn manage(&self, message: super::management::Message) -> Result<()> {
+        message.validate()?;
+        self.commands
+            .try_send(Command::Management(message))
+            .context("The management request could not be queued")?;
+        Ok(())
+    }
     pub fn poll(&self) -> impl Iterator<Item = Event> + '_ {
         let mut snapshot = self.snapshot.lock().unwrap();
         let mut events = self.events.try_iter().take(64).collect::<Vec<_>>();
@@ -203,12 +213,18 @@ struct Notifier {
     // Request or Connected behind stale snapshots.
     events: mpsc::Sender<Event>,
     snapshot: Arc<Mutex<Option<Box<Node>>>>,
+    last_state: Arc<Mutex<Option<Box<Node>>>>,
     ctx: eframe::egui::Context,
 }
 impl Notifier {
     fn send(&self, event: Event) -> bool {
         let mut snapshot = self.snapshot.lock().unwrap();
         let sent = if let Event::State(node) = event {
+            let mut last = self.last_state.lock().unwrap();
+            if last.as_ref() == Some(&node) {
+                return true;
+            }
+            *last = Some(node.clone());
             *snapshot = Some(node);
             true
         } else {
@@ -217,6 +233,7 @@ impl Notifier {
                 Event::Closed(_) | Event::Connected { .. } | Event::Forgotten
             ) {
                 snapshot.take();
+                self.last_state.lock().unwrap().take();
             }
             self.events.send(event).is_ok()
         };
@@ -231,6 +248,8 @@ struct Hello {
     app: String,
     protocol: u16,
     port: u16,
+    #[serde(default)]
+    control_protocol: Option<u16>,
 }
 impl Hello {
     fn validate(&self) -> Result<()> {
@@ -247,10 +266,19 @@ impl Hello {
                 && self.name.chars().all(|c| !c.is_control()),
             "invalid computer name"
         );
-        Version::current().require(Some(&Version {
+        let version = Version {
             app: self.app.clone(),
             protocol: self.protocol,
-        }))
+        };
+        semver::Version::parse(&version.app)?;
+        match self.control_protocol {
+            Some(protocol) => ensure!(
+                protocol == super::management::PROTOCOL,
+                "Unsupported management protocol; update Desk Switch on the other PC"
+            ),
+            None => Version::current().require(Some(&version))?,
+        }
+        Ok(())
     }
 }
 
@@ -277,14 +305,36 @@ struct Candidate {
     outgoing: bool,
     requested: bool,
     address: SocketAddr,
+    version: Version,
 }
 async fn authenticate(
+    stream: TcpStream,
+    identity: &Identity,
+    name: &str,
+    outgoing: bool,
+    expected: Option<&str>,
+    port: u16,
+) -> Result<Candidate> {
+    authenticate_version(
+        stream,
+        identity,
+        name,
+        outgoing,
+        expected,
+        port,
+        &Version::current(),
+    )
+    .await
+}
+
+async fn authenticate_version(
     mut stream: TcpStream,
     identity: &Identity,
     name: &str,
     outgoing: bool,
     expected: Option<&str>,
     port: u16,
+    version: &Version,
 ) -> Result<Candidate> {
     stream.set_nodelay(true)?;
     let mut address = stream.peer_addr()?;
@@ -303,9 +353,10 @@ async fn authenticate(
     };
     let hello = serde_json::to_vec(&Hello {
         name: name.into(),
-        app: crate::compatibility::VERSION.into(),
-        protocol: crate::compatibility::PROTOCOL,
+        app: version.app.clone(),
+        protocol: version.protocol,
         port,
+        control_protocol: Some(super::management::PROTOCOL),
     })?;
     let mut remote = None;
     let mut buffer = vec![0; LIMIT];
@@ -341,6 +392,10 @@ async fn authenticate(
         stream,
         noise: noise.into_transport_mode()?,
         key,
+        version: Version {
+            app: remote.app,
+            protocol: remote.protocol,
+        },
         name: remote.name,
         code,
         outgoing,
@@ -357,6 +412,7 @@ enum Frame {
     Forget,
     Forgotten,
     Update(super::update::Message),
+    Management(super::management::Message),
 }
 
 fn remove_pin(dir: &std::path::Path) -> Result<()> {
@@ -679,6 +735,10 @@ async fn session(
                     send_frame(&mut write,&mut peer.noise,Frame::Update(message.clone())).await?;
                     ensure!(notify.send(Event::UpdateSent(message)),"окно приложения закрыто");
                 }
+                Some(Command::Management(message)) if forgetting.is_none()=> {
+                    message.validate()?;
+                    send_frame(&mut write,&mut peer.noise,Frame::Management(message)).await?;
+                }
                 _=>{}
             },
             _=tick.tick()=> {
@@ -707,13 +767,18 @@ async fn session(
                     }
                     if matches!(frame,Frame::Forgotten) && forgetting.is_some() {notify.send(Event::Forgotten);return Ok(());}
                     match frame {
-                        Frame::State(state) => {
+                        Frame::State(mut state) => {
+                            state.version = Some(peer.version.clone());
                             state.validate(own,&key)?;
                             ensure!(notify.send(Event::State(state)),"окно приложения закрыто");
                         }
                         Frame::Update(message) => {
                             message.validate()?;
                             ensure!(notify.send(Event::Update(message)),"окно приложения закрыто");
+                        }
+                        Frame::Management(message) => {
+                            message.validate()?;
+                            ensure!(notify.send(Event::Management(message)),"application window closed");
                         }
                         _ => bail!("unexpected pair command"),
                     }
@@ -743,6 +808,7 @@ mod tests {
         dir: PathBuf,
         key: String,
         address: SocketAddr,
+        pending: Mutex<std::collections::VecDeque<Event>>,
     }
     impl Fixture {
         fn new(label: &str) -> Self {
@@ -772,19 +838,23 @@ mod tests {
                 dir,
                 key,
                 address,
+                pending: Mutex::new(Default::default()),
             }
         }
         #[track_caller]
         fn wait(&self, accept: impl Fn(&Event) -> bool) -> Event {
             let deadline = std::time::Instant::now() + Duration::from_secs(6);
-            let mut seen = Vec::new();
             loop {
-                for event in self.service.poll() {
-                    if accept(&event) {
-                        return event;
-                    }
-                    seen.push(format!("{event:?}"));
+                let mut pending = self.pending.lock().unwrap();
+                pending.extend(self.service.poll());
+                if let Some(index) = pending.iter().position(&accept) {
+                    return pending.remove(index).unwrap();
                 }
+                let seen = pending
+                    .iter()
+                    .map(|event| format!("{event:?}"))
+                    .collect::<Vec<_>>();
+                drop(pending);
                 std::thread::sleep(Duration::from_millis(5));
                 assert!(
                     std::time::Instant::now() < deadline,
@@ -793,6 +863,7 @@ mod tests {
             }
         }
         fn restart(&mut self) {
+            self.pending.lock().unwrap().clear();
             let node = self.service.state.borrow().clone();
             let identity = config::load_identity(&self.dir).unwrap();
             let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -912,6 +983,7 @@ mod tests {
         let notify = Notifier {
             events: send,
             snapshot: Arc::clone(&snapshot),
+            last_state: Arc::new(Mutex::new(None)),
             ctx: Default::default(),
         };
         for i in 0..1000 {
@@ -1104,5 +1176,89 @@ mod tests {
         };
         let (rejected, finished) = tokio::join!(client, server);
         assert!(rejected && finished);
+    }
+
+    #[tokio::test]
+    async fn management_authenticates_mixed_versions_and_preserves_their_real_identity() {
+        let a = identity();
+        let b = identity();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let (a_stream, b_stream) = tokio::join!(
+            TcpStream::connect(listener.local_addr().unwrap()),
+            listener.accept()
+        );
+        let older = Version {
+            app: "0.4.9".into(),
+            protocol: 6,
+        };
+        let newer = Version {
+            app: "99.0.0".into(),
+            protocol: 7,
+        };
+        let a_key = config::hex(&a.public);
+        let b_key = config::hex(&b.public);
+        let (a_result, b_result) = tokio::join!(
+            authenticate_version(a_stream.unwrap(), &a, "A", true, Some(&b_key), 4000, &older),
+            authenticate_version(
+                b_stream.unwrap().0,
+                &b,
+                "B",
+                false,
+                Some(&a_key),
+                4001,
+                &newer
+            )
+        );
+        let a_peer = a_result.unwrap();
+        let b_peer = b_result.unwrap();
+        assert_eq!(a_peer.version, newer);
+        assert_eq!(b_peer.version, older);
+        assert_eq!(a_peer.key, b.public);
+        assert_eq!(b_peer.key, a.public);
+        assert!(
+            older.require(Some(&newer)).is_err(),
+            "device streams still require matching versions"
+        );
+        let unsupported = Hello {
+            name: "Other".into(),
+            app: newer.app,
+            protocol: newer.protocol,
+            port: 4001,
+            control_protocol: Some(99),
+        };
+        assert!(unsupported.validate().is_err());
+    }
+    #[test]
+    fn unchanged_network_snapshots_do_not_redraw_even_after_the_gui_consumes_them() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let wakes = Arc::new(AtomicUsize::new(0));
+        let counter = wakes.clone();
+        let ctx = eframe::egui::Context::default();
+        ctx.set_request_repaint_callback(move |_| {
+            counter.fetch_add(1, Ordering::SeqCst);
+        });
+        let (events, _receive) = mpsc::channel();
+        let snapshot = Arc::new(Mutex::new(None));
+        let notify = Notifier {
+            events,
+            snapshot: snapshot.clone(),
+            last_state: Arc::new(Mutex::new(None)),
+            ctx,
+        };
+        let state = Box::new(crate::workspace::tests::node("peer"));
+        assert!(notify.send(Event::State(state.clone())));
+        let first = wakes.load(Ordering::SeqCst);
+        assert!(snapshot.lock().unwrap().take().is_some());
+        for _ in 0..1000 {
+            assert!(notify.send(Event::State(state.clone())));
+        }
+        assert!(snapshot.lock().unwrap().is_none());
+        assert_eq!(wakes.load(Ordering::SeqCst), first);
+        assert!(notify.send(Event::Closed("disconnected".into())));
+        assert!(notify.send(Event::State(state)));
+        assert!(
+            snapshot.lock().unwrap().is_some(),
+            "new connection must publish its initial snapshot"
+        );
     }
 }

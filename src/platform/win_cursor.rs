@@ -11,7 +11,6 @@ use std::{
         mpsc,
     },
     thread::JoinHandle,
-    time::{Duration, Instant},
 };
 use windows_sys::{
     Win32::{
@@ -26,16 +25,32 @@ use windows_sys::{
 const CLASS: windows_sys::core::PCWSTR = w!("DeskSwitch.PointerOverlay");
 const COLOR_KEY: u32 = 0x00ff00ff;
 
-pub struct Overlay {
+const REFRESH: u32 = WM_APP + 0x3b;
+
+#[derive(Clone)]
+struct Wake {
     active: Arc<AtomicBool>,
+    queued: Arc<AtomicBool>,
     thread_id: u32,
+}
+impl Wake {
+    fn refresh(&self) {
+        // Retain only the latest position, never a backlog of obsolete frames.
+        if !self.queued.swap(true, Ordering::AcqRel)
+            && unsafe { PostThreadMessageW(self.thread_id, REFRESH, 0, 0) } == 0
+        {
+            self.queued.store(false, Ordering::Release);
+        }
+    }
+}
+thread_local! { static WAKE: RefCell<Option<Wake>> = const { RefCell::new(None) }; }
+
+pub struct Overlay {
+    wake: Wake,
     thread: Option<JoinHandle<()>>,
 }
-
 impl Overlay {
     pub fn start() -> Result<Self> {
-        let active = Arc::new(AtomicBool::new(true));
-        let enabled = Arc::clone(&active);
         let (send, receive) = mpsc::sync_channel(1);
         let thread = std::thread::Builder::new()
             .name("Desk Switch pointer".into())
@@ -43,29 +58,36 @@ impl Overlay {
                 let result = unsafe { Window::create() };
                 match result {
                     Ok(mut window) => {
-                        let id = unsafe { GetCurrentThreadId() };
-                        if send.send(Ok(id)).is_err() {
+                        let wake = Wake {
+                            active: Arc::new(AtomicBool::new(false)),
+                            queued: Arc::new(AtomicBool::new(false)),
+                            thread_id: unsafe { GetCurrentThreadId() },
+                        };
+                        WAKE.with(|state| *state.borrow_mut() = Some(wake.clone()));
+                        let _notifications = unsafe { Notifications::start(window.hwnd) };
+                        let mut physical_mouse = physical_mouse();
+                        let mut inventory_dirty = false;
+                        if send.send(Ok(wake.clone())).is_err() {
                             return;
                         }
-                        let mut inventory_at = Instant::now() - Duration::from_secs(3);
-                        let mut physical_mouse = true;
                         let mut message = MSG::default();
                         loop {
                             let status = unsafe { GetMessageW(&mut message, null_mut(), 0, 0) };
                             if status <= 0 {
                                 break;
                             }
-                            if message.message == WM_TIMER {
-                                if enabled.load(Ordering::Relaxed)
-                                    && inventory_at.elapsed() >= Duration::from_secs(2)
-                                {
-                                    inventory_at = Instant::now();
-                                    physical_mouse = crate::workspace::hardware::input_devices()
-                                        .map(|devices| devices.iter().any(|d| d.mouse))
-                                        .unwrap_or(true);
+                            if message.message == WM_DEVICECHANGE {
+                                inventory_dirty = true;
+                                wake.refresh();
+                            } else if message.message == REFRESH {
+                                wake.queued.store(false, Ordering::Release);
+                                let active = wake.active.load(Ordering::Acquire);
+                                if active && inventory_dirty {
+                                    physical_mouse = self::physical_mouse();
+                                    inventory_dirty = false;
                                 }
                                 unsafe {
-                                    window.update(enabled.load(Ordering::Relaxed), physical_mouse);
+                                    window.update(active, physical_mouse);
                                 }
                             } else {
                                 unsafe {
@@ -74,6 +96,7 @@ impl Overlay {
                                 }
                             }
                         }
+                        WAKE.with(|state| state.borrow_mut().take());
                     }
                     Err(error) => {
                         let _ = send.send(Err(format!("{error:#}")));
@@ -84,9 +107,8 @@ impl Overlay {
             .recv()
             .context("starting the Windows pointer window")?
         {
-            Ok(thread_id) => Ok(Self {
-                active,
-                thread_id,
+            Ok(wake) => Ok(Self {
+                wake,
                 thread: Some(thread),
             }),
             Err(error) => {
@@ -95,22 +117,95 @@ impl Overlay {
             }
         }
     }
-
     pub fn active(&self, enabled: bool) {
-        self.active.store(enabled, Ordering::Relaxed);
+        if self.wake.active.swap(enabled, Ordering::AcqRel) != enabled {
+            self.wake.refresh();
+        }
+    }
+    pub fn refresh(&self) {
+        self.wake.refresh();
     }
 }
-
 impl Drop for Overlay {
     fn drop(&mut self) {
         self.active(false);
         if let Some(thread) = self.thread.take() {
             if !thread.is_finished() {
                 unsafe {
-                    PostThreadMessageW(self.thread_id, WM_QUIT, 0, 0);
+                    PostThreadMessageW(self.wake.thread_id, WM_QUIT, 0, 0);
                 }
             }
             let _ = thread.join();
+        }
+    }
+}
+fn physical_mouse() -> bool {
+    crate::workspace::hardware::input_devices()
+        .map(|devices| devices.iter().any(|device| device.mouse))
+        .unwrap_or(true)
+}
+unsafe extern "system" fn cursor_changed(
+    _: windows_sys::Win32::UI::Accessibility::HWINEVENTHOOK,
+    _: u32,
+    _: HWND,
+    object: i32,
+    _: i32,
+    _: u32,
+    _: u32,
+) {
+    if object == OBJID_CURSOR {
+        WAKE.with(|state| {
+            if let Some(wake) = state.borrow().as_ref()
+                && wake.active.load(Ordering::Acquire)
+            {
+                wake.refresh();
+            }
+        });
+    }
+}
+struct Notifications {
+    cursor: windows_sys::Win32::UI::Accessibility::HWINEVENTHOOK,
+    devices: HDEVNOTIFY,
+}
+impl Notifications {
+    unsafe fn start(hwnd: HWND) -> Self {
+        use windows_sys::Win32::{
+            Devices::HumanInterfaceDevice::GUID_DEVINTERFACE_MOUSE, UI::Accessibility::*,
+        };
+        unsafe {
+            let cursor = SetWinEventHook(
+                EVENT_OBJECT_SHOW,
+                EVENT_OBJECT_NAMECHANGE,
+                null_mut(),
+                Some(cursor_changed),
+                0,
+                0,
+                WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS,
+            );
+            let filter = DEV_BROADCAST_DEVICEINTERFACE_W {
+                dbcc_size: size_of::<DEV_BROADCAST_DEVICEINTERFACE_W>() as u32,
+                dbcc_devicetype: DBT_DEVTYP_DEVICEINTERFACE,
+                dbcc_classguid: GUID_DEVINTERFACE_MOUSE,
+                ..Default::default()
+            };
+            let devices = RegisterDeviceNotificationW(
+                hwnd,
+                (&filter as *const DEV_BROADCAST_DEVICEINTERFACE_W).cast(),
+                DEVICE_NOTIFY_WINDOW_HANDLE,
+            );
+            Self { cursor, devices }
+        }
+    }
+}
+impl Drop for Notifications {
+    fn drop(&mut self) {
+        unsafe {
+            if !self.cursor.is_null() {
+                windows_sys::Win32::UI::Accessibility::UnhookWinEvent(self.cursor);
+            }
+            if !self.devices.is_null() {
+                UnregisterDeviceNotification(self.devices);
+            }
         }
     }
 }
@@ -120,6 +215,8 @@ struct Drawing {
     cursor: HCURSOR,
     brush: HBRUSH,
 }
+#[cfg(test)]
+thread_local! { static PAINT_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) }; }
 thread_local! { static DRAWING: RefCell<Option<Drawing>> = const { RefCell::new(None) }; }
 
 unsafe extern "system" fn procedure(
@@ -132,6 +229,8 @@ unsafe extern "system" fn procedure(
         WM_NCHITTEST => HTTRANSPARENT as LRESULT,
         WM_MOUSEACTIVATE => MA_NOACTIVATE as LRESULT,
         WM_PAINT => {
+            #[cfg(test)]
+            PAINT_COUNT.with(|count| count.set(count.get() + 1));
             unsafe {
                 let mut paint = PAINTSTRUCT::default();
                 let dc = BeginPaint(hwnd, &mut paint);
@@ -162,6 +261,7 @@ struct Window {
     hotspot: (i32, i32),
     size: (i32, i32),
     visible: bool,
+    position: Option<(i32, i32)>,
 }
 
 impl Window {
@@ -216,14 +316,11 @@ impl Window {
                 hotspot: (0, 0),
                 size: (32, 32),
                 visible: false,
+                position: None,
             };
             ensure!(
                 SetLayeredWindowAttributes(hwnd, COLOR_KEY, 255, LWA_COLORKEY) != 0,
                 "could not make the pointer window transparent"
-            );
-            ensure!(
-                SetTimer(hwnd, 1, 16, None) != 0,
-                "could not start the pointer refresh timer"
             );
             DRAWING.with(|state| {
                 *state.borrow_mut() = Some(Drawing {
@@ -238,8 +335,7 @@ impl Window {
     unsafe fn update(&mut self, active: bool, physical_mouse: bool) {
         unsafe {
             if !active {
-                ShowWindow(self.hwnd, SW_HIDE);
-                self.visible = false;
+                self.hide();
                 return;
             }
             let mut info = CURSORINFO {
@@ -254,21 +350,35 @@ impl Window {
                     info.flags & CURSOR_SUPPRESSED != 0,
                 )
             {
-                ShowWindow(self.hwnd, SW_HIDE);
-                self.visible = false;
+                self.hide();
                 return;
             }
             if !self.visible {
                 println!(
                     "Windows pointer fallback active: system cursor hidden and no physical mouse detected."
                 );
-                self.visible = true;
             }
             let cursor = if info.hCursor.is_null() {
                 LoadCursorW(null_mut(), IDC_ARROW)
             } else {
                 info.hCursor
             };
+            self.render(cursor, info.ptScreenPos.x, info.ptScreenPos.y);
+        }
+    }
+
+    unsafe fn hide(&mut self) {
+        if self.visible {
+            unsafe {
+                ShowWindow(self.hwnd, SW_HIDE);
+            }
+            self.visible = false;
+        }
+    }
+
+    unsafe fn render(&mut self, cursor: HCURSOR, x: i32, y: i32) {
+        unsafe {
+            let changed = cursor != self.cursor;
             let (hotspot, size) = if cursor == self.cursor {
                 (self.hotspot, self.size)
             } else {
@@ -277,22 +387,35 @@ impl Window {
             self.cursor = cursor;
             self.hotspot = hotspot;
             self.size = size;
-            DRAWING.with(|state| {
-                if let Some(state) = state.borrow_mut().as_mut() {
-                    state.cursor = cursor;
-                }
-            });
-            SetWindowPos(
-                self.hwnd,
-                HWND_TOPMOST,
-                info.ptScreenPos.x - hotspot.0,
-                info.ptScreenPos.y - hotspot.1,
-                size.0,
-                size.1,
-                SWP_NOACTIVATE | SWP_SHOWWINDOW,
-            );
-            InvalidateRect(self.hwnd, null(), 0);
-            UpdateWindow(self.hwnd);
+            let position = (x - hotspot.0, y - hotspot.1);
+            if changed || self.position != Some(position) || !self.visible {
+                SetWindowPos(
+                    self.hwnd,
+                    HWND_TOPMOST,
+                    position.0,
+                    position.1,
+                    size.0,
+                    size.1,
+                    SWP_NOACTIVATE
+                        | SWP_SHOWWINDOW
+                        | if changed {
+                            0
+                        } else {
+                            SWP_NOSIZE | SWP_NOREDRAW
+                        },
+                );
+                self.position = Some(position);
+                self.visible = true;
+            }
+            if changed {
+                DRAWING.with(|state| {
+                    if let Some(state) = state.borrow_mut().as_mut() {
+                        state.cursor = cursor;
+                    }
+                });
+                InvalidateRect(self.hwnd, null(), 0);
+                UpdateWindow(self.hwnd);
+            }
         }
     }
 }
@@ -339,7 +462,6 @@ unsafe fn geometry(cursor: HCURSOR) -> ((i32, i32), (i32, i32)) {
 impl Drop for Window {
     fn drop(&mut self) {
         unsafe {
-            KillTimer(self.hwnd, 1);
             DestroyWindow(self.hwnd);
             DRAWING.with(|state| state.borrow_mut().take());
             DeleteObject(self.brush);
@@ -367,7 +489,29 @@ mod tests {
             ] {
                 assert_ne!(styles & required, 0);
             }
-            // Do not draw or inject anything on the test desktop.
+            // Draw only outside the virtual desktop; never inject or move the system pointer.
+            let cursor = LoadCursorW(null_mut(), IDC_ARROW);
+            let x = GetSystemMetrics(SM_XVIRTUALSCREEN) - 4096;
+            let y = GetSystemMetrics(SM_YVIRTUALSCREEN) - 4096;
+            window.render(cursor, x, y);
+            let initial = PAINT_COUNT.with(|count| count.get());
+            assert!(initial > 0);
+            let since = std::time::Instant::now();
+            for offset in 0..1000 {
+                window.render(cursor, x - offset, y);
+            }
+            assert_eq!(
+                PAINT_COUNT.with(|count| count.get()),
+                initial,
+                "moving a cached cursor must not repaint its bitmap"
+            );
+            assert!(since.elapsed() < std::time::Duration::from_secs(2));
+            for _ in 0..1000 {
+                window.render(cursor, x - 999, y);
+            }
+            assert_eq!(PAINT_COUNT.with(|count| count.get()), initial);
+            // Hidden state has no timer or queued repaint.
+
             window.update(false, false);
             assert_eq!(IsWindowVisible(handle), 0);
             assert_eq!(GetForegroundWindow(), foreground);
