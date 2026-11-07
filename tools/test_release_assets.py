@@ -93,6 +93,29 @@ class ReleaseAssetsTests(unittest.TestCase):
             with self.subTest(value=value), self.assertRaises(ValueError):
                 asset_names(value)
 
+    def test_current_releases_only_include_windows_and_ubuntu(self):
+        for version in ["0.5.1", "0.5.2", "1.0.0"]:
+            with self.subTest(version=version):
+                names = asset_names(version)
+                self.assertEqual(names, {
+                    "windows-x86_64": f"desk-switch-v{version}-windows-x86-64.exe",
+                    "linux-x86_64-deb": f"desk-switch-v{version}-linux-x86-64.deb",
+                })
+                candidate = {"tag_name": f"v{version}", "prerelease": True, "draft": False,
+                             "body": "Notes", "assets": [{"id": index, "name": name, "state": "uploaded", "size": 10, "digest": "sha256:" + "11" * 32} for index, name in enumerate(names.values(), 1)]}
+                self.assertEqual(candidate_updates(candidate, version), [])
+                candidate["assets"].append({"id": 3, "name": f"desk-switch-v{version}-macos-arm64.zip", "state": "uploaded", "size": 10, "digest": "sha256:" + "22" * 32})
+                with self.assertRaises(AssertionError):
+                    candidate_updates(candidate, version)
+
+    def test_current_release_rejects_mac_archives_before_signing(self):
+        root = self.directory
+        (root / "src").mkdir()
+        (root / "Cargo.toml").write_text('[package]\nversion = "0.5.1"\n')
+        (root / "src/compatibility.rs").write_text("pub const PROTOCOL: u16 = 7;")
+        with patch.object(prepare_release, "ROOT", root), patch("sys.argv", ["prepare_release.py", "--windows", "missing.exe", "--deb", "missing.deb", "--tag", "v0.5.1", "--macos-arm64", "unexpected.zip"]), patch.object(prepare_release.subprocess, "check_output", side_effect=AssertionError("Signing key must not be accessed")), self.assertRaisesRegex(ValueError, "This release does not include macOS"):
+            prepare_release.main()
+
     def test_both_mac_architectures_pass_without_executing_the_bundle(self):
         for architecture in ["arm64", "x86_64"]:
             with self.subTest(architecture=architecture):
