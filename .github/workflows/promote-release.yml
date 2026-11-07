@@ -3,7 +3,7 @@ name: Publish signed release
 on:
   push:
     branches: [main]
-    paths: ["release/manifests/*.json"]
+    paths: ["release/manifests/*.json", "tools/promote_release.py", "tools/test_promote_release.py", ".github/workflows/promote-release.yml"]
   workflow_dispatch:
 
 permissions:
@@ -14,6 +14,8 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7.0.1
+      - name: Check signed release metadata repairs
+        run: python3 tools/test_promote_release.py
       - name: Verify both binaries and Debian package, then publish
         env:
           GH_TOKEN: ${{ github.token }}
