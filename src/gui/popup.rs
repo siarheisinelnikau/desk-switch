@@ -90,7 +90,7 @@ impl Popup {
             state.seen_focus = false;
             state.position = position(ctx, x, y);
         }
-        ctx.request_repaint();
+        ctx.request_repaint_of(eframe::egui::ViewportId::ROOT);
     }
     pub fn close(&self, ctx: &egui::Context) {
         let was_open = {

@@ -158,7 +158,6 @@ enum Packet {
 
 enum Command {
     Action(Box<Action>),
-    Node(Box<Node>, Option<workspace::AudioLevel>, u64),
     Approve(String, bool),
     Disconnect,
     #[cfg(test)]
@@ -184,6 +183,13 @@ pub struct Service {
     snapshot: Arc<Mutex<Option<Box<Workspace>>>>,
     clipboard: Arc<Mutex<Option<Event>>>,
     clipboard_commands: Arc<ClipboardCommand>,
+    status_commands: Arc<StatusCommand>,
+}
+type StatusUpdate = (Box<Node>, Option<workspace::AudioLevel>, u64);
+#[derive(Default)]
+struct StatusCommand {
+    latest: Mutex<Option<StatusUpdate>>,
+    changed: tokio::sync::Notify,
 }
 #[derive(Default)]
 struct ClipboardCommand {
@@ -233,6 +239,8 @@ impl Service {
         let clipboard = Arc::new(Mutex::new(None));
         let clipboard_commands = Arc::new(ClipboardCommand::default());
         let clipboard_worker = clipboard_commands.clone();
+        let status_commands = Arc::new(StatusCommand::default());
+        let status_worker = status_commands.clone();
         let notify = Notify {
             events: events_send,
             snapshot: snapshot.clone(),
@@ -248,6 +256,7 @@ impl Service {
                         dir,
                         state,
                         commands,
+                        status_worker,
                         clipboard_worker,
                         notify.clone(),
                     ))
@@ -261,6 +270,7 @@ impl Service {
             snapshot,
             clipboard,
             clipboard_commands,
+            status_commands,
         })
     }
     pub fn action(&self, action: Action) -> Result<()> {
@@ -276,9 +286,11 @@ impl Service {
         Ok(())
     }
     pub fn publish(&self, node: Node, native: Option<workspace::AudioLevel>, ready: u64) {
-        let _ = self
-            .commands
-            .try_send(Command::Node(Box::new(node), native, ready));
+        if self.commands.is_closed() {
+            return;
+        }
+        *self.status_commands.latest.lock().unwrap() = Some((Box::new(node), native, ready));
+        self.status_commands.changed.notify_one();
     }
     pub fn approve(&self, key: String, accept: bool) {
         let _ = self.commands.try_send(Command::Approve(key, accept));
@@ -621,6 +633,7 @@ fn start_session(candidate: Candidate, internal: queue::Sender<Incoming>) -> Ses
     let generation = candidate.connection;
     let (send, mut outgoing) = queue::channel(128);
     let (clipboard, mut clips) = tokio::sync::watch::channel::<Option<Arc<Packet>>>(None);
+    let (snapshot, mut snapshots) = tokio::sync::watch::channel::<Option<Arc<Packet>>>(None);
     tokio::spawn(async move {
         let key = config::hex(&candidate.key);
         let noise = Arc::new(Mutex::new(candidate.noise));
@@ -654,6 +667,11 @@ fn start_session(candidate: Candidate, internal: queue::Sender<Incoming>) -> Ses
                     let latest=clips.borrow_and_update().clone();
                     if let Some(latest)=latest && let Err(error)=timeout(Duration::from_secs(30),write_packet(&mut write,&noise,&latest)).await.map_err(anyhow::Error::from).and_then(|result|result){break Err(error);}
                 }
+                changed=snapshots.changed()=>{
+                    if changed.is_err(){break Ok(());}
+                    let latest=snapshots.borrow_and_update().clone();
+                    if let Some(latest)=latest && let Err(error)=timeout(Duration::from_secs(30),write_packet(&mut write,&noise,&latest)).await.map_err(anyhow::Error::from).and_then(|result|result){break Err(error);}
+                }
                 _ = tokio::time::sleep(Duration::from_secs(2)) => {
                     if let Err(error) = timeout(AUTH, write_packet(&mut write, &noise, &Packet::Ping)).await.map_err(anyhow::Error::from).and_then(|result|result) { break Err(error); }
                 }
@@ -671,27 +689,34 @@ fn start_session(candidate: Candidate, internal: queue::Sender<Incoming>) -> Ses
             ))
             .await;
     });
-    (generation, send, clipboard)
+    Session {
+        generation,
+        commands: send,
+        clipboard,
+        snapshot,
+    }
 }
 
-type Session = (
-    [u8; 32],
-    queue::Sender<Packet>,
-    tokio::sync::watch::Sender<Option<Arc<Packet>>>,
-);
+struct Session {
+    generation: [u8; 32],
+    commands: queue::Sender<Packet>,
+    clipboard: tokio::sync::watch::Sender<Option<Arc<Packet>>>,
+    snapshot: tokio::sync::watch::Sender<Option<Arc<Packet>>>,
+}
 type Sessions = BTreeMap<String, Session>;
 fn send(sessions: &Sessions, key: &str, packet: Packet) -> Result<()> {
     sessions
         .get(key)
         .context("The computer is offline")?
-        .1
+        .commands
         .try_send(packet)
         .context("The computer's command queue is busy")?;
     Ok(())
 }
 fn broadcast(sessions: &Sessions, state: &Workspace) {
-    for (_, connection, _) in sessions.values() {
-        let _ = connection.try_send(Packet::State(Box::new(state.clone())));
+    let snapshot = Arc::new(Packet::State(Box::new(state.clone())));
+    for session in sessions.values() {
+        session.snapshot.send_replace(Some(snapshot.clone()));
     }
 }
 
@@ -872,9 +897,9 @@ fn apply(
                 bytes,
                 digest,
             });
-            for (key, (_, _, clipboard)) in sessions {
+            for (key, session) in sessions {
                 if key != source && state.members.get(key).is_some_and(Member::compatible) {
-                    clipboard.send_replace(Some(packet.clone()));
+                    session.clipboard.send_replace(Some(packet.clone()));
                 }
             }
         }
@@ -912,7 +937,7 @@ fn local_action(
         sessions
             .get(&state.hub)
             .context("The workspace controller is offline")?
-            .2
+            .clipboard
             .send_replace(Some(Arc::new(Packet::Action(action))));
     } else {
         send(sessions, &state.hub, Packet::Action(action))?;
@@ -1056,6 +1081,7 @@ async fn run(
     dir: PathBuf,
     mut state: Workspace,
     mut commands: queue::Receiver<Command>,
+    status_commands: Arc<StatusCommand>,
     clipboard_commands: Arc<ClipboardCommand>,
     notify: Notify,
 ) -> Result<()> {
@@ -1094,16 +1120,19 @@ async fn run(
                 #[cfg(test)]
                 Some(Command::Raw(target, packet)) => { let _ = send(&sessions, &target, *packet); }
                 Some(Command::Approve(key, accept)) => { if let Some(approved) = approvals.remove(&key) { let _: Result<(), bool> = approved.send(accept); } }
-                Some(Command::Node(node,native,ready)) => {
-                    match state.update_node(&own, *node.clone(), native, ready) {
-                        Ok(()) => if state.hub != own { let _ = send(&sessions, &state.hub, Packet::Node(node,native,ready)); },
-                        Err(error) => notify.event(Event::Error(error.to_string())),
-                    }
-                }
                 Some(Command::Action(action)) => {
                     if let Err(error) = local_action(*action, &own, &mut state, &sessions, &notify, &identity, &internal, &mut receipts) { notify.event(Event::Error(error.to_string())); }
                 }
             },
+            _ = status_commands.changed.notified() => {
+                let latest = status_commands.latest.lock().unwrap().take();
+                if let Some((node,native,ready)) = latest {
+                    match state.update_node(&own, *node.clone(), native, ready) {
+                        Ok(()) => if state.hub != own && let Some(hub) = sessions.get(&state.hub) { hub.snapshot.send_replace(Some(Arc::new(Packet::Node(node,native,ready)))); },
+                        Err(error) => notify.event(Event::Error(error.to_string())),
+                    }
+                }
+            }
             _ = clipboard_commands.changed.notified() => {
                 let latest = clipboard_commands.latest.lock().unwrap().take();
                 if let Some(action) = latest
@@ -1122,7 +1151,7 @@ async fn run(
                 Incoming::Consent { request, accept } => { if !approvals.contains_key(&request.key) { approvals.insert(request.key.clone(), accept); notify.event(Event::Request(request)); } }
                 Incoming::Ready { candidate, member, controller } => {
                     let key = member.node.key.clone();
-                    if sessions.get(&key).is_some_and(|(generation, _, _)| generation <= &candidate.connection) { continue; }
+                    if sessions.get(&key).is_some_and(|session:&Session| session.generation <= candidate.connection) { continue; }
                     let result = (|| {
                         let mut next = state.clone();
                         let mut local_address = candidate.stream.local_addr()?;
@@ -1141,7 +1170,8 @@ async fn run(
                         }
                         next.validate()?;
                         let connection = start_session(candidate, internal.clone());
-                        if controller { let _ = connection.1.try_send(Packet::State(Box::new(next.clone()))); }
+                        if controller { connection.snapshot.send_replace(Some(Arc::new(Packet::State(Box::new(next.clone()))))); }
+                        else { let local=&next.members[&own];connection.snapshot.send_replace(Some(Arc::new(Packet::Node(Box::new(local.node.clone()),local.native_output,local.input_ready)))); }
                         sessions.insert(key, connection);
                         state = next;
                         connected_once = true;
@@ -1150,13 +1180,13 @@ async fn run(
                     if let Err(error) = result { notify.event(Event::Error(error.to_string())); }
                 }
                 Incoming::Packet(key, generation, packet) => {
-                    if !sessions.get(&key).is_some_and(|(active, _, _)| *active == generation) { continue; }
+                    if !sessions.get(&key).is_some_and(|session| session.generation == generation) { continue; }
                     if let Err(error) = receive_packet(&key, packet, &own, &mut state, &sessions, &notify, &identity, &internal, &mut receipts) {
                         let _ = send(&sessions, &key, Packet::Error(workspace::management::status_text(error.to_string(),1024)));
                     }
                 }
                 Incoming::Closed(key, generation, error) => {
-                    if generation.is_some() && sessions.get(&key).is_some_and(|(active, _, _)| Some(*active) == generation) {
+                    if generation.is_some() && sessions.get(&key).is_some_and(|session| Some(session.generation) == generation) {
                         sessions.remove(&key);
                         receipts.closed(&key, &state.hub);
                         if let Some(member) = state.members.get_mut(&key) { member.online = false; }
@@ -1275,6 +1305,7 @@ mod tests {
             snapshot: Default::default(),
             clipboard: Default::default(),
             clipboard_commands: Default::default(),
+            status_commands: Default::default(),
         };
         service.action(Action::ReturnInput).unwrap();
         for index in 0..100u8 {
@@ -1293,6 +1324,63 @@ mod tests {
         assert!(
             matches!(service.clipboard_commands.latest.lock().unwrap().as_ref(),Some(Action::Clipboard{bytes,..}) if bytes==&vec![99;1024])
         );
+    }
+
+    #[test]
+    fn terminal_monitor_status_survives_full_control_queues_and_snapshot_coalescing() {
+        let (commands, mut receive) = queue::channel(1);
+        let (_, events) = mpsc::channel();
+        let service = Service {
+            commands,
+            events,
+            snapshot: Default::default(),
+            clipboard: Default::default(),
+            clipboard_commands: Default::default(),
+            status_commands: Default::default(),
+        };
+        service.action(Action::ReturnInput).unwrap();
+        assert!(service.action(Action::ReturnInput).is_err());
+        let mut state = model::tests::fixture(2);
+        let own = state.hub.clone();
+        service.publish(state.members[&own].node.clone(), None, 1);
+        let mut completed = state.members[&own].node.clone();
+        completed.name = "Terminal monitor acknowledgement".into();
+        service.publish(completed.clone(), None, 2);
+        let (latest, _, ready) = service
+            .status_commands
+            .latest
+            .lock()
+            .unwrap()
+            .take()
+            .unwrap();
+        assert_eq!(*latest, completed);
+        assert_eq!(ready, 2);
+        assert!(matches!(receive.try_recv().unwrap(), Command::Action(_)));
+        assert!(receive.try_recv().is_err());
+
+        let (commands, mut control) = queue::channel(1);
+        commands.try_send(Packet::Ping).ok().unwrap();
+        let (clipboard, _clips) = tokio::sync::watch::channel(None);
+        let (snapshot, snapshots) = tokio::sync::watch::channel(None);
+        let mut sessions = BTreeMap::new();
+        sessions.insert(
+            "peer".into(),
+            Session {
+                generation: [1; 32],
+                commands,
+                clipboard,
+                snapshot,
+            },
+        );
+        broadcast(&sessions, &state);
+        state.activation = 2;
+        state.members.get_mut(&own).unwrap().input_ready = 2;
+        broadcast(&sessions, &state);
+        assert!(
+            matches!(&**snapshots.borrow().as_ref().unwrap(), Packet::State(latest) if latest.members[&own].input_ready == 2)
+        );
+        assert!(matches!(control.try_recv().unwrap(), Packet::Ping));
+        assert!(control.try_recv().is_err());
     }
 
     #[test]

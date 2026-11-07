@@ -569,6 +569,13 @@ impl Desktop {
                 }
                 self.quitting = true;
                 self.quitting_since.get_or_insert_with(Instant::now);
+                self.group.data.stop();
+                self.group.return_pending = false;
+                self.group.service.take();
+                self.group.clipboard.take();
+                self.group.probe.take();
+                self.group.monitor_job.take();
+                self.group.monitor_wait = None;
                 self.stop_pair();
                 if let Some(input) = &mut self.input {
                     input.stop();
@@ -1031,7 +1038,7 @@ impl Desktop {
         if let Err(error) = self.prefs.save(&self.dir) {
             self.notice = Some((error.to_string(), true));
         }
-        ctx.request_repaint();
+        ctx.request_repaint_of(eframe::egui::ViewportId::ROOT);
     }
 
     fn startup(&mut self, ctx: &egui::Context) {

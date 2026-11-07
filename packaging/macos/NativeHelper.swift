@@ -280,6 +280,7 @@ final class MicrophoneCapture {
     func start(_ uid: String?) async throws {
         guard await AVCaptureDevice.requestAccess(for: .audio) else { throw fail("Allow Desk Switch microphone access in System Settings → Privacy & Security → Microphone") }
         let id = try device(uid, input: true), input = engine.inputNode
+        guard !cable(try stringProperty(id,kAudioObjectPropertyName)) else {throw fail("A virtual microphone feed cannot be shared as a physical microphone")}
         try selectAudioUnit(input.audioUnit, id)
         let format = input.outputFormat(forBus: 0)
         guard format.sampleRate > 0 && format.channelCount > 0 else { throw fail("The selected microphone is not ready") }
@@ -338,6 +339,17 @@ final class InputCapture {
         if event.getIntegerValueField(.eventSourceUserData) == injectedMarker { return Unmanaged.passUnretained(event) }
         if CFAbsoluteTimeGetCurrent() >= deadline { setMode("local") }
         let remote = mode != "local"
+        if type.rawValue==UInt32(NSEvent.EventType.systemDefined.rawValue),let native=NSEvent(cgEvent:event),native.subtype.rawValue==8 {
+            // IOHIDSystem's documented NX_KEYTYPE sound-up/down/mute events.
+            let mapping:[Int:Int64]=[0:72,1:73,7:74], code=(native.data1>>16)&0xffff, state=(native.data1>>8)&0xff
+            if let code=mapping[code],state==0x0a || state==0x0b {
+                let down=state==0x0a
+                if keys[code]==nil && down {keys[code]=remote && keyboard}
+                let owner=keys[code] ?? false;json(["kind":"key","code":code,"down":down,"remote":owner])
+                if !down {keys.removeValue(forKey:code)}
+                return owner ? nil : Unmanaged.passUnretained(event)
+            }
+        }
         switch type {
         case .keyDown, .keyUp, .flagsChanged:
             let code = event.getIntegerValueField(.keyboardEventKeycode)
@@ -403,7 +415,7 @@ final class InputCapture {
         guard AXIsProcessTrustedWithOptions(options) else { throw fail("Allow Desk Switch in System Settings → Privacy & Security → Accessibility, then retry input sharing") }
         guard CGPreflightListenEventAccess() || CGRequestListenEventAccess() else { throw fail("Allow Desk Switch in System Settings → Privacy & Security → Input Monitoring, then retry input sharing") }
         let types: [CGEventType] = [.keyDown,.keyUp,.flagsChanged,.leftMouseDown,.leftMouseUp,.rightMouseDown,.rightMouseUp,.otherMouseDown,.otherMouseUp,.mouseMoved,.leftMouseDragged,.rightMouseDragged,.otherMouseDragged,.scrollWheel]
-        let mask = types.reduce(CGEventMask(0)) { $0 | (CGEventMask(1) << $1.rawValue) }
+        let mask = types.reduce(CGEventMask(0)) { $0 | (CGEventMask(1) << $1.rawValue) } | (CGEventMask(1)<<NSEvent.EventType.systemDefined.rawValue)
         guard let tap = CGEvent.tapCreate(tap: .cgSessionEventTap, place: .headInsertEventTap, options: .defaultTap, eventsOfInterest: mask, callback: { _,type,event,context in
             guard let context = context else { return Unmanaged.passUnretained(event) }
             return Unmanaged<InputCapture>.fromOpaque(context).takeUnretainedValue().event(type,event)
@@ -438,13 +450,20 @@ final class InputPlayback {
         event.post(tap: .cghidEventTap)
     }
     func release() {
-        for key in keys { post(CGEvent(keyboardEventSource: source, virtualKey: CGKeyCode(key), keyDown: false)) }; keys.removeAll()
+        for key in keys { keyEvent(key,false) }; keys.removeAll()
         for button in buttons { mouse(button, false) }; buttons.removeAll()
         active=false;wheelX=0;wheelY=0
     }
     func mouse(_ button: Int, _ down: Bool) {
         let type: CGEventType = button == 0 ? (down ? .leftMouseDown : .leftMouseUp) : button == 1 ? (down ? .rightMouseDown : .rightMouseUp) : (down ? .otherMouseDown : .otherMouseUp)
         post(CGEvent(mouseEventSource: source, mouseType: type, mouseCursorPosition: position, mouseButton: CGMouseButton(rawValue: UInt32(button)) ?? .left))
+    }
+    func keyEvent(_ code:Int,_ down:Bool) {
+        if let media=[72:0,73:1,74:7][code] {
+            let state=down ? 0x0a : 0x0b
+            let event=NSEvent.otherEvent(with:.systemDefined,location:.zero,modifierFlags:NSEvent.ModifierFlags(rawValue:UInt(state<<8)),timestamp:0,windowNumber:0,context:nil,subtype:8,data1:(media<<16)|(state<<8),data2:-1)
+            post(event?.cgEvent)
+        } else {post(CGEvent(keyboardEventSource:source,virtualKey:CGKeyCode(code),keyDown:down))}
     }
     func command(_ value: [String: Any]) {
         switch value["kind"] as? String {
@@ -455,7 +474,7 @@ final class InputPlayback {
         case "release": release()
         case "key":
             guard active, let code = value["code"] as? Int, (0..<128).contains(code), let down = value["down"] as? Bool else { return }
-            if down { keys.insert(code) } else { keys.remove(code) }; post(CGEvent(keyboardEventSource: source, virtualKey: CGKeyCode(code), keyDown: down))
+            if down { keys.insert(code) } else { keys.remove(code) }; keyEvent(code,down)
         case "button":
             guard active, let code = value["code"] as? Int, (0...4).contains(code), let down = value["down"] as? Bool else { return }
             if down { buttons.insert(code) } else { buttons.remove(code) }; mouse(code,down)

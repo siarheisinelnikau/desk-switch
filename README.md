@@ -39,7 +39,7 @@ Permissions are granted through macOS itself and cannot be bypassed. macOS may r
 
 ## Link your computers
 
-1. Start Desk Switch and enable **Available on the network** on the computers you want to link.
+1. Start Desk Switch on the computers you want to link. The workspace advertises itself on the local network while the application is running.
 2. Expand **Add a computer**, choose a discovered computer and click **Connect**. Approve the connection with **Allow** on the invited computer. Compare the displayed security code when confirming a new identity; keys are created and exchanged automatically.
 3. Repeat for each additional computer. Every member sees the complete workspace, connection status and device roles. Use **Switch here** on a computer's card to select it, or **Settings** to manage it.
 
@@ -47,7 +47,7 @@ One computer coordinates the workspace. **That coordinating computer must keep D
 
 You can add computers and change shared settings from any connected member. Previously approved identities reconnect without another prompt. Settings changes are checked against the current revision so simultaneous edits cannot silently overwrite each other. Offline computers remain visible, and unavailable or incompatible devices are excluded from active routes.
 
-If discovery is unavailable, enter an address under **Add a computer → IP address**. Use `IP`, `IP:port`, or `[IPv6]:port`; the workspace control port is **45880/TCP**. A routed network or VPN and appropriate firewall access are required across subnets; Desk Switch does not provide NAT traversal. Direct device connections use **45876/TCP** for input, **45877/TCP** for system audio and **45879/TCP** for microphones. **45878/TCP** is retained for earlier pairing/management compatibility. Allow Desk Switch on your private LAN if the operating system requests firewall permission.
+If discovery is unavailable, enter an address under **Add a computer → IP address**. Use `IP`, `IP:port`, or `[IPv6]:port`; the workspace control port is **45880/TCP**. A routed network or VPN and appropriate firewall access are required across subnets; Desk Switch does not provide NAT traversal. Direct device connections use **45876/TCP** for input and **45877/TCP** for system audio. Microphone fanout uses one TCP listener on the source for each receiver, allocated from **49000** by the member's sorted identity index: for a workspace of N computers, allow **49000 through 49000 + N − 1** on the microphone source. Legacy pairing/management uses **45878/TCP**; **45879/TCP** is the earlier two-computer microphone port, not the new fanout range. Allow Desk Switch on your private LAN if the operating system requests firewall permission.
 
 ## Devices across the workspace
 
@@ -75,7 +75,7 @@ An explicit headphone/speaker output receives every forwarded stream there. Loca
 
 ## Shared microphone
 
-**Microphone** sharing is off by default. Enable it and choose **Microphone from**, or keep Automatic. One physical microphone fans out to eligible online recipients. Select the virtual microphone in each receiving calling/recording application. Shared gain and **Mute microphone** synchronize from any member; mute stops capture. Local applications on the source can still use its physical microphone normally.
+**Microphone** sharing is off by default. Enable it and choose **Microphone from**, or keep Automatic. One physical microphone fans out to eligible online recipients. Select the virtual microphone in each receiving calling/recording application. Shared gain and **Mute microphone** synchronize from any member. Disable microphone sharing to stop capture and forwarding. Local applications on the source can still use its physical microphone normally.
 
 Automatic selection binds to one physical endpoint when sharing starts. Changing the OS default, unplugging the device or losing its computer does not open a different microphone. Choose a replacement in Settings or disable/re-enable sharing to resolve Automatic again. The microphone has its own authenticated transport, independent of sound, input and monitor switching. It is never played to ordinary speakers or selected again as a capture source.
 
@@ -97,7 +97,7 @@ Files and folders are not transferred in this release. Their implementation is t
 
 ## Optional shared monitor
 
-Connect a shared physical monitor to its participating computers using different HDMI/DisplayPort inputs. Enable **Switch the shared monitor** in the workspace. In **Settings**, choose each participating computer, enable **This computer uses the shared monitor** and select that computer's actual port. Saved inputs must be distinct. A member using another display should leave this option disabled. You can edit the saved ports from any member; **Read the current input once** is a local, explicit setup action while that computer's picture is visible.
+Connect a shared physical monitor to its participating computers using different HDMI/DisplayPort inputs. Enable **Switch the shared monitor** in the workspace. In **Settings**, choose each participating computer, enable **This computer uses the shared monitor** and select that computer's actual port. Saved inputs must be distinct. A member using another display should leave this option disabled. You can edit saved ports and request **Read the current input once** for any selected online computer from any member. That explicit request runs on the selected computer; use it while that computer's picture is visible. Reading never selects another input.
 
 When switching to a participating computer, **the destination application sends one VCP `0x60` selection for its own saved port**, then waits briefly before accepting shared input. The global switch and per-computer participation checkboxes determine this behavior. Startup, idle and switch confirmation do not poll DDC/CI. A busy selection cannot accumulate additional commands, and a failed selection does not trigger alternate input codes, retries or a reversal. A monitor error is reported with a manual port-selection/retry action. The application never changes resolution or refresh rate. Enable DDC/CI in the monitor's own menu if access is unavailable; some monitors do not accept commands through an inactive port.
 
@@ -113,13 +113,13 @@ DDC/CI depends on the monitor and firmware. Some LG monitors can show a recurrin
 
 On **Ubuntu GNOME**, enable **Desk Switch Tray** once in GNOME **Extensions** for left-click popup and right-click native-menu behavior. Log out and back in if the newly installed extension is not listed yet. Other desktops need an AppIndicator/StatusNotifier host and may apply their own click policy.
 
-Login startup is enabled after the first launch and can be disabled in Settings for any selected computer. Startup uses that computer's saved profile and availability choice.
+Login startup is enabled after the first launch and can be disabled in Settings for any selected computer. Startup uses that computer's saved profile and auto-connect choice.
 
 ## Updates
 
 **Settings → Updates** shows the selected computer's installed version, progress and result. Select any workspace member, use **Check for updates**, then **Download and install** when a newer compatible release is available. Updating another computer keeps the computer you are using running. The requested installation is complete only after the target reconnects with the requested version. Update members individually; restart the coordinating computer last to keep management available while the others update.
 
-Automatic checks run at startup and every six hours by default. Available updates are downloaded and verified in the background; installation and restart require an explicit action. The persistent automatic-check toggle disables those background requests, while manual checking remains available. Settings, identities, workspace membership and user data survive updates. Older device-protocol versions wait for a compatible update before input or media sharing resumes.
+Automatic checks run at startup and every six hours by default and fetch **signed release metadata only**. They do not download an installer or install anything. **Download and install** explicitly downloads, verifies and installs the update on the selected computer, then restarts it as required. The persistent automatic-check toggle disables background checks; manual checking remains available. Settings, identities, workspace membership and user data survive updates. Older device-protocol versions wait for a compatible update before input or media sharing resumes.
 
 Each computer independently downloads from the canonical repository and verifies a pinned Ed25519 signature covering the exact artifact URL, version, size and SHA-256. Signed metadata is embedded in the release description; the download list contains only the Windows executable, Debian package and two macOS application ZIPs. Windows and Debian updates use the vendored [`rust-auto-updator` 0.4.1](https://github.com/siarheisinelnikau/rust-auto-updator) core; macOS verifies and replaces the complete app bundle as described above.
 
@@ -127,7 +127,7 @@ An installed Ubuntu package updates without an application password prompt. Its 
 
 Recent service logs and diagnostics are synchronized over authenticated, encrypted workspace connections. **Diagnostics → Copy diagnostics** includes member state and recent service messages. Offline reports remain labelled as such. Snapshots are bounded and do not reconfigure device services.
 
-For the first upgrade from **0.4.8 or older**, install the current `.deb` or replace the `.exe` once on each computer: those releases do not support the architecture-labelled names and remote management. Install **0.5.0 on every intended member** before creating a larger workspace. Portable Linux binaries are no longer distributed; the `.deb` uses its installed launcher and package-owned binary so future system updates work correctly.
+For the first upgrade from **0.4.8 or older**, install the current `.deb` or replace the `.exe` once on each computer: those releases do not support the architecture-labelled names and remote management. The saved **0.4.11** partner remains reachable through a limited management/update bridge while upgrading, so it can be updated from the computer already running 0.5.0. Device sharing waits for matching versions. Install **0.5.0 on every intended member** before creating a larger workspace. Portable Linux binaries are no longer distributed; the `.deb` uses its installed launcher and package-owned binary so future system updates work correctly.
 
 ## Platform access
 

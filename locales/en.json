@@ -554,5 +554,12 @@
   "Another update operation is already in progress.": "Another update operation is already in progress.",
   "Reconnect the selected computer before updating it.": "Reconnect the selected computer before updating it.",
   "Paired installation requires the installed application edition.": "Paired installation requires the installed application edition.",
-  "Version {version} is available. Choose Download and install to update.": "Version {version} is available. Choose Download and install to update."
+  "Version {version} is available. Choose Download and install to update.": "Version {version} is available. Choose Download and install to update.",
+  "Diagnostics": "Diagnostics",
+  "Protocol:": "Protocol:",
+  "No recent service messages.": "No recent service messages.",
+  "Recent service messages from every computer in this workspace.": "Recent service messages from every computer in this workspace.",
+  "The copied report includes all computers and workspace settings. Offline computers show the last received diagnostics.": "The copied report includes all computers and workspace settings. Offline computers show the last received diagnostics.",
+  "Select a monitor": "Select a monitor",
+  "Microphone level": "Microphone level"
 }
