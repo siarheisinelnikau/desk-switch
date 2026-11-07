@@ -45,8 +45,8 @@ jobs:
       - if: matrix.platform == 'linux'
         run: |
           python3 tools/package_deb.py --binary target/release/desk-switch --out dist
-          python3 tools/verify_deb.py dist/desk-switch-linux-x86_64.deb
-          sudo apt-get --simulate install ./dist/desk-switch-linux-x86_64.deb
+          python3 tools/verify_deb.py dist/*.deb
+          sudo apt-get --simulate install ./dist/*.deb
       - if: matrix.platform == 'windows'
         uses: actions/upload-artifact@v7.0.2
         with:
@@ -57,7 +57,7 @@ jobs:
         uses: actions/upload-artifact@v7.0.2
         with:
           name: desk-switch-debian
-          path: dist/desk-switch-linux-x86_64.deb
+          path: dist/*.deb
           if-no-files-found: error
 
   publish:
@@ -94,7 +94,7 @@ jobs:
               assert json.loads(Path('release/publish-request.json').read_text())['tag'] == tag
           Path('dist').mkdir(exist_ok=True)
           names = asset_names(version)
-          for source, name in [('desk-switch.exe',names['windows-x86_64']), ('desk-switch-linux-x86_64.deb',names['linux-x86_64-deb'])]:
+          for source, name in [('desk-switch.exe',names['windows-x86_64']), (names['linux-x86_64-deb'],names['linux-x86_64-deb'])]:
               shutil.copy2(Path('artifacts')/source, Path('dist')/name)
           installers = [Path('dist')/name for name in names.values()]
           existing = subprocess.run(['gh','api',f'repos/{os.environ["GITHUB_REPOSITORY"]}/releases/tags/{tag}'],capture_output=True,text=True)
