@@ -95,6 +95,10 @@ pub enum Message {
         expected: super::Monitor,
         monitor: super::Monitor,
     },
+    ReadMonitor {
+        id: u64,
+        monitor: String,
+    },
     ExtractCable {
         id: u64,
         platform: crate::cable::Platform,
@@ -116,7 +120,7 @@ impl Message {
     pub fn id(&self) -> u64 {
         match self {
             Self::InstallCable { id, .. } => *id,
-            Self::SetMonitor { id, .. } => *id,
+            Self::SetMonitor { id, .. } | Self::ReadMonitor { id, .. } => *id,
             Self::ExtractCable { id, .. }
             | Self::CheckUpdates { id }
             | Self::SetApplication { id, .. }
@@ -126,12 +130,30 @@ impl Message {
     pub fn validate(&self) -> Result<()> {
         ensure!(self.id() > 0, "invalid management request");
         match self {
+            Self::ReadMonitor { monitor, .. } => {
+                ensure!(
+                    !monitor.is_empty()
+                        && monitor.len() <= 1024
+                        && !monitor.chars().any(char::is_control),
+                    "Invalid monitor read request"
+                );
+            }
             Self::SetMonitor {
                 expected, monitor, ..
             } => {
                 for value in [expected, monitor] {
                     ensure!(
-                        value.id.len() <= 1024 && value.name.len() <= 256 && value.input != Some(0),
+                        value.id.len() <= 1024
+                            && value.name.len() <= 256
+                            && value.input != Some(0)
+                            && !value.id.chars().any(char::is_control)
+                            && !value.name.chars().any(char::is_control)
+                            && (value.fingerprint.is_empty()
+                                || (value.fingerprint.len() == 64
+                                    && value
+                                        .fingerprint
+                                        .bytes()
+                                        .all(|byte| byte.is_ascii_hexdigit()))),
                         "Invalid monitor selection"
                     );
                 }
@@ -188,6 +210,23 @@ mod tests {
             show_remote_cursor: true,
         }
     }
+    #[test]
+    fn monitor_read_requests_identify_one_bounded_display_without_accepting_extra_commands() {
+        let request = Message::ReadMonitor {
+            id: 7,
+            monitor: "\\\\?\\display#fixture".into(),
+        };
+        request.validate().unwrap();
+        assert_eq!(request.id(), 7);
+        assert_eq!(
+            serde_json::from_slice::<Message>(&serde_json::to_vec(&request).unwrap()).unwrap(),
+            request
+        );
+        for monitor in [String::new(), "display\ncommand".into(), "x".repeat(1025)] {
+            assert!(Message::ReadMonitor { id: 7, monitor }.validate().is_err());
+        }
+    }
+
     #[test]
     fn application_requests_are_bounded_and_do_not_accept_commands_or_paths() {
         let mut request = Message::SetApplication {

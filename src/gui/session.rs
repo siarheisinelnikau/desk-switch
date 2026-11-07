@@ -107,6 +107,16 @@ impl Pair {
 impl Desktop {
     #[cfg(target_os = "linux")]
     pub(super) fn input_permission_paths(&self) -> Vec<String> {
+        if self.group.service.is_some() {
+            return self
+                .group
+                .data
+                .input_permission_paths()
+                .into_iter()
+                .take(16)
+                .map(|path| path.to_string_lossy().into_owned())
+                .collect();
+        }
         let choices = self.prefs.workspace.shared.devices_for(&self.public_key);
         self.pair
             .inputs
@@ -733,6 +743,7 @@ impl Desktop {
     }
 
     pub(super) fn retry_devices(&mut self) {
+        self.group.data.retry();
         if let Some((_, error)) = self.device_notice.take()
             && self
                 .notice
@@ -752,6 +763,7 @@ impl Desktop {
     pub(super) fn request_input_access_if_needed(&mut self) {
         if self.quitting
             || self.install_pending
+            || self.group.service.is_some()
             || !self.pair.synced
             || !self.pair.input_failed
             || self.prefs.role != "host"

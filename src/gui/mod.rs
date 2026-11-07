@@ -100,6 +100,8 @@ pub struct Desktop {
     last_update_check: Option<Instant>,
     last_version_error: Option<String>,
     prepared_update: Option<crate::updater::Prepared>,
+    candidate_update: Option<crate::updater::Candidate>,
+    download_action: Option<paired_update::DownloadAction>,
     install_job: Option<crate::updater::InstallJob>,
     install_pending: bool,
     cable_open: bool,
@@ -248,6 +250,8 @@ impl Desktop {
             last_update_check: None,
             last_version_error: None,
             prepared_update: None,
+            candidate_update: None,
+            download_action: None,
             install_job: None,
             install_pending: false,
             cable_open: false,
@@ -336,6 +340,15 @@ impl Desktop {
     }
 
     fn toggle_audio(&mut self) {
+        if let Some(state) = self.group.workspace.clone() {
+            let mut value = state.settings;
+            value.audio_enabled = !value.audio_enabled;
+            self.group_action(crate::group::net::Action::Settings {
+                expected: state.revision,
+                value,
+            });
+            return;
+        }
         self.prefs.workspace.shared.audio_enabled = !self.prefs.workspace.shared.audio_enabled;
         self.shared_changed();
     }
@@ -457,6 +470,21 @@ impl Desktop {
     }
 
     fn tray_state(&self) -> tray::State {
+        if let Some(workspace) = &self.group.workspace {
+            let available = workspace
+                .members
+                .values()
+                .filter(|member| member.compatible())
+                .count()
+                > 1;
+            return tray::State {
+                connected: available && !workspace.switch_pending(),
+                emergency: self.group.data.input.is_some(),
+                sound: workspace.settings.audio_enabled,
+                monitor: false,
+                combined: workspace.settings.monitor_enabled,
+            };
+        }
         tray::State {
             connected: self.input_switch_ready(),
             emergency: self.input_running(),
@@ -467,6 +495,10 @@ impl Desktop {
     }
 
     fn switch_monitor(&mut self, ctx: &egui::Context) {
+        if self.group.workspace.is_some() {
+            self.group_cycle();
+            return;
+        }
         if !self.monitor_switch_ready() {
             self.action(Action::MonitorSetup, ctx);
         } else if self.connected() {
@@ -504,6 +536,14 @@ impl Desktop {
                 self.action(Action::Show, ctx);
             }
             Action::Emergency => {
+                if self.group.workspace.is_some() {
+                    if let Err(error) = self.group.data.emergency() {
+                        self.notice = Some((error.to_string(), true));
+                    }
+                    self.group.return_pending = true;
+                    ctx.request_repaint_of(egui::ViewportId::ROOT);
+                    return;
+                }
                 if let Some(input) = &mut self.input {
                     let result = input.command("emergency");
                     self.message(result, "Запрошен аварийный возврат управления.");
@@ -701,6 +741,11 @@ impl Desktop {
         self.last_version_error = version_error;
         if let Some(result) = self.update_job.as_ref().and_then(crate::updater::Job::poll) {
             self.update_job = None;
+            let download_action = self.download_action.take();
+            let downloaded = matches!(
+                &result,
+                Ok(crate::updater::Outcome::Ready(_) | crate::updater::Outcome::Prepared(..))
+            );
             match result {
                 Ok(crate::updater::Outcome::Current(version)) => {
                     self.update_channel_version = Some(version.clone());
@@ -708,6 +753,7 @@ impl Desktop {
                     self.update_ready = false;
                     self.update_version = None;
                     self.prepared_update = None;
+                    self.candidate_update = None;
                     self.update_status = if version == crate::compatibility::VERSION {
                         "Установлена актуальная версия.".into()
                     } else {
@@ -725,11 +771,26 @@ impl Desktop {
                     self.update_status = "Канал настроен. Релизы ещё не опубликованы.".into();
                     self.fail_paired_download("No signed release is available.".into(), ctx);
                 }
+                Ok(crate::updater::Outcome::Available(candidate)) => {
+                    let version = candidate.version().to_owned();
+                    if self.update_version.as_ref() != Some(&version) {
+                        self.prepared_update = None;
+                    }
+                    self.update_failed = false;
+                    self.update_channel_version = Some(version.clone());
+                    self.update_version = Some(version.clone());
+                    self.candidate_update = Some(candidate);
+                    self.update_ready = true;
+                    self.update_status = format!(
+                        "Version {version} is available. Choose Download and install to update."
+                    );
+                }
                 Ok(crate::updater::Outcome::Ready(version)) => {
                     self.update_failed = false;
                     self.update_channel_version = Some(version.clone());
                     self.update_version = Some(version.clone());
                     self.update_ready = true;
+                    self.candidate_update = None;
                     self.update_status =
                         format!("Версия {version} проверена. Нажмите «Обновить и перезапустить».");
                     if self.paired_update.is_some() {
@@ -741,6 +802,7 @@ impl Desktop {
                     self.update_channel_version = Some(version.clone());
                     self.update_version = Some(version.clone());
                     self.prepared_update = Some(prepared);
+                    self.candidate_update = None;
                     self.update_ready = true;
                     self.update_status =
                         format!("Версия {version} проверена. Нажмите «Обновить и перезапустить».");
@@ -750,6 +812,13 @@ impl Desktop {
                     self.update_failed = true;
                     self.update_status = format!("Не удалось проверить обновления: {error:#}");
                     self.fail_paired_download(format!("{error:#}"), ctx);
+                }
+            }
+            if downloaded {
+                match download_action {
+                    Some(paired_update::DownloadAction::Install) => self.begin_install_update(ctx),
+                    Some(paired_update::DownloadAction::Pair) => self.start_paired_update(ctx),
+                    None => {}
                 }
             }
         }
@@ -837,7 +906,11 @@ impl Desktop {
                     }
                     QueryKind::Monitors => {
                         let monitor: MonitorInfo = serde_json::from_value(value)?;
-                        if monitor.id == self.prefs.workspace.monitor.id {
+                        anyhow::ensure!(
+                            monitor.id == self.prefs.workspace.monitor.id,
+                            "Monitor settings changed while reading the current input. Try again."
+                        );
+                        {
                             anyhow::ensure!(
                                 monitor.current.is_some_and(|input| input != 0),
                                 "The monitor did not report a usable current input. No input was changed."
@@ -855,6 +928,9 @@ impl Desktop {
                 }
                 Ok(())
             })();
+            if matches!(kind, QueryKind::Monitors) {
+                self.finish_monitor_read(&result, ctx);
+            }
             {
                 let success = match kind {
                     #[cfg(target_os = "linux")]
@@ -996,7 +1072,7 @@ impl Desktop {
             || self.install_job.is_some()
             || self.install_pending
             || self.quitting
-            || self.paired_update.as_ref().is_some_and(|u| u.handed_off)
+            || self.paired_update.is_some()
         {
             return;
         }
@@ -1008,8 +1084,8 @@ impl Desktop {
             Ok(job) => {
                 self.update_job = Some(job);
                 self.update_failed = false;
-                self.update_status = "Проверяем и скачиваем подписанное обновление…".into();
-                ctx.request_repaint();
+                self.update_status = "Checking the signed release…".into();
+                ctx.request_repaint_of(egui::ViewportId::ROOT);
             }
             Err(error) => {
                 self.update_failed = true;
@@ -1018,7 +1094,54 @@ impl Desktop {
         }
     }
 
+    fn prepare_update(&mut self, version: String, ctx: &egui::Context) {
+        if self.update_job.is_some()
+            || self.install_job.is_some()
+            || self.install_pending
+            || self.quitting
+        {
+            self.download_action = None;
+            self.fail_paired_download(
+                "Another update operation is already in progress.".into(),
+                ctx,
+            );
+            return;
+        }
+        let candidate = self
+            .candidate_update
+            .as_ref()
+            .filter(|candidate| candidate.version() == version)
+            .cloned();
+        let result = std::env::current_exe()
+            .map_err(anyhow::Error::from)
+            .and_then(|exe| {
+                crate::updater::Job::prepare(self.dir.clone(), exe, version, candidate, ctx.clone())
+            });
+        match result {
+            Ok(job) => {
+                self.update_job = Some(job);
+                self.update_failed = false;
+                self.update_status = "Downloading and verifying the signed update…".into();
+                ctx.request_repaint_of(egui::ViewportId::ROOT);
+            }
+            Err(error) => {
+                self.download_action = None;
+                self.update_failed = true;
+                self.update_status = error.to_string();
+                self.fail_paired_download(error.to_string(), ctx);
+            }
+        }
+    }
+
     fn begin_install_update(&mut self, ctx: &egui::Context) {
+        if self.prepared_update.is_none()
+            && let Some(candidate) = &self.candidate_update
+        {
+            let version = candidate.version().to_owned();
+            self.download_action = Some(paired_update::DownloadAction::Install);
+            self.prepare_update(version, ctx);
+            return;
+        }
         if self.prepared_update.is_some() {
             if let Err(error) = self.save() {
                 self.notice = Some((error.to_string(), true));
@@ -1029,8 +1152,7 @@ impl Desktop {
             // Quit releases them only after the verified installer succeeds.
             self.install_pending = true;
             self.update_ready = false;
-            self.update_status =
-                "Устанавливаем обновление. На Ubuntu подтвердите системный запрос пароля.".into();
+            self.update_status = "Installing the update…".into();
             return;
         }
         match crate::updater::launch_apply(&self.dir) {

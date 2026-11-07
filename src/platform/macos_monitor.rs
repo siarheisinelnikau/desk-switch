@@ -1,6 +1,7 @@
 use crate::video::Monitor;
 use anyhow::{Context, Result, ensure};
 use serde::Deserialize;
+use sha2::{Digest, Sha256};
 
 #[derive(Deserialize)]
 struct Display {
@@ -87,7 +88,7 @@ pub fn list_displays() -> Result<Vec<super::MonitorInfo>> {
             error: display
                 .builtin
                 .then(|| "The built-in display has no switchable input".into()),
-            fingerprint: display.fingerprint,
+            fingerprint: crate::config::hex(&Sha256::digest(display.fingerprint.as_bytes())),
         })
         .collect())
 }
@@ -112,10 +113,15 @@ pub fn discover() -> Result<Vec<super::MonitorInfo>> {
         .collect())
 }
 pub fn probe(only: Option<&str>) -> Result<()> {
-    for display in list_displays()?
+    let displays: Vec<_> = list_displays()?
         .into_iter()
         .filter(|display| only.is_none_or(|id| id == display.id))
-    {
+        .collect();
+    ensure!(
+        !displays.is_empty(),
+        "The selected macOS display is unavailable"
+    );
+    for display in displays {
         println!("Monitor ID: {} ({})", display.id, display.name);
         match Ddc(display.id).read() {
             Ok(input) => println!("  Current VCP 0x60: {input:#06x}"),

@@ -1,5 +1,7 @@
 //! Consumer workspace for any number of linked computers.
-use super::{Desktop, Page, QueryKind, group_data::Data};
+#[cfg(target_os = "linux")]
+use super::QueryKind;
+use super::{Desktop, Page, group_data::Data};
 use crate::{
     config,
     group::{
@@ -24,6 +26,7 @@ pub(super) struct Group {
     pub selected: String,
     pub request: Option<Request>,
     pub data: Data,
+    pub return_pending: bool,
     probe: Option<workspace::hardware::Probe>,
     last_node: Option<Node>,
     last_volume: Option<workspace::AudioLevel>,
@@ -36,11 +39,25 @@ pub(super) struct Group {
     pub reply_target: Option<String>,
     pub cable_target: Option<String>,
     pub update_target: Option<String>,
+    pub monitor_read_reply: Option<(String, u64)>,
     monitor_seen: Option<Option<String>>,
     monitor_job: Option<super::worker::Worker>,
     pub preview: bool,
+    #[cfg(target_os = "linux")]
+    input_permission_retries: std::collections::BTreeSet<String>,
     manual: String,
     pub clipboard: Option<crate::group::clipboard::Clipboard>,
+}
+
+impl Group {
+    pub(super) fn monitor_busy(&self) -> bool {
+        self.monitor_job.is_some()
+            || self.monitor_wait.is_some()
+            || self
+                .workspace
+                .as_ref()
+                .is_some_and(Workspace::switch_pending)
+    }
 }
 
 impl Desktop {
@@ -266,6 +283,12 @@ impl Desktop {
                     self.group.workspace = Some(*state);
                 }
                 Event::Management { source, message } => {
+                    if let workspace::management::Message::Reply {
+                        error: Some(error), ..
+                    } = &message
+                    {
+                        self.notice = Some((error.clone(), true));
+                    }
                     self.group.reply_target = Some(source);
                     self.receive_management(message, ctx);
                     self.group.reply_target = None;
@@ -354,15 +377,19 @@ impl Desktop {
                 }
             };
             self.group.data.tick(specs, &self.dir, ctx);
+            #[cfg(target_os = "linux")]
+            self.request_group_input_access_if_needed(ctx);
             if self.group.data.cycle {
                 self.group.data.cycle = false;
                 self.group_cycle();
             }
             if self.group.data.returned {
                 self.group.data.returned = false;
-                if let Some(source) = state.plan().input {
-                    self.group_action(Action::Activate { key: source });
-                }
+                self.group.return_pending = true;
+            }
+            if self.group.return_pending && !state.switch_pending() {
+                self.group.return_pending = false;
+                self.group_action(Action::ReturnInput);
             }
             if let Some(error) = self.group.data.error.take() {
                 self.notice = Some((error, true));
@@ -382,7 +409,14 @@ impl Desktop {
                 .group
                 .monitor_failed
                 .is_some_and(|failed| failed != state.activation);
-            if video && (changed || retry) && self.group.monitor_job.is_none() {
+            let requested = video
+                && state.members[&self.public_key].input_ready < state.activation
+                && (changed || retry);
+            if !video && self.group.monitor_job.is_none() {
+                self.group.monitor_error = None;
+                self.group.monitor_failed = None;
+            }
+            if requested && self.group.monitor_job.is_none() && self.query.is_none() {
                 self.group.input_ready = 0;
                 self.group.monitor_wait = None;
                 self.group.monitor_activation = state.activation;
@@ -414,7 +448,9 @@ impl Desktop {
                     }
                 }
             }
-            self.group.monitor_seen = Some(monitor);
+            if !(requested && self.query.is_some()) {
+                self.group.monitor_seen = Some(monitor);
+            }
             if let Some(worker) = &mut self.group.monitor_job {
                 worker.poll();
                 if worker.settled() {
@@ -447,11 +483,17 @@ impl Desktop {
                 }
             }
             if here
+                && !(requested && self.query.is_some())
                 && (!video
                     || (self.group.monitor_job.is_none()
                         && self.group.monitor_wait.is_none()
                         && self.group.monitor_failed.is_none()))
             {
+                self.group.input_ready = state.activation;
+            }
+            if self.group.monitor_failed == Some(state.activation) {
+                // Completion acknowledges the attempt; monitor_error keeps
+                // native input disabled when that attempt did not succeed.
                 self.group.input_ready = state.activation;
             }
         }
@@ -471,6 +513,51 @@ impl Desktop {
         }
         if self.quitting {
             self.group.data.stop();
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn request_group_input_access_if_needed(&mut self, ctx: &egui::Context) {
+        if self.quitting
+            || self.install_pending
+            || self.query.is_some()
+            || self
+                .group
+                .workspace
+                .as_ref()
+                .and_then(|state| state.plan().input)
+                .as_deref()
+                != Some(self.public_key.as_str())
+        {
+            return;
+        }
+        if let Some(delay) = self.group.data.permission_retry_after() {
+            ctx.request_repaint_after(delay);
+            return;
+        }
+        if !self.group.data.permission_denied() {
+            return;
+        }
+        let paths = self.input_permission_paths();
+        if paths.is_empty() {
+            return;
+        }
+        let selection = self.input_access_selection();
+        // udev can restore a saved grant just after the first device open. Give
+        // the selected native profile one retry before requesting new access.
+        if paths.iter().all(|path| std::fs::File::open(path).is_ok())
+            && self
+                .group
+                .input_permission_retries
+                .insert(selection.clone())
+        {
+            self.group.data.retry();
+            return;
+        }
+        if !self.pair.input_access_attempts.contains(&selection) {
+            // scan records this selection before launching the helper. A denied
+            // or cancelled request therefore cannot reopen itself on the next tick.
+            self.scan(QueryKind::InputAccess);
         }
     }
 
@@ -505,12 +592,12 @@ impl Desktop {
         let plan = state.plan();
         let members = state.members.values().collect::<Vec<_>>();
         let columns = if ui.available_width() >= 600.0 { 2 } else { 1 };
-        egui::Grid::new("workspace-computers")
-            .num_columns(columns)
-            .spacing([12.0, 12.0])
-            .show(ui, |ui| {
-                let width = (ui.available_width() - 12.0 * (columns - 1) as f32) / columns as f32;
-                for (index, member) in members.iter().enumerate() {
+        let width = (ui.available_width() - 12.0 * (columns - 1) as f32) / columns as f32;
+        for (row_index, row) in members.chunks(columns).enumerate() {
+            ui.horizontal_top(|ui| {
+                ui.spacing_mut().item_spacing.x = 12.0;
+                for (column, member) in row.iter().enumerate() {
+                    let index = row_index * columns + column;
                     let key = &member.node.key;
                     let accent = [
                         Color32::from_rgb(76, 211, 163),
@@ -518,86 +605,107 @@ impl Desktop {
                         Color32::from_rgb(92, 185, 239),
                         Color32::from_rgb(244, 176, 103),
                     ][index % 4];
-                    egui::Frame::group(ui.style())
-                        .fill(ui.visuals().window_fill())
-                        .corner_radius(12)
-                        .inner_margin(16)
-                        .show(ui, |ui| {
-                            ui.set_width((width - 34.0).max(220.0));
-                            ui.horizontal(|ui| {
-                                ui.colored_label(
-                                    accent,
-                                    RichText::new(&member.node.name).size(18.0).strong(),
-                                );
-                                if key == &self.public_key {
-                                    ui.weak(tr("This PC"));
-                                }
-                            });
-                            let platform = match member.node.diagnostics.platform.as_str() {
-                                "windows" => "Windows",
-                                "linux" => "Ubuntu",
-                                "macos" => "macOS",
-                                _ => "Computer",
-                            };
-                            ui.weak(format!(
-                                "{platform} · {} · {}",
-                                member
-                                    .node
-                                    .version
-                                    .as_ref()
-                                    .map(|version| version.app.as_str())
-                                    .unwrap_or("—"),
-                                tr(if member.online {
-                                    "Connected"
-                                } else {
-                                    "Offline"
-                                })
-                            ));
-                            let mut roles = Vec::new();
-                            if plan.input.as_ref() == Some(key) {
-                                roles.push(tr("Keyboard & mouse"));
-                            }
-                            if plan.audio.as_ref() == Some(key) {
-                                roles.push(tr("Shared output"));
-                            }
-                            if plan
-                                .microphone
-                                .as_ref()
-                                .is_some_and(|binding| &binding.computer == key)
-                            {
-                                roles.push(tr("Microphone"));
-                            }
-                            ui.label(if roles.is_empty() {
-                                tr("Available for sharing")
-                            } else {
-                                roles.join(" · ")
-                            });
-                            ui.horizontal(|ui| {
-                                let active = state.active_input.as_ref() == Some(key);
-                                if ui
-                                    .add_enabled(
-                                        member.compatible() && !active,
-                                        egui::Button::new(tr(if active {
-                                            "Input target"
+                    ui.allocate_ui_with_layout(
+                        egui::vec2(width, 0.0),
+                        egui::Layout::top_down(egui::Align::Min),
+                        |ui| {
+                            egui::Frame::group(ui.style())
+                                .fill(ui.visuals().window_fill())
+                                .corner_radius(12)
+                                .inner_margin(16)
+                                .show(ui, |ui| {
+                                    ui.set_width(width - 34.0);
+                                    ui.set_min_height(106.0);
+                                    ui.horizontal_wrapped(|ui| {
+                                        ui.colored_label(
+                                            accent,
+                                            RichText::new(&member.node.name).size(18.0).strong(),
+                                        );
+                                        if key == &self.public_key {
+                                            ui.weak(tr("This PC"));
+                                        }
+                                    });
+                                    let platform = match member.node.diagnostics.platform.as_str() {
+                                        "windows" => "Windows",
+                                        "linux" => "Ubuntu",
+                                        "macos" => "macOS",
+                                        _ => "Computer",
+                                    };
+                                    ui.weak(format!(
+                                        "{platform} · {} · {}",
+                                        member
+                                            .node
+                                            .version
+                                            .as_ref()
+                                            .map(|version| version.app.as_str())
+                                            .unwrap_or("—"),
+                                        tr(if member.online {
+                                            "Connected"
                                         } else {
-                                            "Switch here"
-                                        })),
-                                    )
-                                    .clicked()
-                                {
-                                    self.group_action(Action::Activate { key: key.clone() });
-                                }
-                                if ui.button(tr("Settings")).clicked() {
-                                    self.group.selected = key.clone();
-                                    self.page = Page::Application;
-                                }
-                            });
-                        });
-                    if (index + 1) % columns == 0 {
-                        ui.end_row();
-                    }
+                                            "Offline"
+                                        })
+                                    ));
+                                    let mut roles = Vec::new();
+                                    if plan.input.as_ref() == Some(key) {
+                                        roles.push(tr("Keyboard & mouse"));
+                                    }
+                                    if plan.audio.as_ref() == Some(key) {
+                                        roles.push(tr("Shared output"));
+                                    }
+                                    if plan
+                                        .microphone
+                                        .as_ref()
+                                        .is_some_and(|binding| &binding.computer == key)
+                                    {
+                                        roles.push(tr("Microphone"));
+                                    }
+                                    ui.label(if roles.is_empty() {
+                                        tr("Available for sharing")
+                                    } else {
+                                        roles.join(" · ")
+                                    });
+                                    ui.horizontal_wrapped(|ui| {
+                                        let active = state.active_input.as_ref() == Some(key);
+                                        let failed = active && member.node.monitor_error.is_some();
+                                        let video_needed = state.settings.monitor_enabled
+                                            && member.node.monitor.enabled
+                                            && state.active_monitor.as_ref() != Some(key);
+                                        if ui
+                                            .add_enabled(
+                                                member.compatible()
+                                                    && (!active || failed || video_needed)
+                                                    && !state.switch_pending(),
+                                                egui::Button::new(tr(if failed {
+                                                    "Retry switch"
+                                                } else if active && state.switch_pending() {
+                                                    "Switching…"
+                                                } else if active && !video_needed {
+                                                    "Input target"
+                                                } else {
+                                                    "Switch here"
+                                                })),
+                                            )
+                                            .clicked()
+                                        {
+                                            self.group_action(Action::Activate {
+                                                key: key.clone(),
+                                            });
+                                        }
+                                        if ui.button(tr("Settings")).clicked() {
+                                            self.group.selected = key.clone();
+                                            self.page = Page::Application;
+                                        }
+                                    });
+                                    if let Some(error) = &member.node.monitor_error {
+                                        ui.colored_label(ui.visuals().error_fg_color, tr(error));
+                                    }
+                                })
+                        },
+                    );
                 }
             });
+            ui.add_space(12.0);
+        }
         ui.add_space(16.0);
         egui::Frame::group(ui.style())
             .inner_margin(16)
@@ -611,6 +719,9 @@ impl Desktop {
                     ui.checkbox(&mut settings.microphone_enabled, tr("Microphone"));
                 });
                 ui.checkbox(&mut settings.clipboard_enabled, tr("Shared clipboard"));
+                ui.weak(tr(
+                    "Text and images. Files are planned for a later release.",
+                ));
                 if let Some(status) = self
                     .group
                     .clipboard
@@ -623,9 +734,6 @@ impl Desktop {
                     &mut settings.edge,
                     tr("Move between computers at the screen edge"),
                 );
-                ui.weak(tr(
-                    "Text and images. Files are planned for a later release.",
-                ));
                 ui.checkbox(
                     &mut settings.monitor_enabled,
                     tr("Switch the shared monitor"),
@@ -716,15 +824,16 @@ impl Desktop {
                     ui.horizontal(|ui| {
                         ui.label(&peer.name);
                         ui.weak(&peer.version);
-                        if ui.button(tr("Connect")).clicked() {
-                            if let (Some(key), Some(address)) =
-                                (peer.public_key, peer.addresses.first())
-                            {
-                                self.group_action(Action::Invite {
-                                    key,
-                                    address: SocketAddr::new(address.ip(), model::PORT),
-                                });
-                            }
+                        if ui.button(tr("Connect")).clicked()
+                            && let (Some(key), Some(address)) = (
+                                peer.public_key,
+                                peer.addresses.iter().find(|address| address.is_ipv4()),
+                            )
+                        {
+                            self.group_action(Action::Invite {
+                                key,
+                                address: SocketAddr::new(address.ip(), model::PORT),
+                            });
                         }
                     });
                 }
@@ -876,7 +985,15 @@ impl Desktop {
                     ));
                     ui.label(tr(&management.update.status));
                     ui.horizontal(|ui| {
-                        if ui.button(tr("Check for updates")).clicked() {
+                        if ui
+                            .add_enabled(
+                                !self.update_action_busy()
+                                    && !management.update.checking
+                                    && !management.update.installing,
+                                egui::Button::new(tr("Check for updates")),
+                            )
+                            .clicked()
+                        {
                             if local {
                                 self.check_updates(&ctx);
                             } else {
@@ -890,17 +1007,12 @@ impl Desktop {
                         }
                         if ui
                             .add_enabled(
-                                management.update.can_install(),
+                                management.update.can_install() && !self.update_action_busy(),
                                 egui::Button::new(tr("Download and install")),
                             )
                             .clicked()
                         {
-                            if local {
-                                self.install_update(&ctx);
-                            } else {
-                                self.group.update_target = Some(member.node.key.clone());
-                                self.start_remote_update(&ctx);
-                            }
+                            self.install_selected_update(&member.node.key, &ctx);
                         }
                     });
                 });
@@ -970,6 +1082,7 @@ impl Desktop {
         }
         ui.add_space(12.0);
         let mut monitor = member.node.monitor.clone();
+        let mut read_monitor = false;
         egui::Frame::group(ui.style())
             .inner_margin(16)
             .show(ui, |ui| {
@@ -978,7 +1091,29 @@ impl Desktop {
                     &mut monitor.enabled,
                     tr("This computer uses the shared monitor"),
                 );
-                ui.label(&monitor.name);
+                egui::ComboBox::from_id_salt("member-monitor")
+                    .width(ui.available_width().min(480.0))
+                    .selected_text(if monitor.name.is_empty() {
+                        tr("Select a monitor")
+                    } else {
+                        monitor.name.clone()
+                    })
+                    .show_ui(ui, |ui| {
+                        for display in &member.node.devices.displays {
+                            if ui
+                                .selectable_value(
+                                    &mut monitor.id,
+                                    display.id.clone(),
+                                    &display.name,
+                                )
+                                .changed()
+                            {
+                                monitor.name = display.name.clone();
+                                monitor.fingerprint = display.fingerprint.clone();
+                                monitor.input = None;
+                            }
+                        }
+                    });
                 egui::ComboBox::from_id_salt("member-monitor-input")
                     .selected_text(
                         monitor
@@ -997,10 +1132,17 @@ impl Desktop {
                             ui.selectable_value(&mut monitor.input, Some(input), label);
                         }
                     });
-                if local && ui.button(tr("Read the current input once")).clicked() {
-                    self.scan(QueryKind::Monitors);
+                if ui
+                    .add_enabled(
+                        member.online && !monitor.id.is_empty(),
+                        egui::Button::new(tr("Read the current input once")),
+                    )
+                    .clicked()
+                {
+                    read_monitor = true;
                 }
             });
+        let monitor_id = monitor.id.clone();
         if monitor != member.node.monitor {
             if local {
                 self.prefs.workspace.monitor = monitor;
@@ -1012,6 +1154,21 @@ impl Desktop {
                         id: super::management::request_id(),
                         expected: member.node.monitor.clone(),
                         monitor,
+                    },
+                });
+            }
+        }
+        if read_monitor {
+            if local {
+                if let Err(error) = self.start_monitor_read(&monitor_id, &ctx) {
+                    self.notice = Some((error.to_string(), true));
+                }
+            } else {
+                self.group_action(Action::Manage {
+                    target: member.node.key.clone(),
+                    message: workspace::management::Message::ReadMonitor {
+                        id: super::management::request_id(),
+                        monitor: monitor_id,
                     },
                 });
             }

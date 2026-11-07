@@ -191,13 +191,23 @@ pub async fn ready(child: &mut tokio::process::Child) -> Result<String> {
     )
     .lines();
     let label = tokio::time::timeout(Duration::from_secs(120), async {
+        let mut warnings = 0;
         while let Some(line) = lines.next_line().await? {
             if let Ok(value) = serde_json::from_str::<serde_json::Value>(&line)
                 && let Some(name) = value["ready"].as_str()
             {
                 return Ok(name.to_owned());
             }
-            anyhow::bail!("{line}");
+            if line.starts_with("Desk Switch macOS:") {
+                anyhow::bail!("{line}");
+            }
+            if warnings < 10 {
+                eprintln!(
+                    "macOS startup: {}",
+                    line.chars().take(4096).collect::<String>()
+                );
+                warnings += 1;
+            }
         }
         anyhow::bail!("The macOS native helper stopped before becoming ready")
     })

@@ -6,6 +6,7 @@
 #include <mach/mach_time.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 #if defined(__arm64__)
 #include "i2c.h"
 #endif
@@ -22,13 +23,14 @@ static CGDirectDisplayID selected(const char *text) {
     NSString *identity = [NSString stringWithUTF8String:text];
     CGDirectDisplayID displays[128]; uint32_t count = 0;
     if (CGGetOnlineDisplayList(128, displays, &count) != kCGErrorSuccess) return 0;
+    CGDirectDisplayID selected=0;
     for (uint32_t i = 0; i < count; ++i) {
         CFUUIDRef uuid = CGDisplayCreateUUIDFromDisplayID(displays[i]);
         if (!uuid) continue;
         NSString *name = CFBridgingRelease(CFUUIDCreateString(NULL, uuid)); CFRelease(uuid);
-        if ([name caseInsensitiveCompare:identity] == NSOrderedSame && !CGDisplayIsBuiltin(displays[i])) return displays[i];
+        if ([name caseInsensitiveCompare:identity] == NSOrderedSame && !CGDisplayIsBuiltin(displays[i])) {if (selected) return 0;selected=displays[i];}
     }
-    return 0;
+    return selected;
 }
 
 #if defined(__arm64__)

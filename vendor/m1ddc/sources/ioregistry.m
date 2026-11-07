@@ -37,9 +37,9 @@ static Boolean isMCDP29XXProxy(io_service_t proxy) {
 
 CGDisplayCount getOnlineDisplayInfos(DisplayInfos* displayInfos) {
     // Getting online display list and count
-    CGDisplayCount screenCount;
+    CGDisplayCount screenCount = 0;
     CGDirectDisplayID screenList[MAX_DISPLAYS];
-    CGGetOnlineDisplayList(MAX_DISPLAYS, screenList, &screenCount);
+    if (CGGetOnlineDisplayList(MAX_DISPLAYS, screenList, &screenCount) != kCGErrorSuccess) return 0;
 
     int validDisplayCount = 0;
     // Fetching each display infos from IOKit

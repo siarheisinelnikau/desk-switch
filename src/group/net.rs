@@ -12,7 +12,7 @@ use anyhow::{Context, Result, bail, ensure};
 use eframe::egui;
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, VecDeque},
     net::SocketAddr,
     path::{Path, PathBuf},
     sync::{Arc, Mutex, mpsc},
@@ -68,6 +68,7 @@ pub enum Action {
         key: String,
         position: u16,
     },
+    ReturnInput,
     Invite {
         address: SocketAddr,
         key: String,
@@ -156,7 +157,7 @@ enum Packet {
 }
 
 enum Command {
-    Action(Action),
+    Action(Box<Action>),
     Node(Box<Node>, Option<workspace::AudioLevel>, u64),
     Approve(String, bool),
     Disconnect,
@@ -171,7 +172,7 @@ enum Incoming {
         member: Box<Member>,
         controller: bool,
     },
-    Packet(String, Packet),
+    Packet(String, [u8; 32], Packet),
     Closed(String, Option<[u8; 32]>, String),
 }
 
@@ -180,23 +181,56 @@ pub struct Service {
     events: mpsc::Receiver<Event>,
     snapshot: Arc<Mutex<Option<Box<Workspace>>>>,
     clipboard: Arc<Mutex<Option<Event>>>,
-    pub port: u16,
+    clipboard_commands: Arc<ClipboardCommand>,
+}
+#[derive(Default)]
+struct ClipboardCommand {
+    latest: Mutex<Option<Action>>,
+    changed: tokio::sync::Notify,
+}
+fn listen(port: u16) -> Result<std::net::TcpListener> {
+    let socket = socket2::Socket::new(
+        socket2::Domain::IPV6,
+        socket2::Type::STREAM,
+        Some(socket2::Protocol::TCP),
+    )
+    .and_then(|socket| {
+        socket.set_only_v6(false)?;
+        socket.set_reuse_address(true)?;
+        socket.bind(&SocketAddr::from(([0, 0, 0, 0, 0, 0, 0, 0], port)).into())?;
+        Ok(socket)
+    })
+    .or_else(|_| {
+        let socket = socket2::Socket::new(
+            socket2::Domain::IPV4,
+            socket2::Type::STREAM,
+            Some(socket2::Protocol::TCP),
+        )?;
+        socket.set_reuse_address(true)?;
+        socket.bind(&SocketAddr::from(([0, 0, 0, 0], port)).into())?;
+        Ok::<_, std::io::Error>(socket)
+    })?;
+    socket.listen(16)?;
+    socket.set_nonblocking(true)?;
+    Ok(socket.into())
 }
 impl Service {
     pub fn start(dir: PathBuf, mut local: Member, port: u16, ctx: egui::Context) -> Result<Self> {
-        let listener = std::net::TcpListener::bind(SocketAddr::from(([0, 0, 0, 0], port)))?;
-        listener.set_nonblocking(true)?;
+        let listener = listen(port)?;
         let port = listener.local_addr()?.port();
         local.address.set_port(port);
         let mut state = load(&dir, local)?;
+        let own = config::hex(&config::load_identity(&dir)?.public);
         for member in state.members.values_mut() {
-            member.online = member.node.key == config::hex(&config::load_identity(&dir)?.public);
+            member.online = member.node.key == own;
         }
         state.validate()?;
         let (send, commands) = queue::channel(128);
         let (events_send, events) = mpsc::channel();
         let snapshot = Arc::new(Mutex::new(None));
         let clipboard = Arc::new(Mutex::new(None));
+        let clipboard_commands = Arc::new(ClipboardCommand::default());
+        let clipboard_worker = clipboard_commands.clone();
         let notify = Notify {
             events: events_send,
             snapshot: snapshot.clone(),
@@ -207,7 +241,14 @@ impl Service {
             .name("Desk Switch workspace links".into())
             .spawn(move || {
                 if let Err(error) = crate::runtime().and_then(|runtime| {
-                    runtime.block_on(run(listener, dir, state, commands, notify.clone()))
+                    runtime.block_on(run(
+                        listener,
+                        dir,
+                        state,
+                        commands,
+                        clipboard_worker,
+                        notify.clone(),
+                    ))
                 }) {
                     notify.event(Event::Error(format!("{error:#}")));
                 }
@@ -217,12 +258,18 @@ impl Service {
             events,
             snapshot,
             clipboard,
-            port,
+            clipboard_commands,
         })
     }
     pub fn action(&self, action: Action) -> Result<()> {
+        if matches!(&action, Action::Clipboard { .. }) {
+            ensure!(!self.commands.is_closed(), "The workspace is disconnected");
+            *self.clipboard_commands.latest.lock().unwrap() = Some(action);
+            self.clipboard_commands.changed.notify_one();
+            return Ok(());
+        }
         self.commands
-            .try_send(Command::Action(action))
+            .try_send(Command::Action(Box::new(action)))
             .context("Workspace command queue is busy")?;
         Ok(())
     }
@@ -293,47 +340,73 @@ fn load(dir: &Path, local: Member) -> Result<Workspace> {
         }
     };
     let mut local = local;
-    if state.members.is_empty() && dir.join("peer").exists() {
-        if let Ok(peer) = config::load_peer(dir) {
-            let key = config::hex(&peer);
-            let document = std::fs::read_to_string(dir.join("desktop.toml"))
-                .ok()
-                .and_then(|text| toml::from_str::<toml::Value>(&text).ok());
-            let previous = document.as_ref().and_then(|value| value.get("workspace"));
-            let address = previous
-                .and_then(|value| value.get("last_address"))
+    if state.members.is_empty() {
+        local.preferences.devices = local.node.shared.devices_for(&local.node.key);
+        if let Some(level) = local.node.shared.audio_levels.get(&local.node.key) {
+            local.preferences.audio = *level;
+        }
+    }
+    if state.members.is_empty()
+        && dir.join("peer").exists()
+        && let Ok(peer) = config::load_peer(dir)
+    {
+        let key = config::hex(&peer);
+        let document = std::fs::read_to_string(dir.join("desktop.toml"))
+            .ok()
+            .and_then(|text| toml::from_str::<toml::Value>(&text).ok());
+        let previous = document.as_ref().and_then(|value| value.get("workspace"));
+        let address = previous
+            .and_then(|value| value.get("last_address"))
+            .and_then(toml::Value::as_str)
+            .and_then(|text| text.parse::<SocketAddr>().ok());
+        if let Some(mut address) = address {
+            address.set_port(model::PORT);
+            let preferences = MemberPreferences {
+                devices: local.node.shared.devices_for(&key),
+                audio: local
+                    .node
+                    .shared
+                    .audio_levels
+                    .get(&key)
+                    .copied()
+                    .unwrap_or(MemberPreferences::default().audio),
+                output: None,
+            };
+            let mut node = local.node.clone();
+            node.key = key.clone();
+            node.name = previous
+                .and_then(|value| value.get("peer_name"))
                 .and_then(toml::Value::as_str)
-                .and_then(|text| text.parse::<SocketAddr>().ok());
-            if let Some(mut address) = address {
-                address.set_port(model::PORT);
-                let mut node = local.node.clone();
-                node.key = key.clone();
-                node.name = previous
-                    .and_then(|value| value.get("peer_name"))
-                    .and_then(toml::Value::as_str)
-                    .filter(|name| !name.is_empty())
-                    .unwrap_or("Linked computer")
-                    .into();
-                node.hardware = Default::default();
-                node.devices = Default::default();
-                node.version = None;
-                node.management = None;
-                node.monitor = Default::default();
-                node.shared = Default::default();
-                node.ack.clear();
-                state.members.insert(
-                    key.clone(),
-                    Member {
-                        node,
-                        address,
-                        online: false,
-                        native_output: None,
-                        preferences: Default::default(),
-                        input_ready: 0,
-                    },
-                );
-                state.hub = state.hub.min(key);
-            }
+                .filter(|name| !name.is_empty())
+                .unwrap_or("Linked computer")
+                .into();
+            node.hardware = Default::default();
+            node.devices = Default::default();
+            node.version = None;
+            node.management = None;
+            node.monitor = Default::default();
+            node.shared = Default::default();
+            node.ack.clear();
+            node.input = None;
+            node.monitor_input = None;
+            node.monitor_error = None;
+            node.audio_playing = false;
+            node.microphone_active = false;
+            node.microphone_error = None;
+            node.audio_error = None;
+            node.input_error = None;
+            state.members.insert(
+                key.clone(),
+                Member {
+                    node,
+                    address,
+                    online: false,
+                    native_output: None,
+                    preferences,
+                    input_ready: 0,
+                },
+            );
+            state.hub = state.hub.min(key);
         }
     }
     if let Some(saved) = state.members.get(&local.node.key) {
@@ -561,7 +634,7 @@ fn start_session(candidate: Candidate, internal: queue::Sender<Incoming>) -> Ses
                 )
                 .await??;
                 reader_internal
-                    .send(Incoming::Packet(reader_key.clone(), packet))
+                    .send(Incoming::Packet(reader_key.clone(), generation, packet))
                     .await?;
             }
             #[allow(unreachable_code)]
@@ -580,7 +653,7 @@ fn start_session(candidate: Candidate, internal: queue::Sender<Incoming>) -> Ses
                     if let Some(latest)=latest && let Err(error)=timeout(Duration::from_secs(30),write_packet(&mut write,&noise,&latest)).await.map_err(anyhow::Error::from).and_then(|result|result){break Err(error);}
                 }
                 _ = tokio::time::sleep(Duration::from_secs(2)) => {
-                    if let Err(error) = write_packet(&mut write, &noise, &Packet::Ping).await { break Err(error); }
+                    if let Err(error) = timeout(AUTH, write_packet(&mut write, &noise, &Packet::Ping)).await.map_err(anyhow::Error::from).and_then(|result|result) { break Err(error); }
                 }
             }
         };
@@ -620,6 +693,59 @@ fn broadcast(sessions: &Sessions, state: &Workspace) {
     }
 }
 
+fn clipboard_data(mime: &str, bytes: &[u8], digest: &str) -> Result<()> {
+    ensure!(
+        ["text/plain", "image/png"].contains(&mime) && bytes.len() <= 8 * 1024 * 1024,
+        "Unsupported clipboard data"
+    );
+    use sha2::{Digest, Sha256};
+    ensure!(
+        digest.len() == 64 && format!("{:x}", Sha256::digest(bytes)) == digest,
+        "Clipboard checksum mismatch"
+    );
+    Ok(())
+}
+
+#[derive(Default)]
+struct UpdateReceipts(VecDeque<(String, workspace::update::Message)>);
+impl UpdateReceipts {
+    fn queued(&self, target: &str, message: &workspace::update::Message) -> bool {
+        self.0
+            .iter()
+            .any(|(peer, value)| peer == target && value == message)
+    }
+    fn permit(&self, target: &str, message: &workspace::update::Message) -> Result<()> {
+        ensure!(
+            self.0.len() < 128 || self.queued(target, message),
+            "Too many update commands are awaiting delivery"
+        );
+        Ok(())
+    }
+    fn remember(&mut self, target: String, message: workspace::update::Message) {
+        if !self.queued(&target, &message) {
+            self.0.push_back((target, message));
+        }
+    }
+    fn confirm(&mut self, source: &str, message: &workspace::update::Message) -> bool {
+        let Some(index) = self
+            .0
+            .iter()
+            .position(|(peer, value)| peer == source && value == message)
+        else {
+            return false;
+        };
+        self.0.remove(index);
+        true
+    }
+    fn closed(&mut self, peer: &str, hub: &str) {
+        if peer == hub {
+            self.0.clear();
+        } else {
+            self.0.retain(|(target, _)| target != peer);
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn apply(
     action: Action,
@@ -645,43 +771,9 @@ fn apply(
             expected,
             value,
         } => state.set_member(&key, &expected, value)?,
-        Action::Activate { key } => {
-            state.active_input_entry = None;
-            ensure!(
-                state.members.get(&key).is_some_and(Member::compatible),
-                "The destination is offline or needs an update"
-            );
-            let monitor =
-                state.settings.monitor_enabled && state.members[&key].node.monitor.enabled;
-            if monitor {
-                state.monitor_input(&key)?;
-            }
-            state.active_input = Some(key.clone());
-            if monitor {
-                state.active_monitor = Some(key);
-            }
-            state.revision = state
-                .revision
-                .checked_add(1)
-                .context("Workspace revision exhausted")?;
-            state.activation = state
-                .activation
-                .checked_add(1)
-                .context("Too many input switches")?;
-        }
-        Action::ActivateEdge { key, position } => {
-            apply(
-                Action::Activate { key },
-                source,
-                own,
-                state,
-                sessions,
-                notify,
-                identity,
-                internal,
-            )?;
-            state.active_input_entry = Some(position);
-        }
+        Action::Activate { key } => state.activate(&key, None)?,
+        Action::ActivateEdge { key, position } => state.activate(&key, Some(position))?,
+        Action::ReturnInput => state.return_input()?,
         Action::Invite { address, key } => {
             if !key.is_empty() {
                 model::valid_key(&key)?;
@@ -698,6 +790,10 @@ fn apply(
         }
         Action::Manage { target, message } => {
             message.validate()?;
+            ensure!(
+                state.members.contains_key(&target),
+                "Unknown management destination"
+            );
             if target == own {
                 notify.event(Event::Management {
                     source: source.into(),
@@ -717,6 +813,10 @@ fn apply(
         }
         Action::Update { target, message } => {
             message.validate()?;
+            ensure!(
+                state.members.contains_key(&target),
+                "Unknown update destination"
+            );
             if target == own {
                 if source != own {
                     send(
@@ -752,31 +852,199 @@ fn apply(
         } => {
             ensure!(state.settings.clipboard_enabled, "Shared clipboard is off");
             ensure!(
-                ["text/plain", "image/png"].contains(&mime.as_str())
-                    && bytes.len() <= 8 * 1024 * 1024,
-                "Unsupported clipboard data"
+                state.members.get(source).is_some_and(Member::compatible),
+                "The clipboard source is offline or needs an update"
             );
-            use sha2::{Digest, Sha256};
-            ensure!(
-                format!("{:x}", Sha256::digest(&bytes)) == digest,
-                "Clipboard checksum mismatch"
-            );
-            notify.event(Event::Clipboard {
-                source: source.into(),
-                mime: mime.clone(),
-                bytes: bytes.clone(),
-                digest: digest.clone(),
-            });
+            clipboard_data(&mime, &bytes, &digest)?;
+            if source != own {
+                notify.event(Event::Clipboard {
+                    source: source.into(),
+                    mime: mime.clone(),
+                    bytes: bytes.clone(),
+                    digest: digest.clone(),
+                });
+            }
             let packet = Arc::new(Packet::Clipboard {
                 source: source.into(),
                 mime,
                 bytes,
                 digest,
             });
-            for (_, _, clipboard) in sessions.values() {
-                clipboard.send_replace(Some(packet.clone()));
+            for (key, (_, _, clipboard)) in sessions {
+                if key != source && state.members.get(key).is_some_and(Member::compatible) {
+                    clipboard.send_replace(Some(packet.clone()));
+                }
             }
         }
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn local_action(
+    action: Action,
+    own: &str,
+    state: &mut Workspace,
+    sessions: &Sessions,
+    notify: &Notify,
+    identity: &config::Identity,
+    internal: &queue::Sender<Incoming>,
+    receipts: &mut UpdateReceipts,
+) -> Result<()> {
+    let update = if let Action::Update { target, message } = &action {
+        message.validate()?;
+        ensure!(
+            state.members.contains_key(target),
+            "Unknown update destination"
+        );
+        receipts.permit(target, message)?;
+        Some((target.clone(), message.clone()))
+    } else {
+        None
+    };
+    if state.hub == own {
+        apply(
+            action, own, own, state, sessions, notify, identity, internal,
+        )?;
+    } else if matches!(&action, Action::Clipboard { .. }) {
+        sessions
+            .get(&state.hub)
+            .context("The workspace controller is offline")?
+            .2
+            .send_replace(Some(Arc::new(Packet::Action(action))));
+    } else {
+        send(sessions, &state.hub, Packet::Action(action))?;
+    }
+    if let Some((target, message)) = update {
+        if target == own && state.hub == own {
+            notify.event(Event::UpdateSent(message));
+        } else {
+            receipts.remember(target, message);
+        }
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn receive_packet(
+    key: &str,
+    packet: Packet,
+    own: &str,
+    state: &mut Workspace,
+    sessions: &Sessions,
+    notify: &Notify,
+    identity: &config::Identity,
+    internal: &queue::Sender<Incoming>,
+    receipts: &mut UpdateReceipts,
+) -> Result<()> {
+    ensure!(state.members.contains_key(key), "Unknown workspace member");
+    match packet {
+        Packet::Ping => {}
+        Packet::State(mut remote) if key == state.hub && state.hub != own => {
+            remote.validate()?;
+            ensure!(
+                remote.hub == key && remote.members.contains_key(own),
+                "Invalid controller state"
+            );
+            ensure!(remote.revision >= state.revision, "Stale controller state");
+            let local = &state.members[own];
+            let observed = remote.members.get_mut(own).unwrap();
+            observed.node = local.node.clone();
+            observed.native_output = local.native_output;
+            observed.input_ready = local.input_ready.min(remote.activation);
+            remote.validate()?;
+            *state = *remote;
+        }
+        Packet::Node(node, native, ready) if state.hub == own => {
+            state.update_node(key, *node, native, ready)?;
+        }
+        Packet::Action(action) if state.hub == own => apply(
+            action, key, own, state, sessions, notify, identity, internal,
+        )?,
+        Packet::Management {
+            source,
+            target,
+            message,
+        } if key == state.hub && target == own => {
+            ensure!(
+                state.members.contains_key(&source),
+                "Unknown management source"
+            );
+            message.validate()?;
+            notify.event(Event::Management { source, message });
+        }
+        Packet::Update {
+            source,
+            target,
+            message,
+        } if key == state.hub && target == own => {
+            ensure!(state.members.contains_key(&source), "Unknown update source");
+            message.validate()?;
+            send(
+                sessions,
+                &state.hub,
+                Packet::UpdateAck {
+                    source: own.into(),
+                    target: source.clone(),
+                    message: message.clone(),
+                },
+            )?;
+            notify.event(Event::Update { source, message });
+        }
+        Packet::UpdateAck {
+            source,
+            target,
+            message,
+        } if (state.hub == own && source == key) || (key == state.hub && target == own) => {
+            ensure!(
+                state.members.contains_key(&source) && state.members.contains_key(&target),
+                "Unknown update acknowledgement"
+            );
+            message.validate()?;
+            if target == own {
+                if receipts.confirm(&source, &message) {
+                    notify.event(Event::UpdateSent(message));
+                }
+            } else {
+                send(
+                    sessions,
+                    &target.clone(),
+                    Packet::UpdateAck {
+                        source,
+                        target,
+                        message,
+                    },
+                )?;
+            }
+        }
+        Packet::Clipboard {
+            source,
+            mime,
+            bytes,
+            digest,
+        } if key == state.hub && state.settings.clipboard_enabled => {
+            ensure!(
+                state.members.get(&source).is_some_and(Member::compatible),
+                "Unknown clipboard source"
+            );
+            clipboard_data(&mime, &bytes, &digest)?;
+            if source != own {
+                notify.event(Event::Clipboard {
+                    source,
+                    mime,
+                    bytes,
+                    digest,
+                });
+            }
+        }
+        Packet::Error(error) => {
+            ensure!(
+                error.len() <= 1024 && !error.chars().any(char::is_control),
+                "Invalid peer error"
+            );
+            notify.event(Event::Error(error));
+        }
+        _ => bail!("Unexpected workspace message"),
     }
     Ok(())
 }
@@ -786,6 +1054,7 @@ async fn run(
     dir: PathBuf,
     mut state: Workspace,
     mut commands: queue::Receiver<Command>,
+    clipboard_commands: Arc<ClipboardCommand>,
     notify: Notify,
 ) -> Result<()> {
     let listener = TcpListener::from_std(listener)?;
@@ -794,6 +1063,7 @@ async fn run(
     let (internal, mut incoming) = queue::channel(256);
     let permits = Arc::new(tokio::sync::Semaphore::new(8));
     let mut sessions = BTreeMap::new();
+    let mut receipts = UpdateReceipts::default();
     let mut approvals: BTreeMap<String, oneshot::Sender<bool>> = BTreeMap::new();
     let mut reconnect = tokio::time::interval(Duration::from_secs(3));
     let mut connected_once = false;
@@ -821,17 +1091,21 @@ async fn run(
                 Some(Command::Disconnect) | None => break,
                 Some(Command::Approve(key, accept)) => { if let Some(approved) = approvals.remove(&key) { let _: Result<(), bool> = approved.send(accept); } }
                 Some(Command::Node(node,native,ready)) => {
-                    state.update_node(&own, *node.clone())?;
-                    state.members.get_mut(&own).unwrap().input_ready=ready;
-                    if let Some(native)=native.filter(|level|level.volume<=100) {state.members.get_mut(&own).unwrap().native_output=Some(native);}
-                    if state.hub != own { let _ = send(&sessions, &state.hub, Packet::Node(node,native,ready)); }
+                    match state.update_node(&own, *node.clone(), native, ready) {
+                        Ok(()) => if state.hub != own { let _ = send(&sessions, &state.hub, Packet::Node(node,native,ready)); },
+                        Err(error) => notify.event(Event::Error(error.to_string())),
+                    }
                 }
                 Some(Command::Action(action)) => {
-                    let result = if state.hub == own { apply(action, &own, &own, &mut state, &sessions, &notify, &identity, &internal) }
-                        else { send(&sessions, &state.hub, Packet::Action(action)) };
-                    if let Err(error) = result { notify.event(Event::Error(error.to_string())); }
+                    if let Err(error) = local_action(*action, &own, &mut state, &sessions, &notify, &identity, &internal, &mut receipts) { notify.event(Event::Error(error.to_string())); }
                 }
             },
+            _ = clipboard_commands.changed.notified() => {
+                let latest = clipboard_commands.latest.lock().unwrap().take();
+                if let Some(action) = latest
+                    && let Err(error) = local_action(action, &own, &mut state, &sessions, &notify, &identity, &internal, &mut receipts)
+                { notify.event(Event::Error(error.to_string())); }
+            }
             _ = reconnect.tick() => {
                 if !connected_once && !state.members[&own].node.management.as_ref().is_none_or(|management|management.application.auto_connect) {continue;}
                 if state.hub != own && !sessions.contains_key(&state.hub) {
@@ -843,59 +1117,44 @@ async fn run(
             event = incoming.recv() => match event.context("Workspace event loop stopped")? {
                 Incoming::Consent { request, accept } => { if !approvals.contains_key(&request.key) { approvals.insert(request.key.clone(), accept); notify.event(Event::Request(request)); } }
                 Incoming::Ready { candidate, member, controller } => {
-                    connected_once=true;
                     let key = member.node.key.clone();
                     if sessions.get(&key).is_some_and(|(generation, _, _)| generation <= &candidate.connection) { continue; }
-                    let mut local_address = candidate.stream.local_addr()?; local_address.set_port(listener.local_addr()?.port());
-                    state.members.get_mut(&own).unwrap().address = local_address;
-                    let connection = start_session(candidate, internal.clone());
-                    if controller {
-                        let mut member = *member;
-                        if let Some(saved) = state.members.get(&key) { member.preferences = saved.preferences.clone(); }
-                        state.members.insert(key.clone(), member);
-                        state.revision += 1;
-                        let _ = connection.1.try_send(Packet::State(Box::new(state.clone())));
-                    } else { state.hub = key.clone(); state.members.insert(key.clone(), *member); }
-                    sessions.insert(key, connection);
+                    let result = (|| {
+                        let mut next = state.clone();
+                        let mut local_address = candidate.stream.local_addr()?;
+                        if let SocketAddr::V6(address) = local_address && let Some(ip) = address.ip().to_ipv4_mapped() {local_address = SocketAddr::new(ip.into(), address.port());}
+                        local_address.set_port(listener.local_addr()?.port());
+                        next.members.get_mut(&own).unwrap().address = local_address;
+                        if controller {
+                            ensure!(state.hub == own, "Add computers through the workspace controller");
+                            let mut member = *member;
+                            if let Some(saved) = state.members.get(&key) { member.preferences = saved.preferences.clone(); }
+                            next.members.insert(key.clone(), member);
+                            next.revision = state.revision.checked_add(1).filter(|revision|*revision<u64::MAX).context("Workspace revision exhausted")?;
+                        } else {
+                            ensure!(state.members.len() <= 1 || state.hub == key, "Leave the existing workspace before joining another");
+                            next.hub = key.clone(); next.members.insert(key.clone(), *member);
+                        }
+                        next.validate()?;
+                        let connection = start_session(candidate, internal.clone());
+                        if controller { let _ = connection.1.try_send(Packet::State(Box::new(next.clone()))); }
+                        sessions.insert(key, connection);
+                        state = next;
+                        connected_once = true;
+                        Ok::<(), anyhow::Error>(())
+                    })();
+                    if let Err(error) = result { notify.event(Event::Error(error.to_string())); }
                 }
-                Incoming::Packet(key, packet) => {
-                    let result = match packet {
-                        Packet::Ping => Ok(()),
-                        Packet::State(remote) if key == state.hub && state.hub != own => {
-                            remote.validate()?;
-                            ensure!(remote.hub == key && remote.members.contains_key(&own), "Invalid controller state");
-                            let local = state.members[&own].node.clone();
-                            state = *remote;
-                            state.members.get_mut(&own).unwrap().node = local;
-                            Ok(())
-                        }
-                        Packet::Node(node,native,ready) if state.hub == own => {
-                            state.update_node(&key, *node)?;
-                            state.members.get_mut(&key).unwrap().input_ready=ready;
-                            if let Some(native)=native.filter(|level|level.volume<=100) {state.members.get_mut(&key).unwrap().native_output=Some(native);}
-                            Ok(())
-                        },
-                        Packet::Action(action) if state.hub == own => apply(action, &key, &own, &mut state, &sessions, &notify, &identity, &internal),
-                        Packet::Management { source, target, message } if key == state.hub && target == own => { message.validate()?; notify.event(Event::Management { source, message }); Ok(()) }
-                        Packet::Update { source, target, message } if key == state.hub && target == own => {
-                            message.validate()?;
-                            send(&sessions,&state.hub,Packet::UpdateAck{source:own.clone(),target:source.clone(),message:message.clone()})?;
-                            notify.event(Event::Update { source, message }); Ok(())
-                        }
-                        Packet::UpdateAck {source,target,message} if (state.hub==own && source==key) || (key==state.hub && target==own) => {
-                            message.validate()?;
-                            if target==own {notify.event(Event::UpdateSent(message));Ok(())}
-                            else {send(&sessions,&target.clone(),Packet::UpdateAck{source,target,message})}
-                        }
-                        Packet::Clipboard { source, mime, bytes, digest } if key == state.hub && state.settings.clipboard_enabled => { notify.event(Event::Clipboard { source, mime, bytes, digest }); Ok(()) }
-                        Packet::Error(error) => { notify.event(Event::Error(error)); Ok(()) }
-                        _ => Err(anyhow::anyhow!("Unexpected workspace message")),
-                    };
-                    if let Err(error) = result { let _ = send(&sessions, &key, Packet::Error(error.to_string())); }
+                Incoming::Packet(key, generation, packet) => {
+                    if !sessions.get(&key).is_some_and(|(active, _, _)| *active == generation) { continue; }
+                    if let Err(error) = receive_packet(&key, packet, &own, &mut state, &sessions, &notify, &identity, &internal, &mut receipts) {
+                        let _ = send(&sessions, &key, Packet::Error(workspace::management::status_text(error.to_string(),1024)));
+                    }
                 }
                 Incoming::Closed(key, generation, error) => {
                     if generation.is_some() && sessions.get(&key).is_some_and(|(active, _, _)| Some(*active) == generation) {
                         sessions.remove(&key);
+                        receipts.closed(&key, &state.hub);
                         if let Some(member) = state.members.get_mut(&key) { member.online = false; }
                         if key == state.hub { for member in state.members.values_mut() { member.online = member.node.key == own; } }
                     }
@@ -917,7 +1176,11 @@ async fn run(
             }
             notify.state(&state);
             if state.revision != before.revision || state.hub != before.hub {
-                save(&dir, &state)?;
+                if let Err(error) = save(&dir, &state) {
+                    notify.event(Event::Error(format!(
+                        "Workspace settings could not be saved: {error}"
+                    )));
+                }
             }
         }
     }
@@ -1004,11 +1267,15 @@ mod tests {
             .map(|computer| computer.member.node.key.clone())
             .collect::<Vec<_>>();
         let mut forwarded = Vec::new();
+        until(&mut computers, &mut forwarded, |computers, _| {
+            computers.iter().all(|computer| computer.state.is_some())
+        });
         for index in 1..4 {
+            let address = computers[index].state.as_ref().unwrap().members[&keys[index]].address;
             computers[0]
                 .service
                 .action(Action::Invite {
-                    address: SocketAddr::from(([127, 0, 0, 1], computers[index].service.port)),
+                    address,
                     key: keys[index].clone(),
                 })
                 .unwrap();

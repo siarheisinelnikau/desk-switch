@@ -222,6 +222,10 @@ impl Workspace {
         for (key, member) in &self.members {
             ensure!(*key == member.node.key, "Computer identity mismatch");
             member.validate(&self.hub)?;
+            ensure!(
+                member.input_ready <= self.activation,
+                "Invalid monitor acknowledgement"
+            );
         }
         for key in [&self.active_input, &self.active_monitor]
             .into_iter()
@@ -282,12 +286,112 @@ impl Workspace {
         self.revision = revision;
         Ok(())
     }
-    pub fn update_node(&mut self, key: &str, node: Node) -> Result<()> {
+    pub fn update_node(
+        &mut self,
+        key: &str,
+        mut node: Node,
+        native: Option<AudioLevel>,
+        ready: u64,
+    ) -> Result<()> {
         ensure!(key == node.key, "Computer identity mismatch");
+        ensure!(ready <= self.activation, "Invalid monitor acknowledgement");
+        ensure!(
+            native.is_none_or(|level| level.volume <= 100),
+            "Invalid system volume"
+        );
+        if self.active_input.as_deref() == Some(key) && ready < self.activation {
+            // A terminal error acknowledges its exact monitor attempt. Ignore
+            // delayed errors from before a new command or an explicit retry.
+            node.monitor_error = None;
+        }
         let mut member = self.members.get(key).context("Unknown computer")?.clone();
         member.node = node;
+        member.input_ready = ready;
+        if let Some(native) = native {
+            member.native_output = Some(native);
+        }
         member.validate(&self.hub)?;
-        self.members.get_mut(key).unwrap().node = member.node;
+        self.members.insert(key.into(), member);
+        Ok(())
+    }
+    /// Readiness acknowledges the monitor command and settling time, never an
+    /// input receiver's authentication. An offline target cannot hold this gate.
+    pub fn switch_pending(&self) -> bool {
+        self.active_input
+            .as_ref()
+            .and_then(|key| self.members.get(key))
+            .is_some_and(|member| {
+                member.online
+                    && self.activation > member.input_ready
+                    && member.node.monitor_error.is_none()
+            })
+    }
+    pub fn activate(&mut self, destination: &str, position: Option<u16>) -> Result<()> {
+        ensure!(
+            !self.switch_pending(),
+            "The previous switch is still finishing. Wait for the monitor before switching again."
+        );
+        let member = self
+            .members
+            .get(destination)
+            .filter(|member| member.compatible())
+            .context("The destination is offline or needs an update")?;
+        let monitor = self.settings.monitor_enabled && member.node.monitor.enabled;
+        if monitor {
+            self.monitor_input(destination)?;
+        }
+        if self.active_input.as_deref() == Some(destination)
+            && self.active_input_entry == position
+            && (!monitor || self.active_monitor.as_deref() == Some(destination))
+            && member.node.monitor_error.is_none()
+        {
+            return Ok(());
+        }
+        let revision = self.next_revision()?;
+        let activation = self
+            .activation
+            .checked_add(1)
+            .context("Too many input switches")?;
+        self.active_input = Some(destination.into());
+        self.active_input_entry = position;
+        if monitor {
+            self.active_monitor = Some(destination.into());
+            // A recorded failure permits one explicit retry. Clearing it as part
+            // of this transition prevents another request racing that retry.
+            self.members
+                .get_mut(destination)
+                .unwrap()
+                .node
+                .monitor_error = None;
+        }
+        self.revision = revision;
+        self.activation = activation;
+        Ok(())
+    }
+    /// Release borrowed input after its local fail-open, preserving the last
+    /// physical monitor selection. Only an explicit Activate may request DDC.
+    pub fn return_input(&mut self) -> Result<()> {
+        ensure!(
+            !self.switch_pending(),
+            "The previous switch is still finishing. Wait for the monitor before switching again."
+        );
+        let source = self
+            .plan()
+            .input
+            .context("The input owner is unavailable")?;
+        if self.active_input.as_ref() == Some(&source) && self.active_input_entry.is_none() {
+            return Ok(());
+        }
+        let revision = self.next_revision()?;
+        let activation = self
+            .activation
+            .checked_add(1)
+            .context("Too many input switches")?;
+        self.active_input = Some(source.clone());
+        self.active_input_entry = None;
+        self.revision = revision;
+        self.activation = activation;
+        self.members.get_mut(&source).unwrap().input_ready = activation;
         Ok(())
     }
     pub fn monitor_input(&self, destination: &str) -> Result<u16> {
@@ -670,6 +774,113 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn failed_switches_preserve_input_monitor_entry_and_counters() {
+        for position in [None, Some(12_345)] {
+            let mut state = fixture(3);
+            state.active_input = Some(key(1));
+            state.active_monitor = Some(key(1));
+            state.active_input_entry = Some(999);
+            let original = state.clone();
+            assert!(state.activate(&key(4), position).is_err());
+            assert_eq!(state, original);
+
+            state.members.get_mut(&key(2)).unwrap().node.monitor.input = Some(15);
+            let original = state.clone();
+            assert!(state.activate(&key(2), position).is_err());
+            assert_eq!(state, original);
+
+            state.members.get_mut(&key(2)).unwrap().node.monitor.input = Some(16);
+            state.revision = u64::MAX - 1;
+            let original = state.clone();
+            assert!(state.activate(&key(2), position).is_err());
+            assert_eq!(state, original);
+
+            state.revision = 0;
+            state.activation = u64::MAX;
+            state.members.get_mut(&key(1)).unwrap().input_ready = u64::MAX;
+            let original = state.clone();
+            assert!(state.activate(&key(2), position).is_err());
+            assert_eq!(state, original);
+        }
+    }
+
+    #[test]
+    fn switches_wait_for_terminal_monitor_ack_and_allow_one_explicit_retry() {
+        let mut state = fixture(3);
+        state.activate(&key(2), Some(12_345)).unwrap();
+        assert!(state.switch_pending());
+        let pending = state.clone();
+        assert!(state.activate(&key(3), None).is_err());
+        assert!(state.activate(&key(2), Some(12_345)).is_err());
+        assert_eq!(state, pending);
+
+        let mut node = state.members[&key(2)].node.clone();
+        node.monitor_error = Some("A failure from an earlier attempt".into());
+        state.update_node(&key(2), node.clone(), None, 0).unwrap();
+        assert!(state.switch_pending());
+        assert!(state.members[&key(2)].node.monitor_error.is_none());
+        state.update_node(&key(2), node, None, 1).unwrap();
+        assert!(!state.switch_pending());
+        state.activate(&key(2), Some(12_345)).unwrap();
+        assert_eq!(state.activation, 2);
+        assert!(state.switch_pending());
+        assert!(state.members[&key(2)].node.monitor_error.is_none());
+        assert!(state.activate(&key(2), Some(12_345)).is_err());
+
+        let mut node = state.members[&key(2)].node.clone();
+        node.input_error = Some("Native input is still reconnecting".into());
+        state.update_node(&key(2), node, None, 2).unwrap();
+        assert!(
+            !state.switch_pending(),
+            "Input authentication must not hold the monitor gate"
+        );
+        let completed = state.clone();
+        state.activate(&key(2), Some(12_345)).unwrap();
+        assert_eq!(
+            state, completed,
+            "A completed duplicate must not send another monitor command"
+        );
+
+        state.activate(&key(3), None).unwrap();
+        assert!(state.switch_pending());
+        state.members.get_mut(&key(3)).unwrap().online = false;
+        assert!(!state.switch_pending());
+        state.activate(&key(1), None).unwrap();
+        let before = state.clone();
+        let node = state.members[&key(1)].node.clone();
+        assert!(
+            state
+                .update_node(&key(1), node, None, state.activation + 1)
+                .is_err()
+        );
+        assert_eq!(state, before);
+    }
+
+    #[test]
+    fn failed_input_returns_preserve_the_monitor_and_cannot_bypass_an_inflight_switch() {
+        let mut state = fixture(3);
+        state.activate(&key(2), Some(123)).unwrap();
+        let pending = state.clone();
+        assert!(state.return_input().is_err());
+        assert_eq!(state, pending);
+        let node = state.members[&key(2)].node.clone();
+        state
+            .update_node(&key(2), node, None, state.activation)
+            .unwrap();
+        let monitor = state.active_monitor.clone();
+        state.return_input().unwrap();
+        assert_eq!(state.active_input, Some(key(1)));
+        assert_eq!(state.active_monitor, monitor);
+        assert_eq!(state.active_input_entry, None);
+        assert_eq!(state.activation, 2);
+        assert_eq!(state.members[&key(1)].input_ready, state.activation);
+        assert!(!state.switch_pending());
+        let returned = state.clone();
+        state.return_input().unwrap();
+        assert_eq!(state, returned);
+    }
+
+    #[test]
     fn source_status_does_not_override_another_computers_preferences() {
         let mut workspace = fixture(3);
         workspace
@@ -688,12 +899,16 @@ pub(crate) mod tests {
             },
         );
         node.shared.microphone_enabled = true;
-        workspace.update_node(&key(2), node).unwrap();
+        workspace.update_node(&key(2), node, None, 0).unwrap();
         assert_eq!(workspace.members[&key(2)].preferences.audio.volume, 37);
         assert!(!workspace.settings.microphone_enabled);
         assert_eq!(workspace.revision, 0);
         let wrong_identity = workspace.members[&key(3)].node.clone();
-        assert!(workspace.update_node(&key(2), wrong_identity).is_err());
+        assert!(
+            workspace
+                .update_node(&key(2), wrong_identity, None, 0)
+                .is_err()
+        );
     }
 
     #[test]
