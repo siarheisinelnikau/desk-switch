@@ -1,0 +1,2 @@
+# Restore only administrator-approved physical input identities for their saved user.
+ACTION=="add|change", SUBSYSTEM=="input", KERNEL=="event*", RUN+="/usr/lib/desk-switch/input-access --restore %k"

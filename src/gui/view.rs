@@ -582,6 +582,60 @@ impl Desktop {
                     self.action(super::Action::MonitorSetup, ui.ctx());
                 }
             });
+            if self.prefs.workspace.shared.monitor_enabled {
+                let local = self.local_node();
+                let configured =
+                    self.pair.remote.as_ref().is_some_and(|r| {
+                        crate::workspace::Plan::monitor_inputs(&local, r).is_some()
+                    });
+                if !configured {
+                    note(
+                        ui,
+                        "One shared monitor is shown in the middle. Remember this PC's video connection on each PC to enable switching.",
+                    );
+                    let allowed = self.can_remember_monitor();
+                    if self.prefs.workspace.pending_monitor.is_some() {
+                        note(
+                            ui,
+                            "Connection saved. Return the borrowed keyboard and mouse to enable monitor switching safely.",
+                        );
+                    } else if self.prefs.workspace.monitor.input.is_none() {
+                        let disabled = if !allowed {
+                            "Сначала верните управление: это единственное устройство ввода на принимающем ПК."
+                        } else if self.query.is_some() {
+                            "Checking the video connection…"
+                        } else {
+                            "Монитор пока не найден"
+                        };
+                        if ui
+                            .add_enabled(
+                                allowed && self.query.is_none() && !self.monitors.is_empty(),
+                                egui::Button::new(crate::i18n::tr(
+                                    "Remember this PC's video connection",
+                                )),
+                            )
+                            .on_disabled_hover_text(crate::i18n::tr(disabled))
+                            .clicked()
+                        {
+                            if self
+                                .monitors
+                                .iter()
+                                .any(|m| m.id == self.prefs.workspace.monitor.id)
+                            {
+                                self.prefs.workspace.monitor.enabled = true;
+                                self.remember_monitor();
+                            } else {
+                                self.action(super::Action::MonitorSetup, ui.ctx());
+                            }
+                        }
+                    } else {
+                        note(
+                            ui,
+                            "This PC's connection is remembered. Complete the same setup on the other PC.",
+                        );
+                    }
+                }
+            }
             if self.pair.plan.as_ref().is_some_and(|p| p.monitor.is_some()) {
                 note(
                     ui,
@@ -649,7 +703,7 @@ impl Desktop {
                 {
                     note(
                         ui,
-                        "Ubuntu needs permission to read the selected keyboard and mouse. Access lasts until they are unplugged; Wayland may also ask for remote-desktop permission.",
+                        "Ubuntu remembers permission for the selected keyboard and mouse after one system approval, including USB reconnection and restart. Wayland permission is separate.",
                     );
                     if ui
                         .add_enabled(
@@ -788,7 +842,7 @@ impl Desktop {
                         egui::Checkbox::new(enabled, crate::i18n::tr(label)))
                         .on_disabled_hover_text(crate::i18n::tr("Сначала верните управление: это единственное устройство ввода на принимающем ПК."));
                 }
-                let mut enabled = shared.monitor_enabled && local.monitor.enabled;
+                let mut enabled = shared.monitor_enabled;
                 if ui.add_enabled(!crate::workspace::Plan::input_in_use(&local, &remote)
                     && crate::workspace::Plan::can_disable(&local,&remote,true)
                     && crate::workspace::Plan::can_disable(&local,&remote,false),
@@ -1023,11 +1077,7 @@ impl Desktop {
         let mut changed = false;
         let open = self.monitor_setup_open;
         let local = self.local_node();
-        let can_configure = self.pair.remote.as_ref().is_none_or(|remote| {
-            !crate::workspace::Plan::input_in_use(&local, remote)
-                && crate::workspace::Plan::can_disable(&local, remote, true)
-                && crate::workspace::Plan::can_disable(&local, remote, false)
-        });
+        let can_configure = self.can_remember_monitor();
         card(ui, |ui| {
             let header = egui::CollapsingHeader::new(crate::i18n::tr("Общий монитор"))
                 .id_salt("local-monitor")
@@ -1059,11 +1109,14 @@ impl Desktop {
                         }
                         if old_id != self.prefs.workspace.monitor.id {
                             self.prefs.workspace.monitor.input = None;
+                            self.prefs.workspace.pending_monitor = None;
                             changed = true;
                         }
                         if self.prefs.workspace.monitor.enabled {
                             if self.query.is_some() { ui.spinner(); }
-                            else if self.prefs.workspace.monitor.input.is_some() {
+                            else if self.prefs.workspace.pending_monitor.is_some() {
+                                note(ui, "Connection saved. Return the borrowed keyboard and mouse to enable monitor switching safely.");
+                            } else if self.prefs.workspace.monitor.input.is_some() {
                                 note(ui, "Текущее подключение этого ПК запомнено.");
                             } else {
                                 note(ui, "Не удалось прочитать текущее подключение. Включите DDC/CI в меню монитора.");
@@ -1094,8 +1147,9 @@ impl Desktop {
     fn diagram(&self, ui: &mut egui::Ui) {
         let local = self.local_node();
         let remote = self.pair.remote.as_ref();
-        let shared_monitor =
-            remote.is_some_and(|r| crate::workspace::Plan::shared_monitor(&local, r));
+        let shared_monitor = remote
+            .map(|r| crate::workspace::Plan::common_monitor(&local, r))
+            .unwrap_or(self.prefs.workspace.shared.monitor_enabled);
         let (rect, _) = ui.allocate_exact_size(
             Vec2::new(
                 ui.available_width(),
@@ -1178,7 +1232,17 @@ impl Desktop {
                 .iter()
                 .find(|(n, _, _)| Some(n.key.as_str()) == owner)
                 .map(|(n, _, _)| n.name.chars().take(22).collect::<String>())
-                .unwrap_or_else(|| crate::i18n::tr("Проверяем видеовход…"));
+                .unwrap_or_else(|| {
+                    crate::i18n::tr(if remote.is_none() {
+                        "Waiting for the other PC"
+                    } else if remote.is_some_and(|r| {
+                        crate::workspace::Plan::monitor_inputs(&local, r).is_some()
+                    }) {
+                        "Проверяем видеовход…"
+                    } else {
+                        "Video connection not set up"
+                    })
+                });
             painter.text(
                 middle + Vec2::new(0.0, 14.0),
                 egui::Align2::CENTER_CENTER,
@@ -1438,6 +1502,23 @@ impl Desktop {
             self.appearance_changed(ui.ctx());
         }
         self.device_settings(ui);
+        #[cfg(target_os = "linux")]
+        card(ui, |ui| {
+            subheading(ui, "Keyboard and mouse permissions");
+            note(
+                ui,
+                "Approve once to remember access to the selected devices after USB reconnection and restart. Devices without a serial number are remembered by model and input interface.",
+            );
+            if ui
+                .add_enabled(
+                    self.query.is_none() && !self.input_permission_paths().is_empty(),
+                    egui::Button::new(crate::i18n::tr("Remember keyboard and mouse access")),
+                )
+                .clicked()
+            {
+                self.scan(super::QueryKind::InputAccess);
+            }
+        });
         card(ui, |ui| {
             subheading(ui, "При входе в систему");
             let changed = ui

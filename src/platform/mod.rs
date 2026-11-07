@@ -11,6 +11,10 @@ pub use linux_monitor::{discover, probe};
 #[cfg(target_os = "linux")]
 pub use linux_monitor::{list_displays, read_monitor};
 
+#[cfg(any(windows, test))]
+mod cursor_policy;
+#[cfg(windows)]
+mod win_cursor;
 #[cfg(windows)]
 mod win_input;
 #[cfg(windows)]

@@ -4,8 +4,8 @@
   <vendor>Desk Switch</vendor>
   <vendor_url>https://github.com/siarheisinelnikau/desk-switch</vendor_url>
   <action id="com.deskswitch.input-access">
-    <description>Allow Desk Switch to read selected input devices</description>
-    <message>Authenticate to share the selected keyboard and mouse with your paired PC.</message>
+    <description>Remember Desk Switch access to selected input devices</description>
+    <message>Authenticate once to share the selected keyboard and mouse, including after USB reconnection and restart.</message>
     <defaults>
       <allow_any>no</allow_any>
       <allow_inactive>no</allow_inactive>
