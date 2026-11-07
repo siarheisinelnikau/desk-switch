@@ -10,6 +10,7 @@ import tomllib
 import urllib.request
 
 from prepare_release import checked_binary
+from release_assets import asset_names
 
 ROOT = Path(__file__).resolve().parents[1]
 REPOSITORY = "siarheisinelnikau/desk-switch"
@@ -46,7 +47,7 @@ def main():
         subprocess.run(["openssl", "pkeyutl", "-verify", "-rawin", "-pubin", "-keyform", "DER", "-inkey", str(work / "key.der"), "-sigfile", str(work / "signature"), "-in", str(work / "payload")], check=True)
         release = json.loads(envelope["payload"])
         assert release["version"] == version and release["protocol"] == protocol
-        targets = {"windows-x86_64": "desk-switch-windows-x86_64.exe", "linux-x86_64-deb": "desk-switch-linux-x86_64.deb"}
+        targets = asset_names(version)
         assert set(release["targets"]) == set(targets)
         info = json.loads(subprocess.check_output(["gh", "release", "view", tag, "--repo", REPOSITORY, "--json", "isPrerelease,assets,body"], text=True))
         assets = {asset["name"]: asset for asset in info["assets"]}

@@ -422,41 +422,44 @@ impl Desktop {
         egui::CentralPanel::default()
             .frame(egui::Frame::new().fill(palette(root).bg).inner_margin(26))
             .show(root, |ui| {
-                egui::ScrollArea::vertical()
-                    .auto_shrink([false, false])
-                    .show(ui, |ui| {
-                        if self.quitting {
-                            title(
-                                ui,
-                                "Завершаем работу",
-                                "Возвращаем управление и останавливаем фоновые службы…",
-                            );
-                            ui.spinner();
-                            return;
-                        }
-                        match self.page {
-                            Page::Overview => self.overview(ui),
-                            Page::Application => self.application(ui),
-                            Page::Diagnostics => self.diagnostics(ui),
-                        }
-                        if let Some((message, error)) = self.notice.clone() {
-                            ui.add_space(10.0);
-                            card(ui, |ui| {
-                                ui.horizontal_wrapped(|ui| {
-                                    ui.label(RichText::new(crate::i18n::tr(message)).color(
-                                        if error {
-                                            palette(ui).error
-                                        } else {
-                                            palette(ui).ink
-                                        },
-                                    ));
-                                    if ui.small_button(crate::i18n::tr("Скрыть")).clicked() {
-                                        self.notice = None;
-                                    }
-                                });
+                let scroll = egui::ScrollArea::vertical().auto_shrink([false, false]);
+                #[cfg(debug_assertions)]
+                let scroll = if self.preview.is_some() && ui.ctx().cumulative_pass_nr() < 3 {
+                    scroll.vertical_scroll_offset(self.preview_scroll)
+                } else {
+                    scroll
+                };
+                scroll.show(ui, |ui| {
+                    if self.quitting {
+                        title(
+                            ui,
+                            "Завершаем работу",
+                            "Возвращаем управление и останавливаем фоновые службы…",
+                        );
+                        ui.spinner();
+                        return;
+                    }
+                    match self.page {
+                        Page::Overview => self.overview(ui),
+                        Page::Application => self.application(ui),
+                        Page::Diagnostics => self.diagnostics(ui),
+                    }
+                    if let Some((message, error)) = self.notice.clone() {
+                        ui.add_space(10.0);
+                        card(ui, |ui| {
+                            ui.horizontal_wrapped(|ui| {
+                                ui.label(RichText::new(crate::i18n::tr(message)).color(if error {
+                                    palette(ui).error
+                                } else {
+                                    palette(ui).ink
+                                }));
+                                if ui.small_button(crate::i18n::tr("Скрыть")).clicked() {
+                                    self.notice = None;
+                                }
                             });
-                        }
-                    });
+                        });
+                    }
+                });
             });
     }
 
@@ -621,20 +624,6 @@ impl Desktop {
                         );
                     }
                 }
-                if let Some(remote) = &self.pair.remote
-                    && local.monitor.input.is_some()
-                    && remote.monitor.input.is_some()
-                    && crate::workspace::Plan::monitor_inputs(&local, remote).is_none()
-                {
-                    note(
-                        ui,
-                        if local.monitor.input == remote.monitor.input {
-                            "Both PCs remembered the same video input. Remember each connection while that PC's picture is visible."
-                        } else {
-                            "The saved connections belong to different monitors. Select the same shared monitor on both PCs."
-                        },
-                    );
-                }
                 let configured =
                     self.pair.remote.as_ref().is_some_and(|r| {
                         crate::workspace::Plan::monitor_inputs(&local, r).is_some()
@@ -661,10 +650,18 @@ impl Desktop {
                     {
                         self.switch_input_for_setup();
                     }
-                    note(
-                        ui,
-                        "One shared monitor is shown in the middle. Remember this PC's video connection on each PC to enable switching.",
-                    );
+                    if self.pair.remote.as_ref().is_none_or(|remote| {
+                        matches!(
+                            crate::workspace::Plan::monitor_setup(&local, remote),
+                            crate::workspace::MonitorSetup::ThisPcMissing
+                                | crate::workspace::MonitorSetup::OtherPcMissing
+                        )
+                    }) {
+                        note(
+                            ui,
+                            "One shared monitor is shown in the middle. Remember this PC's video connection on each PC to enable switching.",
+                        );
+                    }
                     let allowed = self.can_remember_monitor();
                     if self.prefs.workspace.pending_monitor.is_some() {
                         note(
@@ -700,7 +697,10 @@ impl Desktop {
                                 self.action(super::Action::MonitorSetup, ui.ctx());
                             }
                         }
-                    } else {
+                    } else if self.pair.remote.as_ref().is_some_and(|remote| {
+                        crate::workspace::Plan::monitor_setup(&local, remote)
+                            == crate::workspace::MonitorSetup::OtherPcMissing
+                    }) {
                         note(
                             ui,
                             "This PC's connection is remembered. Complete the same setup on the other PC.",
@@ -1000,6 +1000,14 @@ impl Desktop {
                         Color32::from_rgb(66, 211, 157)
                     };
                     ui.colored_label(color, format!("{} · {}", crate::i18n::tr(label), node.name));
+                    note(
+                        ui,
+                        if output.is_some_and(|output| output.key == node.key) {
+                            "System volume of the shared output"
+                        } else {
+                            "Relative to the shared output's system volume"
+                        },
+                    );
                     let mut level = shared.audio_level(&node.key);
                     let changed = ui
                         .horizontal(|ui| {
@@ -1018,7 +1026,7 @@ impl Desktop {
             });
             note(
                 ui,
-                "Каждый ползунок меняет звук своего ПК. Настройки одинаковы на обоих компьютерах и сохраняются при переносе наушников.",
+                "The listening PC controls system volume. The other PC is relative to it: 90% × 50% = 45%.",
             );
             ui.separator();
             let mic_before = (shared.microphone_enabled, shared.microphone.clone());
@@ -1320,12 +1328,12 @@ impl Desktop {
                 .unwrap_or_else(|| {
                     crate::i18n::tr(if remote.is_none() {
                         "Waiting for the other PC"
-                    } else if remote.is_some_and(|r| {
-                        crate::workspace::Plan::monitor_inputs(&local, r).is_some()
-                    }) {
-                        "Проверяем видеовход…"
                     } else {
-                        "Finish setup on both PCs"
+                        remote
+                            .map(|remote| {
+                                crate::workspace::Plan::monitor_setup(&local, remote).caption()
+                            })
+                            .unwrap_or("Waiting for the other PC")
                     })
                 });
             painter.text(
@@ -1439,7 +1447,13 @@ impl Desktop {
                 egui::pos2(center.x + 66.0, icon_y),
                 device_color(microphone_origin),
             );
-            if audio && nodes.iter().all(|(n, _, _)| n.audio_playing) {
+            let output_level = plan
+                .and_then(|p| p.audio_output.as_deref())
+                .map(|key| self.prefs.workspace.shared.audio_level(key));
+            if audio
+                && nodes.iter().all(|(n, _, _)| n.audio_playing)
+                && output_level.is_some_and(|level| !level.muted && level.volume > 0)
+            {
                 for (offset, origin, color) in [
                     (18.0, plan.map(|p| p.purple.as_str()), purple),
                     (29.0, plan.map(|p| p.green.as_str()), green),

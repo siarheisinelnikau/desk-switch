@@ -50,6 +50,7 @@ enum QueryKind {
 }
 
 pub struct Desktop {
+    ctx: egui::Context,
     dir: PathBuf,
     prefs: Preferences,
     form: Form,
@@ -96,6 +97,8 @@ pub struct Desktop {
     quitting_since: Option<Instant>,
     #[cfg(debug_assertions)]
     preview: Option<crate::workspace::Node>,
+    #[cfg(debug_assertions)]
+    preview_scroll: f32,
 }
 
 pub fn run(start_hidden: bool) -> Result<()> {
@@ -162,11 +165,12 @@ impl Desktop {
             .unwrap_or_default();
         let (send, actions) = mpsc::channel();
         let startup_valid = prefs_error.is_none() && settings_error.is_none();
-        let (tray, tray_error) = match tray::Tray::new(send, ctx) {
+        let (tray, tray_error) = match tray::Tray::new(send, ctx.clone()) {
             Ok(tray) => (Some(tray), None),
             Err(error) => (None, Some(format!("{error:#}"))),
         };
         Self {
+            ctx,
             dir,
             prefs,
             form: Form::from_document(document),
@@ -213,6 +217,8 @@ impl Desktop {
             quitting_since: None,
             #[cfg(debug_assertions)]
             preview: None,
+            #[cfg(debug_assertions)]
+            preview_scroll: 0.0,
         }
     }
 
@@ -266,7 +272,7 @@ impl Desktop {
             .context("сначала выполните сопряжение с другим компьютером")?;
         let args = self.prefs.input_args()?;
         self.pair.monitor_input = None;
-        let mut worker = Worker::start(Kind::Input, &args, &self.dir)?;
+        let mut worker = Worker::start(Kind::Input, &args, &self.dir, &self.ctx)?;
         worker.require_monitor(self.prefs.workspace.shared.monitor_enabled)?;
         worker.monitoring = self.form.monitor_enabled;
         self.input = Some(worker);
@@ -495,7 +501,7 @@ impl Desktop {
                 self.prefs.workspace.monitor.id.clone(),
             ],
         };
-        match Worker::start(Kind::Query, &args, &self.dir) {
+        match Worker::start(Kind::Query, &args, &self.dir, &self.ctx) {
             Ok(worker) => self.query = Some((kind, worker)),
             Err(error) => self.notice = Some((format!("{error:#}"), true)),
         }
@@ -545,6 +551,20 @@ impl Desktop {
             if let Some(error) = worker.new_switch_error.take() {
                 self.notice = Some((format!("Switch failed: {error}"), true));
             }
+        }
+        if let Some(level) = self
+            .audio
+            .as_mut()
+            .filter(|worker| worker.kind == Kind::AudioReceive && !worker.stopping)
+            .and_then(|worker| worker.output_level.changed.take())
+            && self.prefs.workspace.shared.audio_level(&self.public_key) != level
+        {
+            self.prefs
+                .workspace
+                .shared
+                .audio_levels
+                .insert(self.public_key.clone(), level);
+            self.shared_changed();
         }
         self.tick_pair(ctx);
         #[cfg(target_os = "linux")]
@@ -805,7 +825,37 @@ impl Desktop {
         {
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
         }
-        ctx.request_repaint_after(Duration::from_millis(200));
+        // Services wake the GUI on changed data. Only unfinished operations need
+        // a short deadline; a settled window has no recurring render timer.
+        if self.quitting
+            || self.pair.busy
+            || self
+                .paired_update
+                .as_ref()
+                .is_some_and(|update| !update.done())
+            || [&self.input, &self.monitor, &self.audio, &self.microphone]
+                .into_iter()
+                .flatten()
+                .any(Worker::needs_poll)
+        {
+            ctx.request_repaint_after(Duration::from_millis(200));
+        }
+        if let Some((_, worker)) = &self.query {
+            ctx.request_repaint_after(worker.next_poll());
+        }
+        if let Some(since) = self.last_switch {
+            let remaining = Duration::from_millis(800).saturating_sub(since.elapsed());
+            if !remaining.is_zero() {
+                ctx.request_repaint_after(remaining);
+            }
+        }
+        if self.prefs.auto_update
+            && let Some(since) = self.last_update_check
+        {
+            ctx.request_repaint_after(
+                Duration::from_secs(6 * 60 * 60).saturating_sub(since.elapsed()),
+            );
+        }
     }
 
     fn appearance_changed(&mut self, ctx: &egui::Context) {
