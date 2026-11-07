@@ -1,4 +1,4 @@
-use anyhow::{Result, bail};
+use anyhow::{Result, bail, ensure};
 use serde::{Deserialize, Serialize};
 use std::{sync::mpsc, time::Duration};
 use tokio::sync::oneshot;
@@ -122,6 +122,43 @@ impl VideoWorker {
     }
 }
 
+pub async fn monitor_service(video: VideoWorker, inputs: Inputs) -> Result<()> {
+    ensure!(
+        inputs.host != 0 && inputs.peer != 0 && inputs.host != inputs.peer,
+        "remember distinct current connections on both PCs before switching"
+    );
+    let mut commands = crate::lifecycle::commands();
+    loop {
+        tokio::select! {
+            result = crate::lifecycle::shutdown() => return Ok(result?),
+            command = commands.recv() => {
+                if matches!(command, Ok(crate::lifecycle::Command::Switch))
+                    && let Err(error) = select_monitor(&video, inputs).await {
+                    eprintln!("Shared monitor: {error:#}");
+                }
+            }
+        }
+    }
+}
+
+async fn select_monitor(video: &VideoWorker, inputs: Inputs) -> Result<()> {
+    // A command on the active PC selects only the other PC's remembered input.
+    // Returning uses that PC's own service and the reversed local mapping.
+    video
+        .submit(Job::Select {
+            from: inputs.host,
+            to: inputs.peer,
+        })?
+        .await??;
+    tokio::time::sleep(SETTLE).await;
+    let confirmed = video.submit(Job::Read)?.await??;
+    ensure!(
+        matches!(confirmed, VideoResult::Read(input) if input == inputs.peer),
+        "the monitor did not confirm the requested input; no other input was tried"
+    );
+    Ok(())
+}
+
 pub fn input_codes(capabilities: &str) -> Vec<u16> {
     let mut remaining = capabilities;
     while let Some((prefix, tail)) = remaining.split_once("60") {
@@ -156,6 +193,52 @@ mod tests {
     struct Fixture {
         selected: usize,
         monitors: [u16; 2],
+    }
+
+    #[tokio::test]
+    async fn monitor_can_return_from_destination_without_an_input_or_portal_session() {
+        struct Shared {
+            input: Arc<AtomicU16>,
+            writes: Arc<std::sync::Mutex<Vec<u16>>>,
+        }
+        impl Monitor for Shared {
+            fn read(&mut self) -> Result<u16> {
+                Ok(self.input.load(SeqCst))
+            }
+            fn write(&mut self, input: u16) -> Result<()> {
+                self.writes.lock().unwrap().push(input);
+                self.input.store(input, SeqCst);
+                Ok(())
+            }
+        }
+        let input = Arc::new(AtomicU16::new(17));
+        let writes = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let a = VideoWorker::start(Shared {
+            input: input.clone(),
+            writes: writes.clone(),
+        })
+        .unwrap();
+        let b = VideoWorker::start(Shared {
+            input: input.clone(),
+            writes: writes.clone(),
+        })
+        .unwrap();
+        select_monitor(&a, Inputs { host: 17, peer: 15 })
+            .await
+            .unwrap();
+        assert_eq!(input.load(SeqCst), 15);
+        // The second click belongs to B, with B's own reversed mapping.
+        select_monitor(&b, Inputs { host: 15, peer: 17 })
+            .await
+            .unwrap();
+        assert_eq!(input.load(SeqCst), 17);
+        input.store(3, SeqCst);
+        assert!(
+            select_monitor(&b, Inputs { host: 15, peer: 17 })
+                .await
+                .is_err()
+        );
+        assert_eq!(*writes.lock().unwrap(), [15, 17]);
     }
 
     impl Monitor for Fixture {

@@ -31,6 +31,26 @@ use crate::{
 use anyhow::Result;
 use std::net::SocketAddr;
 
+pub fn run_monitor_service(id: &str, own: u16, other: u16) -> Result<()> {
+    anyhow::ensure!(
+        !id.is_empty() && own != 0 && other != 0 && own != other,
+        "select a monitor and remember distinct connections on both PCs"
+    );
+    crate::lifecycle::install();
+    #[cfg(target_os = "linux")]
+    let monitor = linux_monitor::Ddc(id.into());
+    #[cfg(windows)]
+    let monitor = win_monitor::Ddc(id.into());
+    let video = VideoWorker::watch(monitor)?;
+    crate::runtime()?.block_on(crate::video::monitor_service(
+        video,
+        crate::video::Inputs {
+            host: own,
+            peer: other,
+        },
+    ))
+}
+
 pub fn run(
     role: Role,
     address: SocketAddr,

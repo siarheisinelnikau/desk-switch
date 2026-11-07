@@ -93,10 +93,20 @@ impl Desktop {
         if case.starts_with("shared-") {
             for (node, input) in [(&mut local, 17), (&mut remote, 15)] {
                 node.monitor.enabled = true;
+                node.monitor.id = format!("fixture-{}", node.name);
                 node.monitor.fingerprint = "preview-shared-monitor".into();
                 node.monitor.input = Some(input);
                 node.monitor.name = "Shared display".into();
             }
+            self.monitors.push(crate::platform::MonitorInfo {
+                id: local.monitor.id.clone(),
+                name: "Shared display".into(),
+                screen: "auto".into(),
+                current: Some(17),
+                inputs: vec![17, 15],
+                error: None,
+                fingerprint: local.monitor.fingerprint.clone(),
+            });
             let input = match case {
                 "shared-pending" => None,
                 "shared-peer" => Some(15),
@@ -109,6 +119,23 @@ impl Desktop {
                 remote.input = Some(InputStatus::Here);
             }
             self.prefs.workspace.monitor = local.monitor.clone();
+        }
+        if case == "shared-independent" {
+            remote.hardware.keyboard = true;
+            remote.hardware.mouse = true;
+            local.input = None;
+            remote.input = None;
+        }
+        if case == "shared-setup" {
+            local.monitor.enabled = false;
+            local.monitor.input = None;
+            self.prefs.workspace.monitor = local.monitor.clone();
+        }
+        if case == "shared-denied" {
+            local.input = None;
+            remote.input = None;
+            local.input_error = Some("Permission denied (os error 13)".into());
+            self.pair.input_failed = true;
         }
         for (node, individual) in [(&mut local, true), (&mut remote, false)] {
             use crate::audio::AudioDevice;
@@ -240,10 +267,10 @@ impl Desktop {
             };
             self.action(action, ctx);
         }
-        let snapshot = (self.pair.synced, false, false);
+        let snapshot = self.tray_state();
         if self.tray_snapshot != snapshot {
             if let Some(tray) = &mut self.tray {
-                tray.update(snapshot.0, false, false);
+                tray.update(snapshot);
             }
             self.tray_snapshot = snapshot;
         }

@@ -106,6 +106,11 @@ fn run() -> Result<()> {
             "@desk-switch-data {}",
             serde_json::to_string(&platform::read_monitor(id)?)?
         ),
+        ["monitor-service", id, own, other] => platform::run_monitor_service(
+            id,
+            u16::from_str_radix(own, 16)?,
+            u16::from_str_radix(other, 16)?,
+        )?,
         #[cfg(target_os = "linux")]
         ["portal-check"] => {
             runtime()?.block_on(platform::portal::check())?;

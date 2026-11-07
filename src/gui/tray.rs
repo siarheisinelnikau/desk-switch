@@ -3,6 +3,25 @@ use anyhow::Result;
 use eframe::egui;
 use std::sync::mpsc::Sender;
 
+#[derive(Clone, Copy, Default, PartialEq)]
+pub(super) struct State {
+    pub connected: bool,
+    pub emergency: bool,
+    pub sound: bool,
+    pub monitor: bool,
+    pub combined: bool,
+}
+
+impl State {
+    fn switch_label(self) -> &'static str {
+        if self.combined {
+            "Switch monitor, keyboard and mouse"
+        } else {
+            "Переключить на другой ПК"
+        }
+    }
+}
+
 pub fn icon_rgba(size: usize) -> Vec<u8> {
     let mut rgba = vec![0; size * size * 4];
     for y in 0..size {
@@ -50,9 +69,7 @@ mod native {
         language: String,
         sender: Sender<Action>,
         ctx: egui::Context,
-        connected: bool,
-        emergency: bool,
-        sound: bool,
+        state: State,
         available: Arc<AtomicBool>,
     }
 
@@ -82,7 +99,7 @@ mod native {
                 title: "Desk Switch".into(),
                 description: crate::i18n::tr_language(
                     &self.language,
-                    if self.connected {
+                    if self.state.connected {
                         "Пара подключена"
                     } else {
                         "Настройка рабочего места"
@@ -115,11 +132,21 @@ mod native {
             vec![
                 item("Открыть Desk Switch", Action::Show, true),
                 MenuItem::Separator,
-                item("Переключить на другой ПК", Action::Switch, self.connected),
-                item("Аварийный возврат", Action::Emergency, self.emergency),
+                item(
+                    self.state.switch_label(),
+                    Action::Switch,
+                    self.state.connected,
+                ),
+                item(
+                    "Switch shared monitor",
+                    Action::MonitorSwitch,
+                    self.state.monitor,
+                ),
+                item("Set up shared monitor…", Action::MonitorSetup, true),
+                item("Аварийный возврат", Action::Emergency, self.state.emergency),
                 MenuItem::Separator,
                 item(
-                    if self.sound {
+                    if self.state.sound {
                         "Выключить аудиоподключение"
                     } else {
                         "Включить аудиоподключение"
@@ -145,9 +172,7 @@ mod native {
                 language: crate::i18n::current_code().into(),
                 sender,
                 ctx,
-                connected: false,
-                emergency: false,
-                sound: false,
+                state: State::default(),
                 available: Arc::clone(&available),
             }
             .assume_sni_available(true)
@@ -157,12 +182,10 @@ mod native {
         pub fn available(&self) -> bool {
             self.available.load(Ordering::Relaxed) && !self.handle.is_closed()
         }
-        pub fn update(&mut self, connected: bool, emergency: bool, sound: bool) {
+        pub fn update(&mut self, state: State) {
             self.handle.update(|item| {
                 item.language = crate::i18n::current_code().into();
-                item.connected = connected;
-                item.emergency = emergency;
-                item.sound = sound;
+                item.state = state;
             });
         }
     }
@@ -187,6 +210,8 @@ mod native {
         show: MenuItem,
         quit: MenuItem,
         switch: MenuItem,
+        monitor: MenuItem,
+        monitor_setup: MenuItem,
         emergency: MenuItem,
         sound: MenuItem,
     }
@@ -208,6 +233,18 @@ mod native {
                 false,
                 None,
             );
+            let monitor = MenuItem::with_id(
+                "monitor",
+                crate::i18n::tr("Switch shared monitor"),
+                false,
+                None,
+            );
+            let monitor_setup = MenuItem::with_id(
+                "monitor-setup",
+                crate::i18n::tr("Set up shared monitor…"),
+                true,
+                None,
+            );
             let sound = MenuItem::with_id(
                 "sound",
                 crate::i18n::tr("Включить аудиоподключение"),
@@ -220,6 +257,8 @@ mod native {
                 &show,
                 &PredefinedMenuItem::separator(),
                 &switch,
+                &monitor,
+                &monitor_setup,
                 &emergency,
                 &PredefinedMenuItem::separator(),
                 &sound,
@@ -232,6 +271,8 @@ mod native {
                 let action = match event.id.0.as_str() {
                     "show" => Action::Show,
                     "switch" => Action::Switch,
+                    "monitor" => Action::MonitorSwitch,
+                    "monitor-setup" => Action::MonitorSetup,
                     "emergency" => Action::Emergency,
                     "sound" => Action::Sound,
                     "quit" => Action::Quit,
@@ -262,6 +303,8 @@ mod native {
                 show,
                 quit,
                 switch,
+                monitor,
+                monitor_setup,
                 emergency,
                 sound,
             })
@@ -269,16 +312,20 @@ mod native {
         pub fn available(&self) -> bool {
             true
         }
-        pub fn update(&mut self, connected: bool, emergency: bool, sound: bool) {
+        pub fn update(&mut self, state: State) {
             self.show.set_text(crate::i18n::tr("Открыть Desk Switch"));
             self.quit.set_text(crate::i18n::tr("Завершить Desk Switch"));
-            self.switch
-                .set_text(crate::i18n::tr("Переключить на другой ПК"));
+            self.switch.set_text(crate::i18n::tr(state.switch_label()));
+            self.monitor
+                .set_text(crate::i18n::tr("Switch shared monitor"));
+            self.monitor_setup
+                .set_text(crate::i18n::tr("Set up shared monitor…"));
+            self.monitor.set_enabled(state.monitor);
             self.emergency
                 .set_text(crate::i18n::tr("Аварийный возврат"));
-            self.switch.set_enabled(connected);
-            self.emergency.set_enabled(emergency);
-            self.sound.set_text(crate::i18n::tr(if sound {
+            self.switch.set_enabled(state.connected);
+            self.emergency.set_enabled(state.emergency);
+            self.sound.set_text(crate::i18n::tr(if state.sound {
                 "Выключить аудиоподключение"
             } else {
                 "Включить аудиоподключение"

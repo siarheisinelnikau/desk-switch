@@ -12,6 +12,7 @@ use std::{
 #[derive(Clone, Copy, PartialEq)]
 pub enum Kind {
     Input,
+    Monitor,
     AudioSend,
     AudioReceive,
     MicrophoneSend,
@@ -189,15 +190,15 @@ impl Worker {
                     self.version_error = if compatible {
                         None
                     } else {
-                        Some(format!(
-                            "Версии не совпадают: этот ПК {} (протокол {}), другой ПК {} (протокол {}). Обновите оба ПК.",
-                            crate::compatibility::VERSION,
-                            crate::compatibility::PROTOCOL,
-                            app.as_deref().unwrap_or("старый клиент"),
-                            protocol
-                                .map(|p| p.to_string())
-                                .unwrap_or_else(|| "неизвестен".into())
-                        ))
+                        Some(
+                            crate::compatibility::Mismatch {
+                                local: crate::compatibility::Version::current(),
+                                peer: app.zip(protocol).map(|(app, protocol)| {
+                                    crate::compatibility::Version { app, protocol }
+                                }),
+                            }
+                            .to_string(),
+                        )
                     };
                 }
                 Event::Input(status) => self.input_status = Some(status),
@@ -285,6 +286,33 @@ impl Drop for Worker {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn service_version_errors_use_the_same_localized_message_as_pairing() {
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        command.arg("--help");
+        let mut worker = Worker::spawn(Kind::Query, command).unwrap();
+        for (app, protocol) in [(Some("0.4.2".into()), Some(4)), (None, None)] {
+            worker.line(format!(
+                "@desk-switch {}",
+                serde_json::to_string(&Event::PeerVersion {
+                    app,
+                    protocol,
+                    compatible: false
+                })
+                .unwrap()
+            ));
+            let message = worker.version_error.as_ref().unwrap();
+            let english = crate::i18n::tr_language("en", message);
+            assert!(english.starts_with("Incompatible versions:"), "{english}");
+            assert!(
+                !english
+                    .chars()
+                    .any(|c| ('\u{0400}'..='\u{04ff}').contains(&c))
+            );
+            assert!(crate::i18n::tr_language("ru", message).starts_with("Несовместимые версии:"));
+        }
+    }
 
     #[test]
     fn statuses_cannot_be_forged_by_an_ordinary_log_line() {

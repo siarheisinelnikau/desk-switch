@@ -2,7 +2,11 @@ use super::Hardware;
 use crate::{audio::AudioDevice, platform::MonitorInfo};
 use anyhow::Result;
 use sha2::{Digest, Sha256};
-use std::{path::PathBuf, sync::mpsc, time::Duration};
+use std::{
+    path::PathBuf,
+    sync::{Arc, Mutex, mpsc},
+    time::Duration,
+};
 
 pub struct Snapshot {
     pub hardware: Hardware,
@@ -13,12 +17,13 @@ pub struct Snapshot {
 }
 pub struct Probe {
     stop: mpsc::Sender<()>,
-    results: mpsc::Receiver<Snapshot>,
+    results: Arc<Mutex<Option<Snapshot>>>,
 }
 impl Probe {
     pub fn start(ctx: eframe::egui::Context) -> Result<Self> {
         let (stop, cancel) = mpsc::channel();
-        let (send, results) = mpsc::sync_channel(1);
+        let results = Arc::new(Mutex::new(None));
+        let send = Arc::clone(&results);
         std::thread::Builder::new()
             .name("Desk Switch devices".into())
             .spawn(move || {
@@ -95,9 +100,9 @@ impl Probe {
                         displays: crate::platform::list_displays().unwrap_or_default(),
                         error,
                     };
-                    if send.try_send(snapshot).is_err() && cancel.try_recv().is_ok() {
-                        break;
-                    }
+                    // Replace a queued scan: a busy GUI must get the newest
+                    // hotplug state, never the first now-stale device list.
+                    *send.lock().unwrap() = Some(snapshot);
                     ctx.request_repaint();
                     if !matches!(
                         cancel.recv_timeout(Duration::from_secs(3)),
@@ -110,7 +115,7 @@ impl Probe {
         Ok(Self { stop, results })
     }
     pub fn poll(&self) -> Option<Snapshot> {
-        self.results.try_recv().ok()
+        self.results.lock().unwrap().take()
     }
 }
 impl Drop for Probe {
@@ -268,42 +273,191 @@ pub fn input_devices() -> Result<Vec<InputEndpoint>> {
     Ok(result)
 }
 
+#[cfg(any(windows, test))]
+fn full_windows_keyboard(keys: u32, function_keys: u32) -> bool {
+    // Media keys, macro pads and a mouse's auxiliary keyboard collection do
+    // not establish that a usable keyboard is attached.
+    keys >= 60 && function_keys >= 12
+}
+
+#[cfg(any(windows, test))]
+fn physical_windows_bus(instance: &str) -> bool {
+    let instance = instance.to_ascii_uppercase();
+    [
+        "USB\\",
+        "BTH\\",
+        "BTHENUM\\",
+        "BTHLEDEVICE\\",
+        "ACPI\\",
+        "VMBUS\\",
+    ]
+    .iter()
+    .any(|prefix| instance.starts_with(prefix))
+}
+
+#[cfg(windows)]
+fn physical_windows_device(interface: &str) -> bool {
+    use windows_sys::Win32::Devices::DeviceAndDriverInstallation::*;
+    let Some(instance) = interface
+        .strip_prefix("\\\\?\\")
+        .and_then(|s| s.split("#{").next())
+    else {
+        return false;
+    };
+    let instance = instance.replace('#', "\\");
+    let wide = instance.encode_utf16().chain(Some(0)).collect::<Vec<_>>();
+    let mut node = 0;
+    if unsafe { CM_Locate_DevNodeW(&mut node, wide.as_ptr(), CM_LOCATE_DEVNODE_NORMAL) }
+        != CR_SUCCESS
+    {
+        return false;
+    }
+    for _ in 0..24 {
+        let mut id = [0u16; 512];
+        if unsafe { CM_Get_Device_IDW(node, id.as_mut_ptr(), id.len() as u32, 0) } != CR_SUCCESS {
+            return false;
+        }
+        let end = id.iter().position(|&c| c == 0).unwrap_or(id.len());
+        if physical_windows_bus(&String::from_utf16_lossy(&id[..end])) {
+            return true;
+        }
+        let mut parent = 0;
+        if unsafe { CM_Get_Parent(&mut parent, node, 0) } != CR_SUCCESS {
+            return false;
+        }
+        node = parent;
+    }
+    false
+}
+
 #[cfg(windows)]
 pub fn input_devices() -> Result<Vec<InputEndpoint>> {
-    use windows_sys::Win32::UI::Input::*;
-    let mut count = 0;
+    use windows_sys::Win32::{
+        Foundation::{ERROR_INSUFFICIENT_BUFFER, GetLastError},
+        UI::Input::*,
+    };
     let size = std::mem::size_of::<RAWINPUTDEVICELIST>() as u32;
-    anyhow::ensure!(
-        unsafe { GetRawInputDeviceList(std::ptr::null_mut(), &mut count, size) } != u32::MAX,
-        "Не удалось проверить устройства ввода"
-    );
-    anyhow::ensure!(count <= 1024, "too many input devices");
-    let mut devices = vec![RAWINPUTDEVICELIST::default(); count as usize];
-    let length = unsafe { GetRawInputDeviceList(devices.as_mut_ptr(), &mut count, size) };
-    anyhow::ensure!(
-        length != u32::MAX,
-        "Список устройств изменился. Повторяем проверку."
-    );
-    devices.truncate(length as usize);
+    let mut devices = Vec::new();
+    // A device can arrive between the count and list queries. Retry the scan
+    // instead of publishing yesterday's inventory or failing the whole pair.
+    for attempt in 0..4 {
+        let mut count = 0;
+        anyhow::ensure!(
+            unsafe { GetRawInputDeviceList(std::ptr::null_mut(), &mut count, size) } != u32::MAX,
+            "Could not enumerate Windows input devices: {}",
+            std::io::Error::last_os_error()
+        );
+        anyhow::ensure!(count <= 1024, "too many input devices");
+        if count == 0 {
+            return Ok(Vec::new());
+        }
+        devices.resize(count as usize, RAWINPUTDEVICELIST::default());
+        let length = unsafe { GetRawInputDeviceList(devices.as_mut_ptr(), &mut count, size) };
+        if length != u32::MAX {
+            devices.truncate(length as usize);
+            break;
+        }
+        anyhow::ensure!(
+            unsafe { GetLastError() } == ERROR_INSUFFICIENT_BUFFER && attempt < 3,
+            "Could not refresh Windows input devices: {}",
+            std::io::Error::last_os_error()
+        );
+    }
+    let mut keyboards = Vec::new();
+    let mut mice = Vec::new();
+    for device in devices {
+        if !matches!(device.dwType, RIM_TYPEKEYBOARD | RIM_TYPEMOUSE) {
+            continue;
+        }
+        let mut info = RID_DEVICE_INFO {
+            cbSize: std::mem::size_of::<RID_DEVICE_INFO>() as u32,
+            ..Default::default()
+        };
+        let mut length = info.cbSize;
+        if unsafe {
+            GetRawInputDeviceInfoW(
+                device.hDevice,
+                RIDI_DEVICEINFO,
+                (&mut info as *mut RID_DEVICE_INFO).cast(),
+                &mut length,
+            )
+        } == u32::MAX
+            || info.dwType != device.dwType
+        {
+            continue;
+        }
+        let supported = unsafe {
+            match info.dwType {
+                RIM_TYPEKEYBOARD => full_windows_keyboard(
+                    info.Anonymous.keyboard.dwNumberOfKeysTotal,
+                    info.Anonymous.keyboard.dwNumberOfFunctionKeys,
+                ),
+                RIM_TYPEMOUSE => info.Anonymous.mouse.dwNumberOfButtons > 0,
+                _ => false,
+            }
+        };
+        if !supported {
+            continue;
+        }
+        let mut length = 0;
+        if unsafe {
+            GetRawInputDeviceInfoW(
+                device.hDevice,
+                RIDI_DEVICENAME,
+                std::ptr::null_mut(),
+                &mut length,
+            )
+        } == u32::MAX
+            || !(1..=2048).contains(&length)
+        {
+            continue;
+        }
+        let mut name = vec![0u16; length as usize];
+        if unsafe {
+            GetRawInputDeviceInfoW(
+                device.hDevice,
+                RIDI_DEVICENAME,
+                name.as_mut_ptr().cast(),
+                &mut length,
+            )
+        } == u32::MAX
+        {
+            continue;
+        }
+        let end = name.iter().position(|&c| c == 0).unwrap_or(name.len());
+        let name = String::from_utf16_lossy(&name[..end]);
+        if !physical_windows_device(&name) {
+            continue;
+        }
+        if info.dwType == RIM_TYPEKEYBOARD {
+            keyboards.push(name);
+        } else {
+            mice.push(name);
+        }
+    }
     let mut result = Vec::new();
-    for (kind, id, name) in [
+    for (names, id, label, keyboard) in [
         (
-            RIM_TYPEKEYBOARD,
+            keyboards,
             "windows-keyboards",
-            "All attached keyboards",
+            "Attached physical keyboards",
+            true,
         ),
-        (RIM_TYPEMOUSE, "windows-mice", "All attached mice"),
+        (mice, "windows-mice", "Attached physical mice", false),
     ] {
-        if devices.iter().any(|d| d.dwType == kind) {
+        if !names.is_empty() {
             result.push(InputEndpoint {
                 info: AudioDevice {
                     id: id.into(),
-                    name: name.into(),
+                    name: format!("{label} ({}): {}", names.len(), names.join(", "))
+                        .chars()
+                        .take(256)
+                        .collect(),
                     default: true,
                 },
                 path: PathBuf::new(),
-                keyboard: kind == RIM_TYPEKEYBOARD,
-                mouse: kind == RIM_TYPEMOUSE,
+                keyboard,
+                mouse: !keyboard,
             });
         }
     }
@@ -365,6 +519,19 @@ pub fn hardware(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn windows_consumer_controls_and_software_buses_do_not_supply_a_keyboard() {
+        assert!(!full_windows_keyboard(8, 0));
+        assert!(!full_windows_keyboard(32, 12));
+        assert!(full_windows_keyboard(101, 12));
+        assert!(full_windows_keyboard(256, 24));
+        for physical in ["USB\\VID_1234", "BTHENUM\\VID_1234", "ACPI\\PNP0303"] {
+            assert!(physical_windows_bus(physical));
+        }
+        for software in ["ROOT\\VHF", "SWD\\HID", "ROOT\\RDP_KBD", "HID\\VID_1234"] {
+            assert!(!physical_windows_bus(software));
+        }
+    }
     #[cfg(target_os = "linux")]
     #[test]
     fn sysfs_bitmaps_are_decoded_from_the_least_significant_word() {
