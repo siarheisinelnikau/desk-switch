@@ -13,11 +13,15 @@ struct PreviewApp {
     desktop: Desktop,
     frames: std::sync::Arc<std::sync::atomic::AtomicU64>,
     causes: std::sync::Arc<std::sync::Mutex<std::collections::BTreeMap<String, u64>>>,
+    capture: Option<Capture>,
 }
 
 impl eframe::App for PreviewApp {
     fn logic(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
         eframe::App::logic(&mut self.desktop, ctx, frame);
+        if let Some(capture) = &mut self.capture {
+            capture.tick(ctx, &mut self.desktop);
+        }
     }
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
         {
@@ -87,15 +91,28 @@ pub fn run(case: &str, dir: PathBuf) -> Result<()> {
     );
     std::fs::create_dir_all(&dir)?;
     let _lock = crate::config::lock(&dir, "desktop.lock")?;
+    let capture_path = std::env::var_os("DESK_SWITCH_CAPTURE_TO").map(PathBuf::from);
+    if let Some(path) = &capture_path {
+        anyhow::ensure!(path.is_absolute(), "capture output must be absolute");
+    }
+    let (capture_send, capture_result) = std::sync::mpsc::sync_channel(1);
+    let capturing = capture_path.is_some();
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("Desk Switch")
-            .with_inner_size(if std::env::var_os("EFRAME_SCREENSHOT_TO").is_some() {
-                [1080.0, 1000.0]
-            } else {
-                [1080.0, 760.0]
-            })
-            .with_min_inner_size([880.0, 650.0]),
+            .with_inner_size(
+                if capturing || std::env::var_os("EFRAME_SCREENSHOT_TO").is_some() {
+                    [1080.0, 1000.0]
+                } else {
+                    [1080.0, 760.0]
+                },
+            )
+            .with_min_inner_size([880.0, 650.0])
+            .with_icon(egui::IconData {
+                rgba: super::tray::icon_rgba(64),
+                width: 64,
+                height: 64,
+            }),
         ..Default::default()
     };
     let case = case.to_owned();
@@ -118,6 +135,16 @@ pub fn run(case: &str, dir: PathBuf) -> Result<()> {
             eprintln!("Desk Switch preview renderer: {backend}");
             let mut app = Desktop::new(cc.egui_ctx.clone(), dir, false);
             app.fixture(&case);
+            if let Ok(language) = std::env::var("DESK_SWITCH_PREVIEW_LANGUAGE") {
+                if !crate::i18n::LANGUAGES
+                    .iter()
+                    .any(|(code, _)| *code == language)
+                {
+                    return Err("Unknown preview language".into());
+                }
+                app.prefs.language = language;
+                crate::i18n::set_language(&app.prefs.language);
+            }
             let frames = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
             let causes =
                 std::sync::Arc::new(std::sync::Mutex::new(std::collections::BTreeMap::new()));
@@ -134,10 +161,23 @@ pub fn run(case: &str, dir: PathBuf) -> Result<()> {
                 desktop: app,
                 frames,
                 causes,
+                capture: capture_path.map(|output| Capture {
+                    output,
+                    since: std::time::Instant::now(),
+                    frames: 0,
+                    requested: false,
+                    result: Some(capture_send),
+                }),
             }))
         }),
     )
-    .map_err(|error| anyhow::anyhow!(error.to_string()))
+    .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+    if capturing {
+        capture_result
+            .recv_timeout(std::time::Duration::from_secs(1))?
+            .map_err(anyhow::Error::msg)?;
+    }
+    Ok(())
 }
 
 impl Desktop {
@@ -434,6 +474,9 @@ impl Desktop {
                 self.discovered.insert(peer.id.clone(), peer);
             }
         }
+        if case == "shared-devices" {
+            self.preview_scroll = 990.0;
+        }
         if ["settings", "light", "shared-devices"].contains(&case) {
             self.page = Page::Application;
         }
@@ -491,6 +534,63 @@ impl Desktop {
         // Let fonts/layout settle for bounded capture, then sleep until input.
         if ctx.cumulative_pass_nr() < 2 {
             ctx.request_repaint();
+        }
+    }
+}
+
+struct Capture {
+    output: PathBuf,
+    since: std::time::Instant,
+    frames: u32,
+    requested: bool,
+    result: Option<std::sync::mpsc::SyncSender<Result<(), String>>>,
+}
+impl Capture {
+    fn tick(&mut self, ctx: &egui::Context, desktop: &mut Desktop) {
+        if self.result.is_none() {
+            return;
+        }
+        self.frames += 1;
+        let screenshot = ctx.input(|input| {
+            input.raw.events.iter().find_map(|event| match event {
+                egui::Event::Screenshot { image, .. } => Some(image.clone()),
+                _ => None,
+            })
+        });
+        let outcome = if let Some(image) = screenshot {
+            let temporary = self.output.with_extension("capture.png");
+            Some(
+                image::save_buffer(
+                    &temporary,
+                    image.as_raw(),
+                    image.width() as u32,
+                    image.height() as u32,
+                    image::ColorType::Rgba8,
+                )
+                .map_err(anyhow::Error::from)
+                .and_then(|()| std::fs::rename(temporary, &self.output).map_err(Into::into))
+                .map_err(|error| error.to_string()),
+            )
+        } else if self.since.elapsed() > std::time::Duration::from_secs(10) || self.frames > 120 {
+            Some(Err(
+                "Native screenshot did not finish within its deadline".into()
+            ))
+        } else {
+            None
+        };
+        if let Some(outcome) = outcome {
+            let _ = self.result.take().unwrap().send(outcome);
+            desktop.quitting = true;
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        } else if self.frames >= 4
+            && self.since.elapsed() >= std::time::Duration::from_millis(250)
+            && !self.requested
+        {
+            self.requested = true;
+            ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot(Default::default()));
+            ctx.request_repaint();
+        } else {
+            ctx.request_repaint_after(std::time::Duration::from_millis(16));
         }
     }
 }

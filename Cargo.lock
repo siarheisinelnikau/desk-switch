@@ -697,6 +697,7 @@ dependencies = [
  "evdev",
  "flume",
  "futures-util",
+ "image",
  "ksni",
  "libc",
  "mdns-sd",
