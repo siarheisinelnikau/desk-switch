@@ -8,6 +8,7 @@ use std::{
     time::Duration,
 };
 
+#[derive(Clone, PartialEq)]
 pub struct Snapshot {
     pub hardware: Hardware,
     pub inputs: Vec<InputEndpoint>,
@@ -27,6 +28,7 @@ impl Probe {
         std::thread::Builder::new()
             .name("Desk Switch devices".into())
             .spawn(move || {
+                let mut previous = None;
                 loop {
                     if cancel.try_recv().is_ok() {
                         break;
@@ -102,8 +104,11 @@ impl Probe {
                     };
                     // Replace a queued scan: a busy GUI must get the newest
                     // hotplug state, never the first now-stale device list.
-                    *send.lock().unwrap() = Some(snapshot);
-                    ctx.request_repaint();
+                    if previous.as_ref() != Some(&snapshot) {
+                        previous = Some(snapshot.clone());
+                        *send.lock().unwrap() = Some(snapshot);
+                        ctx.request_repaint();
+                    }
                     if !matches!(
                         cancel.recv_timeout(Duration::from_secs(3)),
                         Err(mpsc::RecvTimeoutError::Timeout)
@@ -466,7 +471,7 @@ pub fn input_devices() -> Result<Vec<InputEndpoint>> {
     Ok(result)
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct InputEndpoint {
     pub info: AudioDevice,
     pub path: PathBuf,

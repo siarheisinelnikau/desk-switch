@@ -755,7 +755,7 @@ mod shared_tests {
     fn library_download_must_match_the_pinned_signed_artifact() {
         let config = shared_config(Path::new("/tmp/desk-switch-shared-fixture")).unwrap();
         let filename = if cfg!(windows) {
-            "desk-switch-windows-x86_64.exe"
+            "desk-switch-v99.0.0.exe"
         } else {
             "desk-switch-linux-x86_64.deb"
         };

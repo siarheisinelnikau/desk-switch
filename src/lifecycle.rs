@@ -40,6 +40,10 @@ pub enum Event {
         playing: bool,
         message: String,
     },
+    OutputLevel {
+        request: u64,
+        level: crate::workspace::AudioLevel,
+    },
 }
 
 struct Controls {

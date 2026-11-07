@@ -9,6 +9,68 @@ use anyhow::Result;
 use eframe::egui;
 use std::path::PathBuf;
 
+struct PreviewApp {
+    desktop: Desktop,
+    frames: std::sync::Arc<std::sync::atomic::AtomicU64>,
+}
+
+impl eframe::App for PreviewApp {
+    fn logic(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
+        eframe::App::logic(&mut self.desktop, ctx, frame);
+    }
+    fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
+        self.frames
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        eframe::App::ui(&mut self.desktop, ui, frame);
+    }
+}
+
+fn render_probe(
+    ctx: egui::Context,
+    frames: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    backend: String,
+    output: PathBuf,
+) -> Result<()> {
+    anyhow::ensure!(
+        output.is_absolute(),
+        "render probe needs an absolute output path"
+    );
+    std::thread::Builder::new()
+        .name("Desk Switch bounded render probe".into())
+        .spawn(move || {
+            use std::{
+                sync::atomic::Ordering,
+                time::{Duration, Instant},
+            };
+            let mut samples = Vec::new();
+            for state in ["visible-idle", "hidden", "restored-idle"] {
+                if state != "visible-idle" {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Visible(state != "hidden"));
+                }
+                // Each visibility transition may paint. Count the settled interval separately.
+                std::thread::sleep(Duration::from_secs(2));
+                let start = frames.load(Ordering::Relaxed);
+                let since = Instant::now();
+                std::thread::sleep(Duration::from_secs(6));
+                samples.push(serde_json::json!({
+                    "state": state, "seconds": since.elapsed().as_secs_f64(),
+                    "ui_frames": frames.load(Ordering::Relaxed) - start,
+                }));
+            }
+            let result = serde_json::to_string_pretty(&serde_json::json!({
+                "backend": backend, "fixture": true, "samples": samples,
+                "total_ui_frames": frames.load(Ordering::Relaxed),
+            }))
+            .map_err(anyhow::Error::from)
+            .and_then(|data| crate::config::write_atomic(&output, &data));
+            if let Err(error) = result {
+                eprintln!("Render probe failed: {error:#}");
+            }
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        })?;
+    Ok(())
+}
+
 pub fn run(case: &str, dir: PathBuf) -> Result<()> {
     anyhow::ensure!(
         dir.is_absolute(),
@@ -19,7 +81,11 @@ pub fn run(case: &str, dir: PathBuf) -> Result<()> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("Desk Switch")
-            .with_inner_size([1080.0, 760.0])
+            .with_inner_size(if std::env::var_os("EFRAME_SCREENSHOT_TO").is_some() {
+                [1080.0, 1000.0]
+            } else {
+                [1080.0, 760.0]
+            })
             .with_min_inner_size([880.0, 650.0]),
         ..Default::default()
     };
@@ -28,9 +94,29 @@ pub fn run(case: &str, dir: PathBuf) -> Result<()> {
         "Desk Switch",
         options,
         Box::new(move |cc| {
+            use eframe::glow::HasContext;
+            let backend = cc
+                .gl
+                .as_ref()
+                .map(|gl| unsafe {
+                    format!(
+                        "Glow / OpenGL: {} / {}",
+                        gl.get_parameter_string(eframe::glow::RENDERER),
+                        gl.get_parameter_string(eframe::glow::VERSION)
+                    )
+                })
+                .unwrap_or_else(|| "Unknown renderer".into());
+            eprintln!("Desk Switch preview renderer: {backend}");
             let mut app = Desktop::new(cc.egui_ctx.clone(), dir, false);
             app.fixture(&case);
-            Ok(Box::new(app))
+            let frames = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+            if let Some(output) = std::env::var_os("DESK_SWITCH_RENDER_PROBE") {
+                render_probe(cc.egui_ctx.clone(), frames.clone(), backend, output.into())?;
+            }
+            Ok(Box::new(PreviewApp {
+                desktop: app,
+                frames,
+            }))
         }),
     )
     .map_err(|error| anyhow::anyhow!(error.to_string()))
@@ -222,6 +308,7 @@ impl Desktop {
             node.hardware.microphone_receive = true;
         }
         if case == "shared-microphone" {
+            self.preview_scroll = 550.0;
             local.hardware.microphone_score = 80;
             local.hardware.microphone_name = "Headset Microphone".into();
             local.shared.microphone_enabled = true;
@@ -248,6 +335,19 @@ impl Desktop {
         local
             .shared
             .prepare_audio_levels(&local.key, &remote.key, output.as_deref());
+        if case == "shared-audio" {
+            self.preview_scroll = 550.0;
+            local
+                .shared
+                .audio_levels
+                .get_mut(&local.key)
+                .unwrap()
+                .volume = 90;
+        }
+        if case == "shared-identities-differ" {
+            remote.monitor.fingerprint = "preview-hdmi-edid".into();
+            local.monitor.fingerprint = "preview-displayport-edid".into();
+        }
         remote.shared = local.shared.clone();
         self.prefs.workspace.shared = local.shared.clone();
         self.pair.hardware = local.hardware.clone();
@@ -344,6 +444,9 @@ impl Desktop {
         if self.quitting {
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
         }
-        ctx.request_repaint_after(std::time::Duration::from_millis(200));
+        // Let fonts/layout settle for bounded capture, then sleep until input.
+        if ctx.cumulative_pass_nr() < 2 {
+            ctx.request_repaint();
+        }
     }
 }

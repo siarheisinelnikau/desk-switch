@@ -72,21 +72,48 @@ jobs:
           pattern: desk-switch-*
           path: artifacts
           merge-multiple: true
+      - name: Sign tested installers when the pinned update key is configured
+        id: signing
+        env:
+          DESK_SWITCH_UPDATE_SIGNING_KEY: ${{ secrets.DESK_SWITCH_UPDATE_SIGNING_KEY }}
+        run: python3 tools/ci_sign_release.py
       - name: Publish tested installers for signing
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           python3 - <<'PY'
-          import json, os, shutil, subprocess, tomllib
+          import hashlib, json, os, shutil, subprocess, sys, tomllib
           from pathlib import Path
+          sys.path.insert(0, 'tools')
+          from release_assets import asset_names
           version = tomllib.loads(Path('Cargo.toml').read_text())['package']['version']
           tag = f'v{version}'
           if os.environ['GITHUB_REF_TYPE'] == 'tag':
               assert os.environ['GITHUB_REF_NAME'] == tag
           else:
               assert json.loads(Path('release/publish-request.json').read_text())['tag'] == tag
-          Path('dist').mkdir()
-          for source, name in [('desk-switch.exe','desk-switch-windows-x86_64.exe'), ('desk-switch-linux-x86_64.deb','desk-switch-linux-x86_64.deb')]:
+          Path('dist').mkdir(exist_ok=True)
+          names = asset_names(version)
+          for source, name in [('desk-switch.exe',names['windows-x86_64']), ('desk-switch-linux-x86_64.deb',names['linux-x86_64-deb'])]:
               shutil.copy2(Path('artifacts')/source, Path('dist')/name)
-          subprocess.run(['gh','release','create',tag,*map(str,Path('dist').iterdir()),'--target',os.environ['GITHUB_SHA'],'--prerelease','--title',f'Desk Switch {tag}','--notes-file',f'release/notes/{version}.md'],check=True)
+          installers = [Path('dist')/name for name in names.values()]
+          existing = subprocess.run(['gh','api',f'repos/{os.environ["GITHUB_REPOSITORY"]}/releases/tags/{tag}'],capture_output=True,text=True)
+          if existing.returncode == 0:
+              info = json.loads(existing.stdout)
+              assets = {asset['name']:asset for asset in info['assets']}
+              assert set(assets) == set(names.values()), 'Existing release assets differ; do not overwrite them'
+              ref = json.loads(subprocess.check_output(['gh','api',f'repos/{os.environ["GITHUB_REPOSITORY"]}/git/ref/tags/{tag}'],text=True))
+              assert ref['object']['sha'] == os.environ['GITHUB_SHA'], 'Existing release belongs to another source commit'
+              for installer in installers:
+                  data = installer.read_bytes()
+                  asset = assets[installer.name]
+                  assert asset['size'] == len(data) and asset['digest'] == 'sha256:'+hashlib.sha256(data).hexdigest(), 'Existing installer differs; do not replace it'
+              print('The same tested release candidate already exists; keeping its installers')
+          else:
+              subprocess.run(['gh','release','create',tag,*map(str,installers),'--target',os.environ['GITHUB_SHA'],'--prerelease','--title',f'Desk Switch {tag}','--notes-file',f'release/notes/{version}.md'],check=True)
           PY
+      - name: Publish the verified signed stable release
+        if: steps.signing.outputs.ready == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 tools/promote_release.py
