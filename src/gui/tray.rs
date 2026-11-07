@@ -23,27 +23,49 @@ impl State {
 }
 
 pub fn icon_rgba(size: usize) -> Vec<u8> {
-    let mut rgba = vec![0; size * size * 4];
-    for y in 0..size {
-        for x in 0..size {
-            let fx = x as f32 / size as f32;
-            let fy = y as f32 / size as f32;
-            let background = (0.08..0.92).contains(&fx) && (0.08..0.92).contains(&fy);
-            let first = (0.19..0.57).contains(&fx) && (0.24..0.58).contains(&fy);
-            let second = (0.45..0.82).contains(&fx) && (0.43..0.76).contains(&fy);
-            let inner_first = (0.23..0.53).contains(&fx) && (0.28..0.53).contains(&fy);
-            let inner_second = (0.49..0.78).contains(&fx) && (0.47..0.71).contains(&fy);
-            let color = if (first && !inner_first) || (second && !inner_second) {
-                [255, 255, 255, 255]
-            } else if background {
-                [82, 99, 224, 255]
-            } else {
-                [0, 0, 0, 0]
-            };
-            rgba[(y * size + x) * 4..][..4].copy_from_slice(&color);
-        }
-    }
-    rgba
+    use std::sync::LazyLock;
+    static ICONS: LazyLock<std::collections::BTreeMap<usize, Vec<u8>>> = LazyLock::new(|| {
+        [
+            (
+                16,
+                include_bytes!("../../assets/icons/desk-switch-16.png").as_slice(),
+            ),
+            (
+                20,
+                include_bytes!("../../assets/icons/desk-switch-20.png").as_slice(),
+            ),
+            (
+                24,
+                include_bytes!("../../assets/icons/desk-switch-24.png").as_slice(),
+            ),
+            (
+                32,
+                include_bytes!("../../assets/icons/desk-switch-32.png").as_slice(),
+            ),
+            (
+                48,
+                include_bytes!("../../assets/icons/desk-switch-48.png").as_slice(),
+            ),
+            (
+                64,
+                include_bytes!("../../assets/icons/desk-switch-64.png").as_slice(),
+            ),
+        ]
+        .into_iter()
+        .map(|(size, png)| {
+            (
+                size,
+                eframe::icon_data::from_png_bytes(png)
+                    .expect("valid application icon")
+                    .rgba,
+            )
+        })
+        .collect()
+    });
+    ICONS
+        .get(&size)
+        .expect("supported native icon size")
+        .clone()
 }
 
 fn dispatch(sender: &Sender<Action>, ctx: &egui::Context, action: Action) {
@@ -291,7 +313,17 @@ mod native {
                     dispatch(&sender, &ctx, Action::Show);
                 }
             }));
-            let icon = Icon::from_rgba(icon_rgba(32), 32, 32)?;
+            let metric = unsafe {
+                windows_sys::Win32::UI::WindowsAndMessaging::GetSystemMetrics(
+                    windows_sys::Win32::UI::WindowsAndMessaging::SM_CXSMICON,
+                )
+            }
+            .max(16) as usize;
+            let size = [16usize, 20, 24, 32, 48, 64]
+                .into_iter()
+                .min_by_key(|size| size.abs_diff(metric))
+                .unwrap();
+            let icon = Icon::from_rgba(icon_rgba(size), size as u32, size as u32)?;
             let icon = TrayIconBuilder::new()
                 .with_menu(Box::new(menu))
                 .with_menu_on_left_click(true)
