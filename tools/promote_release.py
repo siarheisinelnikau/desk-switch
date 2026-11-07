@@ -13,6 +13,22 @@ from prepare_release import checked_binary
 
 ROOT = Path(__file__).resolve().parents[1]
 REPOSITORY = "siarheisinelnikau/desk-switch"
+SIGNED_START = "<!-- desk-switch-update:start -->"
+SIGNED_END = "<!-- desk-switch-update:end -->"
+
+
+def signed_notes(body, manifest, fallback):
+    """Preserve release notes, attach missing metadata, reject a conflicting block."""
+    expected = json.loads(manifest)
+    if SIGNED_START in body or SIGNED_END in body:
+        assert body.count(SIGNED_START) == body.count(SIGNED_END) == 1, "Malformed signed update block"
+        before, rest = body.split(SIGNED_START, 1)
+        signed, after = rest.split(SIGNED_END, 1)
+        assert SIGNED_END not in before and SIGNED_START not in after, "Malformed signed update block"
+        assert json.loads(signed.strip()) == expected, "A different signed update is already attached"
+        return body
+    block = SIGNED_START + "\n" + manifest.strip() + "\n" + SIGNED_END
+    return (body.strip() or fallback.strip()) + "\n\n" + block + "\n"
 
 
 def main():
@@ -52,16 +68,18 @@ def main():
                 assert subprocess.check_output(["dpkg-deb", "--field", str(path), "Package"], text=True).strip() == "desk-switch"
                 assert subprocess.check_output(["dpkg-deb", "--field", str(path), "Version"], text=True).strip() == version
                 assert subprocess.check_output(["dpkg-deb", "--field", str(path), "Architecture"], text=True).strip() == "amd64"
-        update = work / "update.json"
-        update.write_bytes(manifest.read_bytes())
-        signed_block = "<!-- desk-switch-update:start -->\n" + update.read_text().strip() + "\n<!-- desk-switch-update:end -->"
-        if not info["isPrerelease"]:
-            assert signed_block in info["body"]
-            print("Already published with this signed metadata")
-            return
         notes = work / "notes.md"
-        notes.write_text((ROOT / f"release/notes/{version}.md").read_text().strip() + "\n\n" + signed_block + "\n")
+        # A maintainer may have cleared Prerelease manually before this job.
+        # The signature, both binaries and package metadata were still verified
+        # above. Repair the missing envelope without changing the release files.
+        expected_notes = signed_notes(info["body"], manifest.read_text(), (ROOT / f"release/notes/{version}.md").read_text())
+        notes.write_text(expected_notes)
         subprocess.run(["gh", "release", "edit", tag, "--repo", REPOSITORY, "--notes-file", str(notes), "--prerelease=false", "--latest"], check=True)
+        published = json.loads(subprocess.check_output(["gh", "release", "view", tag, "--repo", REPOSITORY, "--json", "isPrerelease,body"], text=True))
+        assert not published["isPrerelease"]
+        assert signed_notes(published["body"], manifest.read_text(), "") == published["body"], "Signed metadata was not saved"
+        latest = json.loads(subprocess.check_output(["gh", "api", f"repos/{REPOSITORY}/releases/latest"], text=True))
+        assert latest["tag_name"] == tag, "The signed release is not the update channel's latest release"
         print(f"Published signed stable {tag}: .deb + .exe only")
 
 
