@@ -25,6 +25,13 @@ On 2026-11-07, the `release` environment and its ref restrictions were configure
 
 ## Release behavior
 
+### Release from any computer
+
+1. Commit a new package version in `Cargo.toml` and `Cargo.lock`, matching `release/publish-request.json` and `release/notes/VERSION.md`. Updating the request on `main` is the existing automatic release trigger.
+2. For a manual run, open **Actions → Release → Run workflow** in GitHub and select `main`. Repository Actions access is required; no local SDK, private key, or CLI login is needed.
+3. Leave **Publish a new version after build and signing checks** unchecked for a build-and-sign verification. The installers and public signed metadata are available as Actions artifacts; no release is created or changed.
+4. Enable that option to publish a prepared new version. The workflow builds, signs, verifies the public installers, and promotes stable. Tags and previously published versions are preserved; prepare a new version instead of replacing an existing one.
+
 Builds run without signing credentials on GitHub-hosted runners. The signing job downloads installers from the same workflow run, verifies versions, embedded build stamps, Debian metadata, and the pinned public key using `tools/prepare_release.py`, then signs the manifest. Missing or mismatched keys stop the job. The private PEM is written with owner-only permissions under `RUNNER_TEMP`, removed on exit, and never included in artifacts. Actions in this workflow are pinned to verified full commit SHAs, and checkout does not retain Git credentials.
 
 The public `update.json` is retained as the `desk-switch-signed-metadata` artifact for 30 days. The publication job receives it without receiving the key, publishes the tested installers, and runs the existing stable-promotion verifier. That verifier checks the signature, public installers, and package metadata before attaching the signed envelope to release notes and marking stable. Only the two installers are release assets. Local signing with `tools/prepare_release.py` remains available; committing that metadata as `release/manifests/VERSION.json` still requests the separate promotion workflow. Do not overwrite existing tags or releases, or rerun an already published version to change its assets. The workflow retains the versioned EXE naming and idempotent candidate checks introduced by the concurrent 0.4.8 release change.
