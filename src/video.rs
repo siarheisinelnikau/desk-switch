@@ -174,6 +174,7 @@ impl VideoWorker {
     }
 }
 
+#[cfg(any(windows, target_os = "linux", test))]
 pub fn input_codes(capabilities: &str) -> Vec<u16> {
     let mut remaining = capabilities;
     while let Some((prefix, tail)) = remaining.split_once("60") {

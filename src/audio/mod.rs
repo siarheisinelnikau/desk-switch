@@ -141,7 +141,7 @@ fn list() -> Result<()> {
                 device.name
             );
         }
-        return Ok(());
+        Ok(())
     }
     #[cfg(target_os = "linux")]
     crate::runtime()?.block_on(linux::list())
