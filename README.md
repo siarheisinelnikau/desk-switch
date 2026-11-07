@@ -6,13 +6,13 @@ Two computers. One workspace. Share a keyboard, mouse, system audio and micropho
 
 ## Install
 
-Get the **same version on both PCs** from [Releases](https://github.com/siarheisinelnikau/desk-switch/releases/latest). New releases contain exactly two downloads:
+Get the **same version on both PCs** from [Releases](https://github.com/siarheisinelnikau/desk-switch/releases). New releases contain exactly two downloads:
 
-- **Ubuntu 24.04/26.04 x86-64:** `desk-switch-linux-x86_64.deb`.
-- **Windows x86-64:** `desk-switch-v0.4.8.exe`.
+- **Ubuntu 24.04/26.04 x86-64:** [desk-switch-v0.4.8-linux.deb](https://github.com/siarheisinelnikau/desk-switch/releases/download/v0.4.8/desk-switch-v0.4.8-linux.deb).
+- **Windows x86-64:** [desk-switch-v0.4.8-windows.exe](https://github.com/siarheisinelnikau/desk-switch/releases/download/v0.4.8/desk-switch-v0.4.8-windows.exe).
 
 ```sh
-sudo apt install ./desk-switch-linux-x86_64.deb
+sudo apt install ./desk-switch-v0.4.8-linux.deb
 ```
 
 Open **Desk Switch** from Ubuntu's application menu or run the Windows executable. New profiles use **English** and **Dark**. Existing language/theme choices are preserved. Russian, German, French, Spanish and Italian are also available. Language and theme changes apply immediately to the window and tray.
@@ -112,7 +112,7 @@ cargo test --locked
 python3 tools/test_input_access.py
 cargo build --locked --release
 python3 tools/package_deb.py --binary target/release/desk-switch --out dist
-python3 tools/verify_deb.py dist/desk-switch-linux-x86_64.deb
+python3 tools/verify_deb.py dist/desk-switch-v0.4.8-linux.deb
 ```
 
 Tests use synthetic input/audio/monitor devices and loopback peer connections. They cover approval/rejection, automatic key exchange, manual IP connections, pin protection, reconnection from either side, simultaneous requests, paused-GUI event delivery, shared decisions, capability changes, monitor mappings, version rejection, signed metadata and input release. GUI screenshots use isolated fixture PCs and never switch a real monitor or grab input. Windows captures use a bounded native render-and-exit process; Linux captures use a private Xvfb display and private D-Bus. The portal regression test (`/usr/bin/python3 tools/test_portal_restore.py --binary target/debug/desk-switch`, requiring `python3-gi` and `dbus`) creates its own D-Bus and fake portal to verify persistent consent, token rotation and cancellation without touching the compositor. Native CI builds/tests on Ubuntu and Windows. `dbus-run-session -- python3 tools/test_microphone_pipewire.py` (PipeWire and WirePlumber 0.5+) validates microphone PCM forwarding, live gain and virtual-input/capture cleanup on a separate server using a synthetic tone, with hardware monitoring disabled. Real two-PC multicast, interactive Windows, VB-CABLE and monitor firmware still need target-machine validation. Use **Diagnostics → Copy diagnostics** to capture both PC states and recent service messages without private keys. The explicit CLI remains available through `--help`.
