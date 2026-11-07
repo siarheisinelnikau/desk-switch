@@ -6,6 +6,12 @@ on:
     paths: [release/publish-request.json]
     tags: ["v*"]
   workflow_dispatch:
+    inputs:
+      publish:
+        description: Publish a new version after build and signing checks
+        type: boolean
+        required: true
+        default: false
 
 permissions:
   contents: read
@@ -92,6 +98,7 @@ jobs:
           retention-days: 30
 
   publish:
+    if: github.event_name != 'workflow_dispatch' || inputs.publish
     needs: [build, sign]
     runs-on: ubuntu-24.04
     permissions:
