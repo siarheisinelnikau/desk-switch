@@ -123,7 +123,7 @@ pub fn run(
     }
 }
 
-#[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
+#[derive(Clone, Debug, PartialEq, serde::Deserialize, serde::Serialize)]
 pub struct MonitorInfo {
     pub id: String,
     pub name: String,

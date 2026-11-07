@@ -397,5 +397,12 @@
   "The other PC did not complete the paired update. The verified download is kept for retry.": "Другой ПК не завершил обновление пары. Проверенный файл сохранён для повторной попытки.",
   "Switch back using Desk Switch on the other PC.": "Для возврата используйте Desk Switch на другом ПК.",
   "Switch keyboard and mouse only for setup": "Передать клавиатуру и мышь для настройки",
-  "Select the other PC's input in the monitor menu, then remember its connection there. Return input with F11; use the monitor menu to return the picture during this first setup.": "Выберите вход другого ПК в меню монитора и сохраните подключение в его приложении. Верните ввод клавишей F11; при этой первой настройке верните картинку через меню монитора."
+  "Select the other PC's input in the monitor menu, then remember its connection there. Return input with F11; use the monitor menu to return the picture during this first setup.": "Выберите вход другого ПК в меню монитора и сохраните подключение в его приложении. Верните ввод клавишей F11; при этой первой настройке верните картинку через меню монитора.",
+  "System volume of the shared output": "Системная громкость общего выхода",
+  "Relative to the shared output's system volume": "Относительно системной громкости общего выхода",
+  "The listening PC controls system volume. The other PC is relative to it: 90% × 50% = 45%.": "ПК с наушниками управляет системной громкостью. Уровень другого ПК — относительно неё: 90% × 50% = 45%.",
+  "Shared monitor is off": "Общий монитор выключен",
+  "Set up this PC": "Настройте этот ПК",
+  "Set up the other PC": "Настройте второй ПК",
+  "Same input on both PCs": "На обоих ПК один вход"
 }

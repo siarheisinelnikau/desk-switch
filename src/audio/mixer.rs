@@ -220,6 +220,7 @@ impl Controller {
 }
 
 enum Command {
+    #[cfg(test)]
     Set(AudioLevel),
     Stop,
 }
@@ -235,7 +236,7 @@ impl NativeMixer {
     }
     fn start_with<B: Backend + 'static>(
         dir: PathBuf,
-        mut level: AudioLevel,
+        level: AudioLevel,
         open: impl FnOnce() -> Result<B> + Send + 'static,
     ) -> Result<Self> {
         let (commands, receive) = mpsc::channel();
@@ -244,6 +245,8 @@ impl NativeMixer {
         let thread = std::thread::Builder::new()
             .name("Desk Switch native audio mix".into())
             .spawn(move || {
+                #[cfg(test)]
+                let mut level = level;
                 let run = || -> Result<()> {
                     let mut backend = open()?;
                     let mut controller = Controller::load(&dir)?;
@@ -256,6 +259,7 @@ impl NativeMixer {
                                 let _ = ready.send(());
                             }
                             match receive.recv_timeout(Duration::from_millis(300)) {
+                                #[cfg(test)]
                                 Ok(Command::Set(value)) => level = value,
                                 Ok(Command::Stop) | Err(mpsc::RecvTimeoutError::Disconnected) => {
                                     break;
@@ -277,7 +281,8 @@ impl NativeMixer {
             thread: Some(thread),
         })
     }
-    pub fn set(&self, level: AudioLevel) -> Result<()> {
+    #[cfg(test)]
+    fn set(&self, level: AudioLevel) -> Result<()> {
         self.commands
             .send(Command::Set(level))
             .context("native audio mixer stopped")
