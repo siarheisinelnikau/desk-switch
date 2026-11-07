@@ -141,7 +141,7 @@ mod native {
         }
         fn watcher_offline(&self, _: ksni::OfflineReason) -> bool {
             self.available.store(false, Ordering::Relaxed);
-            self.ctx.request_repaint();
+            self.ctx.request_repaint_of(eframe::egui::ViewportId::ROOT);
             true
         }
         fn menu(&self) -> Vec<ksni::MenuItem<Self>> {

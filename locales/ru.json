@@ -554,5 +554,12 @@
   "Another update operation is already in progress.": "Другая операция обновления уже выполняется.",
   "Reconnect the selected computer before updating it.": "Перед обновлением восстановите соединение с выбранным компьютером.",
   "Paired installation requires the installed application edition.": "Для совместной установки нужна установленная версия приложения.",
-  "Version {version} is available. Choose Download and install to update.": "Доступна версия {version}. Нажмите «Скачать и установить» для обновления."
+  "Version {version} is available. Choose Download and install to update.": "Доступна версия {version}. Нажмите «Скачать и установить» для обновления.",
+  "Diagnostics": "Диагностика",
+  "Protocol:": "Протокол:",
+  "No recent service messages.": "Пока нет сообщений служб.",
+  "Recent service messages from every computer in this workspace.": "Последние сообщения служб со всех компьютеров рабочего места.",
+  "The copied report includes all computers and workspace settings. Offline computers show the last received diagnostics.": "Отчёт включает все компьютеры и настройки рабочего места. Для отключённых компьютеров показана последняя полученная диагностика.",
+  "Select a monitor": "Выберите монитор",
+  "Microphone level": "Уровень микрофона"
 }

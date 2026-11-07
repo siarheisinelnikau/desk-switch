@@ -124,7 +124,7 @@ impl Discovery {
                     };
                     if let Some(update) = update {
                         match send.try_send(update) {
-                            Ok(()) => ctx.request_repaint(),
+                            Ok(()) => ctx.request_repaint_of(eframe::egui::ViewportId::ROOT),
                             Err(mpsc::TrySendError::Disconnected(_)) => break,
                             Err(mpsc::TrySendError::Full(_)) => {}
                         }
