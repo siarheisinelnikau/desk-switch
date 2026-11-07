@@ -126,10 +126,18 @@ impl Desktop {
             local.input = None;
             remote.input = None;
         }
-        if case == "shared-setup" {
+        if case == "shared-setup" || case == "shared-borrowed-setup" {
             local.monitor.enabled = false;
             local.monitor.input = None;
             self.prefs.workspace.monitor = local.monitor.clone();
+        }
+        if case == "shared-borrowed-setup" {
+            local.hardware.keyboard = false;
+            local.hardware.mouse = false;
+            remote.hardware.keyboard = true;
+            remote.hardware.mouse = true;
+            local.input = Some(InputStatus::Here);
+            remote.input = Some(InputStatus::Peer);
         }
         if case == "shared-denied" {
             local.input = None;
@@ -257,6 +265,25 @@ impl Desktop {
         }
         if ["settings", "light", "shared-devices"].contains(&case) {
             self.page = Page::Application;
+        }
+        for (keyboard, devices) in [
+            (true, &local.devices.keyboards),
+            (false, &local.devices.mice),
+        ] {
+            for device in devices {
+                self.pair
+                    .inputs
+                    .push(crate::workspace::hardware::InputEndpoint {
+                        info: device.clone(),
+                        path: std::path::PathBuf::from(if keyboard {
+                            "/dev/input/fixture-keyboard"
+                        } else {
+                            "/dev/input/fixture-mouse"
+                        }),
+                        keyboard,
+                        mouse: !keyboard,
+                    });
+            }
         }
         self.preview = Some(local);
     }

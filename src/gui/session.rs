@@ -23,7 +23,7 @@ pub(super) struct Pair {
     probe: Option<Probe>,
     pub remote: Option<Node>,
     pub hardware: Hardware,
-    inputs: Vec<workspace::hardware::InputEndpoint>,
+    pub(super) inputs: Vec<workspace::hardware::InputEndpoint>,
     pub devices: workspace::devices::Inventory,
     pub microphone_failed: bool,
     microphone_profile: String,
@@ -104,6 +104,21 @@ impl Pair {
 }
 
 impl Desktop {
+    #[cfg(target_os = "linux")]
+    pub(super) fn input_permission_paths(&self) -> Vec<String> {
+        let choices = self.prefs.workspace.shared.devices_for(&self.public_key);
+        self.pair
+            .inputs
+            .iter()
+            .filter(|d| {
+                d.keyboard && choices.keyboard.as_ref().is_none_or(|id| id == &d.info.id)
+                    || d.mouse && choices.mouse.as_ref().is_none_or(|id| id == &d.info.id)
+            })
+            .take(16)
+            .map(|d| d.path.to_string_lossy().into_owned())
+            .collect()
+    }
+
     pub(super) fn local_node(&self) -> Node {
         #[cfg(debug_assertions)]
         if let Some(node) = &self.preview {
@@ -299,7 +314,9 @@ impl Desktop {
                 monitor.id = found.id.clone();
                 monitor.name = found.name.clone();
                 monitor.fingerprint = found.fingerprint.clone();
-                self.pair.monitor_setup_pending = monitor.enabled;
+                if monitor.enabled {
+                    self.remember_monitor();
+                }
             }
         }
         if self.pair.monitor_setup_pending {
@@ -427,6 +444,14 @@ impl Desktop {
                 .remote
                 .as_ref()
                 .is_some_and(|r| r.hardware.known && !node.ack.is_empty() && node.ack == r.ack);
+        if self
+            .prefs
+            .workspace
+            .apply_pending_monitor(self.monitor_setup_is_local())
+        {
+            let _ = self.prefs.save(&self.dir);
+            self.pair.synced = false;
+        }
         if self.pair.synced {
             self.pair.reconnect.restored();
         } else if self.pair.reconnect.expired(Instant::now()) {
@@ -589,7 +614,14 @@ impl Desktop {
     }
 
     pub(super) fn remember_monitor(&mut self) {
+        if !self.prefs.workspace.monitor.enabled {
+            self.prefs.workspace.pending_monitor = None;
+        }
         if self.prefs.workspace.monitor.enabled && !self.prefs.workspace.monitor.id.is_empty() {
+            if !self.monitor_setup_is_local() && self.can_remember_monitor() {
+                self.scan(QueryKind::Monitors);
+                return;
+            }
             self.prefs.workspace.monitor.input = None;
             self.pair.monitor_input = None;
             self.pair.monitor_setup_pending = true;
@@ -597,6 +629,22 @@ impl Desktop {
         if let Err(e) = self.prefs.save(&self.dir) {
             self.notice = Some((e.to_string(), true));
         }
+    }
+
+    pub(super) fn monitor_setup_is_local(&self) -> bool {
+        let local = self.local_node();
+        self.pair.remote.as_ref().is_none_or(|remote| {
+            !Plan::input_in_use(&local, remote)
+                && Plan::can_disable(&local, remote, true)
+                && Plan::can_disable(&local, remote, false)
+        })
+    }
+
+    pub(super) fn can_remember_monitor(&self) -> bool {
+        self.monitor_setup_is_local()
+            || self.prefs.workspace.monitor.input.is_none()
+                && !self.monitor_running()
+                && self.input.as_ref().is_none_or(|w| !w.monitoring)
     }
 
     pub(super) fn retry_devices(&mut self) {

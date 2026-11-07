@@ -25,6 +25,8 @@ pub struct NativeSink {
     keys: BTreeSet<u16>,
     buttons: BTreeSet<u16>,
     inject: fn(Input) -> Result<()>,
+    pointer: Option<super::win_cursor::Overlay>,
+    pointer_failed: bool,
 }
 
 impl NativeSink {
@@ -51,6 +53,8 @@ impl NativeSink {
             keys: BTreeSet::new(),
             buttons: BTreeSet::new(),
             inject,
+            pointer: None,
+            pointer_failed: false,
         })
     }
 
@@ -76,6 +80,25 @@ impl NativeSink {
             }
         }
         Ok(())
+    }
+
+    fn receiving_mouse(&mut self) {
+        // Unit tests use an injected sink and must never create a native window.
+        if cfg!(test) {
+            return;
+        }
+        if self.pointer.is_none() && !self.pointer_failed {
+            match super::win_cursor::Overlay::start() {
+                Ok(pointer) => self.pointer = Some(pointer),
+                Err(error) => {
+                    self.pointer_failed = true;
+                    eprintln!("Windows pointer fallback could not start: {error:#}");
+                }
+            }
+        }
+        if let Some(pointer) = &self.pointer {
+            pointer.active(true);
+        }
     }
 }
 
@@ -188,6 +211,7 @@ impl Sink for NativeSink {
         }
         self.return_edge = position.is_some();
         self.active = true;
+        self.pointer_failed = false;
         Ok(())
     }
 
@@ -247,10 +271,16 @@ impl Sink for NativeSink {
             }
             _ => (self.inject)(event)?,
         }
+        if !matches!(event, Input::Key { .. }) {
+            self.receiving_mouse();
+        }
         Ok(None)
     }
 
     fn release(&mut self) -> Result<()> {
+        if let Some(pointer) = &self.pointer {
+            pointer.active(false);
+        }
         let mut result = Ok(());
         for code in std::mem::take(&mut self.keys) {
             result = result.and((self.inject)(Input::Key { code, down: false }));
@@ -299,6 +329,8 @@ mod tests {
             keys: BTreeSet::new(),
             buttons: BTreeSet::new(),
             inject: fake,
+            pointer: None,
+            pointer_failed: false,
         };
         sink.prepare(None, Mode::Input).unwrap();
         sink.activate(None, Mode::Input).unwrap();
