@@ -72,6 +72,8 @@ def main():
             "NSHighResolutionCapable": True,
             "NSMicrophoneUsageDescription": "Share the selected microphone with computers you paired in Desk Switch.",
             "NSAudioCaptureUsageDescription": "Share system audio with computers you paired in Desk Switch.",
+            "NSLocalNetworkUsageDescription": "Find your computers and securely share input, audio, clipboard and settings on your local network.",
+            "NSBonjourServices": ["_desk-switch._tcp"],
             "NSHumanReadableCopyright": "Copyright Desk Switch contributors. MIT license.",
         }
         (contents / "Info.plist").write_bytes(plistlib.dumps(info, fmt=plistlib.FMT_XML, sort_keys=True))
