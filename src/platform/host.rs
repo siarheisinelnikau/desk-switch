@@ -170,7 +170,7 @@ impl Handoff {
                     match command {
                         Ok(crate::lifecycle::Command::Switch) => io.cursor.request_toggle().await?,
                         Ok(crate::lifecycle::Command::Emergency) => io.gate.emergency(),
-                        Err(_) => {}
+                        Ok(crate::lifecycle::Command::MicrophoneVolume(_)) | Err(_) => {}
                     }
                     continue;
                 }

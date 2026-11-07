@@ -119,7 +119,7 @@ fn open_devices(paths: &[PathBuf]) -> Result<Vec<Device>> {
     Ok(devices)
 }
 
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 enum Owner {
     Local,
     Suppressed,
@@ -132,6 +132,7 @@ struct Routing {
     hotkeys: BTreeSet<(usize, u16)>,
     cooldown: Instant,
     sharing: crate::config::InputSharing,
+    device_sharing: Vec<crate::config::InputSharing>,
 }
 
 impl Routing {
@@ -142,7 +143,14 @@ impl Routing {
             hotkeys: BTreeSet::new(),
             cooldown: Instant::now(),
             sharing,
+            device_sharing: Vec::new(),
         }
+    }
+    fn sharing_for(&self, device: usize) -> crate::config::InputSharing {
+        self.device_sharing
+            .get(device)
+            .copied()
+            .unwrap_or(self.sharing)
     }
 
     fn toggle(&self) -> Option<Control> {
@@ -189,7 +197,7 @@ impl Routing {
             return (None, None);
         }
         let (token, route) = self.gate.current();
-        let route = if self.sharing.allows(input) {
+        let route = if self.sharing_for(device).allows(input) {
             route
         } else {
             Route::Local
@@ -278,10 +286,23 @@ pub async fn run(
     identity: Identity,
     peer: Key,
     edge: Option<Edge>,
-    sharing: crate::config::InputSharing,
-    paths: Vec<PathBuf>,
+    capture_settings: crate::config::CaptureSettings,
     video: Option<(Inputs, VideoWorker)>,
 ) -> Result<()> {
+    let paths = if capture_settings.devices.is_empty() {
+        crate::workspace::hardware::inputs()?.2
+    } else {
+        capture_settings.devices.clone()
+    };
+    let masks = paths
+        .iter()
+        .map(|path| crate::config::InputSharing {
+            keyboard: capture_settings.sharing.keyboard
+                && capture_settings.keyboard.as_ref().is_none_or(|p| p == path),
+            mouse: capture_settings.sharing.mouse
+                && capture_settings.mouse.as_ref().is_none_or(|p| p == path),
+        })
+        .collect::<Vec<_>>();
     let mut devices = open_devices(&paths)?;
     let mut portal = Portal::open(edge.clone()).await?;
     let result = async {
@@ -318,7 +339,7 @@ pub async fn run(
         println!("Ubuntu host active. F12 switches, F11 restores local input. Closing the process releases the selected devices.");
         tokio::select! {
             result = coordinator => result,
-            result = capture(&mut portal, (streams, high_resolution), gate, control_send, event_send, cursor_receive, sharing) => result,
+            result = capture(&mut portal, (streams, high_resolution), gate, control_send, event_send, cursor_receive, masks) => result,
         }
     }.await;
     // Drop grabs before awaiting D-Bus cleanup, including failures halfway through setup.
@@ -335,9 +356,14 @@ async fn capture(
     controls: mpsc::Sender<Control>,
     events: mpsc::Sender<(u64, Input)>,
     mut cursor: mpsc::Receiver<CursorCommand>,
-    sharing: crate::config::InputSharing,
+    masks: Vec<crate::config::InputSharing>,
 ) -> Result<()> {
+    let sharing = crate::config::InputSharing {
+        keyboard: masks.iter().all(|m| m.keyboard),
+        mouse: masks.iter().all(|m| m.mouse),
+    };
     let mut routing = Routing::new(Arc::clone(&gate), sharing);
+    routing.device_sharing = masks;
     let mut motion = (0..streams.len())
         .map(|_| Motion::default())
         .collect::<Vec<_>>();
@@ -437,7 +463,7 @@ async fn capture(
                     EventSummary::RelativeAxis(_, code, value) => motion[device].axis(code, value, high_resolution[device]),
                     EventSummary::Synchronization(_, SynchronizationCode::SYN_REPORT, _) => {
                         let (token, active) = gate.current();
-                        let owner = match if sharing.mouse { active } else { Route::Local } {
+                        let owner = match if routing.sharing_for(device).mouse { active } else { Route::Local } {
                             Route::Local => Owner::Local,
                             Route::Hold => Owner::Suppressed,
                             Route::Remote => Owner::Remote(token),
@@ -496,6 +522,27 @@ fn route(
 mod tests {
     use super::*;
 
+    #[test]
+    fn composite_interfaces_share_only_the_selected_device_kind() {
+        let gate = Arc::new(Gate::new());
+        let token = gate.begin().unwrap();
+        assert!(gate.forward(token));
+        let mut routing = Routing::new(gate, crate::config::InputSharing::default());
+        routing.device_sharing = vec![
+            crate::config::InputSharing {
+                keyboard: true,
+                mouse: false,
+            },
+            crate::config::InputSharing {
+                keyboard: false,
+                mouse: true,
+            },
+        ];
+        assert_eq!(routing.key(0, 30, 1).1.unwrap().0, Owner::Remote(token));
+        assert_eq!(routing.key(1, 31, 1).1.unwrap().0, Owner::Local);
+        assert_eq!(routing.key(0, 272, 1).1.unwrap().0, Owner::Local);
+        assert_eq!(routing.key(1, 273, 1).1.unwrap().0, Owner::Remote(token));
+    }
     #[test]
     fn emergency_discards_remote_held_keys_until_their_physical_release() {
         let gate = Arc::new(Gate::new());

@@ -1,0 +1,71 @@
+#!/usr/bin/python3 -I
+"""Grant the invoking desktop user read access to selected physical input nodes."""
+import os
+from pathlib import Path
+import re
+import stat
+import subprocess
+import sys
+
+
+def input_path(value):
+    path = Path(value).resolve(strict=True)
+    if not re.fullmatch(r"/dev/input/event[0-9]+", str(path)):
+        raise ValueError("Only /dev/input/event devices can be authorized")
+    return path
+
+
+def supported(path, metadata):
+    if not stat.S_ISCHR(metadata.st_mode) or metadata.st_uid != 0:
+        raise ValueError("The selected input must be a root-owned character device")
+    major, minor = os.major(metadata.st_rdev), os.minor(metadata.st_rdev)
+    if major != 13 or not 64 <= minor < 1024:
+        raise ValueError("The selected device is not an evdev interface")
+    device = Path(f"/sys/dev/char/{major}:{minor}/device")
+    if (device / "id/bustype").read_text().strip() == "0006":
+        raise ValueError("Virtual input devices cannot be authorized")
+    def bit(name, code):
+        words = (device / f"capabilities/{name}").read_text().split()
+        index = code // 64
+        return index < len(words) and bool(int(words[-1-index], 16) & (1 << (code % 64)))
+    if any(bit("abs", axis) for axis in [0, 1, 53, 54]):
+        raise ValueError("Select a relative mouse and keyboard, not an absolute pointer")
+    keyboard = all(bit("key", key) for key in [30, 57, 87, 88])
+    mouse = bit("key", 272) and bit("rel", 0) and bit("rel", 1)
+    if not keyboard and not mouse:
+        raise ValueError("The selected device is not a supported keyboard or mouse")
+
+
+def grant(values):
+    if os.geteuid() != 0:
+        raise ValueError("Run this helper through the system authorization dialog")
+    uid_text = os.environ.get("PKEXEC_UID", "")
+    if not uid_text.isascii() or not uid_text.isdecimal() or not 0 < int(uid_text) < 2**32:
+        raise ValueError("No unprivileged desktop user was authenticated")
+    if not 1 <= len(values) <= 16:
+        raise ValueError("Select between one and sixteen input interfaces")
+    descriptors = []
+    try:
+        # Validate the entire request before changing any access. Keep each
+        # inode open so unplug/replug cannot redirect setfacl to a new node.
+        for value in values:
+            path = input_path(value)
+            descriptor = os.open(path, os.O_PATH | os.O_NOFOLLOW | os.O_CLOEXEC)
+            descriptors.append(descriptor)
+            supported(path, os.fstat(descriptor))
+        for descriptor in descriptors:
+            subprocess.run(["/usr/bin/setfacl", "--modify", f"u:{int(uid_text)}:r",
+                            f"/proc/self/fd/{descriptor}"], pass_fds=(descriptor,),
+                           check=True, timeout=5, env={"PATH": "/usr/bin:/bin", "LC_ALL": "C"})
+    finally:
+        for descriptor in descriptors:
+            os.close(descriptor)
+
+
+if __name__ == "__main__":
+    try:
+        grant(sys.argv[1:])
+        print('@desk-switch-data {"input_access":true}')
+    except Exception as error:
+        print(f"Input access was not granted: {error}", file=sys.stderr)
+        sys.exit(1)

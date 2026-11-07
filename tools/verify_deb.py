@@ -18,7 +18,7 @@ def check(package):
         actual = subprocess.check_output(["dpkg-deb", "--field", str(package), field], text=True).strip()
         assert actual == expected, (field, actual)
     dependencies = subprocess.check_output(["dpkg-deb", "--field", str(package), "Depends"], text=True)
-    for required in ["ddcutil", "pipewire-bin", "pipewire-pulse", "pulseaudio-utils"]:
+    for required in ["ddcutil", "pipewire-bin", "pipewire-pulse", "pulseaudio-utils", "acl", "python3"]:
         assert any(re.fullmatch(r"\s*" + re.escape(required) + r"(?:\s*\([^)]*\))?\s*", dependency)
                    for dependency in dependencies.split(",")), f"{required} must be a required runtime dependency"
     with tempfile.TemporaryDirectory(prefix="desk-switch-deb-check-") as temporary:
@@ -27,6 +27,9 @@ def check(package):
         subprocess.run(["dpkg-deb", "--extract", str(package), str(extracted)], check=True)
         subprocess.run(["desktop-file-validate", str(extracted / "usr/share/applications/com.deskswitch.Desktop.desktop")], check=True)
         environment = dict(os.environ, XDG_DATA_HOME=str(work / "user data"), XDG_CONFIG_HOME=str(work / "config"))
+        helper = extracted / "usr/lib/desk-switch/input-access"
+        assert helper.is_file() and os.access(helper, os.X_OK)
+        assert (extracted / "usr/share/polkit-1/actions/com.deskswitch.input-access.policy").is_file()
         launcher = extracted / "usr/bin/desk-switch"
         result = subprocess.check_output([str(launcher), "--build-info"], env=environment, text=True).strip()
         stamp = json.loads(result.removeprefix("DESK-SWITCH-BUILD:"))
