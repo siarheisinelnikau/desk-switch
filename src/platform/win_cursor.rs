@@ -347,3 +347,32 @@ impl Drop for Window {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pointer_window_is_hidden_click_through_and_never_activates() {
+        unsafe {
+            let foreground = GetForegroundWindow();
+            let mut window = Window::create().unwrap();
+            let handle = window.hwnd;
+            let styles = GetWindowLongPtrW(handle, GWL_EXSTYLE) as u32;
+            for required in [
+                WS_EX_LAYERED,
+                WS_EX_TRANSPARENT,
+                WS_EX_NOACTIVATE,
+                WS_EX_TOOLWINDOW,
+            ] {
+                assert_ne!(styles & required, 0);
+            }
+            // Do not draw or inject anything on the test desktop.
+            window.update(false, false);
+            assert_eq!(IsWindowVisible(handle), 0);
+            assert_eq!(GetForegroundWindow(), foreground);
+            drop(window);
+            assert_eq!(IsWindow(handle), 0);
+        }
+    }
+}
