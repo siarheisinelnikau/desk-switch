@@ -7,7 +7,6 @@ use crate::{
 use anyhow::{Context, Result, bail, ensure};
 use std::{net::SocketAddr, time::Duration};
 use tokio::{
-    net::TcpListener,
     sync::oneshot,
     time::{Instant, MissedTickBehavior, interval},
 };
@@ -68,10 +67,11 @@ pub async fn run(
     sink: &mut impl Sink,
     video: Option<(Inputs, VideoWorker)>,
 ) -> Result<()> {
-    let listener = TcpListener::bind(address)
-        .await
-        .context("binding receiver listen address")?;
-    println!("Listening for the pinned host peer on {address}.");
+    let listener = crate::listen::tcp(address).context("binding receiver listen address")?;
+    println!(
+        "Listening for the pinned host peer on {}.",
+        listener.local_addr()?
+    );
     crate::lifecycle::report(crate::lifecycle::Event::Input(
         crate::lifecycle::InputStatus::Waiting,
     ));
@@ -288,7 +288,7 @@ mod tests {
         Arc,
         atomic::{AtomicU16, AtomicUsize, Ordering::SeqCst},
     };
-    use tokio::net::TcpStream;
+    use tokio::net::{TcpListener, TcpStream};
 
     const INPUTS: Inputs = Inputs { host: 17, peer: 15 };
     const KEY: Input = Input::Key {
