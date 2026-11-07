@@ -145,7 +145,7 @@ def main():
             checked_macos_archive(source, target, version, protocol)
             sources[target] = source
         elif source is not None:
-            raise ValueError("This historical release does not include macOS applications")
+            raise ValueError("This release does not include macOS applications")
     artifacts = [(sources[target], filename) for target, filename in names.items()]
     checked_binary(args.windows,"windows-x86_64",version,protocol)
     fields = subprocess.check_output(["dpkg-deb", "--field", str(args.deb), "Package", "Version", "Architecture"], text=True)
