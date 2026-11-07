@@ -36,6 +36,8 @@ pub enum Message {
         edge: Option<u16>,
     },
     Ready(u64),
+    SelectMonitor(u64),
+    SelectFallback(u64),
     Verify(u64),
     Observed {
         id: u64,
@@ -50,7 +52,10 @@ pub enum Message {
     },
     Return(u64),
     Returning(u64),
+    RestoreMonitor(u64),
+    MonitorRestored(u64),
     Returned(u64),
     Rejected(u64),
     SwitchRequested,
+    SetupSwitchRequested,
 }

@@ -37,6 +37,7 @@ pub struct Coordinator<C> {
     pub controls: mpsc::Receiver<Control>,
     pub events: mpsc::Receiver<(u64, Input)>,
     pub cursor: C,
+    pub monitor_required: fn() -> bool,
 }
 
 pub async fn connect<C: Cursor>(
@@ -71,6 +72,13 @@ pub async fn connect<C: Cursor>(
                     crate::lifecycle::InputStatus::Recovering,
                 ));
                 drop(pipe);
+                if handoff.logic.id().is_some()
+                    && let Some(Err(error)) = &result
+                {
+                    crate::lifecycle::report(crate::lifecycle::Event::Switch {
+                        error: Some(format!("{error:#}")),
+                    });
+                }
                 // A timeout may leave a Win32 DDC call in flight. Never race a new transfer
                 // with the old job or its recovery. The hook remains local while we wait.
                 let recover = handoff.logic.abort();
@@ -111,6 +119,7 @@ struct Handoff {
     id: u64,
     job: Option<(Job, oneshot::Receiver<Result<VideoResult>>)>,
     next_job: Option<(Instant, Job)>,
+    allow_setup: bool,
 }
 
 impl Handoff {
@@ -122,10 +131,12 @@ impl Handoff {
             id: 0,
             job: None,
             next_job: None,
+            allow_setup: false,
         }
     }
 
     fn start(&mut self, token: u64, mode: Mode, edge: Option<u16>) -> Result<Effect> {
+        crate::lifecycle::report(crate::lifecycle::Event::Switch { error: None });
         self.token = Some(token);
         self.deadline = Some(Instant::now() + SWITCH_TIMEOUT);
         self.id += 1;
@@ -169,6 +180,7 @@ impl Handoff {
                 command = commands.recv() => {
                     match command {
                         Ok(crate::lifecycle::Command::Switch) => io.cursor.request_toggle().await?,
+                        Ok(crate::lifecycle::Command::SetupSwitch) => { self.allow_setup = true; io.cursor.request_toggle().await?; }
                         Ok(crate::lifecycle::Command::Emergency) => io.gate.emergency(),
                         Ok(crate::lifecycle::Command::MicrophoneVolume(_)) | Err(_) => {}
                     }
@@ -187,13 +199,23 @@ impl Handoff {
                     let control = control.context("host hook stopped")?;
                     match control {
                         Control::Toggle(token) if io.gate.current() == (token, Route::Hold) => {
+                            let setup = std::mem::take(&mut self.allow_setup);
                             if self.logic.is_local() {
+                                if io.video.is_none() && (io.monitor_required)() && !setup {
+                                    io.gate.local(token);
+                                    crate::lifecycle::report(crate::lifecycle::Event::Switch { error: Some("Remember the video connection on both PCs before switching the shared monitor.".into()) });
+                                    continue;
+                                }
                                 self.start(token, if io.video.is_some() {Mode::Video} else {Mode::Input}, None)?
                             } else if self.logic.is_remote() {
                                 self.returning(None, true)?
                             } else { continue; }
                         }
                         Control::Edge { token, position } if io.gate.current() == (token, Route::Hold) && self.logic.is_local() => {
+                            if io.video.is_none() && (io.monitor_required)() {
+                                io.gate.local(token);
+                                continue;
+                            }
                             let mode = io.edge.as_ref().context("host edge is disabled")?.mode;
                             self.start(token, mode, Some(position))?
                         }
@@ -204,6 +226,11 @@ impl Handoff {
                     let message = message.context("peer disconnected")??;
                     match message {
                         Message::SwitchRequested => {
+                            io.cursor.request_toggle().await?;
+                            continue;
+                        }
+                        Message::SetupSwitchRequested => {
+                            self.allow_setup = true;
                             io.cursor.request_toggle().await?;
                             continue;
                         }
@@ -256,10 +283,19 @@ impl Handoff {
         let job = *job;
         self.job = None;
         match job {
-            Job::Select { .. } => {
-                result.context("host could not select the peer monitor input")?;
-                Ok(Some(self.logic.written()?))
-            }
+            Job::Select { .. } => match result {
+                Ok(VideoResult::Written) => Ok(Some(self.logic.written()?)),
+                Err(error) => {
+                    eprintln!(
+                        "Target-side monitor selection failed; trying the active port: {error:#}"
+                    );
+                    self.logic
+                        .write_failed()
+                        .map(Some)
+                        .with_context(|| format!("monitor selection failed: {error:#}"))
+                }
+                _ => bail!("invalid monitor selection response"),
+            },
             Job::Read => {
                 let observed = match result {
                     Ok(VideoResult::Read(value)) => Some(value),
@@ -422,6 +458,7 @@ mod tests {
         let (_event_send, events) = mpsc::channel(8);
         let inputs = Inputs { host: 17, peer: 15 };
         let mut io = Coordinator {
+            monitor_required: || false,
             gate: Arc::clone(&gate),
             edge: None,
             video: Some((
@@ -468,6 +505,8 @@ mod tests {
             );
             assert_eq!(input.load(SeqCst), inputs.host);
             pipe.send(Message::Ready(1)).await.unwrap();
+            assert_eq!(next(&mut pipe).await, Message::SelectMonitor(1));
+            pipe.send(Message::SelectFallback(1)).await.unwrap();
             assert_eq!(next(&mut pipe).await, Message::Verify(1));
             assert_eq!(input.load(SeqCst), inputs.peer);
             assert!(gate.current().1 == Route::Hold);
@@ -484,7 +523,6 @@ mod tests {
             }
             pipe.send(Message::SwitchRequested).await.unwrap();
             assert_eq!(next(&mut pipe).await, Message::Return(1));
-            input.store(inputs.host, SeqCst);
             pipe.send(Message::Returning(1)).await.unwrap();
             assert_eq!(next(&mut pipe).await, Message::Returned(1));
             while gate.current().1 != Route::Local {
@@ -499,5 +537,87 @@ mod tests {
         assert_eq!(input.load(SeqCst), inputs.host);
         assert!(gate.current().1 == Route::Local);
         assert_eq!(toggles.load(SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn incomplete_video_blocks_normal_switch_but_explicit_setup_can_lend_and_return_input() {
+        let host = identity();
+        let peer = identity();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let gate = Arc::new(Gate::new());
+        let toggles = Arc::new(AtomicUsize::new(0));
+        let (control_send, controls) = mpsc::channel(8);
+        let (_keep_events, events) = mpsc::channel(8);
+        let mut io = Coordinator {
+            monitor_required: || true,
+            gate: gate.clone(),
+            edge: None,
+            video: None,
+            controls,
+            events,
+            cursor: FixtureCursor {
+                gate: gate.clone(),
+                controls: control_send,
+                toggles: toggles.clone(),
+            },
+        };
+        let source = async {
+            let stream = TcpStream::connect(address).await.unwrap();
+            let mut pipe = Pipe::connect(stream, &host, &peer.public, true)
+                .await
+                .unwrap();
+            assert!(Handoff::new(None).run(&mut pipe, &mut io).await.is_err());
+        };
+        let destination = async {
+            let mut pipe = Pipe::connect(
+                listener.accept().await.unwrap().0,
+                &peer,
+                &host.public,
+                false,
+            )
+            .await
+            .unwrap();
+            pipe.send(Message::SwitchRequested).await.unwrap();
+            loop {
+                let message = pipe.messages.recv().await.unwrap().unwrap();
+                let Message::Ping(nonce) = message else {
+                    panic!("unconfigured video silently lent input: {message:?}")
+                };
+                pipe.send(Message::Pong(nonce)).await.unwrap();
+                if toggles.load(SeqCst) == 1 && gate.current().1 == Route::Local {
+                    break;
+                }
+            }
+            pipe.send(Message::SetupSwitchRequested).await.unwrap();
+            assert_eq!(
+                next(&mut pipe).await,
+                Message::Prepare {
+                    id: 1,
+                    inputs: None,
+                    edge: None
+                }
+            );
+            pipe.send(Message::Ready(1)).await.unwrap();
+            assert_eq!(next(&mut pipe).await, Message::Activate(1));
+            pipe.send(Message::Active(1)).await.unwrap();
+            while gate.current().1 != Route::Remote {
+                sleep(Duration::from_millis(1)).await;
+            }
+            pipe.send(Message::SwitchRequested).await.unwrap();
+            assert_eq!(next(&mut pipe).await, Message::Return(1));
+            pipe.send(Message::Returning(1)).await.unwrap();
+            assert_eq!(next(&mut pipe).await, Message::Returned(1));
+            while gate.current().1 != Route::Local {
+                sleep(Duration::from_millis(1)).await;
+            }
+        };
+        timeout(Duration::from_secs(4), async {
+            tokio::join!(source, destination);
+        })
+        .await
+        .unwrap();
+        assert!(gate.current().1 == Route::Local);
+        assert_eq!(toggles.load(SeqCst), 3);
     }
 }

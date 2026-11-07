@@ -52,7 +52,9 @@ impl Renderer {
                     return Ok(());
                 }
                 let mut tick = interval(Duration::from_millis(10));
-                tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
+                // Keep the original sample clock after scheduler jitter. Delay
+                // would permanently slow down every subsequent audio block.
+                tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
                 let mut pcm = [0; FRAME_BYTES];
                 loop {
                     tokio::select! {

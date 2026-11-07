@@ -334,6 +334,7 @@ pub async fn run(
         let (event_send, events) = mpsc::channel(256);
         let (cursor_send, cursor_receive) = mpsc::channel(2);
         let coordinator = host::connect(address, identity, peer, host::Coordinator {
+            monitor_required: crate::lifecycle::monitor_required,
             gate: Arc::clone(&gate), edge, video, controls, events, cursor: PortalCursor(cursor_send),
         });
         println!("Ubuntu host active. F12 switches, F11 restores local input. Closing the process releases the selected devices.");

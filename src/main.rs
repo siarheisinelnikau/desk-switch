@@ -106,10 +106,23 @@ fn run() -> Result<()> {
             "@desk-switch-data {}",
             serde_json::to_string(&platform::read_monitor(id)?)?
         ),
-        ["monitor-service", id, own, other] => platform::run_monitor_service(
+        [
+            "monitor-service",
             id,
-            u16::from_str_radix(own, 16)?,
+            host,
+            other,
+            role @ ("host" | "receiver"),
+            address,
+        ] => platform::run_monitor_service(
+            id,
+            u16::from_str_radix(host, 16)?,
             u16::from_str_radix(other, 16)?,
+            if *role == "host" {
+                config::Role::Host
+            } else {
+                config::Role::Receiver
+            },
+            parse_address(address)?,
         )?,
         #[cfg(target_os = "linux")]
         ["portal-check"] => {

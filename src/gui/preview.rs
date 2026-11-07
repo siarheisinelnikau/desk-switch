@@ -57,12 +57,14 @@ impl Desktop {
             shared: Shared::default(),
             input: Some(InputStatus::Here),
             monitor_input: None,
+            monitor_error: None,
             audio_playing: true,
             microphone_active: false,
             microphone_error: None,
             audio_error: None,
             input_error: None,
             ack: String::new(),
+            diagnostics: Default::default(),
         };
         let mut remote = local.clone();
         remote.key = if own_green { "11" } else { "22" }.repeat(32);
@@ -92,6 +94,7 @@ impl Desktop {
         }
         if case.starts_with("shared-") {
             for (node, input) in [(&mut local, 17), (&mut remote, 15)] {
+                node.shared.monitor_enabled = true;
                 node.monitor.enabled = true;
                 node.monitor.id = format!("fixture-{}", node.name);
                 node.monitor.fingerprint = "preview-shared-monitor".into();
@@ -144,6 +147,30 @@ impl Desktop {
             remote.input = None;
             local.input_error = Some("Permission denied (os error 13)".into());
             self.pair.input_failed = true;
+        }
+        if case == "shared-separate" {
+            local.shared.monitor_enabled = false;
+            remote.shared.monitor_enabled = false;
+        }
+        if case == "shared-unconfigured" {
+            remote.monitor.input = None;
+        }
+        if case == "shared-diagnostics" {
+            remote.diagnostics.platform = "windows".into();
+            remote
+                .diagnostics
+                .line("Monitor", "This PC remembered its DisplayPort input (0x0F)");
+            remote
+                .diagnostics
+                .line("Monitor", "Target input confirmed; video switch completed");
+            remote
+                .diagnostics
+                .line("Audio", "Playing remote audio at 48 kHz stereo");
+            self.page = Page::Diagnostics;
+        }
+        if case == "shared-update-confirmation" {
+            self.page = Page::Application;
+            self.update_confirmation = true;
         }
         for (node, individual) in [(&mut local, true), (&mut remote, false)] {
             use crate::audio::AudioDevice;
@@ -295,6 +322,13 @@ impl Desktop {
                 break;
             };
             self.action(action, ctx);
+        }
+        if let Some(local) = &mut self.preview {
+            local.shared = self.prefs.workspace.shared.clone();
+            if let Some(remote) = &mut self.pair.remote {
+                remote.shared = local.shared.clone();
+                self.pair.plan = Some(Plan::build(local, remote));
+            }
         }
         let snapshot = self.tray_state();
         if self.tray_snapshot != snapshot {

@@ -5,9 +5,10 @@ use std::{
     time::{Duration, Instant},
 };
 
-const QUEUE_CAPACITY: usize = 4;
-const PREBUFFER: usize = 2;
-const MAX_QUEUE_AGE: Duration = Duration::from_millis(60);
+const QUEUE_CAPACITY: usize = 12;
+const PREBUFFER: usize = 4;
+const MAX_PREBUFFER: usize = 8;
+const MAX_QUEUE_AGE: Duration = Duration::from_millis(180);
 
 #[derive(Clone, Copy)]
 pub struct Mix {
@@ -25,6 +26,7 @@ pub struct Playout {
     next: Option<u64>,
     offset: usize,
     playing: bool,
+    prebuffer: usize,
 }
 
 impl Playout {
@@ -34,18 +36,17 @@ impl Playout {
             next: None,
             offset: 0,
             playing: false,
+            prebuffer: PREBUFFER,
         }
     }
 
     pub fn push(&mut self, sequence: u64, pcm: Pcm, now: Instant) {
-        if let Some(next) = self.next {
-            if sequence < next {
-                return;
-            }
-            if sequence > next {
-                self.clear();
-            }
+        if let Some(next) = self.next
+            && sequence < next
+        {
+            return;
         }
+        // A dropped capture frame must not also erase valid buffered audio.
         self.next = sequence.checked_add(1);
         if self.queue.len() == QUEUE_CAPACITY {
             self.queue.pop_front();
@@ -62,6 +63,7 @@ impl Playout {
         self.next = None;
         self.offset = 0;
         self.playing = false;
+        self.prebuffer = PREBUFFER;
     }
 
     pub fn render(&mut self, output: &mut [u8], mix: Mix, now: Instant) {
@@ -77,7 +79,7 @@ impl Playout {
             self.playing = false;
         }
         if !self.playing {
-            self.playing = self.queue.len() >= PREBUFFER;
+            self.playing = self.queue.len() >= self.prebuffer;
             if !self.playing {
                 return;
             }
@@ -87,6 +89,7 @@ impl Playout {
         while written < output.len() {
             let Some(frame) = self.queue.front() else {
                 self.playing = false;
+                self.prebuffer = (self.prebuffer + 1).min(MAX_PREBUFFER);
                 break;
             };
             let count = (output.len() - written).min(frame.pcm.len() - self.offset);
@@ -160,6 +163,8 @@ mod tests {
         );
         assert_eq!(sample(&out), 0);
         queue.push(1, frame(-800), now);
+        queue.push(2, frame(400), now);
+        queue.push(3, frame(400), now);
         queue.render(
             &mut out,
             Mix {
@@ -181,7 +186,7 @@ mod tests {
     }
 
     #[test]
-    fn drops_old_frames_and_rebuffers_after_a_gap() {
+    fn bounds_latency_but_preserves_buffered_frames_across_capture_gaps() {
         let mut queue = Playout::new();
         let now = Instant::now();
         let mut out = [0; FRAME_BYTES];
@@ -189,23 +194,53 @@ mod tests {
             volume: 100,
             muted: false,
         };
-        for sequence in 0..6 {
+        for sequence in 0..16 {
             queue.push(sequence, frame(sequence as i16 + 1), now);
         }
         queue.render(&mut out, mix, now);
-        assert_eq!(sample(&out), 3);
+        assert_eq!(sample(&out), 5);
         let later = now + MAX_QUEUE_AGE;
         queue.render(&mut out, mix, later);
         assert_eq!(sample(&out), 0);
-        queue.push(6, frame(10), later);
-        queue.push(9, frame(11), later);
+        queue.push(16, frame(10), later);
+        queue.push(19, frame(11), later);
         queue.render(&mut out, mix, later);
         assert_eq!(sample(&out), 0);
-        queue.push(10, frame(12), later);
+        queue.push(20, frame(12), later);
+        queue.push(21, frame(13), later);
         queue.render(&mut out, mix, later);
-        assert_eq!(sample(&out), 11);
+        assert_eq!(sample(&out), 10);
         queue.clear();
         queue.render(&mut out, mix, later);
         assert_eq!(sample(&out), 0);
+    }
+
+    #[test]
+    fn plays_continuously_when_network_delivers_forty_ms_bursts() {
+        let mut queue = Playout::new();
+        let start = Instant::now();
+        let mix = Mix {
+            volume: 100,
+            muted: false,
+        };
+        let mut out = [0; FRAME_BYTES];
+        let mut sequence = 0;
+        for tick in 0..500 {
+            let now = start + Duration::from_millis(tick * 10);
+            if tick % 4 == 0 {
+                for _ in 0..4 {
+                    queue.push(sequence, frame(1200), now);
+                    sequence += 1;
+                }
+            }
+            queue.render(&mut out, mix, now);
+            assert!(
+                out.as_chunks::<2>()
+                    .0
+                    .iter()
+                    .all(|s| i16::from_le_bytes(*s) == 1200),
+                "underrun at {tick}"
+            );
+        }
     }
 }

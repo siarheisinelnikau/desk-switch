@@ -1,4 +1,5 @@
 mod model;
+mod paired_update;
 #[cfg(debug_assertions)]
 mod preview;
 mod session;
@@ -77,6 +78,9 @@ pub struct Desktop {
     update_job: Option<crate::updater::Job>,
     update_status: String,
     update_ready: bool,
+    update_version: Option<String>,
+    update_confirmation: bool,
+    paired_update: Option<crate::workspace::update::Coordinator>,
     last_update_check: Option<Instant>,
     last_version_error: Option<String>,
     prepared_update: Option<rust_auto_updator::Prepared>,
@@ -191,6 +195,9 @@ impl Desktop {
             update_job: None,
             update_status: "Проверка ещё не выполнялась.".into(),
             update_ready: false,
+            update_version: None,
+            update_confirmation: false,
+            paired_update: None,
             last_update_check: None,
             last_version_error: None,
             prepared_update: None,
@@ -211,6 +218,16 @@ impl Desktop {
 
     fn input_running(&self) -> bool {
         self.input.as_ref().is_some_and(Worker::running)
+    }
+
+    fn apply_input_monitor_requirement(&mut self) {
+        if let Some(worker) = &mut self.input
+            && worker.running()
+            && !worker.stopping
+            && let Err(error) = worker.require_monitor(self.prefs.workspace.shared.monitor_enabled)
+        {
+            self.notice = Some((error.to_string(), true));
+        }
     }
     fn audio_running(&self) -> bool {
         self.audio.as_ref().is_some_and(Worker::running)
@@ -250,6 +267,7 @@ impl Desktop {
         let args = self.prefs.input_args()?;
         self.pair.monitor_input = None;
         let mut worker = Worker::start(Kind::Input, &args, &self.dir)?;
+        worker.require_monitor(self.prefs.workspace.shared.monitor_enabled)?;
         worker.monitoring = self.form.monitor_enabled;
         self.input = Some(worker);
         Ok(())
@@ -261,6 +279,21 @@ impl Desktop {
     }
 
     fn switch(&mut self) {
+        if self.prefs.workspace.shared.monitor_enabled
+            && self.pair.plan.as_ref().is_none_or(|p| p.monitor.is_none())
+            && !self
+                .pair
+                .remote
+                .as_ref()
+                .is_some_and(|r| crate::workspace::Plan::input_in_use(&self.local_node(), r))
+        {
+            self.notice = Some((
+                "Remember the video connection on both PCs before switching the shared monitor."
+                    .into(),
+                true,
+            ));
+            return;
+        }
         #[cfg(debug_assertions)]
         if let Some(local) = &mut self.preview {
             local.input = Some(if local.input == Some(InputStatus::Here) {
@@ -323,14 +356,43 @@ impl Desktop {
                 return local.monitor_input == Some(inputs.host);
             }
             self.monitor.as_ref().is_some_and(|worker| {
-                worker.running() && !worker.stopping && worker.monitor_input == Some(inputs.host)
+                worker.connected() && worker.monitor_input == Some(inputs.host)
             })
         }
     }
 
+    fn switch_input_for_setup(&mut self) {
+        if !self.connected() || !self.pair.synced {
+            return;
+        }
+        #[cfg(debug_assertions)]
+        if self.preview.is_some() {
+            self.notice = Some(("Select the other PC's input in the monitor menu, then remember its connection there. Return input with F11; use the monitor menu to return the picture during this first setup.".into(), false));
+            return;
+        }
+        let result = self
+            .input
+            .as_mut()
+            .context("input service is not ready")
+            .and_then(|w| w.command("setup-switch"));
+        self.message(result, "Select the other PC's input in the monitor menu, then remember its connection there. Return input with F11; use the monitor menu to return the picture during this first setup.");
+    }
+
+    fn input_switch_ready(&self) -> bool {
+        self.connected()
+            && self.pair.synced
+            && (!self.prefs.workspace.shared.monitor_enabled
+                || self.pair.plan.as_ref().is_some_and(|p| p.monitor.is_some())
+                || self
+                    .pair
+                    .remote
+                    .as_ref()
+                    .is_some_and(|r| crate::workspace::Plan::input_in_use(&self.local_node(), r)))
+    }
+
     fn tray_state(&self) -> tray::State {
         tray::State {
-            connected: self.connected() && self.pair.synced,
+            connected: self.input_switch_ready(),
             emergency: self.input_running(),
             sound: self.audio_running(),
             monitor: self.monitor_switch_ready(),
@@ -480,6 +542,9 @@ impl Desktop {
                 self.device_notice = Some((worker.kind, error.clone()));
                 self.notice = Some((error, true));
             }
+            if let Some(error) = worker.new_switch_error.take() {
+                self.notice = Some((format!("Switch failed: {error}"), true));
+            }
         }
         self.tick_pair(ctx);
         #[cfg(target_os = "linux")]
@@ -531,17 +596,25 @@ impl Desktop {
             self.update_job = None;
             match result {
                 Ok(crate::updater::Outcome::Current) => {
-                    self.update_status = "Установлена актуальная версия.".into()
+                    self.update_status = "Установлена актуальная версия.".into();
+                    self.fail_paired_update(
+                        "The requested signed update is not available on this PC.".into(),
+                        ctx,
+                    );
                 }
                 Ok(crate::updater::Outcome::Unpublished) => {
-                    self.update_status = "Канал настроен. Релизы ещё не опубликованы.".into()
+                    self.update_status = "Канал настроен. Релизы ещё не опубликованы.".into();
+                    self.fail_paired_update("No signed release is available.".into(), ctx);
                 }
                 Ok(crate::updater::Outcome::Ready(version)) => {
+                    self.update_version = Some(version.clone());
                     self.update_ready = true;
                     self.update_status = format!(
                         "Версия {version} проверена и скачана. Установится при следующем запуске."
                     );
-                    if self.prefs.auto_update
+                    if self.paired_update.is_some() {
+                        self.paired_download_ready(ctx);
+                    } else if self.prefs.auto_update
                         && !self.input_running()
                         && !self.monitor_running()
                         && !self.audio_running()
@@ -553,27 +626,28 @@ impl Desktop {
                     }
                 }
                 Ok(crate::updater::Outcome::Prepared(version, prepared)) => {
+                    self.update_version = Some(version.clone());
                     self.prepared_update = Some(prepared);
                     self.update_ready = true;
                     self.update_status =
                         format!("Версия {version} проверена. Нажмите «Обновить и перезапустить».");
+                    self.paired_download_ready(ctx);
                 }
                 Err(error) => {
-                    self.update_status = format!("Не удалось проверить обновления: {error:#}")
+                    self.update_status = format!("Не удалось проверить обновления: {error:#}");
+                    self.fail_paired_update(format!("{error:#}"), ctx);
                 }
             }
         }
-        if self.install_pending
-            && !self.input_running()
-            && !self.monitor_running()
-            && !self.audio_running()
-            && !self.microphone_running()
-        {
+        if self.install_pending {
             self.install_pending = false;
             if let Some(prepared) = self.prepared_update.take() {
                 match crate::updater::InstallJob::start(prepared, &self.dir, ctx.clone()) {
                     Ok(job) => self.install_job = Some(job),
-                    Err(error) => self.update_status = error.to_string(),
+                    Err(error) => {
+                        self.update_status = error.to_string();
+                        self.fail_paired_update(error.to_string(), ctx);
+                    }
                 }
             }
         }
@@ -584,14 +658,23 @@ impl Desktop {
         {
             self.install_job = None;
             match result {
-                Ok(()) => self.action(Action::Quit, ctx),
+                Ok(()) => {
+                    if let Some(coordinator) = &mut self.paired_update {
+                        let effects = coordinator.installed();
+                        self.apply_update_effects(effects, ctx);
+                    } else {
+                        self.action(Action::Quit, ctx);
+                    }
+                }
                 Err(error) => {
                     self.prepared_update = Some(prepared);
                     self.update_ready = true;
                     self.update_status = format!("Установка отменена или не удалась: {error}");
+                    self.fail_paired_update(error, ctx);
                 }
             }
         }
+        self.tick_paired_update(ctx);
         if self.prefs.auto_update
             && !self.quitting
             && self.update_job.is_none()
@@ -784,6 +867,7 @@ impl Desktop {
             || self.install_job.is_some()
             || self.install_pending
             || self.quitting
+            || self.paired_update.as_ref().is_some_and(|u| u.handed_off)
         {
             return;
         }
@@ -800,14 +884,15 @@ impl Desktop {
         }
     }
 
-    fn install_update(&mut self, ctx: &egui::Context) {
+    fn begin_install_update(&mut self, ctx: &egui::Context) {
         if self.prepared_update.is_some() {
             if let Err(error) = self.save() {
                 self.notice = Some((error.to_string(), true));
+                self.fail_paired_update(error.to_string(), ctx);
                 return;
             }
-            self.stop_pair();
-            self.query.take();
+            // Keep the pair and existing devices alive during polkit consent.
+            // Quit releases them only after the verified installer succeeds.
             self.install_pending = true;
             self.update_ready = false;
             self.update_status =
@@ -884,6 +969,7 @@ impl eframe::App for Desktop {
 
     fn ui(&mut self, ui: &mut egui::Ui, _: &mut eframe::Frame) {
         self.render(ui);
+        self.paired_update_dialog(ui.ctx());
         self.presented = true;
     }
 }

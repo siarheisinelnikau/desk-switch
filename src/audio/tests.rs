@@ -185,6 +185,8 @@ async fn user_off_releases_capture_and_reconnects_without_old_audio() {
     let mut first = Fixture::start(&windows, &ubuntu, Arc::clone(&queue), pcm).await;
     first.frame().await;
     first.frame().await;
+    first.frame().await;
+    first.frame().await;
     assert_eq!(first.render(), pcm);
     first.off().await;
 
@@ -201,6 +203,8 @@ async fn user_off_releases_capture_and_reconnects_without_old_audio() {
 
     let fresh = tone(800.0);
     let mut second = Fixture::start(&windows, &ubuntu, queue, fresh).await;
+    second.frame().await;
+    second.frame().await;
     second.frame().await;
     second.frame().await;
     assert_eq!(second.render(), fresh);
@@ -263,12 +267,12 @@ async fn late_audio_is_never_rendered() {
             .is_err()
         );
     };
-    let delayed = async {
+    let delayed = async move {
         stream::request_start(&mut server).await.unwrap();
         server.send(Packet::Ready, &SILENCE).await.unwrap();
         let mut pcm = SILENCE;
         assert_eq!(server.receive(&mut pcm).await.unwrap(), Packet::Credit(0));
-        sleep(Duration::from_millis(250)).await;
+        sleep(Duration::from_millis(500)).await;
         let _ = server
             .send(
                 Packet::Audio {
@@ -296,6 +300,85 @@ async fn audio_and_control_cannot_authenticate_as_each_other() {
         Link::open(server, &ubuntu, &windows.public, false)
     );
     assert!(control.is_err() && audio.is_err());
+}
+
+#[tokio::test]
+async fn delayed_audio_renews_credits_and_recovers_on_the_same_connection() {
+    let (mut client, mut server) = links(&identity(), &identity()).await;
+    let queue = Arc::new(Mutex::new(Playout::new()));
+    let playout = Arc::clone(&queue);
+    let (send, mut frames) = mpsc::unbounded_channel();
+    let player = tokio::spawn(async move {
+        stream::receive(&mut client, &playout, |sequence| {
+            send.send(sequence).unwrap();
+        })
+        .await
+    });
+    stream::request_start(&mut server).await.unwrap();
+    server.send(Packet::Ready, &SILENCE).await.unwrap();
+    let mut pcm = SILENCE;
+    for ticket in 0..12 {
+        assert_eq!(
+            server.receive(&mut pcm).await.unwrap(),
+            Packet::Credit(ticket)
+        );
+    }
+    sleep(Duration::from_millis(500)).await;
+    for ticket in 0..12 {
+        server
+            .send(
+                Packet::Audio {
+                    ticket,
+                    sequence: ticket,
+                },
+                &tone(3000.0),
+            )
+            .await
+            .unwrap();
+    }
+    let fresh = tone(700.0);
+    for ticket in 12..16 {
+        assert_eq!(
+            server.receive(&mut pcm).await.unwrap(),
+            Packet::Credit(ticket)
+        );
+        server
+            .send(
+                Packet::Audio {
+                    ticket,
+                    sequence: ticket,
+                },
+                &fresh,
+            )
+            .await
+            .unwrap();
+    }
+    for expected in 12..16 {
+        assert_eq!(
+            timeout(Duration::from_secs(1), frames.recv())
+                .await
+                .unwrap(),
+            Some(expected)
+        );
+    }
+    let mut output = SILENCE;
+    queue.lock().unwrap().render(
+        &mut output,
+        Mix {
+            volume: 100,
+            muted: false,
+        },
+        Instant::now(),
+    );
+    assert_eq!(output, fresh);
+    drop(server);
+    assert!(
+        timeout(Duration::from_secs(1), player)
+            .await
+            .unwrap()
+            .unwrap()
+            .is_err()
+    );
 }
 
 #[tokio::test]
@@ -332,6 +415,10 @@ async fn audio_stays_continuous_through_a_video_and_input_round_trip() {
             controller
                 .message(client.messages.recv().await.unwrap().unwrap())
                 .unwrap(),
+            Effect::Send(Message::SelectMonitor(1))
+        );
+        assert_eq!(
+            controller.message(Message::SelectFallback(1)).unwrap(),
             Effect::Ddc(Job::Select { from: 17, to: 15 })
         );
         sleep(Duration::from_millis(25)).await;
@@ -356,8 +443,9 @@ async fn audio_stays_continuous_through_a_video_and_input_round_trip() {
         sleep(Duration::from_millis(25)).await;
         assert_eq!(
             controller.message(Message::Returning(1)).unwrap(),
-            Effect::Ddc(Job::Read)
+            Effect::Ddc(Job::Select { from: 15, to: 17 })
         );
+        assert_eq!(controller.written().unwrap(), Effect::Ddc(Job::Read));
         assert_eq!(
             controller.checked(Some(17)).unwrap(),
             Effect::Send(Message::Returned(1))
@@ -377,7 +465,7 @@ async fn audio_stays_continuous_through_a_video_and_input_round_trip() {
             assert_eq!(sequence, previous + 1);
             previous = sequence;
             let output = fixture.render();
-            if sequence >= 2 {
+            if sequence >= 4 {
                 assert_eq!(output, pcm);
                 continuous = true;
             }
