@@ -1,0 +1,5 @@
+#!/bin/sh
+set -e
+if [ "$1" = configure ] && [ -x /usr/bin/udevadm ]; then
+    /usr/bin/udevadm control --reload-rules || true
+fi

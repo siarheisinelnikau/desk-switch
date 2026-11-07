@@ -158,9 +158,34 @@ impl Default for AudioLevel {
 pub struct Preferences {
     pub shared: Shared,
     pub monitor: Monitor,
+    pub pending_monitor: Option<Monitor>,
     pub peer_name: String,
     pub last_address: String,
     pub manual_address: String,
+}
+
+impl Preferences {
+    pub fn record_monitor(&mut self, monitor: Monitor, borrowed_input: bool) {
+        if borrowed_input {
+            self.pending_monitor = Some(monitor);
+        } else {
+            self.monitor = monitor;
+            self.pending_monitor = None;
+        }
+    }
+
+    pub fn apply_pending_monitor(&mut self, input_is_local: bool) -> bool {
+        if !input_is_local {
+            return false;
+        }
+        let Some(monitor) = self.pending_monitor.take() else {
+            return false;
+        };
+        if self.shared.monitor_enabled && monitor.id == self.monitor.id {
+            self.monitor = monitor;
+        }
+        true
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -333,6 +358,15 @@ impl Plan {
             && b.monitor.enabled
             && !a.monitor.fingerprint.is_empty()
             && a.monitor.fingerprint == b.monitor.fingerprint
+    }
+
+    pub fn common_monitor(a: &Node, b: &Node) -> bool {
+        let shared = if a.shared.revision >= b.shared.revision {
+            &a.shared
+        } else {
+            &b.shared
+        };
+        shared.monitor_enabled
     }
 
     // Local/other mapping is also available when both PCs have their own input
@@ -574,6 +608,55 @@ pub fn pairing_code(handshake: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn remembering_video_while_input_is_borrowed_does_not_activate_ddc_until_input_returns() {
+        let (mut a, mut b) = (node("a"), node("b"));
+        a.hardware.keyboard = true;
+        a.hardware.mouse = true;
+        for n in [&mut a, &mut b] {
+            n.monitor.enabled = true;
+            n.monitor.fingerprint = "common-display".into();
+        }
+        a.monitor.input = Some(17);
+        b.monitor.id = "other-connector".into();
+        let mut prefs = Preferences {
+            monitor: b.monitor.clone(),
+            ..Default::default()
+        };
+        let saved = Monitor {
+            input: Some(15),
+            ..b.monitor.clone()
+        };
+        prefs.record_monitor(saved, true);
+        b.monitor = prefs.monitor.clone();
+        assert!(Plan::build(&a, &b).monitor.is_none());
+        assert!(!prefs.apply_pending_monitor(false));
+        assert_eq!(prefs.monitor.input, None);
+        assert!(prefs.apply_pending_monitor(true));
+        b.monitor = prefs.monitor;
+        assert_eq!(
+            Plan::build(&a, &b).monitor,
+            Some(Inputs { host: 17, peer: 15 })
+        );
+    }
+    #[test]
+    fn common_monitor_layout_does_not_depend_on_ddc_setup_or_input_readiness() {
+        let (mut a, mut b) = (node("a"), node("b"));
+        assert!(Plan::common_monitor(&a, &b));
+        assert!(Plan::common_monitor(&b, &a));
+        assert!(!Plan::shared_monitor(&a, &b));
+        assert_eq!(Plan::monitor_inputs(&a, &b), None);
+        assert_eq!(Plan::monitor_owner(&a, &b, true), None);
+        a.monitor.enabled = true;
+        a.monitor.fingerprint = "display".into();
+        a.monitor.input = Some(17);
+        assert!(Plan::common_monitor(&a, &b));
+        assert_eq!(Plan::monitor_inputs(&a, &b), None);
+        b.shared.monitor_enabled = false;
+        b.shared.changed("b");
+        assert!(!Plan::common_monitor(&a, &b));
+        assert!(!Plan::common_monitor(&b, &a));
+    }
     #[test]
     fn shared_monitor_is_available_when_both_pcs_have_their_own_keyboard_and_mouse() {
         let (mut a, mut b) = (node("a"), node("b"));
