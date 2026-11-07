@@ -45,12 +45,15 @@ pub enum Event {
     State(Box<Node>),
     Closed(String),
     Forgotten,
+    Update(super::update::Message),
+    UpdateSent(super::update::Message),
 }
 enum Command {
     Dial(Vec<SocketAddr>, String),
     Approve(String, bool),
     Disconnect,
     Forget,
+    Update(super::update::Message),
 }
 
 pub struct Service {
@@ -168,6 +171,13 @@ impl Service {
     }
     pub fn publish(&self, node: Node) {
         self.state.send_replace(node);
+    }
+    pub fn update(&self, message: super::update::Message) -> Result<()> {
+        message.validate()?;
+        self.commands
+            .try_send(Command::Update(message))
+            .context("The paired update command could not be queued")?;
+        Ok(())
     }
     pub fn poll(&self) -> impl Iterator<Item = Event> + '_ {
         let mut snapshot = self.snapshot.lock().unwrap();
@@ -346,6 +356,7 @@ enum Frame {
     State(Box<Node>),
     Forget,
     Forgotten,
+    Update(super::update::Message),
 }
 
 fn remove_pin(dir: &std::path::Path) -> Result<()> {
@@ -663,6 +674,11 @@ async fn session(
                     }
                     forgetting=Some(Instant::now()+AUTH_TIMEOUT);
                 }
+                Some(Command::Update(message)) if forgetting.is_none()=> {
+                    message.validate()?;
+                    send_frame(&mut write,&mut peer.noise,Frame::Update(message.clone())).await?;
+                    ensure!(notify.send(Event::UpdateSent(message)),"окно приложения закрыто");
+                }
                 _=>{}
             },
             _=tick.tick()=> {
@@ -690,9 +706,18 @@ async fn session(
                         notify.send(Event::Forgotten);result?;return Ok(());
                     }
                     if matches!(frame,Frame::Forgotten) && forgetting.is_some() {notify.send(Event::Forgotten);return Ok(());}
-                    let Frame::State(state)=frame else {bail!("unexpected pair command")};
-                    state.validate(own,&key)?; last_seen=Instant::now();
-                    ensure!(notify.send(Event::State(state)),"окно приложения закрыто");
+                    match frame {
+                        Frame::State(state) => {
+                            state.validate(own,&key)?;
+                            ensure!(notify.send(Event::State(state)),"окно приложения закрыто");
+                        }
+                        Frame::Update(message) => {
+                            message.validate()?;
+                            ensure!(notify.send(Event::Update(message)),"окно приложения закрыто");
+                        }
+                        _ => bail!("unexpected pair command"),
+                    }
+                    last_seen=Instant::now();
                     read_buffer.drain(..length+2);
                 }
             }
@@ -920,6 +945,47 @@ mod tests {
             a.wait(|e| matches!(e, Event::State(_)));
             b.wait(|e| matches!(e, Event::State(_)));
         }
+    }
+
+    #[test]
+    fn paired_diagnostics_and_update_commands_share_the_authenticated_control_channel() {
+        let a = Fixture::new("diagnostics-a");
+        let b = Fixture::new("diagnostics-b");
+        a.service.dial_address(b.address).unwrap();
+        b.wait(|e| matches!(e, Event::Request(_)));
+        b.service.approve(&a.key, true);
+        a.wait(|e| matches!(e, Event::Connected { .. }));
+        b.wait(|e| matches!(e, Event::Connected { .. }));
+        let mut node = a.service.state.borrow().clone();
+        let other = b.service.state.borrow().clone();
+        let before = super::super::Plan::build(&node, &other).digest(&node, &other);
+        node.diagnostics.platform = "linux".into();
+        node.diagnostics.line(
+            "Monitor",
+            "Target port unavailable; active-port fallback confirmed",
+        );
+        assert_eq!(
+            before,
+            super::super::Plan::build(&node, &other).digest(&node, &other)
+        );
+        a.service.publish(node);
+        b.wait(|event| matches!(event, Event::State(node) if node.diagnostics.logs.iter().any(|line| line.contains("fallback confirmed"))));
+        let request = super::super::update::Message::Prepare {
+            id: 42,
+            version: "99.0.0".into(),
+        };
+        a.service.update(request.clone()).unwrap();
+        a.wait(|event| matches!(event, Event::UpdateSent(message) if *message == request));
+        b.wait(|event| matches!(event, Event::Update(message) if *message == request));
+        b.service
+            .update(super::super::update::Message::Ready(42))
+            .unwrap();
+        a.wait(|event| {
+            matches!(
+                event,
+                Event::Update(super::super::update::Message::Ready(42))
+            )
+        });
     }
 
     #[test]

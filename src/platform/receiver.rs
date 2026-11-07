@@ -15,11 +15,13 @@ use tokio::{
 #[derive(Clone, Copy, PartialEq)]
 enum Stage {
     Armed,
+    Selecting,
     Reading,
+    AwaitFallback,
     Verified,
     Active,
     Exiting,
-    Returning,
+    Restoring,
     Returned,
 }
 
@@ -29,6 +31,7 @@ struct Transfer {
     edge: Option<u16>,
     stage: Stage,
     deadline: Instant,
+    fallback: bool,
 }
 
 const SWITCH_TIMEOUT: Duration = Duration::from_secs(15);
@@ -106,6 +109,11 @@ pub async fn run(
         drop(pipe);
         if let Some(Err(error)) = &result {
             eprintln!("Session ended: {error:#}");
+            if transfer.is_some() {
+                crate::lifecycle::report(crate::lifecycle::Event::Switch {
+                    error: Some(format!("{error:#}")),
+                });
+            }
         }
         if let Err(error) = disconnect(sink, transfer, video.as_ref()).await {
             return Err(error.context("input adapter failed to release its held keys/buttons"));
@@ -145,6 +153,7 @@ async fn session(
         tokio::select! {
             command = commands.recv() => match command {
                 Ok(crate::lifecycle::Command::Switch) => pipe.send(Message::SwitchRequested).await?,
+                Ok(crate::lifecycle::Command::SetupSwitch) => pipe.send(Message::SetupSwitchRequested).await?,
                 Ok(crate::lifecycle::Command::Emergency) => bail!("local emergency recovery requested"),
                 Ok(crate::lifecycle::Command::MicrophoneVolume(_)) | Err(_) => {}
             },
@@ -155,6 +164,16 @@ async fn session(
                         Ok(result) => {
                             job = None;
                             match active.stage {
+                                Stage::Selecting => {
+                                    if matches!(result, Ok(VideoResult::Written)) {
+                                        active.stage = Stage::Reading;
+                                        next_read = Instant::now() + SETTLE;
+                                    } else {
+                                        if let Err(error) = result { eprintln!("Target monitor is not accessible on this port: {error:#}"); }
+                                        active.stage = Stage::AwaitFallback;
+                                        pipe.send(Message::SelectFallback(active.id)).await?;
+                                    }
+                                }
                                 Stage::Reading => {
                                     let (inputs, _) = video.unwrap();
                                     if matches!(result, Ok(VideoResult::Read(input)) if input == inputs.peer) {
@@ -164,13 +183,18 @@ async fn session(
                                         if let Err(error) = result {
                                             eprintln!("Waiting for receiver-side DDC read: {error:#}");
                                         }
-                                        next_read = Instant::now() + Duration::from_millis(300);
+                                        if !active.fallback {
+                                            active.stage = Stage::AwaitFallback;
+                                            pipe.send(Message::SelectFallback(active.id)).await?;
+                                        } else {
+                                            next_read = Instant::now() + Duration::from_millis(300);
+                                        }
                                     }
                                 }
-                                Stage::Returning => {
+                                Stage::Restoring => {
                                     result.context("receiver could not select the host monitor input")?;
                                     active.stage = Stage::Returned;
-                                    pipe.send(Message::Returning(active.id)).await?;
+                                    pipe.send(Message::MonitorRestored(active.id)).await?;
                                 }
                                 _ => bail!("unexpected DDC job result"),
                             }
@@ -195,6 +219,7 @@ async fn session(
                     let mode = if inputs.is_some() { Mode::Video } else { Mode::Input };
                     ensure!(id > *last_id && transfer.is_none(), "stale or overlapping transfer");
                     *last_id = id;
+                    crate::lifecycle::report(crate::lifecycle::Event::Switch { error: None });
                     if let Err(error) = sink.prepare(edge, mode) {
                         eprintln!("Transfer rejected: {error:#}");
                         pipe.send(Message::Rejected(id)).await?;
@@ -205,13 +230,19 @@ async fn session(
                         pipe.send(Message::Rejected(id)).await?;
                         continue;
                     }
-                    *transfer = Some(Transfer { id, mode, edge, stage: Stage::Armed, deadline: Instant::now() + SWITCH_TIMEOUT });
+                    *transfer = Some(Transfer { id, mode, edge, stage: Stage::Armed, deadline: Instant::now() + SWITCH_TIMEOUT, fallback: false });
                     pipe.send(Message::Ready(id)).await?;
                     continue;
                 }
                 let active = transfer.as_mut().context("transfer message without a transfer")?;
                 match message {
-                    Message::Verify(id) if active.id == id && active.mode == Mode::Video && active.stage == Stage::Armed => {
+                    Message::SelectMonitor(id) if active.id == id && active.mode == Mode::Video && active.stage == Stage::Armed => {
+                        active.stage = Stage::Selecting;
+                        let (inputs, worker) = video.unwrap();
+                        job = Some(worker.submit(Job::Select { from: inputs.host, to: inputs.peer })?);
+                    }
+                    Message::Verify(id) if active.id == id && active.mode == Mode::Video && active.stage == Stage::AwaitFallback => {
+                        active.fallback = true;
                         active.stage = Stage::Reading;
                         next_read = Instant::now() + SETTLE;
                     }
@@ -235,14 +266,15 @@ async fn session(
                     Message::Return(id) if active.id == id && matches!(active.stage, Stage::Active | Stage::Exiting) => {
                         sink.release()?;
                         active.deadline = Instant::now() + SWITCH_TIMEOUT;
-                        if active.mode == Mode::Video {
-                            let (inputs, worker) = video.unwrap();
-                            active.stage = Stage::Returning;
-                            job = Some(worker.submit(Job::Select { from: inputs.peer, to: inputs.host })?);
-                        } else {
-                            active.stage = Stage::Returned;
-                            pipe.send(Message::Returning(id)).await?;
-                        }
+                        // Release input before the returning PC activates its own
+                        // remembered port. This side is only a DDC fallback.
+                        active.stage = Stage::Returned;
+                        pipe.send(Message::Returning(id)).await?;
+                    }
+                    Message::RestoreMonitor(id) if active.id == id && active.mode == Mode::Video && active.stage == Stage::Returned => {
+                        let (inputs, worker) = video.unwrap();
+                        active.stage = Stage::Restoring;
+                        job = Some(worker.submit(Job::Select { from: inputs.peer, to: inputs.host })?);
                     }
                     Message::Returned(id) if active.id == id && active.stage == Stage::Returned => {
                         *transfer = None;
@@ -340,7 +372,7 @@ mod tests {
         }
     }
 
-    async fn fixture(mode: Mode) {
+    async fn fixture(mode: Mode, restore_on_active_port: bool) {
         let windows = identity();
         let ubuntu = identity();
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -370,9 +402,7 @@ mod tests {
                 Message::Ready(1)
             );
             if mode == Mode::Video {
-                // The fixture supplies the outcome of the source-side DDC write.
-                monitor.input.store(INPUTS.peer, SeqCst);
-                pipe.send(Message::Verify(1)).await.unwrap();
+                pipe.send(Message::SelectMonitor(1)).await.unwrap();
                 assert_eq!(
                     pipe.messages.recv().await.unwrap().unwrap(),
                     Message::Observed {
@@ -380,6 +410,7 @@ mod tests {
                         input: INPUTS.peer
                     }
                 );
+                assert_eq!(monitor.input.load(SeqCst), INPUTS.peer);
             }
             pipe.send(Message::Activate(1)).await.unwrap();
             assert_eq!(
@@ -392,6 +423,28 @@ mod tests {
                 pipe.messages.recv().await.unwrap().unwrap(),
                 Message::Pong(2)
             );
+            if restore_on_active_port {
+                pipe.send(Message::Return(1)).await.unwrap();
+                assert_eq!(
+                    pipe.messages.recv().await.unwrap().unwrap(),
+                    Message::Returning(1)
+                );
+                // Returning first asks the destination to select its own input;
+                // this receiver has released the key but has not written video.
+                assert_eq!(monitor.input.load(SeqCst), INPUTS.peer);
+                pipe.send(Message::RestoreMonitor(1)).await.unwrap();
+                assert_eq!(
+                    pipe.messages.recv().await.unwrap().unwrap(),
+                    Message::MonitorRestored(1)
+                );
+                assert_eq!(monitor.input.load(SeqCst), INPUTS.host);
+                pipe.send(Message::Returned(1)).await.unwrap();
+                pipe.send(Message::Ping(3)).await.unwrap();
+                assert_eq!(
+                    pipe.messages.recv().await.unwrap().unwrap(),
+                    Message::Pong(3)
+                );
+            }
         };
         let server = async {
             let mut pipe = Pipe::connect(
@@ -409,7 +462,7 @@ mod tests {
                     .await
                     .is_err()
             );
-            assert!(sink.held);
+            assert_eq!(sink.held, !restore_on_active_port);
             disconnect(&mut sink, transfer, Some(&worker))
                 .await
                 .unwrap();
@@ -431,11 +484,16 @@ mod tests {
 
     #[tokio::test]
     async fn broken_link_releases_held_input_and_recovers_shared_video() {
-        fixture(Mode::Video).await;
+        fixture(Mode::Video, false).await;
     }
 
     #[tokio::test]
     async fn broken_input_only_link_releases_input_without_touching_ddc() {
-        fixture(Mode::Input).await;
+        fixture(Mode::Input, false).await;
+    }
+
+    #[tokio::test]
+    async fn return_releases_held_input_before_the_active_port_fallback() {
+        fixture(Mode::Video, true).await;
     }
 }

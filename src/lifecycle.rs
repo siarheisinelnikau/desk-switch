@@ -1,13 +1,17 @@
 use serde::{Deserialize, Serialize};
 use std::{
     io::{self, BufRead, Write},
-    sync::OnceLock,
+    sync::{
+        Arc, OnceLock,
+        atomic::{AtomicBool, Ordering},
+    },
 };
 use tokio::sync::{broadcast, watch};
 
 #[derive(Clone, Copy, Debug)]
 pub enum Command {
     Switch,
+    SetupSwitch,
     Emergency,
     MicrophoneVolume(u8),
 }
@@ -29,6 +33,9 @@ pub enum Event {
     },
     Input(InputStatus),
     Monitor(Option<u16>),
+    Switch {
+        error: Option<String>,
+    },
     Audio {
         playing: bool,
         message: String,
@@ -38,6 +45,7 @@ pub enum Event {
 struct Controls {
     stop: watch::Sender<bool>,
     commands: broadcast::Sender<Command>,
+    monitor_required: Arc<AtomicBool>,
 }
 
 static CONTROLS: OnceLock<Controls> = OnceLock::new();
@@ -52,6 +60,8 @@ fn controls() -> &'static Controls {
         let (commands, _) = broadcast::channel(16);
         let stop_send = stop.clone();
         let command_send = commands.clone();
+        let monitor_required = Arc::new(AtomicBool::new(false));
+        let required = Arc::clone(&monitor_required);
         if let Err(error) = std::thread::Builder::new()
             .name("Desk Switch commands".into())
             .spawn(move || {
@@ -61,6 +71,11 @@ fn controls() -> &'static Controls {
                         "switch" => {
                             let _ = command_send.send(Command::Switch);
                         }
+                        "setup-switch" => {
+                            let _ = command_send.send(Command::SetupSwitch);
+                        }
+                        "monitor-required on" => required.store(true, Ordering::Release),
+                        "monitor-required off" => required.store(false, Ordering::Release),
                         "emergency" => {
                             let _ = command_send.send(Command::Emergency);
                         }
@@ -87,7 +102,11 @@ fn controls() -> &'static Controls {
             eprintln!("Cannot start the service command reader: {error}");
             stop.send_replace(true);
         }
-        Controls { stop, commands }
+        Controls {
+            stop,
+            commands,
+            monitor_required,
+        }
     })
 }
 
@@ -97,6 +116,10 @@ pub fn install() {
 
 pub fn commands() -> broadcast::Receiver<Command> {
     controls().commands.subscribe()
+}
+
+pub fn monitor_required() -> bool {
+    controls().monitor_required.load(Ordering::Acquire)
 }
 
 pub async fn shutdown() -> io::Result<()> {

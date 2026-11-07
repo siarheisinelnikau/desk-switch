@@ -19,9 +19,10 @@ use std::{
 
 #[derive(Default)]
 pub(super) struct Pair {
-    service: Option<Service>,
+    pub(super) service: Option<Service>,
     probe: Option<Probe>,
     pub remote: Option<Node>,
+    pub last_remote: Option<Node>,
     pub hardware: Hardware,
     pub(super) inputs: Vec<workspace::hardware::InputEndpoint>,
     pub devices: workspace::devices::Inventory,
@@ -88,7 +89,9 @@ impl Pair {
     }
 
     fn connection_lost(&mut self, error: String, now: Instant) {
-        self.remote = None;
+        if let Some(remote) = self.remote.take() {
+            self.last_remote = Some(remote);
+        }
         self.plan = None;
         self.reconnect.lost(now);
         self.synced = false;
@@ -162,11 +165,20 @@ impl Desktop {
                 .audio
                 .as_ref()
                 .is_some_and(|w| w.running() && w.audio_playing),
-            input_error: self
-                .input
-                .as_ref()
-                .filter(|w| w.exit_ok == Some(false))
-                .and_then(|w| w.logs.back().cloned()),
+            monitor_error: self.monitor.as_ref().and_then(|w| {
+                w.switch_error.clone().or_else(|| {
+                    (w.exit_ok == Some(false))
+                        .then(|| w.logs.back().cloned())
+                        .flatten()
+                })
+            }),
+            input_error: self.input.as_ref().and_then(|w| {
+                w.switch_error.clone().or_else(|| {
+                    (w.exit_ok == Some(false))
+                        .then(|| w.logs.back().cloned())
+                        .flatten()
+                })
+            }),
             audio_error: self
                 .audio
                 .as_ref()
@@ -182,11 +194,13 @@ impl Desktop {
                 .filter(|w| w.exit_ok == Some(false))
                 .and_then(|w| w.logs.back().cloned()),
             ack: String::new(),
+            diagnostics: self.diagnostics_snapshot(),
         };
         for error in [
             &mut node.input_error,
             &mut node.audio_error,
             &mut node.microphone_error,
+            &mut node.monitor_error,
         ]
         .into_iter()
         .flatten()
@@ -197,6 +211,28 @@ impl Desktop {
             node.ack = Plan::build(&node, remote).digest(&node, remote);
         }
         node
+    }
+
+    fn diagnostics_snapshot(&self) -> workspace::diagnostics::Diagnostics {
+        let mut report = workspace::diagnostics::Diagnostics {
+            platform: std::env::consts::OS.into(),
+            ..Default::default()
+        };
+        report.line("Update", &self.update_status);
+        report.line("Pair", &self.pair.status);
+        for (name, worker) in [
+            ("Input", &self.input),
+            ("Monitor", &self.monitor),
+            ("Audio", &self.audio),
+            ("Microphone", &self.microphone),
+        ] {
+            if let Some(worker) = worker {
+                for line in worker.logs.iter().rev().take(9).rev() {
+                    report.line(name, line);
+                }
+            }
+        }
+        report
     }
 
     pub(super) fn availability_changed(&mut self, ctx: &egui::Context) {
@@ -256,6 +292,7 @@ impl Desktop {
             || self.quitting
             || self.install_pending
             || self.install_job.is_some()
+            || self.paired_update.as_ref().is_some_and(|u| u.handed_off)
         {
             return;
         }
@@ -373,6 +410,16 @@ impl Desktop {
                     self.prefs.workspace.peer_name = name;
                     self.prefs.workspace.last_address = address.to_string();
                     self.pair.connection_restored(address);
+                    if let Some(message) = self
+                        .paired_update
+                        .as_ref()
+                        .and_then(workspace::update::Coordinator::retry)
+                    {
+                        self.apply_update_effects(
+                            vec![workspace::update::Effect::Send(message)],
+                            ctx,
+                        );
+                    }
                     let _ = self.prefs.save(&self.dir);
                 }
                 Event::State(remote) => {
@@ -381,7 +428,10 @@ impl Desktop {
                         let _ = self.prefs.save(&self.dir);
                     }
                     self.pair.remote = Some(*remote);
+                    self.apply_input_monitor_requirement();
                 }
+                Event::Update(message) => self.receive_update(message, ctx),
+                Event::UpdateSent(message) => self.sent_update(&message, ctx),
                 Event::Forgotten => self.apply_forget(),
                 Event::Closed(error) => {
                     self.pair.connection_lost(error, Instant::now());
@@ -577,6 +627,7 @@ impl Desktop {
 
     pub(super) fn shared_changed(&mut self) {
         self.prefs.workspace.shared.changed(&self.public_key);
+        self.apply_input_monitor_requirement();
         if let Err(error) = self.prefs.save(&self.dir) {
             self.notice = Some((error.to_string(), true));
         }
@@ -597,6 +648,8 @@ impl Desktop {
 
     fn apply_forget(&mut self) {
         self.stop_pair();
+        self.pair.last_remote = None;
+        self.paired_update = None;
         let result: Result<()> = (|| {
             if self.dir.join("peer").exists() {
                 std::fs::remove_file(self.dir.join("peer"))?;
@@ -614,6 +667,9 @@ impl Desktop {
     }
 
     pub(super) fn remember_monitor(&mut self) {
+        if !self.prefs.workspace.shared.monitor_enabled {
+            return;
+        }
         if !self.prefs.workspace.monitor.enabled {
             self.prefs.workspace.pending_monitor = None;
         }
@@ -706,11 +762,23 @@ impl Desktop {
             && Plan::monitor_only_available(&self.local_node(), remote)
         {
             Plan::monitor_inputs(&self.local_node(), remote).map(|inputs| {
+                let host = self.public_key < remote.key;
+                let mut address = self.pair.remote_address.expect("connected pair address");
+                address.set_port(workspace::INPUT_PORT);
+                if !host {
+                    address.set_ip(if address.is_ipv4() {
+                        std::net::Ipv4Addr::UNSPECIFIED.into()
+                    } else {
+                        std::net::Ipv6Addr::UNSPECIFIED.into()
+                    });
+                }
                 vec![
                     "monitor-service".to_owned(),
                     self.prefs.workspace.monitor.id.clone(),
                     format!("{:X}", inputs.host),
                     format!("{:X}", inputs.peer),
+                    if host { "host" } else { "receiver" }.into(),
+                    address.to_string(),
                 ]
             })
         } else {
@@ -753,6 +821,7 @@ impl Desktop {
         if self.quitting
             || self.install_pending
             || self.install_job.is_some()
+            || self.paired_update.as_ref().is_some_and(|u| u.handed_off)
             || !self.prefs.discovery
             || self.pair.monitor_setup_pending
             || self
@@ -803,7 +872,8 @@ impl Desktop {
         }
         self.pair.active_plan = Some(plan.clone());
         self.reconcile_microphone(&plan, address);
-        if Plan::shared_monitor(&self.local_node(), &remote)
+        if Plan::common_monitor(&self.local_node(), &remote)
+            && Plan::shared_monitor(&self.local_node(), &remote)
             && plan.monitor.is_none()
             && !Plan::monitor_only_available(&self.local_node(), &remote)
             && !self.monitor_running()

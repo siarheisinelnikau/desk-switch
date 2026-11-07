@@ -62,6 +62,7 @@ pub fn run(
                 identity,
                 peer,
                 super::host::Coordinator {
+                    monitor_required: crate::lifecycle::monitor_required,
                     gate,
                     edge,
                     video,
