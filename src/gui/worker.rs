@@ -29,6 +29,9 @@ pub struct Worker {
     pub input_status: Option<InputStatus>,
     pub monitor_input: Option<u16>,
     pub monitoring: bool,
+    pub switch_error: Option<String>,
+    pub new_switch_error: Option<String>,
+    monitor_required: Option<bool>,
     pub audio_playing: bool,
     pub peer_version: Option<String>,
     pub version_error: Option<String>,
@@ -111,6 +114,9 @@ impl Worker {
             input_status: None,
             monitor_input: None,
             monitoring: false,
+            switch_error: None,
+            new_switch_error: None,
+            monitor_required: None,
             audio_playing: false,
             peer_version: None,
             version_error: None,
@@ -155,6 +161,18 @@ impl Worker {
             .context("канал управления службой закрыт")?;
         writeln!(input, "{command}")?;
         input.flush()?;
+        Ok(())
+    }
+
+    pub fn require_monitor(&mut self, required: bool) -> Result<()> {
+        if self.monitor_required != Some(required) {
+            self.command(if required {
+                "monitor-required on"
+            } else {
+                "monitor-required off"
+            })?;
+            self.monitor_required = Some(required);
+        }
         Ok(())
     }
 
@@ -208,6 +226,16 @@ impl Worker {
                 }
                 Event::Input(status) => self.input_status = Some(status),
                 Event::Monitor(input) => self.monitor_input = input,
+                Event::Switch { error } => {
+                    self.switch_error = error.clone();
+                    self.new_switch_error = error.clone();
+                    if let Some(error) = error {
+                        if self.logs.len() == 120 {
+                            self.logs.pop_front();
+                        }
+                        self.logs.push_back(format!("Switch failed: {error}"));
+                    }
+                }
                 Event::Audio { playing, .. } => self.audio_playing = playing && self.running(),
             }
             return;

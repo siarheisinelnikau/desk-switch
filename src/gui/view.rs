@@ -546,49 +546,121 @@ impl Desktop {
             });
         }
         card(ui, |ui| {
+            self.monitor_choice(ui);
             self.diagram(ui);
+            let monitor_only = self
+                .pair
+                .plan
+                .as_ref()
+                .is_some_and(|p| p.input_source.is_none())
+                && self.prefs.workspace.shared.monitor_enabled;
             ui.horizontal(|ui| {
-                ui.add_enabled_ui(self.connected() && self.pair.synced, |ui| {
-                    let label = if self.pair.plan.as_ref().is_some_and(|p| p.monitor.is_some()) {
-                        "Switch monitor, keyboard and mouse"
+                ui.add_enabled_ui(
+                    if monitor_only {
+                        self.monitor_switch_ready()
                     } else {
-                        "Передать клавиатуру и мышь"
-                    };
-                    if primary(ui, label).clicked() {
-                        self.switch();
-                    }
-                });
-                note(ui, "F12 — переключить · F11 — вернуть");
-            });
-            ui.horizontal(|ui| {
-                if self.pair.remote.as_ref().is_some_and(|r| {
-                    crate::workspace::Plan::monitor_inputs(&self.local_node(), r).is_some()
-                }) && ui
-                    .add_enabled(
-                        self.monitor_switch_ready(),
-                        egui::Button::new(crate::i18n::tr("Switch shared monitor")),
-                    )
-                    .on_disabled_hover_text(crate::i18n::tr(
-                        "Waiting for the monitor and input services to be ready on both PCs.",
-                    ))
-                    .clicked()
-                {
-                    self.action(super::Action::MonitorSwitch, ui.ctx());
-                }
-                if ui
-                    .small_button(crate::i18n::tr("Set up shared monitor…"))
-                    .clicked()
-                {
-                    self.action(super::Action::MonitorSetup, ui.ctx());
-                }
+                        self.input_switch_ready()
+                    },
+                    |ui| {
+                        let label = if monitor_only {
+                            "Switch shared monitor"
+                        } else if self.prefs.workspace.shared.monitor_enabled {
+                            "Switch monitor, keyboard and mouse"
+                        } else {
+                            "Передать клавиатуру и мышь"
+                        };
+                        if primary(ui, label).clicked() {
+                            if monitor_only {
+                                self.switch_monitor(ui.ctx());
+                            } else {
+                                self.switch();
+                            }
+                        }
+                    },
+                );
+                note(
+                    ui,
+                    if monitor_only {
+                        "Switch back using Desk Switch on the other PC."
+                    } else {
+                        "F12 — переключить · F11 — вернуть"
+                    },
+                );
             });
             if self.prefs.workspace.shared.monitor_enabled {
+                ui.horizontal(|ui| {
+                    if ui
+                        .small_button(crate::i18n::tr("Set up shared monitor…"))
+                        .clicked()
+                    {
+                        self.action(super::Action::MonitorSetup, ui.ctx());
+                    }
+                });
+            }
+            if self.prefs.workspace.shared.monitor_enabled {
                 let local = self.local_node();
+                for node in [&local].into_iter().chain(self.pair.remote.iter()) {
+                    let status =
+                        if let Some(input) = node.monitor.input.filter(|_| node.monitor.enabled) {
+                            format!(
+                                "{} ({input:#04X})",
+                                crate::i18n::tr("Connection remembered")
+                            )
+                        } else {
+                            crate::i18n::tr("Remember the connection on this PC")
+                        };
+                    note(ui, &format!("{}: {status}", node.name));
+                    if let Some(error) = &node.monitor_error {
+                        ui.colored_label(
+                            palette(ui).error,
+                            format!(
+                                "{}: {}",
+                                node.name,
+                                crate::i18n::tr(format!("Switch failed: {error}"))
+                            ),
+                        );
+                    }
+                }
+                if let Some(remote) = &self.pair.remote
+                    && local.monitor.input.is_some()
+                    && remote.monitor.input.is_some()
+                    && crate::workspace::Plan::monitor_inputs(&local, remote).is_none()
+                {
+                    note(
+                        ui,
+                        if local.monitor.input == remote.monitor.input {
+                            "Both PCs remembered the same video input. Remember each connection while that PC's picture is visible."
+                        } else {
+                            "The saved connections belong to different monitors. Select the same shared monitor on both PCs."
+                        },
+                    );
+                }
                 let configured =
                     self.pair.remote.as_ref().is_some_and(|r| {
                         crate::workspace::Plan::monitor_inputs(&local, r).is_some()
                     });
                 if !configured {
+                    if self
+                        .pair
+                        .plan
+                        .as_ref()
+                        .is_some_and(|p| p.input_source.is_some())
+                        && !self
+                            .pair
+                            .remote
+                            .as_ref()
+                            .is_some_and(|r| crate::workspace::Plan::input_in_use(&local, r))
+                        && ui
+                            .add_enabled(
+                                self.connected() && self.pair.synced,
+                                egui::Button::new(crate::i18n::tr(
+                                    "Switch keyboard and mouse only for setup",
+                                )),
+                            )
+                            .clicked()
+                    {
+                        self.switch_input_for_setup();
+                    }
                     note(
                         ui,
                         "One shared monitor is shown in the middle. Remember this PC's video connection on each PC to enable switching.",
@@ -665,10 +737,12 @@ impl Desktop {
             }
             if self.pair.remote.is_some()
                 && (self.pair.input_failed
+                    || self.pair.monitor_failed
                     || self.pair.audio_failed
                     || self.pair.microphone_failed
                     || self.pair.remote.as_ref().is_some_and(|r| {
                         r.input_error.is_some()
+                            || r.monitor_error.is_some()
                             || r.audio_error.is_some()
                             || r.microphone_error.is_some()
                     }))
@@ -825,7 +899,6 @@ impl Desktop {
         let remote = self.pair.remote.as_ref().unwrap().clone();
         let local = self.local_node();
         let before = self.prefs.workspace.shared.clone();
-        let mut setup_monitor = false;
         card(ui, |ui| {
             subheading(ui, "Общие устройства");
             note(
@@ -842,15 +915,7 @@ impl Desktop {
                         egui::Checkbox::new(enabled, crate::i18n::tr(label)))
                         .on_disabled_hover_text(crate::i18n::tr("Сначала верните управление: это единственное устройство ввода на принимающем ПК."));
                 }
-                let mut enabled = shared.monitor_enabled;
-                if ui.add_enabled(!crate::workspace::Plan::input_in_use(&local, &remote)
-                    && crate::workspace::Plan::can_disable(&local,&remote,true)
-                    && crate::workspace::Plan::can_disable(&local,&remote,false),
-                    egui::Checkbox::new(&mut enabled, crate::i18n::tr("Общий монитор")))
-                    .on_disabled_hover_text(crate::i18n::tr("Сначала верните управление: это единственное устройство ввода на принимающем ПК.")).changed() {
-                    shared.monitor_enabled = enabled;
-                    setup_monitor = enabled && (!local.monitor.enabled || local.monitor.input.is_none());
-                }
+
             });
             if !crate::workspace::Plan::can_disable(&local, &remote, true)
                 || !crate::workspace::Plan::can_disable(&local, &remote, false)
@@ -1066,10 +1131,32 @@ impl Desktop {
         if self.prefs.workspace.shared != before {
             self.shared_changed();
         }
-        if setup_monitor {
-            self.prefs.workspace.monitor.enabled = true;
-            self.monitor_setup_open = true;
-            self.remember_monitor();
+    }
+
+    fn monitor_choice(&mut self, ui: &mut egui::Ui) {
+        let local = self.local_node();
+        let active = self.pair.remote.as_ref().is_some_and(|remote| {
+            crate::workspace::Plan::input_in_use(&local, remote)
+                && self
+                    .pair
+                    .plan
+                    .as_ref()
+                    .is_some_and(|plan| plan.monitor.is_some())
+        });
+        if ui
+            .add_enabled(
+                !active,
+                egui::Checkbox::new(
+                    &mut self.prefs.workspace.shared.monitor_enabled,
+                    crate::i18n::tr("Общий монитор"),
+                ),
+            )
+            .on_disabled_hover_text(crate::i18n::tr(
+                "Сначала верните управление: это единственное устройство ввода на принимающем ПК.",
+            ))
+            .changed()
+        {
+            self.shared_changed();
         }
     }
 
@@ -1079,10 +1166,14 @@ impl Desktop {
         let local = self.local_node();
         let can_configure = self.can_remember_monitor();
         card(ui, |ui| {
-            let header = egui::CollapsingHeader::new(crate::i18n::tr("Общий монитор"))
+            let header = egui::CollapsingHeader::new(crate::i18n::tr("Monitor connection on this PC"))
                 .id_salt("local-monitor")
                 .open(open.then_some(true))
                 .show(ui, |ui| {
+                    if !self.prefs.workspace.shared.monitor_enabled {
+                        note(ui, "Select Shared monitor above to configure video input switching.");
+                        return;
+                    }
                     note(ui, "Each PC remembers its own video connection. Set this up once on each PC while its picture is visible.");
                     ui.add_enabled_ui(can_configure, |ui| {
                         let old_id = self.prefs.workspace.monitor.id.clone();
@@ -1099,33 +1190,27 @@ impl Desktop {
                                     }
                                 }
                             });
-                        if ui.checkbox(&mut self.prefs.workspace.monitor.enabled,
-                            crate::i18n::tr("This monitor is connected to both PCs")).changed() {
-                            if self.prefs.workspace.monitor.enabled {
-                                self.prefs.workspace.shared.monitor_enabled = true;
-                                self.shared_changed();
-                            }
-                            changed = true;
-                        }
                         if old_id != self.prefs.workspace.monitor.id {
                             self.prefs.workspace.monitor.input = None;
                             self.prefs.workspace.pending_monitor = None;
                             changed = true;
                         }
-                        if self.prefs.workspace.monitor.enabled {
-                            if self.query.is_some() { ui.spinner(); }
-                            else if self.prefs.workspace.pending_monitor.is_some() {
-                                note(ui, "Connection saved. Return the borrowed keyboard and mouse to enable monitor switching safely.");
-                            } else if self.prefs.workspace.monitor.input.is_some() {
-                                note(ui, "Текущее подключение этого ПК запомнено.");
-                            } else {
-                                note(ui, "Не удалось прочитать текущее подключение. Включите DDC/CI в меню монитора.");
-                            }
-                            if ui.small_button(crate::i18n::tr("Запомнить текущее подключение заново")).clicked() { changed = true; }
-                            if self.pair.remote.as_ref().is_some_and(|remote| crate::workspace::Plan::monitor_inputs(&local, remote).is_none()) {
-                                note(ui, "Для переключения выберите этот же общий монитор на втором ПК. Оба текущих входа должны быть разными.");
-                            }
+                        if self.query.is_some() { ui.spinner(); }
+                        else if self.prefs.workspace.pending_monitor.is_some() {
+                            note(ui, "Connection saved. Return the borrowed keyboard and mouse to enable monitor switching safely.");
+                        } else if self.prefs.workspace.monitor.input.is_some() {
+                            note(ui, "Текущее подключение этого ПК запомнено.");
+                        } else {
+                            note(ui, "Video connection not set up");
                         }
+                        if ui.small_button(crate::i18n::tr("Запомнить текущее подключение заново")).clicked() {
+                            self.prefs.workspace.monitor.enabled = true;
+                            changed = true;
+                        }
+                        if self.pair.remote.as_ref().is_some_and(|remote| crate::workspace::Plan::monitor_inputs(&local, remote).is_none()) {
+                            note(ui, "Для переключения выберите этот же общий монитор на втором ПК. Оба текущих входа должны быть разными.");
+                        }
+
                     });
                     if !can_configure {
                         note(ui, "Сначала верните управление: это единственное устройство ввода на принимающем ПК.");
@@ -1240,7 +1325,7 @@ impl Desktop {
                     }) {
                         "Проверяем видеовход…"
                     } else {
-                        "Video connection not set up"
+                        "Finish setup on both PCs"
                     })
                 });
             painter.text(
@@ -1392,7 +1477,7 @@ impl Desktop {
         if ui.button(crate::i18n::tr("Copy diagnostics")).clicked() {
             let mut report = format!("Desk Switch {} / protocol {}\nPair synchronized: {}\n{}\n",
                 crate::compatibility::VERSION, crate::compatibility::PROTOCOL, self.pair.synced,
-                serde_json::to_string_pretty(&serde_json::json!({"local":self.local_node(),"remote":self.pair.remote,"pair_status":self.pair.status})).unwrap_or_default());
+                serde_json::to_string_pretty(&serde_json::json!({"local":self.local_node(),"remote":self.pair.remote.as_ref().or(self.pair.last_remote.as_ref()),"peer_connected":self.pair.remote.is_some(),"pair_status":self.pair.status})).unwrap_or_default());
             for (name, worker) in [
                 ("Input", &self.input),
                 ("Monitor", &self.monitor),
@@ -1409,6 +1494,35 @@ impl Desktop {
             }
             ui.ctx().copy_text(report);
         }
+        card(ui, |ui| {
+            subheading(ui, "Diagnostics from the other PC");
+            if let Some(remote) = self.pair.remote.as_ref().or(self.pair.last_remote.as_ref()) {
+                note(ui, &remote.name);
+                if self.pair.remote.is_none() {
+                    note(ui, "Offline: showing the last received diagnostics.");
+                }
+                egui::ScrollArea::vertical()
+                    .id_salt("remote-diagnostics")
+                    .max_height(230.0)
+                    .stick_to_bottom(true)
+                    .show(ui, |ui| {
+                        for line in &remote.diagnostics.logs {
+                            ui.label(crate::i18n::ui_text(
+                                RichText::new(crate::i18n::tr(line)).monospace().size(12.0),
+                            ));
+                        }
+                    });
+            } else {
+                note(
+                    ui,
+                    "Reconnect the linked PC to receive its latest diagnostics.",
+                );
+            }
+            note(
+                ui,
+                "The report includes recent service logs from both linked PCs. Logs travel only over the encrypted paired connection.",
+            );
+        });
         card(ui, |ui| {
             subheading(ui, "Профиль этого компьютера");
             ui.label(crate::i18n::ui_text(
@@ -1592,6 +1706,7 @@ impl Desktop {
                 if ui
                     .add_enabled(
                         self.update_job.is_none()
+                            && self.paired_update.is_none()
                             && self.install_job.is_none()
                             && !self.install_pending,
                         egui::Button::new(crate::i18n::ui_text("Проверить обновления")),
@@ -1602,7 +1717,7 @@ impl Desktop {
                 }
                 if ui
                     .add_enabled(
-                        self.update_ready,
+                        self.update_ready && self.paired_update.is_none(),
                         egui::Button::new(crate::i18n::ui_text("Обновить и перезапустить")),
                     )
                     .clicked()
