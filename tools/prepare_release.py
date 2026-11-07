@@ -12,6 +12,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 REPOSITORY = "siarheisinelnikau/desk-switch"
+from release_assets import asset_names
 
 
 def checked_binary(path: Path, platform: str, version: str, protocol: int) -> bytes:
@@ -53,7 +54,8 @@ def main():
     if public != bytes.fromhex("302a300506032b6570032100") + pinned:
         raise ValueError("The signing key does not match the public key pinned in the clients")
     targets = {}
-    artifacts = [(args.windows,"desk-switch-windows-x86_64.exe"),(args.deb,"desk-switch-linux-x86_64.deb")]
+    names = asset_names(version)
+    artifacts = [(args.windows,names["windows-x86_64"]),(args.deb,names["linux-x86_64-deb"])]
     checked_binary(args.windows,"windows-x86_64",version,protocol)
     fields = subprocess.check_output(["dpkg-deb", "--field", str(args.deb), "Package", "Version", "Architecture"], text=True)
     if fields.splitlines() != ["Package: desk-switch", f"Version: {version}", "Architecture: amd64"]:

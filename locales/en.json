@@ -397,5 +397,12 @@
   "The other PC did not complete the paired update. The verified download is kept for retry.": "The other PC did not complete the paired update. The verified download is kept for retry.",
   "Switch back using Desk Switch on the other PC.": "Switch back using Desk Switch on the other PC.",
   "Switch keyboard and mouse only for setup": "Switch keyboard and mouse only for setup",
-  "Select the other PC's input in the monitor menu, then remember its connection there. Return input with F11; use the monitor menu to return the picture during this first setup.": "Select the other PC's input in the monitor menu, then remember its connection there. Return input with F11; use the monitor menu to return the picture during this first setup."
+  "Select the other PC's input in the monitor menu, then remember its connection there. Return input with F11; use the monitor menu to return the picture during this first setup.": "Select the other PC's input in the monitor menu, then remember its connection there. Return input with F11; use the monitor menu to return the picture during this first setup.",
+  "System volume of the shared output": "System volume of the shared output",
+  "Relative to the shared output's system volume": "Relative to the shared output's system volume",
+  "The listening PC controls system volume. The other PC is relative to it: 90% × 50% = 45%.": "The listening PC controls system volume. The other PC is relative to it: 90% × 50% = 45%.",
+  "Shared monitor is off": "Shared monitor is off",
+  "Set up this PC": "Set up this PC",
+  "Set up the other PC": "Set up the other PC",
+  "Same input on both PCs": "Same input on both PCs"
 }
