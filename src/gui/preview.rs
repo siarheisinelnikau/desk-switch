@@ -12,6 +12,7 @@ use std::path::PathBuf;
 struct PreviewApp {
     desktop: Desktop,
     frames: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    causes: std::sync::Arc<std::sync::Mutex<std::collections::BTreeMap<String, u64>>>,
 }
 
 impl eframe::App for PreviewApp {
@@ -19,6 +20,12 @@ impl eframe::App for PreviewApp {
         eframe::App::logic(&mut self.desktop, ctx, frame);
     }
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
+        {
+            let mut causes = self.causes.lock().unwrap();
+            for cause in ui.ctx().repaint_causes() {
+                *causes.entry(cause.to_string()).or_default() += 1;
+            }
+        }
         self.frames
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         eframe::App::ui(&mut self.desktop, ui, frame);
@@ -29,6 +36,7 @@ fn render_probe(
     ctx: egui::Context,
     frames: std::sync::Arc<std::sync::atomic::AtomicU64>,
     backend: String,
+    causes: std::sync::Arc<std::sync::Mutex<std::collections::BTreeMap<String, u64>>>,
     output: PathBuf,
 ) -> Result<()> {
     anyhow::ensure!(
@@ -60,6 +68,7 @@ fn render_probe(
             let result = serde_json::to_string_pretty(&serde_json::json!({
                 "backend": backend, "fixture": true, "samples": samples,
                 "total_ui_frames": frames.load(Ordering::Relaxed),
+                "repaint_causes": *causes.lock().unwrap(),
             }))
             .map_err(anyhow::Error::from)
             .and_then(|data| crate::config::write_atomic(&output, &data));
@@ -110,12 +119,21 @@ pub fn run(case: &str, dir: PathBuf) -> Result<()> {
             let mut app = Desktop::new(cc.egui_ctx.clone(), dir, false);
             app.fixture(&case);
             let frames = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+            let causes =
+                std::sync::Arc::new(std::sync::Mutex::new(std::collections::BTreeMap::new()));
             if let Some(output) = std::env::var_os("DESK_SWITCH_RENDER_PROBE") {
-                render_probe(cc.egui_ctx.clone(), frames.clone(), backend, output.into())?;
+                render_probe(
+                    cc.egui_ctx.clone(),
+                    frames.clone(),
+                    backend,
+                    causes.clone(),
+                    output.into(),
+                )?;
             }
             Ok(Box::new(PreviewApp {
                 desktop: app,
                 frames,
+                causes,
             }))
         }),
     )
