@@ -42,6 +42,7 @@ fn render_probe(
     backend: String,
     causes: std::sync::Arc<std::sync::Mutex<std::collections::BTreeMap<String, u64>>>,
     output: PathBuf,
+    send: std::sync::mpsc::Sender<Action>,
 ) -> Result<()> {
     anyhow::ensure!(
         output.is_absolute(),
@@ -62,11 +63,13 @@ fn render_probe(
                 // Each visibility transition may paint. Count the settled interval separately.
                 std::thread::sleep(Duration::from_secs(2));
                 let start = frames.load(Ordering::Relaxed);
+                let popup_start = super::popup::FRAMES.load(Ordering::Relaxed);
                 let since = Instant::now();
                 std::thread::sleep(Duration::from_secs(6));
                 samples.push(serde_json::json!({
                     "state": state, "seconds": since.elapsed().as_secs_f64(),
                     "ui_frames": frames.load(Ordering::Relaxed) - start,
+                    "popup_ui_frames": super::popup::FRAMES.load(Ordering::Relaxed) - popup_start,
                 }));
             }
             let result = serde_json::to_string_pretty(&serde_json::json!({
@@ -79,7 +82,8 @@ fn render_probe(
             if let Err(error) = result {
                 eprintln!("Render probe failed: {error:#}");
             }
-            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            let _ = send.send(Action::Quit);
+            ctx.request_repaint();
         })?;
     Ok(())
 }
@@ -100,14 +104,18 @@ pub fn run(case: &str, dir: PathBuf) -> Result<()> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("Desk Switch")
-            .with_inner_size(
-                if capturing || std::env::var_os("EFRAME_SCREENSHOT_TO").is_some() {
-                    [1080.0, 1000.0]
-                } else {
-                    [1080.0, 760.0]
-                },
-            )
-            .with_min_inner_size([880.0, 650.0])
+            .with_inner_size(if case == "quick-controls" {
+                [344.0, 442.0]
+            } else if capturing || std::env::var_os("EFRAME_SCREENSHOT_TO").is_some() {
+                [1080.0, 1000.0]
+            } else {
+                [1080.0, 760.0]
+            })
+            .with_min_inner_size(if case == "quick-controls" {
+                [344.0, 442.0]
+            } else {
+                [880.0, 650.0]
+            })
             .with_icon(egui::IconData {
                 rgba: super::tray::icon_rgba(64),
                 width: 64,
@@ -155,6 +163,7 @@ pub fn run(case: &str, dir: PathBuf) -> Result<()> {
                     backend,
                     causes.clone(),
                     output.into(),
+                    app.quick.sender(),
                 )?;
             }
             Ok(Box::new(PreviewApp {
@@ -182,6 +191,16 @@ pub fn run(case: &str, dir: PathBuf) -> Result<()> {
 
 impl Desktop {
     fn fixture(&mut self, case: &str) {
+        #[cfg(windows)]
+        if let Some(tray) = &self.tray {
+            tray.preview_label();
+        }
+        self.preview_popup = case == "quick-controls";
+        let case = if self.preview_popup {
+            "shared-audio"
+        } else {
+            case
+        };
         self.prefs.auto_update = false;
         self.prefs.autostart = false;
         self.startup_pending = false;
@@ -525,8 +544,7 @@ impl Desktop {
             self.tray_snapshot = snapshot;
         }
         if ctx.input(|input| input.viewport().close_requested()) && !self.quitting {
-            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
-            self.action(Action::Quit, ctx);
+            self.close_window(ctx);
         }
         if self.quitting {
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);

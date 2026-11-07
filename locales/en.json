@@ -460,5 +460,17 @@
   "The other PC is now running version {version}.": "The other PC is now running version {version}.",
   "Discovered version: {version}": "Discovered version: {version}",
   "Version {version} is verified and ready to install.": "Version {version} is verified and ready to install.",
-  "Last checked: no newer release was available.": "Last checked: no newer release was available."
+  "Last checked: no newer release was available.": "Last checked: no newer release was available.",
+  "Headphones / speakers": "Headphones / speakers",
+  "Keyboard": "Keyboard",
+  "Mouse": "Mouse",
+  "Switch to the other PC": "Switch to the other PC",
+  "Input": "Input",
+  "System volume": "System volume",
+  "Relative volume": "Relative volume",
+  "Mute": "Mute",
+  "Open Desk Switch": "Open Desk Switch",
+  "Quit application": "Quit application",
+  "No paired computer": "No paired computer",
+  "Sound": "Sound"
 }

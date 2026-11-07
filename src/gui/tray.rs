@@ -68,14 +68,19 @@ pub fn icon_rgba(size: usize) -> Vec<u8> {
         .clone()
 }
 
-fn dispatch(sender: &Sender<Action>, ctx: &egui::Context, action: Action) {
+pub(super) fn dispatch(sender: &Sender<Action>, ctx: &egui::Context, action: Action) {
     if action == Action::Show {
-        ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
-        ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
-        ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+        ctx.send_viewport_cmd_to(egui::ViewportId::ROOT, egui::ViewportCommand::Visible(true));
+        ctx.send_viewport_cmd_to(
+            egui::ViewportId::ROOT,
+            egui::ViewportCommand::Minimized(false),
+        );
+        ctx.send_viewport_cmd_to(egui::ViewportId::ROOT, egui::ViewportCommand::Focus);
     }
     let _ = sender.send(action);
-    ctx.request_repaint();
+    // Context clones share the active viewport. A child popup must explicitly
+    // wake ROOT, whose logic drains commands even while its window is hidden.
+    ctx.request_repaint_of(egui::ViewportId::ROOT);
 }
 
 #[cfg(target_os = "linux")]
@@ -102,8 +107,8 @@ mod native {
         fn title(&self) -> String {
             "Desk Switch".into()
         }
-        fn activate(&mut self, _: i32, _: i32) {
-            dispatch(&self.sender, &self.ctx, Action::Show);
+        fn activate(&mut self, x: i32, y: i32) {
+            dispatch(&self.sender, &self.ctx, Action::QuickOpen { x, y });
         }
         fn icon_pixmap(&self) -> Vec<ksni::Icon> {
             let mut pixels = icon_rgba(32);
@@ -223,7 +228,7 @@ mod native {
 mod native {
     use super::*;
     use tray_icon::{
-        Icon, MouseButton, TrayIcon, TrayIconBuilder, TrayIconEvent,
+        Icon, MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent,
         menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem},
     };
 
@@ -303,14 +308,21 @@ mod native {
                 dispatch(&menu_sender, &menu_ctx, action);
             }));
             TrayIconEvent::set_event_handler(Some(move |event| {
-                if matches!(
-                    event,
-                    TrayIconEvent::DoubleClick {
-                        button: MouseButton::Left,
-                        ..
-                    }
-                ) {
-                    dispatch(&sender, &ctx, Action::Show);
+                if let TrayIconEvent::Click {
+                    button: MouseButton::Left,
+                    button_state: MouseButtonState::Up,
+                    position,
+                    ..
+                } = event
+                {
+                    dispatch(
+                        &sender,
+                        &ctx,
+                        Action::QuickOpen {
+                            x: position.x as i32,
+                            y: position.y as i32,
+                        },
+                    );
                 }
             }));
             let metric = unsafe {
@@ -326,7 +338,7 @@ mod native {
             let icon = Icon::from_rgba(icon_rgba(size), size as u32, size as u32)?;
             let icon = TrayIconBuilder::new()
                 .with_menu(Box::new(menu))
-                .with_menu_on_left_click(true)
+                .with_menu_on_left_click(false)
                 .with_tooltip("Desk Switch")
                 .with_icon(icon)
                 .build()?;
@@ -340,6 +352,10 @@ mod native {
                 emergency,
                 sound,
             })
+        }
+        #[cfg(debug_assertions)]
+        pub(crate) fn preview_label(&self) {
+            let _ = self._icon.set_tooltip(Some("Desk Switch preview"));
         }
         pub fn available(&self) -> bool {
             true

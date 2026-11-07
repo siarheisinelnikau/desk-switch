@@ -460,5 +460,17 @@
   "The other PC is now running version {version}.": "На другом ПК теперь работает версия {version}.",
   "Discovered version: {version}": "Обнаружена версия: {version}",
   "Version {version} is verified and ready to install.": "Версия {version} проверена и готова к установке.",
-  "Last checked: no newer release was available.": "При последней проверке новых версий не было."
+  "Last checked: no newer release was available.": "При последней проверке новых версий не было.",
+  "Headphones / speakers": "Наушники / динамики",
+  "Keyboard": "Клавиатура",
+  "Mouse": "Мышь",
+  "Switch to the other PC": "Переключиться на другой ПК",
+  "Input": "Управление",
+  "System volume": "Громкость ОС",
+  "Relative volume": "Относительно",
+  "Mute": "Без звука",
+  "Open Desk Switch": "Открыть Desk Switch",
+  "Quit application": "Выйти",
+  "No paired computer": "Нет связанного ПК",
+  "Sound": "Звук"
 }
