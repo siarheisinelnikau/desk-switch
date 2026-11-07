@@ -2,6 +2,7 @@
 
 #include "i2c.h"
 #include "utils.h"
+#include <unistd.h>
 
 static int getBytesUsed(UInt8* data) {
     int bytes = 0;

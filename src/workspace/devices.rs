@@ -41,6 +41,7 @@ pub struct Choices {
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(default)]
 pub struct Inventory {
+    pub displays: Vec<Display>,
     pub keyboards: Vec<crate::audio::AudioDevice>,
     pub mice: Vec<crate::audio::AudioDevice>,
     pub speakers: Vec<crate::audio::AudioDevice>,
@@ -49,8 +50,43 @@ pub struct Inventory {
     pub individual_input: bool,
 }
 
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct Display {
+    pub id: String,
+    pub name: String,
+    pub fingerprint: String,
+}
+impl Display {
+    pub fn validate(&self) -> Result<()> {
+        ensure!(
+            !self.id.is_empty()
+                && self.id.len() <= 1024
+                && self.name.len() <= 256
+                && !self.id.chars().any(char::is_control)
+                && !self.name.chars().any(char::is_control)
+                && (self.fingerprint.is_empty()
+                    || (self.fingerprint.len() == 64
+                        && self
+                            .fingerprint
+                            .bytes()
+                            .all(|byte| byte.is_ascii_hexdigit()))),
+            "Invalid display information"
+        );
+        Ok(())
+    }
+}
+
 impl Inventory {
     pub fn validate(&self) -> Result<()> {
+        ensure!(self.displays.len() <= 32, "Too many displays");
+        let mut display_ids = std::collections::BTreeSet::new();
+        for display in &self.displays {
+            display.validate()?;
+            ensure!(
+                display_ids.insert(&display.id),
+                "Duplicate display information"
+            );
+        }
         for list in [
             &self.keyboards,
             &self.mice,
@@ -92,6 +128,52 @@ pub fn selected<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn display_inventory_accepts_legacy_reports_and_rejects_ambiguous_or_unbounded_displays() {
+        let legacy: Inventory = serde_json::from_str("{\"individual_input\":true}").unwrap();
+        assert!(legacy.displays.is_empty());
+        let display = Display {
+            id: "display-1".into(),
+            name: "Desk monitor".into(),
+            fingerprint: "ab".repeat(32),
+        };
+        let mut inventory = Inventory {
+            displays: vec![display.clone()],
+            ..Default::default()
+        };
+        inventory.validate().unwrap();
+        inventory.displays.push(display.clone());
+        assert!(inventory.validate().is_err());
+        for invalid in [
+            Display {
+                id: "x".repeat(1025),
+                ..display.clone()
+            },
+            Display {
+                name: "line\nbreak".into(),
+                ..display.clone()
+            },
+            Display {
+                fingerprint: "q".repeat(64),
+                ..display.clone()
+            },
+            Display {
+                fingerprint: "a".repeat(63),
+                ..display.clone()
+            },
+        ] {
+            inventory.displays = vec![invalid];
+            assert!(inventory.validate().is_err());
+        }
+        inventory.displays = (0..33)
+            .map(|index| Display {
+                id: format!("display-{index}"),
+                ..display.clone()
+            })
+            .collect();
+        assert!(inventory.validate().is_err());
+    }
     #[test]
     fn manual_address_supports_routed_ipv4_ipv6_and_explicit_ports() {
         assert_eq!(

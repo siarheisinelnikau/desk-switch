@@ -22,13 +22,13 @@ pub enum Device {
 pub enum Command {
     Toggle(Device, bool),
     Level { remote: bool, level: AudioLevel },
-    GroupLevel { index: usize, level: AudioLevel },
-    Target(usize),
+    GroupLevel { key: [u8; 32], level: AudioLevel },
+    Target([u8; 32]),
 }
 
 #[derive(Clone, Default, PartialEq)]
 struct Snapshot {
-    targets: Vec<(usize, String, bool)>,
+    targets: Vec<([u8; 32], String, bool)>,
     connected: bool,
     can_switch: bool,
     monitor: bool,
@@ -46,7 +46,7 @@ struct Snapshot {
 }
 #[derive(Clone, PartialEq)]
 struct Level {
-    group_index: Option<usize>,
+    group_key: Option<[u8; 32]>,
     name: String,
     remote: bool,
     system: bool,
@@ -211,8 +211,8 @@ impl Desktop {
                         value,
                     });
                 }
-                Command::GroupLevel { index, level } => {
-                    if let Some(member) = state.members.values().nth(index) {
+                Command::GroupLevel { key, level } => {
+                    if let Some(member) = state.members.get(&crate::config::hex(&key)) {
                         let mut value = member.preferences.clone();
                         if state.plan().audio.as_ref() == Some(&member.node.key) {
                             value.output = Some(level);
@@ -226,10 +226,10 @@ impl Desktop {
                         });
                     }
                 }
-                Command::Target(index) => {
-                    if let Some(key) = state.members.keys().nth(index) {
-                        self.group_action(GroupAction::Activate { key: key.clone() });
-                    }
+                Command::Target(key) => {
+                    self.group_action(GroupAction::Activate {
+                        key: crate::config::hex(&key),
+                    });
                 }
                 Command::Level { .. } => {}
             }
@@ -344,7 +344,7 @@ impl Desktop {
         for (node, is_remote) in [(Some(&local), false), (remote, true)] {
             if let Some(node) = node {
                 snapshot.levels.push(Level {
-                    group_index: None,
+                    group_key: None,
                     name: node.name.clone(),
                     remote: is_remote,
                     system: output == Some(node.key.as_str()),
@@ -360,7 +360,7 @@ impl Desktop {
                 .filter(|member| member.online)
                 .count()
                 > 1;
-            snapshot.can_switch = snapshot.connected;
+            snapshot.can_switch = snapshot.connected && !workspace.switch_pending();
             snapshot.monitor = false;
             snapshot.peer = format!(
                 "{} {}",
@@ -384,13 +384,18 @@ impl Desktop {
                 .map(|member| member.node.hardware.audio_name.clone())
                 .unwrap_or_default();
             snapshot.levels.clear();
-            for (index, member) in workspace.members.values().enumerate() {
-                snapshot
-                    .targets
-                    .push((index, member.node.name.clone(), member.compatible()));
+            for member in workspace.members.values() {
+                let Ok(key) = crate::config::key(&member.node.key) else {
+                    continue;
+                };
+                snapshot.targets.push((
+                    key,
+                    member.node.name.clone(),
+                    member.compatible() && !workspace.switch_pending(),
+                ));
                 let system = plan.audio.as_ref() == Some(&member.node.key);
                 snapshot.levels.push(Level {
-                    group_index: Some(index),
+                    group_key: Some(key),
                     name: member.node.name.clone(),
                     remote: member.node.key != self.public_key,
                     system,
@@ -533,9 +538,9 @@ fn content(ui: &mut egui::Ui, snapshot: &Snapshot, mut send: impl FnMut(Action))
                     .width(WIDTH - 64.0)
                     .selected_text(tr("Switch to computer…"))
                     .show_ui(ui, |ui| {
-                        for (index, name, enabled) in &snapshot.targets {
+                        for (key, name, enabled) in &snapshot.targets {
                             if ui.add_enabled(*enabled, egui::Button::new(name)).clicked() {
-                                send(Action::Quick(Command::Target(*index)));
+                                send(Action::Quick(Command::Target(*key)));
                             }
                         }
                     });
@@ -642,8 +647,8 @@ fn content(ui: &mut egui::Ui, snapshot: &Snapshot, mut send: impl FnMut(Action))
                             })
                             .inner;
                         if changed {
-                            send(Action::Quick(if let Some(index) = row.group_index {
-                                Command::GroupLevel { index, level }
+                            send(Action::Quick(if let Some(key) = row.group_key {
+                                Command::GroupLevel { key, level }
                             } else {
                                 Command::Level {
                                     remote: row.remote,

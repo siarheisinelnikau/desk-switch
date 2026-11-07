@@ -2,9 +2,65 @@ use super::{Action, Desktop};
 use crate::workspace::update::{Coordinator, Effect, Message};
 use eframe::egui;
 
+pub(super) enum DownloadAction {
+    Install,
+    Pair,
+}
+
 impl Desktop {
+    pub(super) fn update_action_busy(&self) -> bool {
+        self.paired_update.is_some()
+            || self.peer_restart.is_some()
+            || self.update_job.is_some()
+            || self.install_job.is_some()
+            || self.install_pending
+            || self.quitting
+    }
+
+    fn accept_update_action(&mut self) -> bool {
+        if self.update_action_busy() {
+            self.notice = Some((
+                "Another update operation is already in progress.".into(),
+                true,
+            ));
+            false
+        } else {
+            true
+        }
+    }
+
+    pub(super) fn install_selected_update(&mut self, target: &str, ctx: &egui::Context) {
+        if !self.accept_update_action() {
+            return;
+        }
+        if target == self.public_key {
+            if !self.update_ready {
+                return;
+            }
+            self.update_confirmation = false;
+            self.group.update_target = None;
+            self.begin_install_update(ctx);
+            return;
+        }
+        let remote = self
+            .group
+            .workspace
+            .as_ref()
+            .and_then(|state| state.members.get(target))
+            .filter(|member| member.online)
+            .map(|member| member.node.clone());
+        let Some(remote) = remote else {
+            self.notice = Some((
+                "Reconnect the selected computer before updating it.".into(),
+                true,
+            ));
+            return;
+        };
+        self.start_remote_update_on(&remote, ctx);
+    }
+
     pub(super) fn install_update(&mut self, ctx: &egui::Context) {
-        if self.paired_update.is_some() || self.install_job.is_some() || self.install_pending {
+        if !self.accept_update_action() {
             return;
         }
         if !self.update_ready {
@@ -12,7 +68,7 @@ impl Desktop {
             return;
         }
         if self.pair.remote.is_some()
-            && self.prepared_update.is_some()
+            && (self.prepared_update.is_some() || self.candidate_update.is_some())
             && self.update_version.is_some()
             && self.pair.remote.as_ref().is_some_and(|remote| {
                 remote.management.is_some()
@@ -33,14 +89,21 @@ impl Desktop {
     }
 
     pub(super) fn start_remote_update(&mut self, ctx: &egui::Context) {
-        if self.paired_update.is_some()
-            || self.peer_restart.is_some()
-            || self.install_job.is_some()
-            || self.install_pending
-        {
+        if !self.accept_update_action() {
             return;
         }
-        let Some(remote) = self.pair.remote.as_ref().filter(|node| {
+        let Some(remote) = self.pair.remote.clone() else {
+            self.notice = Some((
+                "Reconnect the selected computer before updating it.".into(),
+                true,
+            ));
+            return;
+        };
+        self.start_remote_update_on(&remote, ctx);
+    }
+
+    fn start_remote_update_on(&mut self, remote: &crate::workspace::Node, ctx: &egui::Context) {
+        let Some(remote) = Some(remote).filter(|node| {
             node.management
                 .as_ref()
                 .is_some_and(|state| state.update.can_install())
@@ -59,6 +122,9 @@ impl Desktop {
             .version
             .clone()
             .unwrap();
+        // Keep the recipient stable while another computer is selected in Settings.
+        self.group.update_target = Some(remote.key.clone());
+        self.update_confirmation = false;
         self.paired_update = Some(
             Coordinator::peer_only(
                 super::management::request_id(),
@@ -73,17 +139,46 @@ impl Desktop {
     }
 
     pub(super) fn start_paired_update(&mut self, ctx: &egui::Context) {
-        let Some(remote) = &self.pair.remote else {
+        if !self.accept_update_action() {
+            return;
+        }
+        let remote = if let Some(target) = &self.group.update_target {
+            self.group
+                .workspace
+                .as_ref()
+                .and_then(|state| state.members.get(target))
+                .map(|member| member.node.clone())
+                .or_else(|| {
+                    self.pair
+                        .remote
+                        .as_ref()
+                        .filter(|node| &node.key == target)
+                        .cloned()
+                })
+        } else {
+            self.pair.remote.clone()
+        };
+        let Some(remote) = remote else {
             self.notice = Some((
                 "Reconnect the other PC before updating both computers.".into(),
                 true,
             ));
             return;
         };
+        self.group.update_target = Some(remote.key.clone());
         let Some(version) = self.update_version.clone() else {
             return;
         };
         if self.prepared_update.is_none() {
+            if self.candidate_update.is_some() {
+                self.download_action = Some(DownloadAction::Pair);
+                self.prepare_update(version, ctx);
+            } else {
+                self.notice = Some((
+                    "Paired installation requires the installed application edition.".into(),
+                    true,
+                ));
+            }
             return;
         }
         let id = std::time::SystemTime::now()
@@ -107,8 +202,10 @@ impl Desktop {
         if let Message::Prepare { id, version } = &message
             && self.paired_update.is_none()
         {
-            let result = if self.install_job.is_some() || self.install_pending || self.quitting {
-                Err(anyhow::anyhow!("This PC is already installing an update"))
+            let result = if self.update_action_busy() || self.download_action.is_some() {
+                Err(anyhow::anyhow!(
+                    "Another update operation is already in progress."
+                ))
             } else {
                 Coordinator::incoming(*id, version.clone(), false)
             };
@@ -217,7 +314,12 @@ impl Desktop {
                         self.notice = Some((error.to_string(), true));
                     }
                 }
-                Effect::Download => self.check_updates(ctx),
+                Effect::Download => {
+                    if let Some(coordinator) = &self.paired_update {
+                        let version = coordinator.version.clone();
+                        self.prepare_update(version, ctx);
+                    }
+                }
                 Effect::Install => {
                     if self.prepared_update.is_some() {
                         self.begin_install_update(ctx);
@@ -254,6 +356,9 @@ impl Desktop {
         }
         if self.paired_update.as_ref().is_some_and(Coordinator::done) {
             self.paired_update = None;
+            if self.peer_restart.is_none() {
+                self.group.update_target = None;
+            }
         }
         if let Some(coordinator) = &self.paired_update {
             let status = format!(
@@ -270,6 +375,13 @@ impl Desktop {
     }
 
     pub(super) fn tick_paired_update(&mut self, ctx: &egui::Context) {
+        if self.paired_update.is_none()
+            && self.download_action.is_none()
+            && self.peer_restart.is_none()
+        {
+            self.group.update_target = None;
+            return;
+        }
         let connected = self.update_target_connected(
             self.group
                 .update_target

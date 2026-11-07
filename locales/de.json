@@ -318,7 +318,6 @@
   "Управление компьютерами": "Computersteuerung",
   "Управление на другом ПК": "Steuerung auf dem anderen PC",
   "Управление на этом ПК": "Steuerung auf diesem PC",
-  "Устанавливаем обновление. На Ubuntu подтвердите системный запрос пароля.": "Update wird installiert. Unter Ubuntu die Systemabfrage des Passworts bestätigen.",
   "Установка отменена или не удалась: {error}": "Installation abgebrochen oder fehlgeschlagen: {error}",
   "Установлена актуальная версия.": "Die aktuelle Version ist installiert.",
   "Устройства не ответили. Проверьте системные зависимости.": "Geräte haben nicht geantwortet. Systemabhängigkeiten prüfen.",
@@ -543,5 +542,17 @@
   "Move between computers at the screen edge": "Am Bildschirmrand zwischen Computern wechseln",
   "The saved partner's management connection is offline": "Die Verwaltungsverbindung zum gespeicherten Partner ist offline",
   "The saved partner's management connection is unavailable": "Die Verwaltungsverbindung zum gespeicherten Partner ist nicht verfügbar",
-  "Update Desk Switch on the saved partner before using this action": "Aktualisiere Desk Switch auf dem gespeicherten Partner, bevor du diese Aktion nutzt"
+  "Update Desk Switch on the saved partner before using this action": "Aktualisiere Desk Switch auf dem gespeicherten Partner, bevor du diese Aktion nutzt",
+  "Retry switch": "Wechsel erneut versuchen",
+  "Switching…": "Wechsel läuft…",
+  "A monitor switch is still finishing. Wait for it to complete.": "Der Monitorwechsel läuft noch. Warte, bis er abgeschlossen ist.",
+  "The previous switch is still finishing. Wait for the monitor before switching again.": "Der vorherige Wechsel läuft noch. Warte, bis der Monitor bereit ist, bevor du erneut wechselst.",
+  "Installing the update…": "Update wird installiert…",
+  "Monitor selection failed. Select the port manually or retry.": "Der Monitorwechsel ist fehlgeschlagen. Wähle den Anschluss manuell oder versuche es erneut.",
+  "Checking the signed release…": "Signierte Version wird geprüft…",
+  "Downloading and verifying the signed update…": "Signiertes Update wird heruntergeladen und geprüft…",
+  "Another update operation is already in progress.": "Ein anderer Aktualisierungsvorgang läuft bereits.",
+  "Reconnect the selected computer before updating it.": "Verbinde den ausgewählten Computer erneut, bevor du ihn aktualisierst.",
+  "Paired installation requires the installed application edition.": "Die gemeinsame Installation erfordert die installierte Anwendungsversion.",
+  "Version {version} is available. Choose Download and install to update.": "Version {version} ist verfügbar. Wähle zum Aktualisieren „Herunterladen und installieren“."
 }
