@@ -664,7 +664,7 @@ impl Desktop {
     }
 
     pub(super) fn shared_changed(&mut self) {
-        self.ctx.request_repaint();
+        self.ctx.request_repaint_of(eframe::egui::ViewportId::ROOT);
         self.prefs.workspace.shared.changed(&self.public_key);
         self.apply_input_monitor_requirement();
         if let Err(error) = self.prefs.save(&self.dir) {

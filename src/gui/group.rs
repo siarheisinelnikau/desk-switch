@@ -27,12 +27,12 @@ pub(super) struct Group {
     pub request: Option<Request>,
     pub data: Data,
     pub return_pending: bool,
-    probe: Option<workspace::hardware::Probe>,
+    pub(super) probe: Option<workspace::hardware::Probe>,
     last_node: Option<Node>,
     last_volume: Option<workspace::AudioLevel>,
     last_ready: u64,
     input_ready: u64,
-    monitor_wait: Option<(u64, std::time::Instant)>,
+    pub(super) monitor_wait: Option<(u64, std::time::Instant)>,
     monitor_activation: u64,
     monitor_error: Option<String>,
     monitor_failed: Option<u64>,
@@ -41,7 +41,7 @@ pub(super) struct Group {
     pub update_target: Option<String>,
     pub monitor_read_reply: Option<(String, u64)>,
     monitor_seen: Option<Option<String>>,
-    monitor_job: Option<super::worker::Worker>,
+    pub(super) monitor_job: Option<super::worker::Worker>,
     pub preview: bool,
     #[cfg(target_os = "linux")]
     input_permission_retries: std::collections::BTreeSet<String>,
@@ -419,7 +419,8 @@ impl Desktop {
                 .group
                 .monitor_failed
                 .is_some_and(|failed| failed != state.activation);
-            let requested = video
+            let requested = !self.quitting
+                && video
                 && state.members[&self.public_key].input_ready < state.activation
                 && (changed || retry);
             if !video && self.group.monitor_job.is_none() {
@@ -626,6 +627,7 @@ impl Desktop {
                                 .show(ui, |ui| {
                                     ui.set_width(width - 34.0);
                                     ui.set_min_height(106.0);
+                                    ui.spacing_mut().item_spacing.y = 6.0;
                                     ui.horizontal_wrapped(|ui| {
                                         ui.colored_label(
                                             accent,
@@ -714,62 +716,29 @@ impl Desktop {
                     );
                 }
             });
-            ui.add_space(12.0);
         }
-        ui.add_space(16.0);
+        ui.add_space(4.0);
         egui::Frame::group(ui.style())
             .inner_margin(16)
             .show(ui, |ui| {
+                ui.spacing_mut().item_spacing.y = 8.0;
                 ui.strong(tr("Shared devices"));
                 let mut settings = state.settings.clone();
-                ui.horizontal_wrapped(|ui| {
-                    ui.checkbox(&mut settings.keyboard_enabled, tr("Keyboard"));
-                    ui.checkbox(&mut settings.mouse_enabled, tr("Mouse"));
-                    ui.checkbox(&mut settings.audio_enabled, tr("Sound"));
-                    ui.checkbox(&mut settings.microphone_enabled, tr("Microphone"));
-                });
-                ui.checkbox(&mut settings.clipboard_enabled, tr("Shared clipboard"));
-                ui.weak(tr(
-                    "Text and images. Files are planned for a later release.",
-                ));
-                if let Some(status) = self
+                let previous = settings.microphone.clone();
+                let status = self
                     .group
                     .clipboard
                     .as_ref()
-                    .and_then(|clipboard| clipboard.status())
-                {
-                    ui.weak(tr(&status));
+                    .and_then(|clipboard| clipboard.status());
+                if ui.available_width() >= 700.0 {
+                    ui.columns(2, |columns| {
+                        sharing_toggles(&mut columns[0], &mut settings, status.as_deref());
+                        sharing_sources(&mut columns[1], &mut settings, &state);
+                    });
+                } else {
+                    sharing_toggles(ui, &mut settings, status.as_deref());
+                    sharing_sources(ui, &mut settings, &state);
                 }
-                ui.checkbox(
-                    &mut settings.edge,
-                    tr("Move between computers at the screen edge"),
-                );
-                ui.checkbox(
-                    &mut settings.monitor_enabled,
-                    tr("Switch the shared monitor"),
-                );
-                selection(
-                    ui,
-                    "group-input-source",
-                    "Keyboard & mouse from",
-                    &mut settings.input,
-                    &state,
-                );
-                selection(
-                    ui,
-                    "group-audio-output",
-                    "Play all sound on",
-                    &mut settings.audio,
-                    &state,
-                );
-                let previous = settings.microphone.clone();
-                selection(
-                    ui,
-                    "group-microphone-source",
-                    "Microphone from",
-                    &mut settings.microphone,
-                    &state,
-                );
                 if settings.microphone != previous {
                     settings.microphone_binding = None;
                 }
@@ -866,10 +835,10 @@ impl Desktop {
                         }
                     }
                 });
+                if ui.button(tr("Retry devices")).clicked() {
+                    self.group.data.retry();
+                }
             });
-        if ui.button(tr("Retry devices")).clicked() {
-            self.group.data.retry();
-        }
     }
 
     pub(super) fn group_settings(&mut self, ui: &mut egui::Ui) {
@@ -907,131 +876,168 @@ impl Desktop {
         }
         ui.label(tr("Changes apply to the selected computer."));
         ui.add_space(12.0);
-        if let Some(management) = &member.node.management {
-            let mut application = if local {
-                self.local_application()
-            } else {
-                management.application.clone()
-            };
-            let before = application.clone();
-            egui::Frame::group(ui.style())
-                .inner_margin(16)
-                .show(ui, |ui| {
-                    ui.strong(tr("Application"));
-                    egui::ComboBox::from_id_salt("group-theme")
-                        .selected_text(tr(&application.theme))
-                        .show_ui(ui, |ui| {
-                            for theme in ["system", "dark", "light"] {
-                                ui.selectable_value(
-                                    &mut application.theme,
-                                    theme.into(),
-                                    tr(theme),
-                                );
-                            }
-                        });
-                    egui::ComboBox::from_id_salt("group-language")
-                        .selected_text(
-                            crate::i18n::LANGUAGES
-                                .iter()
-                                .find(|(code, _)| *code == application.language)
-                                .map(|(_, name)| *name)
-                                .unwrap_or("English"),
-                        )
-                        .show_ui(ui, |ui| {
-                            for (code, name) in crate::i18n::LANGUAGES {
-                                ui.selectable_value(&mut application.language, code.into(), name);
-                            }
-                        });
-                    ui.checkbox(&mut application.autostart, tr("Start at login"));
-                    ui.checkbox(
-                        &mut application.auto_connect,
-                        tr("Connect the workspace at application startup"),
-                    );
-                    ui.checkbox(
-                        &mut application.auto_update,
-                        tr("Check for updates at startup"),
-                    );
-                    if member.node.diagnostics.platform == "windows" {
-                        ui.checkbox(
-                            &mut application.show_remote_cursor,
-                            tr("Show the remote cursor on Windows"),
-                        );
-                    }
-                    if ui.button(tr("VB-CABLE installers…")).clicked() {
-                        self.cable_open = true;
-                        self.cable_remote = !local;
-                    }
-                });
-            if application != before {
-                if local {
-                    if let Err(error) = self.apply_application(&application, &ctx) {
-                        self.notice = Some((error.to_string(), true));
-                    }
-                } else {
-                    self.group_action(Action::Manage {
-                        target: member.node.key.clone(),
-                        message: workspace::management::Message::SetApplication {
-                            id: super::management::request_id(),
-                            expected: before,
-                            application,
-                        },
-                    });
-                }
-            }
+        if ui.available_width() >= 740.0 {
+            ui.columns(2, |columns| {
+                self.group_application_settings(&mut columns[0], &member, local, &ctx);
+                columns[0].add_space(12.0);
+                self.group_device_settings(&mut columns[0], &member);
+                self.group_update_settings(&mut columns[1], &member, local, &ctx);
+                columns[1].add_space(12.0);
+                self.group_monitor_settings(&mut columns[1], &member, local, &ctx);
+            });
+        } else {
+            self.group_application_settings(ui, &member, local, &ctx);
             ui.add_space(12.0);
-            egui::Frame::group(ui.style())
-                .inner_margin(16)
-                .show(ui, |ui| {
-                    ui.strong(tr("Updates"));
-                    ui.label(format!(
-                        "{} {}",
-                        tr("Installed version:"),
-                        member
-                            .node
-                            .version
-                            .as_ref()
-                            .map(|version| version.app.as_str())
-                            .unwrap_or("—")
-                    ));
-                    ui.label(tr(&management.update.status));
-                    ui.horizontal(|ui| {
-                        if ui
-                            .add_enabled(
-                                !self.update_action_busy()
-                                    && !management.update.checking
-                                    && !management.update.installing,
-                                egui::Button::new(tr("Check for updates")),
-                            )
-                            .clicked()
-                        {
-                            if local {
-                                self.check_updates(&ctx);
-                            } else {
-                                self.group_action(Action::Manage {
-                                    target: member.node.key.clone(),
-                                    message: workspace::management::Message::CheckUpdates {
-                                        id: super::management::request_id(),
-                                    },
-                                });
-                            }
-                        }
-                        if ui
-                            .add_enabled(
-                                management.update.can_install() && !self.update_action_busy(),
-                                egui::Button::new(tr("Download and install")),
-                            )
-                            .clicked()
-                        {
-                            self.install_selected_update(&member.node.key, &ctx);
+            self.group_update_settings(ui, &member, local, &ctx);
+            ui.add_space(12.0);
+            self.group_device_settings(ui, &member);
+            ui.add_space(12.0);
+            self.group_monitor_settings(ui, &member, local, &ctx);
+        }
+    }
+    fn group_application_settings(
+        &mut self,
+        ui: &mut egui::Ui,
+        member: &Member,
+        local: bool,
+        ctx: &egui::Context,
+    ) {
+        let Some(management) = &member.node.management else {
+            return;
+        };
+        let mut application = if local {
+            self.local_application()
+        } else {
+            management.application.clone()
+        };
+        let before = application.clone();
+        egui::Frame::group(ui.style())
+            .inner_margin(16)
+            .show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.strong(tr("Application"));
+                egui::ComboBox::from_id_salt("group-theme")
+                    .selected_text(tr(&application.theme))
+                    .show_ui(ui, |ui| {
+                        for theme in ["system", "dark", "light"] {
+                            ui.selectable_value(&mut application.theme, theme.into(), tr(theme));
                         }
                     });
+                egui::ComboBox::from_id_salt("group-language")
+                    .selected_text(
+                        crate::i18n::LANGUAGES
+                            .iter()
+                            .find(|(code, _)| *code == application.language)
+                            .map(|(_, name)| *name)
+                            .unwrap_or("English"),
+                    )
+                    .show_ui(ui, |ui| {
+                        for (code, name) in crate::i18n::LANGUAGES {
+                            ui.selectable_value(&mut application.language, code.into(), name);
+                        }
+                    });
+                ui.checkbox(&mut application.autostart, tr("Start at login"));
+                ui.checkbox(
+                    &mut application.auto_connect,
+                    tr("Connect the workspace at application startup"),
+                );
+                ui.checkbox(
+                    &mut application.auto_update,
+                    tr("Check for updates at startup"),
+                );
+                if member.node.diagnostics.platform == "windows" {
+                    ui.checkbox(
+                        &mut application.show_remote_cursor,
+                        tr("Show the remote cursor on Windows"),
+                    );
+                }
+                if ui.button(tr("VB-CABLE installers…")).clicked() {
+                    self.cable_open = true;
+                    self.cable_remote = !local;
+                }
+            });
+        if application != before {
+            if local {
+                if let Err(error) = self.apply_application(&application, ctx) {
+                    self.notice = Some((error.to_string(), true));
+                }
+            } else {
+                self.group_action(Action::Manage {
+                    target: member.node.key.clone(),
+                    message: workspace::management::Message::SetApplication {
+                        id: super::management::request_id(),
+                        expected: before,
+                        application,
+                    },
                 });
+            }
         }
-        ui.add_space(12.0);
+    }
+    fn group_update_settings(
+        &mut self,
+        ui: &mut egui::Ui,
+        member: &Member,
+        local: bool,
+        ctx: &egui::Context,
+    ) {
+        let Some(management) = &member.node.management else {
+            return;
+        };
+        egui::Frame::group(ui.style())
+            .inner_margin(16)
+            .show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.strong(tr("Updates"));
+                ui.label(format!(
+                    "{} {}",
+                    tr("Installed version:"),
+                    member
+                        .node
+                        .version
+                        .as_ref()
+                        .map(|version| version.app.as_str())
+                        .unwrap_or("—")
+                ));
+                ui.label(tr(&management.update.status));
+                ui.horizontal(|ui| {
+                    if ui
+                        .add_enabled(
+                            !self.update_action_busy()
+                                && !management.update.checking
+                                && !management.update.installing,
+                            egui::Button::new(tr("Check for updates")),
+                        )
+                        .clicked()
+                    {
+                        if local {
+                            self.check_updates(ctx);
+                        } else {
+                            self.group_action(Action::Manage {
+                                target: member.node.key.clone(),
+                                message: workspace::management::Message::CheckUpdates {
+                                    id: super::management::request_id(),
+                                },
+                            });
+                        }
+                    }
+                    if ui
+                        .add_enabled(
+                            management.update.can_install() && !self.update_action_busy(),
+                            egui::Button::new(tr("Download and install")),
+                        )
+                        .clicked()
+                    {
+                        self.install_selected_update(&member.node.key, ctx);
+                    }
+                });
+            });
+    }
+    fn group_device_settings(&mut self, ui: &mut egui::Ui, member: &Member) {
         let mut preferences = member.preferences.clone();
         egui::Frame::group(ui.style())
             .inner_margin(16)
             .show(ui, |ui| {
+                ui.set_width(ui.available_width());
                 ui.strong(tr("Devices on this computer"));
                 for (id, label, value, devices) in [
                     (
@@ -1067,7 +1073,7 @@ impl Desktop {
                 ] {
                     ui.label(tr(label));
                     egui::ComboBox::from_id_salt(id)
-                        .width(420.0)
+                        .width(ui.available_width())
                         .selected_text(
                             value
                                 .as_ref()
@@ -1090,12 +1096,20 @@ impl Desktop {
                 value: preferences,
             });
         }
-        ui.add_space(12.0);
+    }
+    fn group_monitor_settings(
+        &mut self,
+        ui: &mut egui::Ui,
+        member: &Member,
+        local: bool,
+        ctx: &egui::Context,
+    ) {
         let mut monitor = member.node.monitor.clone();
         let mut read_monitor = false;
         egui::Frame::group(ui.style())
             .inner_margin(16)
             .show(ui, |ui| {
+                ui.set_width(ui.available_width());
                 ui.strong(tr("Shared monitor"));
                 ui.checkbox(
                     &mut monitor.enabled,
@@ -1170,7 +1184,7 @@ impl Desktop {
         }
         if read_monitor {
             if local {
-                if let Err(error) = self.start_monitor_read(&monitor_id, &ctx) {
+                if let Err(error) = self.start_monitor_read(&monitor_id, ctx) {
                     self.notice = Some((error.to_string(), true));
                 }
             } else {
@@ -1186,6 +1200,60 @@ impl Desktop {
     }
 }
 
+fn sharing_toggles(ui: &mut egui::Ui, settings: &mut model::Settings, status: Option<&str>) {
+    ui.horizontal_wrapped(|ui| {
+        ui.checkbox(&mut settings.keyboard_enabled, tr("Keyboard"));
+        ui.checkbox(&mut settings.mouse_enabled, tr("Mouse"));
+        ui.checkbox(&mut settings.audio_enabled, tr("Sound"));
+        ui.checkbox(&mut settings.microphone_enabled, tr("Microphone"));
+    });
+    ui.checkbox(&mut settings.clipboard_enabled, tr("Shared clipboard"));
+    ui.weak(tr(
+        "Text and images. Files are planned for a later release.",
+    ));
+    if let Some(status) = status {
+        ui.weak(tr(status));
+    }
+    ui.checkbox(
+        &mut settings.edge,
+        tr("Move between computers at the screen edge"),
+    );
+    ui.checkbox(
+        &mut settings.monitor_enabled,
+        tr("Switch the shared monitor"),
+    );
+    if settings.microphone_enabled {
+        egui::CollapsingHeader::new(tr("Microphone level")).show(ui, |ui| {
+            ui.add(egui::Slider::new(&mut settings.microphone_level.volume, 0..=100).suffix(" %"));
+            ui.checkbox(&mut settings.microphone_level.muted, tr("Mute microphone"));
+        });
+    }
+}
+
+fn sharing_sources(ui: &mut egui::Ui, settings: &mut model::Settings, state: &Workspace) {
+    selection(
+        ui,
+        "group-input-source",
+        "Keyboard & mouse from",
+        &mut settings.input,
+        state,
+    );
+    selection(
+        ui,
+        "group-audio-output",
+        "Play all sound on",
+        &mut settings.audio,
+        state,
+    );
+    selection(
+        ui,
+        "group-microphone-source",
+        "Microphone from",
+        &mut settings.microphone,
+        state,
+    );
+}
+
 pub(super) fn selection(
     ui: &mut egui::Ui,
     id: &str,
@@ -1193,8 +1261,8 @@ pub(super) fn selection(
     value: &mut Selection,
     state: &Workspace,
 ) {
-    ui.horizontal(|ui| {
-        ui.add_sized([180.0, 20.0], egui::Label::new(tr(label)));
+    ui.vertical(|ui| {
+        ui.label(tr(label));
         let caption = match value {
             Selection::Auto => tr("Automatic"),
             Selection::Computer(key) => state
@@ -1204,7 +1272,7 @@ pub(super) fn selection(
                 .unwrap_or_else(|| tr("Unavailable")),
         };
         egui::ComboBox::from_id_salt(id)
-            .width(260.0)
+            .width(ui.available_width().min(320.0))
             .selected_text(caption)
             .show_ui(ui, |ui| {
                 ui.selectable_value(value, Selection::Auto, tr("Automatic"));

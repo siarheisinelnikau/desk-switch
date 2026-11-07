@@ -109,7 +109,7 @@ impl Probe {
                     if previous.as_ref() != Some(&snapshot) {
                         previous = Some(snapshot.clone());
                         *send.lock().unwrap() = Some(snapshot);
-                        ctx.request_repaint();
+                        ctx.request_repaint_of(eframe::egui::ViewportId::ROOT);
                     }
                     if !matches!(
                         cancel.recv_timeout(Duration::from_secs(3)),
