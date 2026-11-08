@@ -919,13 +919,14 @@ impl Engine {
                         if matched < self.last_index() {
                             self.replicate(from, &mut effects);
                         }
-                    } else if self.next_index.get(from).copied() == probe.checked_add(1) {
-                        let next = conflict
-                            .max(1)
-                            .min(probe.max(1))
-                            .min(self.last_index().saturating_add(1));
-                        self.next_index.insert(from.into(), next);
-                        self.replicate(from, &mut effects);
+                    } else if let Some(current) = probe.checked_add(1)
+                        && self.next_index.get(from).copied() == Some(current)
+                    {
+                        let next = conflict.clamp(1, self.last_index().saturating_add(1));
+                        if next != current {
+                            self.next_index.insert(from.into(), next);
+                            self.replicate(from, &mut effects);
+                        }
                     }
                 }
             }
@@ -2193,6 +2194,258 @@ mod tests {
         for node in cluster.nodes.values() {
             node.hard.validate().unwrap();
         }
+    }
+
+    fn sent_rpc(effects: &[Effect], target: &str) -> Rpc {
+        effects
+            .iter()
+            .find_map(|effect| match effect {
+                Effect::Send { target: peer, rpc } if peer == target => Some(rpc.clone()),
+                _ => None,
+            })
+            .expect("A replication packet was not sent")
+    }
+
+    #[test]
+    fn a_bootstrapped_snapshot_moves_a_stale_probe_forward_and_receives_the_missing_tail() {
+        let mut cluster = Cluster::new(3);
+        let leader = cluster.elect();
+        let follower = cluster
+            .enabled
+            .iter()
+            .find(|peer| *peer != &leader)
+            .unwrap()
+            .clone();
+        cluster.enabled.remove(&follower);
+        cluster.propose(&leader, b"committed prefix");
+        assert_eq!(cluster.nodes[&leader].hard.commit_index, 2);
+
+        // An existing session can have queued an early probe before its
+        // authenticated directory fast-forwarded the follower's snapshot.
+        cluster
+            .nodes
+            .get_mut(&leader)
+            .unwrap()
+            .next_index
+            .insert(follower.clone(), 1);
+        let image = cluster.nodes[&leader].export();
+        let effects = cluster
+            .nodes
+            .get_mut(&follower)
+            .unwrap()
+            .catch_up(&leader, image, cluster.now)
+            .unwrap();
+        cluster.stage(&follower, effects);
+        cluster.drain();
+        assert_eq!(cluster.nodes[&follower].hard.snapshot_index, 2);
+        assert_eq!(cluster.nodes[&follower].hard.commit_index, 2);
+        assert!(cluster.nodes[&follower].hard.entries.is_empty());
+        cluster.enabled.insert(follower.clone());
+
+        let effects = cluster
+            .nodes
+            .get_mut(&leader)
+            .unwrap()
+            .propose(b"missing entry three".to_vec(), cluster.now)
+            .unwrap();
+        // Drop the other peer's packet so a NACK alone cannot appear to
+        // advance the commit through an unrelated acknowledgement.
+        let probe = sent_rpc(&effects, &follower);
+        assert!(matches!(
+            &probe.message,
+            Message::Append { prev_index: 0, .. }
+        ));
+        let replies = cluster
+            .nodes
+            .get_mut(&follower)
+            .unwrap()
+            .receive(&leader, probe, cluster.now)
+            .unwrap();
+        let nack = sent_rpc(&replies, &leader);
+        assert!(matches!(
+            &nack.message,
+            Message::Appended {
+                success: false,
+                conflict: 3,
+                ..
+            }
+        ));
+        let durable = cluster.nodes[&leader].hard.clone();
+        let matched = cluster.nodes[&leader].matched.clone();
+        let retry = cluster
+            .nodes
+            .get_mut(&leader)
+            .unwrap()
+            .receive(&follower, nack, cluster.now)
+            .unwrap();
+        assert_eq!(cluster.nodes[&leader].next_index[&follower], 3);
+        assert_eq!(cluster.nodes[&leader].hard, durable);
+        assert_eq!(cluster.nodes[&leader].matched, matched);
+        assert!(
+            matches!(sent_rpc(&retry, &follower).message, Message::Append { prev_index: 2, ref entries, .. } if entries.len() == 1 && entries[0].index == 3)
+        );
+        cluster.stage(&leader, retry);
+        cluster.drain();
+        cluster.until(|cluster| {
+            cluster
+                .nodes
+                .values()
+                .all(|node| node.committed().2 == b"missing entry three")
+        });
+        assert_eq!(cluster.nodes[&follower].hard.commit_index, 3);
+        for node in cluster.nodes.values() {
+            node.hard.validate().unwrap();
+        }
+    }
+
+    #[test]
+    fn nack_hints_are_bounded_and_never_grant_replication_or_commit() {
+        let mut cluster = Cluster::new(3);
+        let leader = cluster.elect();
+        cluster.propose(&leader, b"committed prefix");
+        let follower = cluster
+            .enabled
+            .iter()
+            .find(|peer| *peer != &leader)
+            .unwrap()
+            .clone();
+        let upper = cluster.nodes[&leader].last_index() + 1;
+        for (current, hint, expected) in [
+            (1, 0, 1),
+            (1, u64::MAX, upper),
+            (upper, 0, 1),
+            (upper, u64::MAX, upper),
+        ] {
+            cluster
+                .nodes
+                .get_mut(&leader)
+                .unwrap()
+                .next_index
+                .insert(follower.clone(), current);
+            let durable = cluster.nodes[&leader].hard.clone();
+            let matched = cluster.nodes[&leader].matched.clone();
+            let rpc = Rpc {
+                workspace_id: key(1),
+                term: durable.term,
+                message: Message::Appended {
+                    probe: current - 1,
+                    success: false,
+                    matched: u64::MAX,
+                    conflict: hint,
+                },
+            };
+            let effects = cluster
+                .nodes
+                .get_mut(&leader)
+                .unwrap()
+                .receive(&follower, rpc, cluster.now)
+                .unwrap();
+            assert_eq!(cluster.nodes[&leader].next_index[&follower], expected);
+            assert!((1..=upper).contains(&expected));
+            assert_eq!(cluster.nodes[&leader].hard, durable);
+            assert_eq!(cluster.nodes[&leader].matched, matched);
+            assert_eq!(
+                effects
+                    .iter()
+                    .filter(|effect| matches!(effect, Effect::Send { .. }))
+                    .count(),
+                usize::from(current != expected)
+            );
+        }
+        for current in [None, Some(upper)] {
+            if let Some(current) = current {
+                cluster
+                    .nodes
+                    .get_mut(&leader)
+                    .unwrap()
+                    .next_index
+                    .insert(follower.clone(), current);
+            } else {
+                cluster
+                    .nodes
+                    .get_mut(&leader)
+                    .unwrap()
+                    .next_index
+                    .remove(&follower);
+            }
+            let before = cluster.nodes[&leader].hard.clone();
+            let matched = cluster.nodes[&leader].matched.clone();
+            let effects = cluster
+                .nodes
+                .get_mut(&leader)
+                .unwrap()
+                .receive(
+                    &follower,
+                    Rpc {
+                        workspace_id: key(1),
+                        term: before.term,
+                        message: Message::Appended {
+                            probe: u64::MAX,
+                            success: false,
+                            matched: u64::MAX,
+                            conflict: u64::MAX,
+                        },
+                    },
+                    cluster.now,
+                )
+                .unwrap();
+            assert!(effects.is_empty());
+            assert_eq!(
+                cluster.nodes[&leader].next_index.get(&follower).copied(),
+                current
+            );
+            assert_eq!(cluster.nodes[&leader].hard, before);
+            assert_eq!(cluster.nodes[&leader].matched, matched);
+        }
+    }
+
+    #[test]
+    fn unchanged_or_stale_nacks_wait_for_heartbeats_instead_of_spinning() {
+        let mut cluster = Cluster::new(3);
+        let leader = cluster.elect();
+        let follower = cluster
+            .enabled
+            .iter()
+            .find(|peer| *peer != &leader)
+            .unwrap()
+            .clone();
+        cluster
+            .nodes
+            .get_mut(&leader)
+            .unwrap()
+            .next_index
+            .insert(follower.clone(), 1);
+        let durable = cluster.nodes[&leader].hard.clone();
+        let matched = cluster.nodes[&leader].matched.clone();
+        let reply = |probe, conflict| Rpc {
+            workspace_id: key(1),
+            term: durable.term,
+            message: Message::Appended {
+                probe,
+                success: false,
+                matched: 0,
+                conflict,
+            },
+        };
+        for rpc in [reply(0, 1), reply(1, 1)] {
+            let effects = cluster
+                .nodes
+                .get_mut(&leader)
+                .unwrap()
+                .receive(&follower, rpc, cluster.now)
+                .unwrap();
+            assert!(effects.is_empty());
+            assert_eq!(cluster.nodes[&leader].next_index[&follower], 1);
+            assert_eq!(cluster.nodes[&leader].hard, durable);
+            assert_eq!(cluster.nodes[&leader].matched, matched);
+        }
+        let now = cluster.nodes[&leader].heartbeat_at;
+        let effects = cluster.nodes.get_mut(&leader).unwrap().tick(now).unwrap();
+        assert!(matches!(
+            sent_rpc(&effects, &follower).message,
+            Message::Append { prev_index: 0, .. }
+        ));
+        assert_eq!(cluster.nodes[&leader].hard, durable);
     }
 
     #[test]
