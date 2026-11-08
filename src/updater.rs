@@ -268,9 +268,10 @@ fn fetch_release_at(
 }
 
 fn artifact<'a>(release: &'a Release, target: &str) -> Result<&'a Artifact> {
-    release.targets.get(target).with_context(|| {
-        format!("The signed release does not contain an update for {target}")
-    })
+    release
+        .targets
+        .get(target)
+        .with_context(|| format!("The signed release does not contain an update for {target}"))
 }
 
 fn sibling(executable: &Path, suffix: &str) -> Result<PathBuf> {
