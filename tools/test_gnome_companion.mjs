@@ -17,6 +17,10 @@ const selection = new Signals();
 const display = new Signals();
 display.get_selection = () => selection;
 const windows = [], focused = [];
+let pointerReads = 0;
+const pointer = [-1280, 300, 0];
+const procFiles = new Map(), fileInfo = new Map(), procReads = new Map();
+let onProcRead = null;
 const formats = [];
 let text = '', png = new Uint8Array(), reads = 0, writes = 0;
 const clipboard = {
@@ -30,6 +34,7 @@ const idle = new Map(), timeouts = new Map();
 let sourceId = 0, exports = 0, owned = 0;
 const GLib = {
     PRIORITY_DEFAULT_IDLE: 0, PRIORITY_DEFAULT: 0, SOURCE_REMOVE: false,
+    path_is_absolute: value => value.startsWith('/'),
     idle_add(_priority, callback) { const id = ++sourceId; idle.set(id, callback); return id; },
     timeout_add(_priority, duration, callback) { assert.equal(duration, 2000); const id = ++sourceId; timeouts.set(id, callback); return id; },
     Source: {remove(id) { assert(idle.delete(id) || timeouts.delete(id)); }},
@@ -39,14 +44,51 @@ const GLib = {
 const Gio = {
     Cancellable: class { cancel() { this.cancelled = true; } },
     IOErrorEnum: {CANCELLED: 1}, BusType: {SESSION: 0}, BusNameOwnerFlags: {NONE: 0}, DBusCallFlags: {NONE: 0},
+    FileQueryInfoFlags: {NOFOLLOW_SYMLINKS: 1}, FileType: {REGULAR: 1},
+    File: {new_for_path(path) {
+        return {
+            read_async(_priority, _cancel, callback) {
+                const count = (procReads.get(path) ?? 0) + 1;
+                procReads.set(path, count); onProcRead?.(path, count);
+                queueMicrotask(() => callback(this, {}));
+            },
+            read_finish() {
+                if (!procFiles.has(path)) throw new Error('Fixture process exited');
+                const bytes = new TextEncoder().encode(procFiles.get(path));
+                let offset = 0;
+                return {
+                    read_bytes_async(count, _priority, _cancel, callback) {
+                        assert(count > 0 && count <= 4096);
+                        const data = bytes.slice(offset, offset + Math.min(count, 997));
+                        offset += data.length;
+                        queueMicrotask(() => callback(this, {data}));
+                    },
+                    read_bytes_finish(result) { return {get_data: () => result.data}; },
+                    close() {},
+                };
+            },
+            query_info_async(_attributes, flags, _priority, _cancel, callback) {
+                assert.equal(flags, Gio.FileQueryInfoFlags.NOFOLLOW_SYMLINKS);
+                queueMicrotask(() => callback(this, {}));
+            },
+            query_info_finish() {
+                if (!fileInfo.has(path)) throw new Error('Fixture metadata unavailable');
+                const info = fileInfo.get(path);
+                return {get_symlink_target: () => info.target, get_file_type: () => info.type,
+                    get_attribute_uint32: name => { assert.equal(name, 'unix::uid'); return info.uid; }};
+            },
+        };
+    }},
     DBusExportedObject: {wrapJSObject() { return {export() { exports++; }, unexport() { exports--; }}; }},
     DBus: {session: {
         call(_name, _path, _interface, method, arguments_, _reply, _flags, _timeout, _cancel, callback) {
-            assert.equal(method, 'GetConnectionUnixProcessID');
+            assert(['GetConnectionUnixProcessID', 'GetConnectionUnixUser'].includes(method));
             const name = arguments_.data[0];
-            queueMicrotask(() => callback(this, {pid: [':1.4', ':1.5'].includes(name) ? 4200 : 9000}));
+            const pid = [':1.4', ':1.5'].includes(name) ? 4200 :
+                /^:1\.\d+$/.test(name) && Number(name.slice(3)) >= 6 && Number(name.slice(3)) <= 13 ? 4195 + Number(name.slice(3)) : 9000;
+            queueMicrotask(() => callback(this, {value: method === 'GetConnectionUnixProcessID' ? pid : pid === 4205 ? 2000 : 1000}));
         },
-        call_finish(result) { return {deep_unpack: () => [result.pid]}; },
+        call_finish(result) { return {deep_unpack: () => [result.value]}; },
     }},
     bus_own_name() { return ++owned; }, bus_unown_name() { owned--; },
 };
@@ -65,7 +107,7 @@ const own = icon('desk-switch', ':1.4', 100), other = icon('another-app', ':1.9'
 const boxes = [new Signals(), new Signals(), new Signals()];
 const Main = {panel: {_leftBox: boxes[0], _centerBox: boxes[1], _rightBox: boxes[2], statusArea: {own, other}}, activateWindow: (window, timestamp) => focused.push({window, timestamp})};
 const Clutter = {EventType: {BUTTON_PRESS: 1, BUTTON_RELEASE: 2}, BUTTON_PRIMARY: 1, EVENT_PROPAGATE: false, EVENT_STOP: true, PickMode: {REACTIVE: 0}};
-const sandbox = {Clutter, Gio, GLib, Meta: {SelectionType: {SELECTION_CLIPBOARD: 1}}, St: {Clipboard: {get_default: () => clipboard}, ClipboardType: {CLIPBOARD: 1}}, Main, Extension: class {}, global: {stage, display, get_window_actors: () => windows.map(meta_window => ({meta_window})), get_current_time: () => 1234}, console, TextEncoder, TextDecoder};
+const sandbox = {Clutter, Gio, GLib, Meta: {SelectionType: {SELECTION_CLIPBOARD: 1}}, St: {Clipboard: {get_default: () => clipboard}, ClipboardType: {CLIPBOARD: 1}}, Main, Extension: class {}, global: {stage, display, get_window_actors: () => windows.map(meta_window => ({meta_window})), get_current_time: () => 1234, get_pointer: () => { pointerReads++; return pointer; }}, console, TextEncoder, TextDecoder};
 const source = (await readFile(new URL('../packaging/linux/gnome-extension/extension.js', import.meta.url), 'utf8'))
     .replace(/^import .*;\r?\n/gm, '').replace('export default class DeskSwitchTray', 'globalThis.Subject = class DeskSwitchTray');
 vm.runInNewContext(source, sandbox, {filename: 'Desk Switch GNOME extension.js'});
@@ -107,6 +149,57 @@ class Invocation {
     return_value(value) { assert(!this.result && !this.error); this.result = value; }
     return_dbus_error(name, message) { assert(!this.result && !this.error); this.error = {name, message}; }
 }
+function processFixture(pid, {parent = 4200, role = 'host', uid = 1000, executable = '/opt/DeskSwitch/desk-switch', started = '100'} = {}) {
+    const fields = Array(20).fill('0'); fields[0] = 'S'; fields[1] = String(parent); fields[19] = started;
+    procFiles.set(`/proc/${pid}/stat`, `${pid} (desk-switch) ${fields.join(' ')}`);
+    procFiles.set(`/proc/${pid}/status`, `Name:\tdesk-switch\nPid:\t${pid}\nPPid:\t${parent}\nUid:\t${uid}\t${uid}\t${uid}\t${uid}\n`);
+    procFiles.set(`/proc/${pid}/cmdline`, [executable, 'run', '--role', role, '192.0.2.10:45876', ''].join('\0'));
+    const profile = `/tmp/desk-switch-fixture/${pid}`;
+    procFiles.set(`/proc/${pid}/environ`, `DESK_SWITCH_MANAGED=1\0DESK_SWITCH_GROUP_INPUT=1\0DESK_SWITCH_STATE=${profile}\0`);
+    procFiles.set(`${profile}/group-input`, '1');
+    fileInfo.set(`${profile}/group-input`, {type: Gio.FileType.REGULAR, uid});
+    fileInfo.set(`/proc/${pid}/exe`, {target: executable});
+}
+processFixture(4200, {parent: 1000});
+processFixture(4201);
+const ownPointer = new Invocation(); await extension.PointerStateAsync([], ownPointer);
+assert.deepEqual(Array.from(ownPointer.result.data), [-1280, 300]);
+const childPointer = new Invocation(':1.6'); await extension.PointerStateAsync([], childPointer);
+assert(childPointer.result, childPointer.error?.message); assert.equal(childPointer.result.signature, '(ii)');
+assert.deepEqual(Array.from(childPointer.result.data), [-1280, 300]);
+processFixture(4201, {role: 'receiver'});
+const receiverPointer = new Invocation(':1.6'); await extension.PointerStateAsync([], receiverPointer);
+assert(receiverPointer.result, receiverPointer.error?.message);
+const readBeforeChild = reads;
+const forbiddenChildClipboard = new Invocation(':1.6'); await extension.ReadAsync([0], forbiddenChildClipboard);
+assert(forbiddenChildClipboard.error); assert.equal(reads, readBeforeChild, 'pointer permission never grants child clipboard access');
+const forbiddenChildFocus = new Invocation(':1.6'); await extension.ActivateWindowAsync(['main'], forbiddenChildFocus);
+assert(forbiddenChildFocus.error, 'pointer permission never grants child window activation');
+processFixture(4202, {parent: 9999});
+processFixture(4203, {executable: '/opt/unrelated-app'});
+processFixture(4204, {role: 'audio'});
+processFixture(4205, {uid: 2000});
+processFixture(4206);
+fileInfo.set('/tmp/desk-switch-fixture/4206/group-input', {type: 3, uid: 1000});
+const acceptedPointerReads = pointerReads;
+for (const sender of [':1.7', ':1.8', ':1.9', ':1.10', ':1.11', ':1.99']) {
+    const denied = new Invocation(sender); await extension.PointerStateAsync([], denied);
+    assert(denied.error, `pointer access must reject ${sender}`);
+}
+assert.equal(pointerReads, acceptedPointerReads, 'unrelated, wrong-parent, wrong-executable, wrong-role, wrong-UID and symlink profiles cannot read the pointer');
+processFixture(4207);
+onProcRead = (path, count) => {
+    if (path === '/proc/4207/stat' && count === 2)
+        processFixture(4207, {started: '101'});
+};
+const reused = new Invocation(':1.12'); await extension.PointerStateAsync([], reused);
+assert(reused.error, 'process reuse during validation must fail closed');
+onProcRead = null;
+processFixture(4208);
+procFiles.set('/proc/4208/environ', 'x'.repeat(65537));
+const unbounded = new Invocation(':1.13'); await extension.PointerStateAsync([], unbounded);
+assert(unbounded.error, 'process metadata reads must have a fixed upper bound');
+assert.equal(pointerReads, acceptedPointerReads);
 formats.push('text/plain;charset=utf-8'); text = 'Hello — привет\n';
 const first = new Invocation(); await extension.ReadAsync([0], first);
 assert.equal(first.result.signature, '(usay)'); assert.equal(first.result.data[1], 'text/plain');
@@ -178,12 +271,16 @@ assert.equal(timeouts.size, 1);
 extension._queueScan(); assert.equal(idle.size, 1);
 const late = new Invocation();
 const inFlight = extension.WriteAsync(['text/plain', [88]], late);
+const latePointer = new Invocation();
+const pointerInFlight = extension.PointerStateAsync([], latePointer);
 extension.disable();
 await inFlight;
+await pointerInFlight;
 assert(late.error); assert.equal(writes, 1, 'disabling cancels an authenticated write before clipboard access');
+assert(latePointer.error); assert.equal(pointerReads, acceptedPointerReads, 'disabling cancels an authenticated pointer read');
 assert.equal(idle.size, 0); assert.equal(stage.handlers.size, 0); assert.equal(selection.handlers.size, 0);
 assert.equal(timeouts.size, 0); assert.equal(display.handlers.size, 0);
 assert.equal(main.handlers.size, 0); assert.equal(unrelated.handlers.size, 0);
 assert(boxes.every(box => box.handlers.size === 0)); assert.equal(own.handlers.size, 0); assert.equal(other.handlers.size, 0);
 assert.equal(exports, 0); assert.equal(owned, 0);
-console.log('PASS: shipped GNOME handlers keep right-click native, activate one left click, ignore other apps, authorize clipboard callers by process, transfer text/image bytes, raise only own fixed-title windows with bounded one-shot observers and clean up signals. Mock Shell only; physical Ubuntu routing/focus remains unverified.');
+console.log('PASS: shipped GNOME handlers preserve tray routing, bounded text/image sharing, own-window focus and read-only pointer access for the GUI or verified direct managed input children; unrelated/reused/wrong-role processes are rejected and clipboard/focus authorization stays strict. Mock Shell only; physical Ubuntu behavior remains unverified.');

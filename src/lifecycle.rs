@@ -1,3 +1,4 @@
+use crate::edge::{Crossing, Entry, Routes};
 use serde::{Deserialize, Serialize};
 use std::{
     io::{self, BufRead, Write},
@@ -8,13 +9,30 @@ use std::{
 };
 use tokio::sync::{broadcast, watch};
 
+#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct DisplaySwitch {
+    pub activation: u64,
+    pub entry: Option<Entry>,
+}
+#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct DisplayEntry {
+    pub activation: u64,
+    pub entry: Entry,
+}
+
 #[derive(Clone, Copy, Debug)]
 pub enum Command {
     Switch,
     SwitchEdge(u16),
     EnterEdge(u16),
+    SwitchDisplay(DisplaySwitch),
+    EnterDisplay(DisplayEntry),
+    RoutesChanged,
     SetupSwitch,
     Emergency,
+    ReturnInput(u64),
     MicrophoneVolume(u8),
 }
 
@@ -30,6 +48,15 @@ pub enum InputStatus {
 pub enum Event {
     CycleInput,
     CycleInputEdge(u16),
+    EdgeCrossed(Crossing),
+    DisplayEntry {
+        activation: u64,
+        error: Option<String>,
+    },
+    InputReturned {
+        activation: u64,
+        completed: bool,
+    },
     PeerVersion {
         app: Option<String>,
         protocol: Option<u16>,
@@ -54,6 +81,7 @@ struct Controls {
     stop: watch::Sender<bool>,
     commands: broadcast::Sender<Command>,
     monitor_required: Arc<AtomicBool>,
+    routes: watch::Sender<Routes>,
     #[cfg(windows)]
     remote_cursor: watch::Sender<bool>,
 }
@@ -76,6 +104,8 @@ fn controls() -> &'static Controls {
         let command_send = commands.clone();
         let monitor_required = Arc::new(AtomicBool::new(false));
         let required = Arc::clone(&monitor_required);
+        let (routes, _) = watch::channel(Routes::default());
+        let route_send = routes.clone();
         #[cfg(windows)]
         let (remote_cursor, _) =
             watch::channel(std::env::var("DESK_SWITCH_REMOTE_CURSOR").as_deref() != Ok("off"));
@@ -86,6 +116,9 @@ fn controls() -> &'static Controls {
             .spawn(move || {
                 for line in io::stdin().lock().lines() {
                     let Ok(line) = line else { break };
+                    if line.len() > 1024 * 1024 {
+                        continue;
+                    }
                     match line.trim() {
                         "switch" => {
                             let _ = command_send.send(Command::Switch);
@@ -98,6 +131,28 @@ fn controls() -> &'static Controls {
                         value if value.starts_with("enter-edge ") => {
                             if let Ok(position) = value[11..].trim().parse::<u16>() {
                                 let _ = command_send.send(Command::EnterEdge(position));
+                            }
+                        }
+                        value if value.starts_with("routes ") => {
+                            if let Ok(routes) = serde_json::from_str::<Routes>(&value[7..])
+                                && routes.validate().is_ok()
+                            {
+                                route_send.send_replace(routes);
+                                let _ = command_send.send(Command::RoutesChanged);
+                            }
+                        }
+                        value if value.starts_with("switch-display ") => {
+                            if let Ok(request) = serde_json::from_str::<DisplaySwitch>(&value[15..])
+                                && request.entry.is_none_or(|entry| entry.validate().is_ok())
+                            {
+                                let _ = command_send.send(Command::SwitchDisplay(request));
+                            }
+                        }
+                        value if value.starts_with("enter-display ") => {
+                            if let Ok(request) = serde_json::from_str::<DisplayEntry>(&value[14..])
+                                && request.entry.validate().is_ok()
+                            {
+                                let _ = command_send.send(Command::EnterDisplay(request));
                             }
                         }
                         "setup-switch" => {
@@ -115,6 +170,13 @@ fn controls() -> &'static Controls {
                         }
                         "emergency" => {
                             let _ = command_send.send(Command::Emergency);
+                        }
+                        value if value.starts_with("return-input ") => {
+                            if let Ok(activation) = value[13..].parse::<u64>()
+                                && activation != 0
+                            {
+                                let _ = command_send.send(Command::ReturnInput(activation));
+                            }
                         }
                         "stop" | "quit" => {
                             stop_send.send_replace(true);
@@ -143,6 +205,7 @@ fn controls() -> &'static Controls {
             stop,
             commands,
             monitor_required,
+            routes,
             #[cfg(windows)]
             remote_cursor,
         }
@@ -155,6 +218,20 @@ pub fn install() {
 
 pub fn commands() -> broadcast::Receiver<Command> {
     controls().commands.subscribe()
+}
+
+pub fn routes() -> watch::Receiver<Routes> {
+    controls().routes.subscribe()
+}
+
+pub fn install_routes(routes: Routes) -> anyhow::Result<()> {
+    routes.validate()?;
+    let controls = controls();
+    let unconfigured = controls.routes.borrow().revision == 0;
+    if unconfigured {
+        controls.routes.send_replace(routes);
+    }
+    Ok(())
 }
 
 pub fn monitor_required() -> bool {

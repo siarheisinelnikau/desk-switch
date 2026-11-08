@@ -1,6 +1,7 @@
 use crate::{
     config::{Edge, Identity, Key},
     controller::{Controller, Effect, Transfer},
+    edge::{Crossing, Entry},
     gate::{Gate, Route},
     transport::{LEASE, PING_PERIOD, Pipe},
     video::{Inputs, Job, SETTLE, VideoResult, VideoWorker},
@@ -16,15 +17,25 @@ use tokio::{
 
 const SWITCH_TIMEOUT: Duration = Duration::from_secs(15);
 
+fn current_routes() -> (u64, u64) {
+    let routes = crate::lifecycle::routes();
+    let routes = routes.borrow();
+    (routes.activation, routes.revision)
+}
+
 pub enum Control {
     Toggle(u64),
     Edge { token: u64, position: u16 },
+    Boundary { token: u64, crossing: Crossing },
 }
 
 pub trait Cursor {
     async fn request_toggle(&self) -> Result<()>;
     async fn center(&self) -> Result<()>;
     async fn enter(&self, edge: &Edge, position: u16) -> Result<()>;
+    async fn enter_display(&self, _activation: u64, _entry: Entry) -> Result<()> {
+        bail!("Display entry is unavailable on this platform")
+    }
     async fn resume(&self) -> Result<()> {
         Ok(())
     }
@@ -137,11 +148,18 @@ async fn connect_mode<C: Cursor>(
 }
 
 fn waiting_group_control(control: Control, gate: &Gate) {
+    if let Control::Boundary { token, crossing } = control {
+        if gate.current() == (token, Route::Local) {
+            crate::lifecycle::report(crate::lifecycle::Event::EdgeCrossed(crossing));
+        }
+        return;
+    }
     let (token, event) = match control {
         Control::Toggle(token) => (token, crate::lifecycle::Event::CycleInput),
         Control::Edge { token, position } => {
             (token, crate::lifecycle::Event::CycleInputEdge(position))
         }
+        Control::Boundary { .. } => unreachable!(),
     };
     if gate.current() == (token, Route::Hold) {
         gate.local(token);
@@ -149,10 +167,26 @@ fn waiting_group_control(control: Control, gate: &Gate) {
     }
 }
 
+pub(super) fn display_entry_result(activation: u64, result: Result<()>) {
+    let error = result.err().map(|error| {
+        let mut text = format!("{error:#}");
+        text.retain(|character| !character.is_control());
+        text.truncate(text.floor_char_boundary(1024));
+        text
+    });
+    crate::lifecycle::report(crate::lifecycle::Event::DisplayEntry { activation, error });
+}
+
 struct Handoff {
     group: bool,
     group_requested: bool,
     group_entry: Option<u16>,
+    display_switch: Option<crate::lifecycle::DisplaySwitch>,
+    group_generation: u64,
+    positioning: Option<(u64, u64)>,
+    return_requested: bool,
+    canceling: bool,
+    return_activation: Option<u64>,
     logic: Controller,
     token: Option<u64>,
     deadline: Option<Instant>,
@@ -219,6 +253,7 @@ impl Heartbeat {
         loop {
             self.check()?;
             tokio::select! {
+                biased;
                 result = &mut operation => return result,
                 _ = &mut deadline => bail!("Windows/Wayland cursor operation timed out while the peer remained connected"),
                 _ = ping.tick() => self.ping(pipe).await?,
@@ -250,6 +285,12 @@ impl Handoff {
             group: crate::lifecycle::group_input(),
             group_requested: false,
             group_entry: None,
+            display_switch: None,
+            group_generation: 0,
+            positioning: None,
+            return_requested: false,
+            canceling: false,
+            return_activation: None,
             logic: Controller::new(inputs),
             token: None,
             deadline: None,
@@ -278,6 +319,20 @@ impl Handoff {
         self.logic.return_home(exit, hotkey)
     }
 
+    fn request_group_return(&mut self, gate: &Gate) -> Result<Option<Effect>> {
+        if !self.group || self.logic.is_local() {
+            return Ok(None);
+        }
+        self.return_requested = true;
+        if self.logic.is_remote() {
+            let token = self.token.context("missing active input token")?;
+            if gate.hold(token) {
+                return self.returning(None, false).map(Some);
+            }
+        }
+        Ok(None)
+    }
+
     async fn run(&mut self, pipe: &mut Pipe, io: &mut Coordinator<impl Cursor>) -> Result<()> {
         let mut tick = interval(Duration::from_millis(20));
         let mut ping = interval(PING_PERIOD);
@@ -304,18 +359,68 @@ impl Handoff {
             let effect = tokio::select! {
                 command = commands.recv() => {
                     match command {
-                        Ok(crate::lifecycle::Command::Switch) => { self.group_requested = true; self.group_entry = None; io.cursor.request_toggle().await?; }
+                        Ok(crate::lifecycle::Command::Switch) => { self.group_requested = true; self.group_entry = None; self.display_switch = None; io.cursor.request_toggle().await?; }
                         Ok(crate::lifecycle::Command::SwitchEdge(position)) if self.group && io.edge.is_some() => {
                             self.group_requested = true;
                             self.group_entry = Some(position);
+                            self.display_switch = None;
                             io.cursor.request_toggle().await?;
                         }
                         Ok(crate::lifecycle::Command::EnterEdge(position)) if self.group && self.logic.is_local() => {
                             if let Some(edge) = &io.edge { io.cursor.enter(edge, position).await?; }
                         }
                         Ok(crate::lifecycle::Command::SwitchEdge(_) | crate::lifecycle::Command::EnterEdge(_)) => {},
+                        Ok(crate::lifecycle::Command::SwitchDisplay(request)) if self.group => {
+                            if request.activation == 0 || request.activation != current_routes().0 {
+                                display_entry_result(request.activation, Err(anyhow::anyhow!("The display activation changed before input could switch")));
+                                continue;
+                            }
+                            if !self.logic.is_local() {
+                                display_entry_result(request.activation, Err(anyhow::anyhow!("Input is still switching; try the display again")));
+                                continue;
+                            }
+                            self.group_requested = true;
+                            self.group_entry = None;
+                            self.group_generation = request.activation;
+                            self.display_switch = Some(request);
+                            io.cursor.request_toggle().await?;
+                        }
+                        Ok(crate::lifecycle::Command::EnterDisplay(request)) if self.group => {
+                            if request.activation == 0 || request.activation != current_routes().0 || request.activation < self.group_generation {
+                                display_entry_result(request.activation, Err(anyhow::anyhow!("The display activation changed before the cursor could enter")));
+                            } else if self.logic.is_local() {
+                                self.group_generation = request.activation;
+                                let token = io.gate.current().0;
+                                let result = heartbeat.cursor(current_display_operation(request.activation, io.cursor.enter_display(request.activation, request.entry)), pipe, &io.gate, token).await;
+                                display_entry_result(request.activation, result);
+                            } else if self.logic.is_remote() {
+                                let id = self.logic.id().context("missing active transfer")?;
+                                self.group_generation = request.activation;
+                                self.positioning = Some((id, request.activation));
+                                pipe.send(Message::Reposition { id, generation: request.activation, entry: request.entry }).await?;
+                            } else {
+                                display_entry_result(request.activation, Err(anyhow::anyhow!("Input is still switching; try the display again")));
+                            }
+                        }
+                        Ok(crate::lifecycle::Command::RoutesChanged) if self.group => {
+                            self.group_generation = self.group_generation.max(current_routes().0);
+                        }
+                        Ok(crate::lifecycle::Command::SwitchDisplay(_) | crate::lifecycle::Command::EnterDisplay(_) | crate::lifecycle::Command::RoutesChanged) => {},
                         Ok(crate::lifecycle::Command::SetupSwitch) => { self.allow_setup = true; io.cursor.request_toggle().await?; }
                         Ok(crate::lifecycle::Command::Emergency) => io.gate.emergency(),
+                        Ok(crate::lifecycle::Command::ReturnInput(activation)) => {
+                            if !self.group || activation != current_routes().0 {
+                                crate::lifecycle::report(crate::lifecycle::Event::InputReturned { activation, completed: false });
+                            } else if self.logic.is_local() {
+                                crate::lifecycle::report(crate::lifecycle::Event::Input(crate::lifecycle::InputStatus::Here));
+                                crate::lifecycle::report(crate::lifecycle::Event::InputReturned { activation, completed: true });
+                            } else {
+                                self.return_activation = Some(activation);
+                                if let Some(effect) = self.request_group_return(&io.gate)? {
+                                    self.apply(effect, pipe, io, &mut heartbeat).await?;
+                                }
+                            }
+                        }
                         Ok(crate::lifecycle::Command::MicrophoneVolume(_)) | Err(_) => {}
                     }
                     continue;
@@ -341,6 +446,14 @@ impl Handoff {
                                     continue;
                                 }
                             } else {
+                                if let Some(request) = self.display_switch
+                                    && request.activation != current_routes().0
+                                {
+                                    io.gate.local(token);
+                                    self.display_switch = None;
+                                    display_entry_result(request.activation, Err(anyhow::anyhow!("The display activation changed before input could switch")));
+                                    continue;
+                                }
                                 let entry = self.group_entry.take();
                                 let setup = std::mem::take(&mut self.allow_setup);
                                 if self.logic.is_local() {
@@ -349,7 +462,7 @@ impl Handoff {
                                         crate::lifecycle::report(crate::lifecycle::Event::Switch { error: Some("Remember the video connection on both PCs before switching the shared monitor.".into()) });
                                         continue;
                                     }
-                                    self.start(token, if io.video.is_some() {Mode::Video} else {Mode::Input}, entry)?
+                                    self.start(token, if self.display_switch.is_some() || io.video.is_none() {Mode::Input} else {Mode::Video}, entry)?
                                 } else if self.logic.is_remote() {
                                     self.returning(None, true)?
                                 } else { continue; }
@@ -367,6 +480,10 @@ impl Handoff {
                             }
                             let mode = io.edge.as_ref().context("host edge is disabled")?.mode;
                             self.start(token, mode, Some(position))?
+                        }
+                        Control::Boundary { token, crossing } if self.group && self.logic.is_local() && io.gate.current() == (token, Route::Local) => {
+                            crate::lifecycle::report(crate::lifecycle::Event::EdgeCrossed(crossing));
+                            continue;
                         }
                         _ => continue,
                     }
@@ -389,6 +506,44 @@ impl Handoff {
                         }
                         Message::Pong(nonce) => {
                             heartbeat.pong(nonce, &io.gate, self.token)?;
+                            continue;
+                        }
+                        Message::Crossed { id, crossing } if self.group => {
+                            if self.logic.is_remote() && self.logic.id() == Some(id)
+                                && crossing.activation == self.group_generation
+                                && crossing.activation == current_routes().0
+                                && crossing.revision == current_routes().1
+                                && crossing.boundary != 0
+                            {
+                                crate::lifecycle::report(crate::lifecycle::Event::EdgeCrossed(crossing));
+                            }
+                            continue;
+                        }
+                        Message::Positioned { id, generation } if self.group => {
+                            if self.positioning == Some((id, generation)) {
+                                self.positioning = None;
+                                display_entry_result(generation, Ok(()));
+                            }
+                            continue;
+                        }
+                        Message::RepositionRejected { id, generation } if self.group => {
+                            if self.positioning == Some((id, generation)) {
+                                self.positioning = None;
+                                display_entry_result(generation, Err(anyhow::anyhow!("The destination display changed or cursor entry is unavailable; input remains active")));
+                            }
+                            continue;
+                        }
+                        Message::Returning(id) if self.canceling && self.logic.id() == Some(id) => {
+                            pipe.send(Message::Returned(id)).await?;
+                            self.logic.abort();
+                            self.finish_local(pipe, io, &mut heartbeat, None).await?;
+                            continue;
+                        }
+                        Message::Rejected(id) if self.return_requested && self.logic.id() == Some(id) => {
+                            // An obsolete preparation can be rejected after the
+                            // controller has already returned focus to this PC.
+                            self.logic.abort();
+                            self.finish_local(pipe, io, &mut heartbeat, None).await?;
                             continue;
                         }
                         Message::ExitEdge { id, position } if self.logic.is_remote() && self.logic.id() == Some(id) => {
@@ -479,6 +634,31 @@ impl Handoff {
         ensure!(io.gate.current().0 == token, "host route was revoked");
         match effect {
             Effect::Send(message) => {
+                let message = if self.return_requested && self.display_switch.is_some() {
+                    if let Message::Activate(id) = message {
+                        // The receiver is only armed. Release it without ever
+                        // activating input or starting a new native session.
+                        self.canceling = true;
+                        Message::Return(id)
+                    } else {
+                        message
+                    }
+                } else {
+                    message
+                };
+                let message = match (message, self.display_switch) {
+                    (
+                        Message::Prepare {
+                            id, inputs: None, ..
+                        },
+                        Some(request),
+                    ) => Message::PrepareDisplay {
+                        id,
+                        generation: request.activation,
+                        entry: request.entry,
+                    },
+                    (message, _) => message,
+                };
                 pipe.send(message).await?;
                 if matches!(message, Message::Returned(_)) {
                     let Effect::Local { position, upgrade } = self.logic.finished() else {
@@ -490,27 +670,24 @@ impl Handoff {
                         };
                         pipe.send(prepare).await?;
                     } else {
-                        if let (Some(position), Some(edge)) = (position, &io.edge) {
-                            heartbeat
-                                .cursor(io.cursor.enter(edge, position), pipe, &io.gate, token)
-                                .await?;
-                        } else {
-                            heartbeat
-                                .cursor(io.cursor.resume(), pipe, &io.gate, token)
-                                .await?;
-                        }
-                        io.gate.local(token);
-                        self.token = None;
-                        self.deadline = None;
-                        crate::lifecycle::report(crate::lifecycle::Event::Input(
-                            crate::lifecycle::InputStatus::Here,
-                        ));
-                        println!("Input returned to host.");
+                        self.finish_local(pipe, io, heartbeat, position).await?;
                     }
                 }
             }
             Effect::Ddc(job) => self.submit(io, job)?,
             Effect::Forward => {
+                if self.return_requested {
+                    let Effect::Send(message) = self.returning(None, false)? else {
+                        unreachable!()
+                    };
+                    pipe.send(message).await?;
+                    return Ok(());
+                }
+                ensure!(
+                    self.display_switch
+                        .is_none_or(|request| request.activation == current_routes().0),
+                    "The display activation changed before input became active"
+                );
                 heartbeat
                     .cursor(io.cursor.center(), pipe, &io.gate, token)
                     .await?;
@@ -519,6 +696,9 @@ impl Handoff {
                     "host route was revoked before activation"
                 );
                 self.deadline = None;
+                if self.display_switch.is_some() {
+                    display_entry_result(self.group_generation, Ok(()));
+                }
                 crate::lifecycle::report(crate::lifecycle::Event::Input(
                     crate::lifecycle::InputStatus::Peer,
                 ));
@@ -526,6 +706,43 @@ impl Handoff {
             }
             Effect::Local { .. } => bail!("unexpected local routing effect"),
         }
+        Ok(())
+    }
+
+    async fn finish_local(
+        &mut self,
+        pipe: &mut Pipe,
+        io: &Coordinator<impl Cursor>,
+        heartbeat: &mut Heartbeat,
+        position: Option<u16>,
+    ) -> Result<()> {
+        let token = self.token.context("missing input return token")?;
+        if let (Some(position), Some(edge)) = (position, &io.edge) {
+            heartbeat
+                .cursor(io.cursor.enter(edge, position), pipe, &io.gate, token)
+                .await?;
+        } else {
+            heartbeat
+                .cursor(io.cursor.resume(), pipe, &io.gate, token)
+                .await?;
+        }
+        io.gate.local(token);
+        self.token = None;
+        self.deadline = None;
+        self.display_switch = None;
+        self.return_requested = false;
+        self.canceling = false;
+        self.positioning = None;
+        crate::lifecycle::report(crate::lifecycle::Event::Input(
+            crate::lifecycle::InputStatus::Here,
+        ));
+        if let Some(activation) = self.return_activation.take() {
+            crate::lifecycle::report(crate::lifecycle::Event::InputReturned {
+                activation,
+                completed: true,
+            });
+        }
+        println!("Input returned to host.");
         Ok(())
     }
 }
@@ -537,6 +754,32 @@ async fn next_event(
     match pending.take() {
         Some(event) => Some(event),
         None => events.recv().await,
+    }
+}
+
+async fn current_display_operation(
+    activation: u64,
+    operation: impl std::future::Future<Output = Result<()>>,
+) -> Result<()> {
+    current_display_operation_with(activation, operation, crate::lifecycle::routes()).await
+}
+
+async fn current_display_operation_with(
+    activation: u64,
+    operation: impl std::future::Future<Output = Result<()>>,
+    mut routes: tokio::sync::watch::Receiver<crate::edge::Routes>,
+) -> Result<()> {
+    tokio::pin!(operation);
+    loop {
+        ensure!(
+            routes.borrow().activation == activation,
+            "The display activation changed before the cursor could enter"
+        );
+        tokio::select! {
+            biased;
+            changed = routes.changed() => { changed.context("display routes channel closed")?; }
+            result = &mut operation => return result,
+        }
     }
 }
 
@@ -1086,14 +1329,22 @@ mod tests {
         let mut remote = b_pipe.unwrap();
         let gate = Gate::new();
         let token = gate.begin().unwrap();
+        let (_route_send, route_recv) = tokio::sync::watch::channel(crate::edge::Routes {
+            activation: 7,
+            ..Default::default()
+        });
         let source = async {
             let mut heartbeat = Heartbeat::new();
             heartbeat
                 .cursor(
-                    async {
-                        sleep(LEASE + Duration::from_millis(400)).await;
-                        Ok(())
-                    },
+                    current_display_operation_with(
+                        7,
+                        async {
+                            sleep(LEASE + Duration::from_millis(400)).await;
+                            Ok(())
+                        },
+                        route_recv,
+                    ),
                     &mut local,
                     &gate,
                     token,
@@ -1112,5 +1363,163 @@ mod tests {
             }
         };
         tokio::select! { _ = source => {}, _ = peer => panic!("peer closed early") }
+    }
+
+    #[tokio::test]
+    async fn a_new_activation_cancels_a_slow_entry_before_it_can_warp() {
+        let (send, receive) = tokio::sync::watch::channel(crate::edge::Routes {
+            activation: 7,
+            ..Default::default()
+        });
+        let entered = AtomicUsize::new(0);
+        let operation = current_display_operation_with(
+            7,
+            async {
+                sleep(Duration::from_millis(100)).await;
+                entered.fetch_add(1, SeqCst);
+                Ok(())
+            },
+            receive,
+        );
+        let change = async {
+            sleep(Duration::from_millis(10)).await;
+            send.send_replace(crate::edge::Routes {
+                activation: 8,
+                ..Default::default()
+            });
+        };
+        let (result, ()) = tokio::join!(operation, change);
+        assert!(result.is_err());
+        assert_eq!(entered.load(SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn group_return_cancels_armed_input_then_reuses_the_same_authenticated_connection() {
+        let host = identity();
+        let peer = identity();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let gate = Arc::new(Gate::new());
+        let (controls, control_recv) = mpsc::channel(8);
+        let (_keep_events, events) = mpsc::channel(8);
+        let io = Coordinator {
+            gate: gate.clone(),
+            edge: None,
+            video: None,
+            controls: control_recv,
+            events,
+            cursor: FixtureCursor {
+                gate: gate.clone(),
+                controls,
+                toggles: Arc::new(AtomicUsize::new(0)),
+            },
+            monitor_required: || false,
+        };
+        let source = async {
+            let mut pipe = Pipe::connect(
+                TcpStream::connect(address).await.unwrap(),
+                &host,
+                &peer.public,
+                true,
+            )
+            .await
+            .unwrap();
+            let mut heartbeat = Heartbeat::new();
+            let mut handoff = Handoff::new(None);
+            handoff.group = true;
+            handoff.display_switch = Some(crate::lifecycle::DisplaySwitch {
+                activation: 4,
+                entry: None,
+            });
+            let token = gate.begin().unwrap();
+            let prepare = handoff.start(token, Mode::Input, None).unwrap();
+            handoff
+                .apply(prepare, &mut pipe, &io, &mut heartbeat)
+                .await
+                .unwrap();
+            assert!(handoff.request_group_return(&gate).unwrap().is_none());
+            let ready = handoff.logic.message(next(&mut pipe).await).unwrap();
+            handoff
+                .apply(ready, &mut pipe, &io, &mut heartbeat)
+                .await
+                .unwrap();
+            assert!(handoff.canceling);
+            assert_eq!(next(&mut pipe).await, Message::Returning(1));
+            pipe.send(Message::Returned(1)).await.unwrap();
+            handoff.logic.abort();
+            handoff
+                .finish_local(&mut pipe, &io, &mut heartbeat, None)
+                .await
+                .unwrap();
+            assert!(gate.current().1 == Route::Local && handoff.logic.is_local());
+            // Start and gracefully return another transfer on the very same
+            // encrypted socket. Neither return revokes the native gate.
+            let token = gate.begin().unwrap();
+            let prepare = handoff.start(token, Mode::Input, None).unwrap();
+            handoff
+                .apply(prepare, &mut pipe, &io, &mut heartbeat)
+                .await
+                .unwrap();
+            for _ in 0..2 {
+                let effect = handoff.logic.message(next(&mut pipe).await).unwrap();
+                handoff
+                    .apply(effect, &mut pipe, &io, &mut heartbeat)
+                    .await
+                    .unwrap();
+            }
+            assert!(gate.current() == (token, Route::Remote));
+            let returned = handoff.request_group_return(&gate).unwrap().unwrap();
+            handoff
+                .apply(returned, &mut pipe, &io, &mut heartbeat)
+                .await
+                .unwrap();
+            let returned = handoff.logic.message(next(&mut pipe).await).unwrap();
+            handoff
+                .apply(returned, &mut pipe, &io, &mut heartbeat)
+                .await
+                .unwrap();
+            assert!(gate.current().1 == Route::Local && handoff.logic.is_local());
+        };
+        let destination = async {
+            let mut pipe = Pipe::connect(
+                listener.accept().await.unwrap().0,
+                &peer,
+                &host.public,
+                false,
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                next(&mut pipe).await,
+                Message::PrepareDisplay {
+                    id: 1,
+                    generation: 4,
+                    entry: None
+                }
+            );
+            pipe.send(Message::Ready(1)).await.unwrap();
+            assert_eq!(next(&mut pipe).await, Message::Return(1));
+            pipe.send(Message::Returning(1)).await.unwrap();
+            assert_eq!(next(&mut pipe).await, Message::Returned(1));
+            assert_eq!(
+                next(&mut pipe).await,
+                Message::Prepare {
+                    id: 2,
+                    inputs: None,
+                    edge: None
+                }
+            );
+            pipe.send(Message::Ready(2)).await.unwrap();
+            assert_eq!(next(&mut pipe).await, Message::Activate(2));
+            pipe.send(Message::Active(2)).await.unwrap();
+            assert_eq!(next(&mut pipe).await, Message::Return(2));
+            pipe.send(Message::Returning(2)).await.unwrap();
+            assert_eq!(next(&mut pipe).await, Message::Returned(2));
+        };
+        timeout(Duration::from_secs(3), async {
+            tokio::join!(source, destination);
+        })
+        .await
+        .unwrap();
     }
 }

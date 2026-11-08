@@ -789,9 +789,9 @@ mod tests {
     #[test]
     fn pointer_window_is_hidden_click_through_and_never_activates() {
         unsafe {
-            let foreground = GetForegroundWindow();
             let mut window = Window::create().unwrap();
             let handle = window.hwnd;
+            assert_ne!(GetForegroundWindow(), handle);
             let styles = GetWindowLongPtrW(handle, GWL_EXSTYLE) as u32;
             for required in [
                 WS_EX_LAYERED,
@@ -806,11 +806,13 @@ mod tests {
             let x = GetSystemMetrics(SM_XVIRTUALSCREEN) - 4096;
             let y = GetSystemMetrics(SM_YVIRTUALSCREEN) - 4096;
             window.render(cursor, x, y).unwrap();
+            assert_ne!(GetForegroundWindow(), handle);
             let initial = window.bitmap_updates;
             assert!(initial > 0);
             let since = std::time::Instant::now();
             for offset in 0..1000 {
                 window.render(cursor, x - offset, y).unwrap();
+                assert_ne!(GetForegroundWindow(), handle);
             }
             assert_eq!(
                 window.bitmap_updates, initial,
@@ -825,7 +827,9 @@ mod tests {
 
             window.update(false, false).unwrap();
             assert_eq!(IsWindowVisible(handle), 0);
-            assert_eq!(GetForegroundWindow(), foreground);
+            // Another application may legitimately gain focus during this test.
+            // This overlay must never become the foreground window itself.
+            assert_ne!(GetForegroundWindow(), handle);
             drop(window);
             assert_eq!(IsWindow(handle), 0);
         }
