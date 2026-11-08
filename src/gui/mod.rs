@@ -5,6 +5,8 @@ mod group_layout;
 mod group_monitor;
 #[cfg(target_os = "linux")]
 mod linux_activation;
+#[cfg(target_os = "linux")]
+mod linux_window;
 mod management;
 mod model;
 mod paired_update;
@@ -180,6 +182,8 @@ pub fn run_at(start_hidden: bool, dir: PathBuf) -> Result<()> {
         )))
     })
     .map_err(anyhow::Error::msg);
+    #[cfg(target_os = "linux")]
+    let options = linux_window::options(options);
     #[cfg(not(windows))]
     eframe::run_native(
         "Desk Switch",
@@ -606,7 +610,7 @@ impl Desktop {
     }
 
     fn close_window(&mut self, ctx: &egui::Context) {
-        ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+        ctx.send_viewport_cmd_to(egui::ViewportId::ROOT, egui::ViewportCommand::CancelClose);
         self.action(
             if self.tray.as_ref().is_some_and(tray::Tray::available) {
                 Action::Hide

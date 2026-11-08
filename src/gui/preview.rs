@@ -325,6 +325,8 @@ fn run_native_preview(
     options: eframe::NativeOptions,
     create: impl FnOnce(egui::Context, String) -> Result<PreviewApp> + 'static,
 ) -> Result<()> {
+    #[cfg(target_os = "linux")]
+    let options = super::linux_window::options(options);
     eframe::run_native(
         "Desk Switch",
         options,
