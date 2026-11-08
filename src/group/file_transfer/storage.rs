@@ -1809,6 +1809,32 @@ impl Receive {
         Ok(paths)
     }
 
+    /// Remove a completed native-paste cache and its staging directory.
+    /// The caller must have exclusive ownership: this is used only for the
+    /// private native cache, never for a user-visible Downloads bundle.
+    pub fn remove_cache(&mut self) -> Result<()> {
+        // Drop every retained capability before removing the directories it
+        // points at; Windows refuses to delete a tree with live child handles.
+        self.stage = None;
+        self.blobs = None;
+        self.finished_tree = None;
+        if let Some(name) = self.owner.bundle.clone() {
+            self.valid_bundle_name(&name)?;
+            if exists(&self.base, &name)? {
+                let bundle = directory(&self.base, OsStr::new(&name), false)?;
+                private_directory(&bundle)?;
+                bundle.remove_open_dir_all()?;
+            }
+        }
+        let stage_name = format!(".partial-{}", self.manifest.id);
+        if exists(&self.base, &stage_name)? {
+            let stage = directory(&self.base, OsStr::new(&stage_name), false)?;
+            private_directory(&stage)?;
+            stage.remove_open_dir_all()?;
+        }
+        sync_dir(&self.base)
+    }
+
     pub fn cancel(&mut self) -> Result<()> {
         ensure!(
             !self.owner.finished,
@@ -2929,6 +2955,26 @@ mod tests {
             b"not our incomplete export"
         );
     }
+    #[test]
+    fn native_cache_removal_deletes_its_private_stage() {
+        let fixture = Fixture::new();
+        fs::create_dir(fixture.path("source")).unwrap();
+        fs::write(fixture.path("source/data"), b"cached").unwrap();
+        let export = fixture.prepare(&[fixture.path("source/data")]);
+        let downloads = fixture.path("downloads");
+        let stage = downloads.join(format!(".partial-{}", export.manifest.id));
+        let mut receive =
+            Receive::open(&downloads, export.manifest.clone(), "peer", "workspace").unwrap();
+        assert!(stage.exists());
+        receive.remove_cache().unwrap();
+        assert!(!stage.exists());
+        assert!(
+            !downloads
+                .join(format!("Transfer {}", &export.manifest.id[..12]))
+                .exists()
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn symlink_sources_ancestors_and_checkpoint_hardlinks_cannot_escape() {
