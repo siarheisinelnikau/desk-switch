@@ -709,6 +709,7 @@ struct MoveReceipt {
 struct ActiveRequest {
     cancelled: Arc<AtomicBool>,
     range: Option<(u64, u64)>,
+    consumer: Option<NativeConsumer>,
 }
 #[derive(Clone, Debug, Default)]
 struct Coverage(Vec<(u64, u64)>);
@@ -1056,6 +1057,7 @@ impl Work {
             ActiveRequest {
                 cancelled: cancelled.clone(),
                 range: request.range,
+                consumer: request.consumer.clone(),
             },
         );
         root.state.busy.fetch_add(1, Ordering::AcqRel);
@@ -1755,19 +1757,38 @@ unsafe extern "system" fn cancel_callback(
             "The Cloud Files cancellation layout is unsupported"
         );
         let args = unsafe { (*raw).Anonymous.Cancel.Anonymous.FetchData };
-        if let Some(active) = root
-            .state
-            .requests
-            .lock()
-            .unwrap()
-            .get(&(request.transfer, request.key))
-        {
+        let cancelled_session = {
+            let mut requests = root.state.requests.lock().unwrap();
+            let Some(active) = requests.get_mut(&(request.transfer, request.key)) else {
+                return Ok(());
+            };
             // Partial cancellation does not retire remaining range readers or
             // cancel the shared network fetch owned by another native lease.
-            if active.range.is_some_and(|required| {
+            if !active.range.is_some_and(|required| {
                 cancelled_range_covers(args.FileOffset, args.Length, required)
             }) {
-                active.cancelled.store(true, Ordering::Release);
+                return Ok(());
+            }
+            active.cancelled.store(true, Ordering::Release);
+            let consumer = active.consumer.clone();
+            let has_live_range = consumer.as_ref().is_some_and(|consumer| {
+                requests.values().any(|other| {
+                    other.consumer.as_ref() == Some(consumer)
+                        && !other.cancelled.load(Ordering::Acquire)
+                })
+            });
+            (!has_live_range).then_some(consumer).flatten()
+        };
+        if let Some(consumer) = cancelled_session {
+            let session = root
+                .state
+                .sessions
+                .lock()
+                .unwrap()
+                .get(&(consumer.process_id, consumer.started))
+                .map(|session| session.handle.clone());
+            if let Some(session) = session {
+                let _ = session.native_complete(NativeResult::Cancelled);
             }
         }
         Ok(())

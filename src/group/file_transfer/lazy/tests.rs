@@ -241,19 +241,27 @@ fn a_full_completion_queue_leaves_the_result_retryable_and_queues_it_once() {
         .clone();
     let native = session(&fetch, reader.id());
     // NativeBegin occupies the only slot until the synthetic service drains it.
-    assert!(reader.native_complete(NativeResult::Succeeded).is_err());
+    assert!(
+        reader
+            .native_complete(NativeResult::Failed("queue full test".into()))
+            .is_err()
+    );
     assert!(!native.reported.load(Ordering::Acquire));
     assert!(!native.reporting.load(Ordering::Acquire));
     assert!(!fetch.state.lock().unwrap().cleanup_started);
     assert!(Arc::ptr_eq(&harness.take_begin(), &fetch));
 
-    reader.native_complete(NativeResult::Succeeded).unwrap();
+    reader
+        .native_complete(NativeResult::Failed("queue full test".into()))
+        .unwrap();
     assert!(native.reported.load(Ordering::Acquire));
     assert!(!native.reporting.load(Ordering::Acquire));
     let (queued, result) = harness.take_result();
     assert!(Arc::ptr_eq(&queued, &native));
-    assert!(matches!(result, NativeResult::Succeeded));
-    reader.native_complete(NativeResult::Succeeded).unwrap();
+    assert!(matches!(result, NativeResult::Failed(_)));
+    reader
+        .native_complete(NativeResult::Failed("queue full test".into()))
+        .unwrap();
     assert!(harness.commands.try_recv().is_err());
 }
 
