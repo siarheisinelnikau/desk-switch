@@ -2250,7 +2250,7 @@ mod tests {
         fs::write(fixture.path("source/unreadable"), b"private bytes").unwrap();
         fs::set_permissions(
             fixture.path("source/unreadable"),
-            fs::Permissions::from_mode(0),
+            fs::Permissions::from_mode(0o0),
         )
         .unwrap();
         let selection = SourceSelection::capture(&[fixture.path("source")], &NO_CANCEL).unwrap();
