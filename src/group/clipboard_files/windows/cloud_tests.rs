@@ -1206,7 +1206,9 @@ fn run_held_read(fixture: &mut Fixture, cancel: bool) -> Result<()> {
         ensure!(stale_provider.begins.load(Ordering::Acquire) == 0);
         let selection =
             clipboard_retry(native::read)?.context("The newer local copy disappeared")?;
-        ensure!(selection.paths == [newer] && selection.sequence == newer_sequence);
+        ensure!(
+            selection.paths == [ordinary_dos_path(&newer)] && selection.sequence == newer_sequence
+        );
         ensure!(u64::from(unsafe { native::GetClipboardSequenceNumber() }) == newer_sequence);
     }
 
