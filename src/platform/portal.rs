@@ -367,6 +367,7 @@ impl Portal {
             })
             .collect();
         if self.group {
+            self.cancel_dwell();
             self.geometry_stamp = self.geometry_stamp.wrapping_add(1);
             self.geometry_dirty = true;
             self.native.clear();
@@ -404,6 +405,7 @@ impl Portal {
     }
 
     fn replace_native(&mut self, native: Vec<NativeScreen>) -> Result<()> {
+        self.cancel_dwell();
         let regions: Vec<_> = self.screens.iter().map(|screen| screen.rect).collect();
         self.native = match_regions(&regions, &native);
         self.router
@@ -452,6 +454,11 @@ impl Portal {
         self.crossing.take()
     }
 
+    pub fn cancel_dwell(&mut self) {
+        self.router.cancel_dwell();
+        self.crossing = None;
+    }
+
     pub fn display_pending(&self) -> bool {
         self.group
             && (self.geometry_dirty
@@ -463,6 +470,7 @@ impl Portal {
 
     pub fn refresh_pointer(&mut self) {
         if self.group {
+            self.cancel_dwell();
             self.pointer_stamp = self.pointer_stamp.wrapping_add(1);
             self.cursor = None;
             self.pointer_dirty = true;
@@ -731,6 +739,11 @@ impl Portal {
             event.valid() && !self.started.is_empty(),
             "invalid or inactive input event"
         );
+        if matches!(event, Input::Key { .. } | Input::Button { .. }) {
+            // Even a press and release between two motions must start a fresh
+            // dwell. Duplicate key events must not preserve an armed crossing.
+            self.cancel_dwell();
+        }
         match event {
             Input::Key { code, down } => {
                 if down == self.keys.contains(&code) {
@@ -869,6 +882,7 @@ impl Portal {
     }
 
     pub fn release(&mut self) -> Result<()> {
+        self.cancel_dwell();
         let mut result = Ok(());
         for code in std::mem::take(&mut self.keys) {
             result =

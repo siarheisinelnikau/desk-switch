@@ -11,6 +11,8 @@ const INDICATOR_ID = 'desk-switch';
 const CLIPBOARD_NAME = 'io.github.siarheisinelnikau.DeskSwitch.Clipboard';
 const CLIPBOARD_PATH = '/io/github/siarheisinelnikau/DeskSwitch/Clipboard';
 const CLIPBOARD_LIMIT = 8 * 1024 * 1024;
+const FILE_CLIPBOARD_LIMIT = 1024 * 1024;
+const FILE_CLIPBOARD_ROOTS = 10000;
 const CLIPBOARD_INTERFACE = `<node><interface name="${CLIPBOARD_NAME}">
     <method name="Version"><arg type="u" direction="out"/></method>
     <method name="Read">
@@ -20,6 +22,15 @@ const CLIPBOARD_INTERFACE = `<node><interface name="${CLIPBOARD_NAME}">
     <method name="Write">
         <arg type="s" direction="in"/><arg type="ay" direction="in"/>
         <arg type="u" direction="out"/>
+    </method>
+    <method name="ReadFiles">
+        <arg type="u" direction="in"/>
+        <arg type="u" direction="out"/><arg type="s" direction="out"/><arg type="ay" direction="out"/>
+    </method>
+    <method name="WriteFiles"><arg type="ay" direction="in"/><arg type="u" direction="out"/></method>
+    <method name="WriteFilesIfCurrent">
+        <arg type="u" direction="in"/><arg type="ay" direction="in"/>
+        <arg type="b" direction="out"/><arg type="u" direction="out"/>
     </method>
     <method name="ActivateWindow"><arg type="s" direction="in"/></method>
     <method name="PointerState"><arg type="i" direction="out"/><arg type="i" direction="out"/></method>
@@ -36,12 +47,15 @@ export default class DeskSwitchTray extends Extension {
         this._focusRequests = new Map();
         this._clipboardSerial = 1;
         this._clipboardRejected = null;
+        this._clipboardFilesRejected = null;
+        this._clipboardFileRead = null;
         this._clipboard = St.Clipboard.get_default();
         this._selection = global.display.get_selection();
         this._selectionSignal = this._selection.connect('owner-changed', (_selection, type) => {
             if (type === Meta.SelectionType.SELECTION_CLIPBOARD) {
                 this._clipboardSerial = (this._clipboardSerial + 1) >>> 0 || 1;
                 this._clipboardRejected = null;
+                this._clipboardFilesRejected = null;
             }
         });
         this._clipboardBridge = Gio.DBusExportedObject.wrapJSObject(CLIPBOARD_INTERFACE, this);
@@ -376,9 +390,10 @@ export default class DeskSwitchTray extends Extension {
             };
             const type = St.ClipboardType.CLIPBOARD;
             const formats = this._clipboard.get_mimetypes(type);
-            // Files are intentionally deferred; do not turn a file-manager copy
-            // into an apparent successful transfer of its path text.
-            if (formats.includes('x-special/gnome-copied-files')) {
+            // The file worker handles native copies separately. Never leak a
+            // file manager's ancillary URI/path text as shared plain text.
+            if (formats.some(mime =>
+                ['x-special/gnome-copied-files', 'text/uri-list'].includes(mime))) {
                 reply('', []);
             } else if (formats.includes('image/png')) {
                 this._clipboard.get_content(type, 'image/png', (_clipboard, bytes) => {
@@ -421,6 +436,163 @@ export default class DeskSwitchTray extends Extension {
             this._clipboardSerial = (this._clipboardSerial + 1) >>> 0 || 1;
             this._clipboardRejected = null;
             invocation.return_value(new GLib.Variant('(u)', [this._clipboardSerial]));
+        } catch (error) {
+            this._clipboardError(invocation, error);
+        }
+    }
+
+    _fileUris(mime, bytes) {
+        if (bytes.length > FILE_CLIPBOARD_LIMIT)
+            throw new Error('File clipboard exceeds the 1 MiB metadata limit');
+        const text = new TextDecoder('utf-8', {fatal: true}).decode(Uint8Array.from(bytes));
+        const lines = text.split(/\r?\n/);
+        if (mime === 'x-special/gnome-copied-files') {
+            const action = lines.shift();
+            if (action === 'cut')
+                return null;
+            if (action !== 'copy')
+                throw new Error('File clipboard does not contain a copy operation');
+        } else if (mime !== 'text/uri-list') {
+            throw new Error('Unsupported file clipboard format');
+        }
+        const uris = [];
+        const paths = new Set();
+        for (const line of lines) {
+            if (!line || (mime === 'text/uri-list' && line.startsWith('#')))
+                continue;
+            if (uris.length >= FILE_CLIPBOARD_ROOTS)
+                throw new Error('File clipboard exceeds 10000 selected items');
+            const match = line.match(/^file:\/\/(?:localhost)?(\/[^?#\r\n\\]*)$/);
+            if (!match)
+                throw new Error('File clipboard contains a non-local or invalid file URL');
+            const path = decodeURIComponent(match[1]);
+            if (!path.startsWith('/') || /[\u0000-\u001f\u007f-\u009f]/.test(path) ||
+                path.split('/').includes('..') || paths.has(path))
+                throw new Error('File clipboard contains an unsupported or duplicate local path');
+            paths.add(path);
+            uris.push(line);
+        }
+        if (uris.length === 0)
+            throw new Error('File clipboard contains no local files');
+        return uris;
+    }
+
+    _readFileBytes(mime, serial) {
+        if (this._clipboardFileRead) {
+            if (this._clipboardFileRead.serial !== serial || this._clipboardFileRead.mime !== mime)
+                return Promise.reject(new Error('The clipboard changed; retry the file copy'));
+            return this._clipboardFileRead.promise;
+        }
+        // St.Clipboard.get_content uses an unlimited memory stream. Mutter's
+        // read-only transfer API accepts an explicit cap; request one extra
+        // byte to reject oversized metadata without allocating its full size.
+        const stream = Gio.MemoryOutputStream.new_resizable();
+        const request = {serial, mime, promise: null};
+        request.promise = new Promise((resolve, reject) => {
+            this._selection.transfer_async(Meta.SelectionType.SELECTION_CLIPBOARD,
+                mime, FILE_CLIPBOARD_LIMIT + 1, stream, this._cancellable,
+                (selection, result) => {
+                    try {
+                        if (!selection.transfer_finish(result))
+                            throw new Error('The clipboard changed; retry the file copy');
+                        stream.close(null);
+                        const bytes = stream.steal_as_bytes().get_data();
+                        if (bytes.length > FILE_CLIPBOARD_LIMIT)
+                            throw new Error('File clipboard exceeds the 1 MiB metadata limit');
+                        resolve(bytes);
+                    } catch (error) {
+                        try { stream.close(null); } catch { /* The stream may already be closed. */ }
+                        reject(error);
+                    }
+                });
+        }).finally(() => {
+            if (this._clipboardFileRead === request)
+                this._clipboardFileRead = null;
+        });
+        this._clipboardFileRead = request;
+        return request.promise;
+    }
+
+    async ReadFilesAsync([knownSerial], invocation) {
+        let serial = 0;
+        try {
+            await this._authorizeCaller(invocation);
+            if (!this._alive)
+                throw new Error('The clipboard companion is disabled');
+            serial = this._clipboardSerial;
+            if (this._clipboardFilesRejected?.serial === serial)
+                throw new Error(this._clipboardFilesRejected.message);
+            if (knownSerial === serial) {
+                invocation.return_value(new GLib.Variant('(usay)', [serial, '', []]));
+                return;
+            }
+            const formats = this._clipboard.get_mimetypes(St.ClipboardType.CLIPBOARD);
+            const mime = formats.includes('x-special/gnome-copied-files')
+                ? 'x-special/gnome-copied-files'
+                : formats.includes('text/uri-list') ? 'text/uri-list' : '';
+            if (!mime) {
+                invocation.return_value(new GLib.Variant('(usay)', [serial, '', []]));
+                return;
+            }
+            const bytes = await this._readFileBytes(mime, serial);
+            if (!this._alive || serial !== this._clipboardSerial)
+                throw new Error('The clipboard changed; retry the file copy');
+            this._fileUris(mime, bytes);
+            // Preserve the genuine cut MIME for the Rust worker to suppress
+            // ancillary text. Its empty selection authorizes no export/move.
+            invocation.return_value(new GLib.Variant('(usay)', [serial, mime, bytes]));
+        } catch (error) {
+            if (serial && serial === this._clipboardSerial && this._alive &&
+                !error.message.startsWith('The clipboard changed'))
+                this._clipboardFilesRejected = {serial, message: error.message};
+            this._clipboardError(invocation, error);
+        }
+    }
+
+    _prepareFileCopy(bytes) {
+        const uris = this._fileUris('text/uri-list', bytes);
+        const copy = new TextEncoder().encode(['copy', ...uris].join('\n'));
+        if (copy.length > FILE_CLIPBOARD_LIMIT)
+            throw new Error('File clipboard exceeds the 1 MiB metadata limit');
+        return copy;
+    }
+
+    _publishFileCopy(copy) {
+        this._clipboard.set_content(St.ClipboardType.CLIPBOARD,
+            'x-special/gnome-copied-files', new GLib.Bytes(copy));
+        this._clipboardSerial = (this._clipboardSerial + 1) >>> 0 || 1;
+        this._clipboardRejected = null;
+        this._clipboardFilesRejected = null;
+        return this._clipboardSerial;
+    }
+
+    async WriteFilesAsync([bytes], invocation) {
+        try {
+            await this._authorizeCaller(invocation);
+            if (!this._alive)
+                throw new Error('The clipboard companion is disabled');
+            const serial = this._publishFileCopy(this._prepareFileCopy(bytes));
+            invocation.return_value(new GLib.Variant('(u)', [serial]));
+        } catch (error) {
+            this._clipboardError(invocation, error);
+        }
+    }
+
+    async WriteFilesIfCurrentAsync([expectedSerial, bytes], invocation) {
+        try {
+            await this._authorizeCaller(invocation);
+            if (!this._alive)
+                throw new Error('The clipboard companion is disabled');
+            const copy = this._prepareFileCopy(bytes);
+            // No await or main-loop yield is allowed between the reservation
+            // check and native ownership change. Even an identical text recopy
+            // invalidates the file download's earlier paste reservation.
+            if (this._clipboardSerial !== expectedSerial) {
+                invocation.return_value(new GLib.Variant('(bu)', [false, this._clipboardSerial]));
+                return;
+            }
+            const serial = this._publishFileCopy(copy);
+            invocation.return_value(new GLib.Variant('(bu)', [true, serial]));
         } catch (error) {
             this._clipboardError(invocation, error);
         }

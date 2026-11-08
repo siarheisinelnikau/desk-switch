@@ -12,7 +12,7 @@ use std::{collections::BTreeMap, net::SocketAddr};
 
 pub type Key = String;
 pub const PORT: u16 = 45880;
-pub const PROTOCOL: u16 = 1;
+pub const PROTOCOL: u16 = 2;
 
 pub fn valid_key(key: &str) -> Result<()> {
     ensure!(
@@ -132,6 +132,8 @@ pub struct Settings {
     pub microphone_level: AudioLevel,
     pub monitor_enabled: bool,
     pub edge: bool,
+    pub edge_delay_ms: u16,
+    pub edge_protect_corners: bool,
     pub clipboard_enabled: bool,
 }
 impl Default for Settings {
@@ -153,12 +155,20 @@ impl From<&workspace::Shared> for Settings {
             microphone_level: value.microphone_level,
             monitor_enabled: value.monitor_enabled,
             edge: value.edge,
+            edge_delay_ms: crate::edge::Policy::default().dwell_ms,
+            edge_protect_corners: true,
             clipboard_enabled: false,
         }
     }
 }
 impl Settings {
     pub fn validate(&self, members: &BTreeMap<Key, Member>) -> Result<()> {
+        crate::edge::Policy {
+            dwell_ms: self.edge_delay_ms,
+            protect_corners: self.edge_protect_corners,
+            paused: false,
+        }
+        .validate()?;
         ensure!(
             self.microphone_level.volume <= 100,
             "Invalid microphone level"
@@ -228,11 +238,24 @@ fn now_ms() -> u64 {
         .min(u128::from(u64::MAX)) as u64
 }
 
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct Authority {
+    pub workspace_id: Key,
+    pub term: u64,
+    pub index: u64,
+}
+
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct Workspace {
     pub hub: Key,
+    #[serde(default)]
+    pub authority: Option<Authority>,
     pub revision: u64,
     pub settings: Settings,
+    #[serde(default)]
+    pub edge_paused: bool,
+    #[serde(default)]
+    pub edge_policy_revision: u64,
     pub members: BTreeMap<Key, Member>,
     pub active_input: Option<Key>,
     #[serde(default)]
@@ -256,6 +279,13 @@ pub struct Workspace {
     pub display_entry: Option<crate::edge::Entry>,
 }
 impl Workspace {
+    pub fn workspace_id(&self) -> &str {
+        self.authority
+            .as_ref()
+            .map(|authority| authority.workspace_id.as_str())
+            .unwrap_or(&self.hub)
+    }
+
     fn next_revision(&self) -> Result<u64> {
         self.revision
             .checked_add(1)
@@ -263,7 +293,18 @@ impl Workspace {
             .context("Workspace revision exhausted")
     }
     pub fn validate(&self) -> Result<()> {
+        if let Some(authority) = &self.authority {
+            valid_key(&authority.workspace_id)?;
+            ensure!(
+                authority.term > 0 && authority.index > 0,
+                "Invalid workspace authority"
+            );
+        }
         self.layout.validate_shape()?;
+        ensure!(
+            self.edge_policy_revision <= self.revision,
+            "Invalid edge policy revision"
+        );
         ensure!(
             self.input_request <= self.activation,
             "Invalid input request"
@@ -344,6 +385,14 @@ impl Workspace {
         }
         self.settings.validate(&self.members)
     }
+    pub fn pause_edges(&mut self, paused: bool) -> Result<()> {
+        if self.edge_paused != paused {
+            self.revision = self.next_revision()?;
+            self.edge_policy_revision = self.revision;
+            self.edge_paused = paused;
+        }
+        Ok(())
+    }
     pub fn set_settings(&mut self, expected: u64, settings: Settings) -> Result<()> {
         ensure!(
             self.revision == expected,
@@ -375,6 +424,13 @@ impl Workspace {
             );
         }
         let revision = self.next_revision()?;
+        if settings.edge != self.settings.edge
+            || settings.edge_delay_ms != self.settings.edge_delay_ms
+            || settings.edge_protect_corners != self.settings.edge_protect_corners
+            || settings.mouse_enabled != self.settings.mouse_enabled
+        {
+            self.edge_policy_revision = revision;
+        }
         self.settings = settings;
         self.revision = revision;
         Ok(())
@@ -608,6 +664,10 @@ impl Workspace {
             None
         };
         self.active_input = Some(destination.into());
+        if self.edge_paused {
+            self.edge_policy_revision = revision;
+        }
+        self.edge_paused = false;
         self.input_intent = Some(destination.into());
         self.active_input_entry = position;
         self.active_display = target;
@@ -700,6 +760,10 @@ impl Workspace {
             .checked_add(1)
             .context("Too many input switches")?;
         self.active_input = source.clone();
+        if self.edge_paused {
+            self.edge_policy_revision = revision;
+        }
+        self.edge_paused = false;
         self.input_intent = source.clone();
         self.active_input_entry = None;
         self.active_display = None;
@@ -1024,8 +1088,11 @@ pub(crate) mod tests {
             .collect();
         Workspace {
             hub: key(1),
+            authority: None,
             revision: 0,
             settings: Settings::default(),
+            edge_paused: false,
+            edge_policy_revision: 0,
             members,
             active_input: None,
             input_intent: None,

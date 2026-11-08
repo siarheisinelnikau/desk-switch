@@ -332,7 +332,7 @@ fn route_commands(routes: &Routes) -> VecDeque<serde_json::Value> {
     }
     std::iter::once(serde_json::json!({"kind":"routes-start"}))
         .chain(routes.boundaries.iter().map(|boundary| serde_json::json!({"kind":"routes-add","boundary":boundary})))
-        .chain(std::iter::once(serde_json::json!({"kind":"routes-commit","revision":routes.revision,"activation":routes.activation})))
+        .chain(std::iter::once(serde_json::json!({"kind":"routes-commit","revision":routes.revision,"activation":routes.activation,"policy":routes.policy})))
         .collect()
 }
 
@@ -567,6 +567,10 @@ impl super::receiver::Sink for NativeSink {
             "Input arrived outside an active macOS lease"
         );
         self.refresh_geometry()?;
+        if matches!(input, Input::Key { .. } | Input::Button { .. }) {
+            self.router.cancel_dwell();
+            self.crossing = None;
+        }
         if let Input::Move { dx, dy } = input {
             let group = crate::lifecycle::group_input();
             let blocked = if group {
@@ -660,6 +664,7 @@ impl super::receiver::Sink for NativeSink {
         Ok(None)
     }
     fn release(&mut self) -> Result<()> {
+        self.router.cancel_dwell();
         self.active = false;
         self.return_edge = false;
         self.crossing = None;
@@ -694,6 +699,6 @@ mod tests {
         boundary.validate().unwrap();
         let value = serde_json::json!({"kind":"routes-add","boundary":boundary});
         assert!(serde_json::to_vec(&value).unwrap().len() < 512);
-        assert!(serde_json::to_vec(&serde_json::json!({"kind":"routes-commit","revision":u64::MAX,"activation":u64::MAX})).unwrap().len()<512);
+        assert!(serde_json::to_vec(&serde_json::json!({"kind":"routes-commit","revision":u64::MAX,"activation":u64::MAX,"policy":crate::edge::Policy {dwell_ms:1000,protect_corners:true,paused:true}})).unwrap().len()<512);
     }
 }

@@ -632,6 +632,7 @@ mod tests {
                 revision: 2,
                 activation: 4,
                 boundaries: Vec::new(),
+                ..Default::default()
             },
             &mut last_generation,
         )

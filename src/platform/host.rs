@@ -23,6 +23,15 @@ fn current_routes() -> (u64, u64) {
     let routes = routes.borrow();
     (routes.activation, routes.revision)
 }
+fn crossing_matches(routes: &crate::edge::Routes, crossing: Crossing) -> bool {
+    !routes.policy.paused
+        && crossing.boundary != 0
+        && crossing.activation == routes.activation
+        && crossing.revision == routes.revision
+}
+fn current_crossing(crossing: Crossing) -> bool {
+    crossing_matches(&crate::lifecycle::routes().borrow(), crossing)
+}
 
 pub enum Control {
     Toggle(u64),
@@ -164,7 +173,7 @@ fn report_recovery(reason: RecoveryReason) {
 
 fn waiting_group_control(control: Control, gate: &Gate) {
     if let Control::Boundary { token, crossing } = control {
-        if gate.current() == (token, Route::Local) {
+        if gate.current() == (token, Route::Local) && current_crossing(crossing) {
             crate::lifecycle::report(crate::lifecycle::Event::EdgeCrossed(crossing));
         }
         return;
@@ -509,7 +518,7 @@ impl Handoff {
                             let mode = io.edge.as_ref().context("host edge is disabled")?.mode;
                             self.start(token, mode, Some(position))?
                         }
-                        Control::Boundary { token, crossing } if self.group && self.logic.is_local() && io.gate.current() == (token, Route::Local) => {
+                        Control::Boundary { token, crossing } if self.group && self.logic.is_local() && io.gate.current() == (token, Route::Local) && current_crossing(crossing) => {
                             crate::lifecycle::report(crate::lifecycle::Event::EdgeCrossed(crossing));
                             continue;
                         }
@@ -539,9 +548,7 @@ impl Handoff {
                         Message::Crossed { id, crossing } if self.group => {
                             if self.logic.is_remote() && self.logic.id() == Some(id)
                                 && crossing.activation == self.group_generation
-                                && crossing.activation == current_routes().0
-                                && crossing.revision == current_routes().1
-                                && crossing.boundary != 0
+                                && current_crossing(crossing)
                             {
                                 crate::lifecycle::report(crate::lifecycle::Event::EdgeCrossed(crossing));
                             }
@@ -849,6 +856,29 @@ mod tests {
     use std::sync::atomic::{AtomicU16, AtomicUsize, Ordering::SeqCst};
     use tokio::net::TcpListener;
 
+    #[test]
+    fn queued_edges_require_the_current_unpaused_policy_generation() {
+        let mut routes = crate::edge::Routes {
+            revision: 4,
+            activation: 7,
+            ..Default::default()
+        };
+        let crossing = Crossing {
+            revision: 4,
+            activation: 7,
+            boundary: 1,
+            position: 32767,
+        };
+        assert!(crossing_matches(&routes, crossing));
+        routes.policy.paused = true;
+        assert!(!crossing_matches(&routes, crossing));
+        routes.policy.paused = false;
+        routes.revision += 1;
+        assert!(!crossing_matches(&routes, crossing));
+        routes.revision = crossing.revision;
+        routes.activation += 1;
+        assert!(!crossing_matches(&routes, crossing));
+    }
     #[test]
     fn expired_peer_heartbeat_has_a_typed_transient_reason() {
         let mut heartbeat = Heartbeat::new();

@@ -862,11 +862,12 @@ impl Desktop {
                 });
             });
         if !self.quitting {
-            if !self.group.layout_editor.is_open() {
+            if !self.group.layout_editor.is_open() && !self.transfers.is_open() {
                 self.settings_windows(&ctx);
             }
             self.group_add_dialog(&ctx);
             self.group_layout_dialog(&ctx);
+            self.transfer_window(&ctx);
         }
     }
 
@@ -954,6 +955,7 @@ impl Desktop {
                         });
                         if settings.clicked() {
                             self.group.add_open = false;
+                            self.transfers.close();
                             self.page = Page::Application;
                         }
                         egui::Frame::new()
@@ -985,9 +987,11 @@ impl Desktop {
                                 )
                                 .clicked()
                         {
+                            self.transfers.close();
                             self.page = Page::Overview;
                             self.group.add_open = true;
                         }
+                        self.transfer_toolbar(ui);
                     });
                 });
             });

@@ -1,22 +1,22 @@
 # Desk Switch guide
 
-Your computers. One workspace. Share a keyboard, mouse, headphones or speakers, microphone and an optional clipboard across **three, four or more computers**. Control the workspace and each computer's settings from any member. Releases support Windows and Ubuntu, with experimental Apple Silicon and Intel macOS bundles returning in **0.6.2**. A shared monitor can follow the selected computer through DDC/CI.
+Your computers. One workspace. Share a keyboard, mouse, headphones or speakers, microphone and an optional clipboard across **two, three, four or more computers**. Control the workspace and each computer's settings from any member, send files directly, and arrange screens around your desk. Releases support Windows, Ubuntu and experimental Apple Silicon/Intel macOS bundles. A shared monitor can follow the selected computer through DDC/CI.
 
 ![A four-computer workspace with shared input, sound, microphone and clipboard controls](workspace-four-computers.png)
 
 ## Install
 
-Install the **same version on every computer** from [Releases](https://github.com/siarheisinelnikau/desk-switch/releases). Version **0.6.2** has four native downloads:
+Install the **same version on every computer** from [Releases](https://github.com/siarheisinelnikau/desk-switch/releases). Version **0.7.0** has four native downloads:
 
 | Platform | Download |
 | --- | --- |
-| Ubuntu 24.04/26.04, x86-64 | [desk-switch-v0.6.2-linux-x86-64.deb](https://github.com/siarheisinelnikau/desk-switch/releases/download/v0.6.2/desk-switch-v0.6.2-linux-x86-64.deb) |
-| Windows, x86-64 | [desk-switch-v0.6.2-windows-x86-64.exe](https://github.com/siarheisinelnikau/desk-switch/releases/download/v0.6.2/desk-switch-v0.6.2-windows-x86-64.exe) |
-| macOS 13+, Apple Silicon (experimental) | [desk-switch-v0.6.2-macos-arm64.zip](https://github.com/siarheisinelnikau/desk-switch/releases/download/v0.6.2/desk-switch-v0.6.2-macos-arm64.zip) |
-| macOS 13+, Intel x86-64 (experimental) | [desk-switch-v0.6.2-macos-x86-64.zip](https://github.com/siarheisinelnikau/desk-switch/releases/download/v0.6.2/desk-switch-v0.6.2-macos-x86-64.zip) |
+| Ubuntu 24.04/26.04, x86-64 | [desk-switch-v0.7.0-linux-x86-64.deb](https://github.com/siarheisinelnikau/desk-switch/releases/download/v0.7.0/desk-switch-v0.7.0-linux-x86-64.deb) |
+| Windows, x86-64 | [desk-switch-v0.7.0-windows-x86-64.exe](https://github.com/siarheisinelnikau/desk-switch/releases/download/v0.7.0/desk-switch-v0.7.0-windows-x86-64.exe) |
+| macOS 13+, Apple Silicon (experimental) | [desk-switch-v0.7.0-macos-arm64.zip](https://github.com/siarheisinelnikau/desk-switch/releases/download/v0.7.0/desk-switch-v0.7.0-macos-arm64.zip) |
+| macOS 13+, Intel x86-64 (experimental) | [desk-switch-v0.7.0-macos-x86-64.zip](https://github.com/siarheisinelnikau/desk-switch/releases/download/v0.7.0/desk-switch-v0.7.0-macos-x86-64.zip) |
 
 ```sh
-sudo apt install ./desk-switch-v0.6.2-linux-x86-64.deb
+sudo apt install ./desk-switch-v0.7.0-linux-x86-64.deb
 ```
 
 Open **Desk Switch** from Ubuntu's application menu or run the Windows executable. New profiles use **English** and **Dark**. Existing language and theme choices are preserved. Russian, German, French, Spanish and Italian are also available; changes apply immediately to the window and tray.
@@ -33,9 +33,9 @@ The Mac adapter uses native OS APIs:
 - **System audio:** ScreenCaptureKit records audio only; no video frames are registered, sent or saved. macOS still requires Screen Recording/System Audio Recording permission. Capture follows the **default system output mix**; a selected nondefault capture output is rejected. Desk Switch playback workers are excluded from the application filter to avoid forwarding received audio or the virtual microphone feed. Newly launched applications join that filter within approximately two seconds. CoreAudio plays received audio on the selected output and reads/writes that output's real system volume. HDMI/DisplayPort and other fixed-level outputs may have no writable macOS volume/mute control; an attempted change reports that limitation. Received streams still have independent relative volume and mute. Public macOS APIs do not provide the Windows/Linux per-application gain-recovery mixer.
 - **Microphone:** AVAudioEngine captures the selected physical microphone after macOS grants Microphone access. To receive a shared microphone, install **VB-CABLE** or **BlackHole**, select its virtual playback endpoint in Desk Switch and choose the matching virtual recording input in your calling app. The saved official VB-CABLE installer can be extracted or opened from the app; macOS's Installer completes driver installation. Desk Switch never routes a received microphone to ordinary speakers.
 - **Monitor:** explicit reads and one VCP `0x60` input-selection transaction on a supported external DDC/CI connection. Intel uses IOI2C; Apple Silicon includes the MIT-licensed [m1ddc transport](../vendor/m1ddc/README.md), which uses private macOS APIs. The built-in display cannot switch video inputs, and some USB-C/Thunderbolt adapters, GPUs and monitors expose no supported transport. Unsupported access produces an error; the application never probes alternate input codes or repeats a selection automatically.
-- **Desktop integration:** a menu-bar icon provides the shared quick-controls popup on left click and the native menu on right click. Closing the window keeps the app in the menu bar. Optional login startup uses the current user's LaunchAgent. Text/image clipboard sharing uses the system pasteboard when enabled for the group.
+- **Desktop integration:** a menu-bar icon provides the shared quick-controls popup on left click and the native menu on right click. Closing the window keeps the app in the menu bar. Optional login startup uses the current user's LaunchAgent. Clipboard sharing uses the system pasteboard when enabled for the group. File copies use actual local file-URL items, not text containing a path or file promises; received files are published only after verified local staging.
 
-Permissions are granted through macOS itself and cannot be bypassed. On macOS 15 or newer, allow **Local Network** access for discovery and connections; it can be changed in **System Settings → Privacy & Security → Local Network**. See [Apple's local network privacy guidance](https://developer.apple.com/documentation/technotes/tn3179-understanding-local-network-privacy). macOS may request consent again after an update; stable permission retention with ad-hoc signed builds has not been verified. Settings and identities live in **~/Library/Application Support/desk-switch** unless a custom profile directory is supplied. A real Mac screenshot and settled/hidden performance measurements are still needed; the README screenshots below were generated by the Windows application.
+Permissions are granted through macOS itself and cannot be bypassed. On macOS 15 or newer, allow **Local Network** access for discovery and connections; it can be changed in **System Settings → Privacy & Security → Local Network**. See [Apple's local network privacy guidance](https://developer.apple.com/documentation/technotes/tn3179-understanding-local-network-privacy). File transfers may also need normal **Files and Folders** access for protected folders or drives. A denied permission fails that operation. macOS may request consent again after an update; stable permission retention with ad-hoc signed builds has not been verified. Settings and identities live in **~/Library/Application Support/desk-switch** unless a custom profile directory is supplied. A real Mac screenshot and settled/hidden performance measurements are still needed; the README screenshots below were generated by the Windows application.
 
 ## Link your computers
 
@@ -43,7 +43,9 @@ Permissions are granted through macOS itself and cannot be bypassed. On macOS 15
 2. Click **+ Add a computer** in the header. In **Nearby computers**, choose a discovered computer and click **Connect**. Approve the connection with **Allow** on the invited computer. Compare the displayed security code when confirming a new identity; keys are created and exchanged automatically. The dialog shows the pending approval, completion or a connection error.
 3. Repeat for each additional computer. Every member sees the complete workspace, connection status and device roles. Use **Switch here** on a computer's card to select it, or **Settings** to manage it.
 
-One computer coordinates the workspace. **That coordinating computer must keep Desk Switch running** for membership, settings, switching requests and shared clipboard delivery. Keyboard/mouse, system audio and microphone streams use direct authenticated connections between their source and destination computers. Automatic replacement of an offline coordinator is not implemented.
+One trusted computer coordinates workspace changes. If it disconnects, sleeps or restarts, the remaining members can elect another coordinator automatically. A **majority of the saved trusted membership** must be connected: two of three, three of four, or three of five. A **two-computer workspace needs both computers** for shared changes; it cannot continue global edits with one missing. During a loss of quorum, shared controls wait and show reconnection/waiting status. F11 emergency input return and local update checking remain available.
+
+Returning computers catch up with the elected coordinator; existing identities stay pinned, and new members still need approval. Keep the computers providing input, sound and microphones online. Their device streams and file transfers use direct authenticated connections between their source and destination, independently of the coordinator. Elections and reconnections do not replay monitor-selection commands. See [Updates](#updates) for the first migration from an older workspace.
 
 You can add computers and change shared settings from any connected member. Previously approved identities reconnect without another prompt. Settings changes are checked against the current revision so simultaneous edits cannot silently overwrite each other. Offline computers remain visible, and unavailable or incompatible devices are excluded from active routes.
 
@@ -53,14 +55,14 @@ If discovery is unavailable, open **+ Add a computer → Manual IP**. Enter a nu
 
 IPv4 and **routable IPv6** addresses (global or ULA) are supported by the control, input, audio and microphone listeners. A routed network or VPN and appropriate firewall access are required across subnets; Desk Switch does not provide NAT traversal. IPv6 link-local interface scope numbers are local to each computer, and Desk Switch does not translate them between members. Use IPv4 or a routable IPv6 address for a workspace spanning computers with different interface scopes.
 
-Direct device connections use **45876/TCP** for input and **45877/TCP** for system audio. Microphone fanout uses one TCP listener on the source for each receiver, allocated from **49000** by the member's sorted identity index: for a workspace of N computers, allow **49000 through 49000 + N − 1** on the microphone source. Legacy pairing/management uses **45878/TCP**; **45879/TCP** is the earlier two-computer microphone port, not the new fanout range. Allow Desk Switch on your private LAN if the operating system requests firewall permission.
+Direct device connections use **45876/TCP** for input and **45877/TCP** for system audio. File transfers use **45881/TCP** by default; allow it on every participating member so sending, receiving, cancellation and resume can connect. A custom control address uses the following TCP port for file connections. Microphone fanout uses one TCP listener on the source for each receiver, allocated from **49000** by the member's sorted identity index: for a workspace of N computers, allow **49000 through 49000 + N − 1** on the microphone source. Legacy pairing/management uses **45878/TCP**; **45879/TCP** is the earlier two-computer microphone port, not the new fanout range. Allow Desk Switch on your private LAN if the operating system requests firewall permission. The application does not change firewall rules.
 
 ## Devices across the workspace
 
 - **Keyboard and mouse:** choose **Keyboard & mouse from**, or keep Automatic. One selected physical keyboard/mouse source controls the active destination. Each computer's card has **Switch here**; F12 cycles through connected, compatible computers and F11 returns input to its source. Optional screen-edge crossing follows the saved display arrangement and places the pointer on the neighboring display at the corresponding edge position. Computers can keep their own local input devices as well.
 - **Headphones or speakers:** **Play all sound on** chooses the listening computer. It receives the sound of every other eligible online member, so all computers can be heard through one set of headphones. The listening computer's level is its real output **system volume and mute**. Each other computer has an independent **relative volume and mute** for its forwarded stream. Any member can adjust every level. Disabling **Sound** stops forwarding and leaves the output's current system level in place. Shared sound stays independent of keyboard/mouse switching.
 - **Microphone:** choose one physical source and deliver it to every eligible online computer with a supported virtual microphone. The shared gain and mute apply to all recipients. See [Shared microphone](#shared-microphone) for driver requirements and source binding.
-- **Clipboard:** enable **Shared clipboard** to copy text and images between members. It is off by default; [limits and platform setup](#shared-clipboard) are described below.
+- **Clipboard:** enable **Shared clipboard** to copy text, images, files and folders between members. It is off by default; [staging, limits and platform setup](#shared-clipboard) are described below. **Send files…** on a recipient's card works independently of that setting.
 - **Monitor:** enable **Switch the shared monitor** and configure the participating computers' ports. The currently visible computer sends one command selecting the destination's saved input. Computers using separate displays can leave their participation disabled.
 
 The original outline device icons identify keyboards, mice, headphones/speakers and microphones. Their colours follow the source computer across the main cards, shared controls and tray popup. Muted sources keep a subdued colour with a slash. The shared-monitor picture shows the last successful Desk Switch selection, with separate switching, failure and unknown states. It updates when you switch with Desk Switch; manual changes in the monitor's own menu are not detected automatically.
@@ -97,11 +99,23 @@ VB-CABLE is donationware by VB-Audio Software; [support its authors](https://vb-
 
 ## Shared clipboard
 
-Enable **Shared clipboard** in the workspace's shared controls to synchronize **plain text and images** across online members. Each transfer is limited to **8 MiB**, and images to **4096 × 4096 pixels**. Images travel as PNG. The setting is off by default; while disabled, the clipboard worker does not open the OS clipboard and discards pending shared content. Received content is not forwarded repeatedly.
+Enable **Shared clipboard** in the workspace's shared controls to synchronize **plain text, images and file copies** across online members. Text and image payloads are limited to **8 MiB**, and images to **4096 × 4096 pixels**. Images travel as PNG. Files and folders use the separate transfer service and [its limits](#files-and-folders).
+
+For a file copy, Desk Switch prepares the contents, transfers them and verifies the local files before publishing the receiving computer's native file clipboard. Wait for **Copied to clipboard** before pasting in that computer's file manager. The operating system's paste action cannot wait for an unfinished download. This historical status confirms that publication succeeded; a later copy can replace the clipboard normally. **Copy received files** publishes the completed local files again without downloading them again.
+
+Once Desk Switch has announced the copied files to the receiving computer, a newer local clipboard copy is preserved during preparation and transfer. Network delivery before that announcement cannot establish a global copy order. The older files can still finish as **Files saved**; reconnecting or resuming does not renew an old publication reservation. Use **Keep current clipboard** to stop pending publication while retaining the downloaded files. Busy clipboard writes retry; **Retry clipboard** retries a failed publication. Shared clipboard is off by default. Disabling it stops new capture and queued publication; an OS call already in progress may finish. Received files remain saved, and received content is not forwarded repeatedly.
 
 On **GNOME Wayland**, enable the bundled **Desk Switch Tray** companion once in the GNOME **Extensions** app. After installing the Debian package, log out and back in if GNOME has not discovered the extension. The companion supplies both the clipboard bridge and the requested tray click behavior. Without it, Desk Switch reports that sharing is unavailable on that session. Windows, macOS and supported X11 sessions use their native clipboard backends.
 
-Files and folders are not transferred in this release. Their implementation is tracked in [issue #2](https://github.com/siarheisinelnikau/desk-switch/issues/2).
+## Files and folders
+
+Click **Send files…** on the recipient's computer card. In **Transfers**, use **Add files…** or **Add folders…**, check the recipient, then **Send**. Previously approved workspace members receive transfers automatically under **Downloads / Desk Switch**, in a unique bundle folder. Existing files are preserved. The clipboard setting is not needed for a direct send.
+
+The transfer list shows preparation, connection, byte progress and verification. **Resume transfer** continues an interrupted transfer when the other computer is reachable; completed data is checked before reuse. **Cancel transfer** ends an unfinished transfer and removes its owned partial data. Sending again creates a new transfer. Completed received files are kept, and **Open folder** opens their location. Receiving a file does not open or execute it.
+
+Each bundle is limited to **10,000 files and directories combined**, **64 GiB** of content, and **64 path components**. Up to four sessions run concurrently. Pending incoming stages and private outgoing exports each have a **64 GiB budget per computer**; final verification also needs room for the completed local copy. Unused private exports are collected after all related recipients complete or cancel. Older completed/cancelled history is pruned, keeping 32 recent entries; unfinished resumable jobs remain available. Received files stay in Downloads until you remove or move them.
+
+Only regular files and directories with portable Unicode names are copied. Symbolic links, Windows reparse points and special files are rejected. Unix permissions, ACLs, timestamps and extended metadata are not preserved. Send a ZIP archive when links, permissions or an application bundle must remain intact.
 
 ## Display arrangement
 
@@ -110,6 +124,10 @@ Files and folders are not transferred in this release. Their implementation is t
 Open **Settings → Arrange displays…** from any connected computer, or use **Arrange displays…** beside the screen-edge checkbox. Drag the display groups to match your desk. Touching edges allow crossing; gaps keep an edge closed. Select a display and use **Left**, **Right**, **Above** or **Below** as a keyboard-accessible alternative. Arrow keys nudge the selected group, with Shift for a larger step. **Apply arrangement** saves the workspace layout; Cancel or Escape discards changes. Escape during a drag restores its starting position first.
 
 Enable **Move between computers at the screen edge** to use the saved layout. Crossing follows the neighboring part of the edge, including screens of different sizes and partial overlaps along an edge. The destination receives a position on its exact display, inset from the opposite edge. Held keys or buttons suppress a cross-computer handoff. F12 and the workspace's **Switch here** buttons remain available.
+
+**Edge switching delay** defaults to **150 ms**. Keep pushing outward to cross; moving back, pressing a key/button or pausing cancels the pending crossing. Parking the pointer at an edge does not start a timer that later switches by itself. Choose no delay or another offered delay in Settings. **Protect screen corners** is enabled by default and reserves a small area at each physical corner, scaled with that screen's geometry.
+
+**Pause edge switching** in quick controls temporarily stops automatic crossings across the workspace. The pause survives reconnection, coordinator changes and application restarts until you resume or manually switch/return input. Manual switching and F11 remain available.
 
 Displays on the same computer keep their relative positions from that computer's OS settings and move together in this editor. The application does not change resolution, refresh rate, rotation or the OS display layout. Computers connected to the shared physical monitor are anchored to its one rectangle, including any of their ordinary displays. If those native arrangements conflict, correct the relevant computer's OS arrangement; moving their connected group cannot change its internal geometry.
 
@@ -127,7 +145,7 @@ When switching to a participating computer, **one named writer uses the currentl
 
 When no successful monitor selection is known, including migration from the older destination-only implementation, the authenticated requesting PC is used as the visible source. **Start that request from the PC whose picture is currently displayed.** Manual changes in the monitor's own menu cannot be inferred automatically. After an ambiguous write error, select the desired input manually and retry explicitly from the visible PC. DDC/CI must be enabled in the monitor's menu; access through an inactive connection is not assumed.
 
-During a staged upgrade of an existing workspace, **update its other members first and the coordinating computer last**. Updated members continue to accept older state and management messages, but an older snapshot without an explicit monitor command cannot authorize a DDC write. Complete the upgrade on every member before using the new monitor workflow.
+Complete the [workspace upgrade](#updates) on every member before using shared input or the monitor workflow. Mixed protocol versions do not authorize device sharing or monitor writes.
 
 DDC/CI depends on the monitor and firmware. Some LG monitors can show a recurring **Out of range** message after a single standard input-selection command, even when the picture is visible; see [ddcutil issue #102](https://github.com/rockowitz/ddcutil/issues/102). This is not evidence of queued application commands. On the reported **LG 27GK750F**, with Ubuntu on **HDMI1** and Windows on **DisplayPort**, selecting **DisplayPort once using the monitor's joystick** stopped the warning; the user then confirmed that subsequent Desk Switch switches worked without it. This is a confirmed workaround for that setup, not a firmware fix. Persistence after monitor power-off has not been verified. If the warning returns, select DisplayPort in the monitor's own menu again. Desk Switch does not guess manufacturer-specific commands or scan possible inputs.
 
@@ -147,7 +165,7 @@ Login startup is enabled after the first launch and can be disabled in Settings 
 
 ## Updates
 
-**Settings → Updates** shows the selected computer's installed version, progress and result. Select any workspace member, use **Check for updates**, then **Download and install** when a newer compatible release is available. Updating another computer keeps the computer you are using running. The requested installation is complete only after the target reconnects with the requested version. Update members individually; restart the coordinating computer last to keep management available while the others update.
+**Settings → Updates** shows the selected computer's installed version, progress and result. Select a connected workspace member, use **Check for updates**, then **Download and install** when a newer compatible release is available. Updating another computer keeps the computer you are using running. The requested installation is complete only after the target reconnects with the requested version. Update members individually and keep a majority online for shared control while a member restarts.
 
 Automatic checks run at startup and every six hours by default and fetch **signed release metadata only**. They do not download an installer or install anything. **Download and install** explicitly downloads, verifies and installs the update on the selected computer, then restarts it as required. The persistent automatic-check toggle disables background checks; manual checking remains available. Settings, identities, workspace membership and user data survive updates. Older device-protocol versions wait for a compatible update before input or media sharing resumes.
 
@@ -157,7 +175,11 @@ An installed Ubuntu package updates without an application password prompt. Its 
 
 Recent service logs and diagnostics are synchronized over authenticated, encrypted workspace connections. Open **Settings → Advanced → Diagnostics → Copy diagnostics** to collect member state and recent service messages. Offline reports remain labelled as such. Snapshots are bounded and do not reconfigure device services.
 
-For the first upgrade from **0.4.8 or older**, install the current `.deb` or replace the `.exe` once on each computer: those releases do not support the architecture-labelled names and remote management. The saved **0.4.11** partner remains reachable through a limited management/update bridge while upgrading, so it can be updated from the computer already running the current version. Device sharing waits for matching versions. Install **0.6.2 on every intended member** before using its shared devices. Portable Linux binaries are no longer distributed; the `.deb` uses its installed launcher and package-owned binary so future system updates work correctly.
+**Upgrading to 0.7.0:** install it on every member before resuming sharing. Native device protocol is **9** and workspace protocol is **2**; mixed versions temporarily disconnect from sharing. To update other computers remotely from one PC, finish those updates before upgrading that controlling PC. Each computer can also check and install its update locally.
+
+The **original coordinating computer must run 0.7.0 online once with a trusted quorum** to establish the canonical membership. It may be upgraded first or last. Independently cached old rosters cannot bootstrap a replacement safely. After this migration, a surviving majority can coordinate without the original computer. Settings, identities and display arrangements are preserved.
+
+If an older installation cannot select the current downloads, install the matching current `.deb`, `.exe` or complete `.app` once; keep its separate settings directory. Portable Linux binaries are no longer distributed. The `.deb` uses its installed launcher and package-owned binary so future system updates work correctly.
 
 ## Platform access
 
@@ -177,12 +199,13 @@ Requires Rust 1.99+, OpenSSL/X11/Wayland development libraries on Linux, and `dp
 cargo fmt --all --check
 cargo clippy --locked --all-targets -- -D warnings
 cargo test --locked
+cargo test --locked -p rust-auto-updator --lib
 node tools/test_gnome_companion.mjs
 python3 tools/test_release_assets.py
 python3 tools/test_input_access.py
 cargo build --locked --release
 python3 tools/package_deb.py --binary target/release/desk-switch --out dist
-python3 tools/verify_deb.py dist/desk-switch-v0.6.2-linux-x86-64.deb
+python3 tools/verify_deb.py dist/desk-switch-v0.7.0-linux-x86-64.deb
 ```
 
 Tests use synthetic input/audio/monitor devices and isolated loopback connections. The multi-computer integration test links four encrypted peers, propagates settings, sends member-management requests and checks reconnect behavior, including an explicit pinned-controller connection with automatic connection disabled. Native listener tests authenticate IPv4 and IPv6 peers and exchange PCM without physical audio hardware. Clipboard tests use fake native backends or a private D-Bus with binary text/image payloads; the Node suite evaluates the shipped GNOME companion against a mocked Shell. They never use the user's clipboard or change a real monitor. A four-computer localhost test verifies networking and routing logic, not four physical computers.
