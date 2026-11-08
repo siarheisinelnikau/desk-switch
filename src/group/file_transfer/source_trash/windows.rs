@@ -519,9 +519,9 @@ fn existing_recycle_parent(anchor: &VolumeAnchor) -> Result<Option<RecycleParent
         pins.identity() == parent_identity && parent_identity.0 == anchor.pins.identity().0,
         "the per-user Recycle Bin does not match the pinned volume"
     );
+    let recycle_owner = owner_sid(&pins.entries.last().context("missing Recycle Bin pin")?.file)?;
     ensure!(
-        owner_sid(&pins.entries.last().context("missing Recycle Bin pin")?.file)?
-            == anchor.user_sid,
+        recycle_owner == anchor.user_sid || recycle_owner == "S-1-5-32-544",
         "the Recycle Bin parent is not owned by the process user"
     );
     let directory = open_absolute_dir(&path, false)?;
