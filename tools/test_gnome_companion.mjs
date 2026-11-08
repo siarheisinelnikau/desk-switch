@@ -41,6 +41,7 @@ const GLib = {
     Variant: class { constructor(signature, data) { this.signature = signature; this.data = data; } deep_unpack() { return this.data; } },
     Bytes: class { constructor(data) { this.data = data; } },
 };
+const calls = [];
 const Gio = {
     Cancellable: class { cancel() { this.cancelled = true; } },
     IOErrorEnum: {CANCELLED: 1}, BusType: {SESSION: 0}, BusNameOwnerFlags: {NONE: 0}, DBusCallFlags: {NONE: 0},
@@ -81,22 +82,33 @@ const Gio = {
     }},
     DBusExportedObject: {wrapJSObject() { return {export() { exports++; }, unexport() { exports--; }}; }},
     DBus: {session: {
-        call(_name, _path, _interface, method, arguments_, _reply, _flags, _timeout, _cancel, callback) {
+        call(name, path, interface_, method, arguments_, _reply, _flags, timeout, cancel, callback) {
+            if (method === 'Activate') {
+                assert.equal(name, ':1.4');
+                assert.equal(path, '/StatusNotifierItem');
+                assert.equal(interface_, 'org.kde.StatusNotifierItem');
+                assert.equal(arguments_.signature, '(ii)');
+                assert.equal(timeout, 1500);
+                assert(!cancel.cancelled);
+                calls.push(Array.from(arguments_.data));
+                queueMicrotask(() => callback(this, {value: []}));
+                return;
+            }
             assert(['GetConnectionUnixProcessID', 'GetConnectionUnixUser'].includes(method));
-            const name = arguments_.data[0];
-            const pid = [':1.4', ':1.5'].includes(name) ? 4200 :
-                /^:1\.\d+$/.test(name) && Number(name.slice(3)) >= 6 && Number(name.slice(3)) <= 13 ? 4195 + Number(name.slice(3)) : 9000;
+            const caller = arguments_.data[0];
+            const pid = [':1.4', ':1.5'].includes(caller) ? 4200 :
+                /^:1\.\d+$/.test(caller) && Number(caller.slice(3)) >= 6 && Number(caller.slice(3)) <= 13 ? 4195 + Number(caller.slice(3)) : 9000;
             queueMicrotask(() => callback(this, {value: method === 'GetConnectionUnixProcessID' ? pid : pid === 4205 ? 2000 : 1000}));
         },
         call_finish(result) { return {deep_unpack: () => [result.value]}; },
     }},
     bus_own_name() { return ++owned; }, bus_unown_name() { owned--; },
 };
-const calls = [];
 function icon(id, busName, x) {
     const actor = new Signals();
     Object.assign(actor, {
-        visible: true, _indicator: {id, busName, _proxy: {}, open: async (...args) => calls.push(args)},
+        visible: true, _indicator: {id, busName, _proxy: {g_object_path: '/StatusNotifierItem'},
+            open: () => assert.fail('AppIndicator.open would reopen the native menu')},
         menu: {closes: 0, close() { this.closes++; }},
         get_transformed_extents: () => ({get_x: () => x, get_y: () => 0, get_width: () => 24, get_height: () => 24}),
         contains: other => other?.parent === actor,
@@ -124,7 +136,7 @@ assert.equal(own.menu.closes, 0);
 assert.equal(extension._handleEvent(event(1)), Clutter.EVENT_STOP);
 assert.equal(extension._handleEvent(event(2)), Clutter.EVENT_STOP);
 await Promise.resolve();
-assert.deepEqual(calls, [[110, 12, 1234]]);
+assert.deepEqual(calls, [[110, 12]]);
 assert.equal(own.menu.closes, 1);
 target = other;
 assert.equal(extension._handleEvent(event(1, 1, 140)), Clutter.EVENT_PROPAGATE);
@@ -136,12 +148,11 @@ target = {parent: own};
 extension._handleEvent(event(1)); extension._handleEvent(event(2));
 await Promise.resolve();
 assert.equal(calls.length, 2, 'a child actor belongs to its indicator');
-const fallback = [];
-own._indicator.open = undefined;
-own._indicator._proxy.ActivateAsync = async (...args) => fallback.push(args);
-await extension._activate(own._indicator, 110.4, 12.2, 1234);
-assert.equal(fallback.length, 1, 'older hosts use their standard SNI activation');
-assert.deepEqual(fallback[0].slice(0, 2), [110, 12]);
+delete own._indicator._proxy.g_object_path;
+extension._activate(own._indicator, 110.4, 12.2);
+assert.equal(calls.length, 3, 'older proxies use the fixed ksni object path');
+assert.deepEqual(calls[2], [110, 12]);
+await Promise.resolve();
 
 class Invocation {
     constructor(sender = ':1.5') { this.sender = sender; }
