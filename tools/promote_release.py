@@ -2,12 +2,15 @@
 """Verify a locally signed manifest and complete its already-built GitHub release."""
 import hashlib
 import json
+import os
 from pathlib import Path
 import re
 import subprocess
 import tempfile
+import time
 import tomllib
 import urllib.request
+import urllib.error
 
 from prepare_release import checked_binary, checked_macos_archive
 from release_assets import asset_names
@@ -16,6 +19,38 @@ ROOT = Path(__file__).resolve().parents[1]
 REPOSITORY = "siarheisinelnikau/desk-switch"
 SIGNED_START = "<!-- desk-switch-update:start -->"
 SIGNED_END = "<!-- desk-switch-update:end -->"
+
+
+def download_asset(artifact, asset, destination):
+    """Read the public file, with a bounded official-API fallback for outages."""
+    request = urllib.request.Request(artifact["url"], headers={
+        "User-Agent": "Desk-Switch-release-verifier",
+        "Accept": "application/octet-stream",
+    })
+    for attempt in range(2):
+        try:
+            with urllib.request.urlopen(request, timeout=60) as response:
+                return response.read(artifact["size"] + 1)
+        except urllib.error.HTTPError as error:
+            if error.code not in {408, 425, 429, 500, 502, 503, 504}:
+                raise
+            error.close()
+            print(f"Public download returned HTTP {error.code}: {asset['name']}", flush=True)
+        except (urllib.error.URLError, TimeoutError):
+            print(f"Public download temporarily unavailable: {asset['name']}", flush=True)
+        if attempt == 0:
+            time.sleep(1)
+    # gh follows the official asset endpoint's redirect. The token stays in the
+    # established CI environment, and the exact signed bytes are checked below.
+    assert type(asset["id"]) is int and asset["id"] > 0, "Invalid release asset identity"
+    print(f"Verifying through the official GitHub asset API: {asset['name']}", flush=True)
+    with destination.open("wb") as output:
+        subprocess.run([
+            "gh", "api", "-H", "Accept: application/octet-stream",
+            f"repos/{REPOSITORY}/releases/assets/{asset['id']}",
+        ], stdout=output, check=True, timeout=90)
+    with destination.open("rb") as downloaded:
+        return downloaded.read(artifact["size"] + 1)
 
 
 def signed_notes(body, manifest, fallback):
@@ -49,16 +84,24 @@ def main():
         assert release["version"] == version and release["protocol"] == protocol
         targets = asset_names(version)
         assert set(release["targets"]) == set(targets)
-        info = json.loads(subprocess.check_output(["gh", "release", "view", tag, "--repo", REPOSITORY, "--json", "isPrerelease,assets,body"], text=True))
+        info = json.loads(subprocess.check_output(["gh", "api", f"repos/{REPOSITORY}/releases/tags/{tag}"], text=True))
+        assert info["tag_name"] == tag and not info["draft"], "Unexpected release candidate"
+        expected_source = os.environ.get("DESK_SWITCH_RELEASE_SOURCE_SHA") or os.environ.get("GITHUB_SHA")
+        if expected_source:
+            assert re.fullmatch(r"[0-9a-f]{40}", expected_source), "Invalid release source"
+            ref = json.loads(subprocess.check_output(["gh", "api", f"repos/{REPOSITORY}/git/ref/tags/{tag}"], text=True))
+            assert ref["object"]["type"] == "commit" and ref["object"]["sha"] == expected_source, "Release tag belongs to another source"
         assets = {asset["name"]: asset for asset in info["assets"]}
         assert set(assets) == set(targets.values()), "Release artifacts do not match the signed platform/architecture matrix"
         for platform, filename in targets.items():
             artifact = release["targets"][platform]
             assert artifact["url"] == f"https://github.com/{REPOSITORY}/releases/download/{tag}/{filename}"
             assert 0 < artifact["size"] <= 128 * 1024 * 1024
+            asset = assets[filename]
+            assert asset["browser_download_url"] == artifact["url"] and asset["state"] == "uploaded", "Unexpected release download"
+            assert asset["size"] == artifact["size"] and asset["digest"] == "sha256:" + artifact["sha256"], "Release asset metadata differs from its signature"
             path = work / filename
-            with urllib.request.urlopen(artifact["url"], timeout=60) as response:
-                data = response.read(artifact["size"] + 1)
+            data = download_asset(artifact, asset, path)
             assert len(data) == artifact["size"] and hashlib.sha256(data).hexdigest() == artifact["sha256"]
             path.write_bytes(data)
             if platform == "windows-x86_64":
