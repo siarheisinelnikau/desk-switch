@@ -40,6 +40,10 @@ impl Wake {
         }
         // Retain only the latest position, never a backlog of obsolete frames.
         if !self.queued.swap(true, Ordering::AcqRel)
+            // SAFETY: thread_id is published only after that thread created its
+            // message queue, and it is cleared again when the thread ends, so the
+            // post targets a live queue. The message carries only the constant
+            // REFRESH id and no pointers, so nothing is borrowed across the call.
             && unsafe { PostThreadMessageW(thread_id, REFRESH, 0, 0) } == 0
         {
             self.queued.store(false, Ordering::Release);
@@ -54,6 +58,9 @@ pub struct Overlay {
 }
 impl Overlay {
     pub fn start() -> Result<Self> {
+        // SAFETY: The closure is invoked on the dedicated pointer thread that owns
+        // the window it creates, runs the matching message loop, and destroys the
+        // window again, so no handle is used from another thread.
         Self::start_with(|| unsafe { Window::create() })
     }
     fn start_with(create: impl FnOnce() -> Result<Window> + Send + 'static) -> Result<Self> {
@@ -73,10 +80,22 @@ impl Overlay {
                     Ok(mut window) => {
                         // Publish the destination only after its message queue exists.
                         let mut message = MSG::default();
+                        // SAFETY: `message` is a writable local MSG and the null
+                        // window handle selects this thread's own message queue,
+                        // which no other thread reads. The call only creates the
+                        // queue and leaves `message` untouched.
                         unsafe { PeekMessageW(&mut message, null_mut(), 0, 0, PM_NOREMOVE) };
                         wake.thread_id
+                            // SAFETY: GetCurrentThreadId returns the identifier of
+                            // this thread, which is published solely to target this
+                            // thread's own message queue. It takes no pointers and
+                            // cannot fail.
                             .store(unsafe { GetCurrentThreadId() }, Ordering::Release);
                         WAKE.with(|state| *state.borrow_mut() = Some(wake.clone()));
+                        // SAFETY: `window.hwnd` is the overlay window owned by this
+                        // thread. The notifications bind to that window and are
+                        // dropped before it, so they never outlive the handle they
+                        // were registered against.
                         let _notifications = unsafe { Notifications::start(window.hwnd) };
                         let mut physical_mouse = physical_mouse();
                         let mut inventory_dirty = false;
@@ -84,6 +103,10 @@ impl Overlay {
                         // the input/heartbeat task, including first motion and disable.
                         wake.refresh();
                         while !wake.closed.load(Ordering::Acquire) {
+                            // SAFETY: `message` is a writable local MSG and the null
+                            // window handle selects this thread's own message queue.
+                            // The call blocks until a message for this thread is
+                            // stored in `message`.
                             let status = unsafe { GetMessageW(&mut message, null_mut(), 0, 0) };
                             if status <= 0 {
                                 break;
@@ -98,6 +121,10 @@ impl Overlay {
                                     physical_mouse = self::physical_mouse();
                                     inventory_dirty = false;
                                 }
+                                // SAFETY: The overlay window was created on this
+                                // thread and is only updated from this message
+                                // loop, so the window handle and its bitmap
+                                // surface cannot be used concurrently.
                                 unsafe {
                                     if let Err(error) = window.update(active, physical_mouse) {
                                         eprintln!("Windows pointer fallback failed: {error:#}");
@@ -105,6 +132,11 @@ impl Overlay {
                                     }
                                 }
                             } else {
+                                // SAFETY: `message` was filled by GetMessageW on
+                                // this thread, so its payload is still owned by
+                                // this queue entry. TranslateMessage only posts to
+                                // this thread's queue and DispatchMessageW calls
+                                // the window procedure registered for this class.
                                 unsafe {
                                     TranslateMessage(&message);
                                     DispatchMessageW(&message);
@@ -140,6 +172,10 @@ impl Drop for Overlay {
         self.wake.closed.store(true, Ordering::Release);
         if let Some(thread) = self.thread.take() {
             if !thread.is_finished() {
+                // SAFETY: thread_id identifies the pointer thread that still owns
+                // its message queue. The WM_QUIT message carries only the constant
+                // message id and no pointers, and a failed post only means the
+                // thread already left its loop.
                 unsafe {
                     let thread_id = self.wake.thread_id.load(Ordering::Acquire);
                     if thread_id != 0 {
@@ -159,6 +195,10 @@ fn physical_mouse() -> bool {
         .map(|devices| devices.iter().any(|device| device.mouse))
         .unwrap_or(true)
 }
+// SAFETY: This callback is registered with SetWinEventHook and is invoked by
+// the OS on the thread that installed the hook, so it must use the callback
+// calling convention. It only reads thread-local state and never dereferences
+// the hook handle or the event arguments.
 unsafe extern "system" fn cursor_changed(
     _: windows_sys::Win32::UI::Accessibility::HWINEVENTHOOK,
     _: u32,
@@ -183,10 +223,18 @@ struct Notifications {
     devices: HDEVNOTIFY,
 }
 impl Notifications {
+    // SAFETY: The caller must pass a live window handle that stays valid for the
+    // whole lifetime of the returned notifications, because the device
+    // notification is bound to that window and the window is needed to receive
+    // the device-change messages.
     unsafe fn start(hwnd: HWND) -> Self {
         use windows_sys::Win32::{
             Devices::HumanInterfaceDevice::GUID_DEVINTERFACE_MOUSE, UI::Accessibility::*,
         };
+        // SAFETY: `hwnd` is the overlay window that outlives these notifications,
+        // and `filter` is a fully initialized local whose pointer is only read
+        // for the duration of the call. The returned hook and device-notification
+        // handles are stored in `Self` and released in its `Drop`.
         unsafe {
             let cursor = SetWinEventHook(
                 EVENT_OBJECT_SHOW,
@@ -214,6 +262,10 @@ impl Notifications {
 }
 impl Drop for Notifications {
     fn drop(&mut self) {
+        // SAFETY: Both handles were returned by SetWinEventHook and
+        // RegisterDeviceNotificationW and are stored in this struct, so they are
+        // still valid here. Each is released exactly once because `Drop` runs a
+        // single time, and neither handle is used afterwards.
         unsafe {
             if !self.cursor.is_null() {
                 windows_sys::Win32::UI::Accessibility::UnhookWinEvent(self.cursor);
@@ -225,6 +277,9 @@ impl Drop for Notifications {
     }
 }
 
+// SAFETY: This is the window procedure registered for the overlay class, so it
+// must use the required window-procedure calling convention. Windows passes the
+// live window handle and the message parameters, which are only forwarded.
 unsafe extern "system" fn procedure(
     hwnd: HWND,
     message: u32,
@@ -234,6 +289,9 @@ unsafe extern "system" fn procedure(
     match message {
         WM_NCHITTEST => HTTRANSPARENT as LRESULT,
         WM_MOUSEACTIVATE => MA_NOACTIVATE as LRESULT,
+        // SAFETY: The handle and parameters are the ones Windows passed for this
+        // live overlay window, and DefWindowProcW interprets them without
+        // retaining any reference beyond the call.
         _ => unsafe { DefWindowProcW(hwnd, message, wparam, lparam) },
     }
 }
@@ -250,7 +308,16 @@ struct Surface {
     screen: HDC,
 }
 impl Surface {
+    // SAFETY: The returned `Surface` owns a private memory DC and its own DIB
+    // section, and the caller must keep it alive while its pixels are used:
+    // `bits` points into that DIB, which `Drop` deletes before the memory can
+    // be released. The dimensions are validated inside this function.
     unsafe fn new(size: (i32, i32)) -> Result<Self> {
+        // SAFETY: `info` is a fully initialized local BITMAPINFO whose pointer is
+        // only read for the duration of the call, and `&mut surface.bits` is a
+        // valid writable pointer to the `bits` field of the live `surface`. The
+        // created DC, the DIB and the replaced stock object are checked for
+        // null and for HGDI_ERROR before they are stored and released in `Drop`.
         unsafe {
             ensure!(
                 (1..=512).contains(&size.0) && (1..=512).contains(&size.1),
@@ -304,17 +371,32 @@ impl Surface {
         }
     }
     fn bytes(&self) -> &[u8] {
+        // SAFETY: `bits` points at the 32-bpp DIB section that was created with
+        // exactly `size.0 * size.1` pixels, and that bitmap stays alive and
+        // selected in `self.dc` while `self` is borrowed, so the slice covers
+        // exactly the allocated pixels.
         unsafe { std::slice::from_raw_parts(self.bits, (self.size.0 * self.size.1 * 4) as usize) }
     }
     fn bytes_mut(&mut self) -> &mut [u8] {
+        // SAFETY: The DIB section behind `bits` is 32 bpp with `size.0 * size.1`
+        // pixels and stays alive while `&mut self` borrows it, so the mutable
+        // slice stays inside the allocation and no other reference exists.
         unsafe {
             std::slice::from_raw_parts_mut(self.bits, (self.size.0 * self.size.1 * 4) as usize)
         }
     }
+    // SAFETY: `cursor` must be a live system cursor handle for the duration of
+    // the call, because it is drawn into this surface's own memory DC. The
+    // handle is borrowed only; ownership stays with the system.
     unsafe fn paint(&mut self, cursor: HCURSOR, background: u8) -> Result<()> {
         for pixel in self.bytes_mut().as_chunks_mut::<4>().0.iter_mut() {
             pixel.copy_from_slice(&[background, background, background, 255]);
         }
+        // SAFETY: `self.dc` is this surface's own memory DC with its 32-bpp DIB
+        // still selected, `cursor` is a live system cursor that DrawIconEx does
+        // not take ownership of, and the null brush is permitted because
+        // DI_NORMAL does not need one. GdiFlush only drains the batch of this
+        // thread.
         unsafe {
             ensure!(
                 DrawIconEx(
@@ -334,7 +416,14 @@ impl Surface {
         }
         Ok(())
     }
+    // SAFETY: `cursor` must stay a live system cursor handle for the whole call
+    // because it is measured and drawn twice. The two sampling surfaces own
+    // their own DCs and DIB sections, and only the black one is returned.
     unsafe fn cursor(cursor: HCURSOR, size: (i32, i32)) -> Result<Self> {
+        // SAFETY: `black` and `white` own the DC and DIB sections created by
+        // `Surface::new`, so their pixel slices stay valid and refer to
+        // distinct buffers. The cursor handle is only read, and `white` is
+        // dropped at the end of this scope while `black` is returned.
         unsafe {
             // Recover coverage from Windows' own rendering on black and white.
             // This also supports legacy masks which have no stored alpha channel.
@@ -373,6 +462,11 @@ impl Surface {
         assert_eq!(background.len(), self.bytes().len());
         for (index, mask) in &self.xor {
             for channel in 0..3 {
+                // SAFETY: Every index in `self.xor` was recorded while scanning
+                // the DIB pixels, so `index * 4 + channel` stays below
+                // `size.0 * size.1 * 4`, the length of the DIB allocation.
+                // `background` was asserted to have that same length, so the
+                // read at the same offset is in bounds as well.
                 unsafe {
                     self.bits
                         .add(index * 4 + channel)
@@ -381,10 +475,19 @@ impl Surface {
             }
         }
     }
+    // SAFETY: The caller must pass screen coordinates inside the virtual
+    // desktop, because the background rectangle is read from the screen DC at
+    // that position. The sampled surface owns its own DC and DIB section, and
+    // the screen DC is released in `Drop`.
     unsafe fn sample_background(&mut self, x: i32, y: i32) -> Result<()> {
         if self.xor.is_empty() {
             return Ok(());
         }
+        // SAFETY: `background` is a `Surface` created with the same size, so its
+        // DIB holds exactly `size.0 * size.1` 32-bpp pixels and `background.bits`
+        // stays valid while `background` is borrowed; the slice length is taken
+        // from that same buffer. `self.screen` is the process-wide screen DC
+        // and is released in `Drop`.
         unsafe {
             if self.screen.is_null() {
                 self.screen = GetDC(null_mut());
@@ -421,6 +524,10 @@ impl Surface {
 }
 impl Drop for Surface {
     fn drop(&mut self) {
+        // SAFETY: Every handle here was created by this `Surface` and is
+        // released exactly once: the previous stock object is restored into the
+        // DC before the DIB is deleted, the DC is deleted before the screen DC
+        // is released, and none of the handles is used after this point.
         unsafe {
             if !self.previous.is_null() {
                 SelectObject(self.dc, self.previous);
@@ -451,7 +558,16 @@ struct Window {
 }
 
 impl Window {
+    // SAFETY: The window must be created on the thread that will own it,
+    // because its window procedure, device notifications and messages are
+    // delivered to the creating thread's queue. The returned window is
+    // destroyed by `Drop` on that same thread.
     unsafe fn create() -> Result<Self> {
+        // SAFETY: `class` is a fully initialized local WNDCLASSW whose class
+        // name is a static NUL-terminated wide string, and `module` is this
+        // process's module handle, which stays loaded for the process lifetime.
+        // The window procedure has the required calling convention, and the
+        // created window is checked for null before it is stored.
         unsafe {
             let module = GetModuleHandleW(null());
             let class = WNDCLASSW {
@@ -513,7 +629,14 @@ impl Window {
         }
     }
 
+    // SAFETY: This runs on the thread that created the window, so the window
+    // handle and the cached surface are only ever touched from one thread. The
+    // system cursor handle read from `CURSORINFO` is borrowed, not owned.
     unsafe fn update(&mut self, active: bool, physical_mouse: bool) -> Result<()> {
+        // SAFETY: `info` is a writable local CURSORINFO whose `cbSize` matches
+        // the struct, and GetCursorInfo only fills it with borrowed system
+        // state: the returned `hCursor` is a shared system cursor that is never
+        // destroyed here.
         unsafe {
             if !active {
                 self.hide();
@@ -549,8 +672,14 @@ impl Window {
         }
     }
 
+    // SAFETY: The window handle is owned by this `Window`, and this method
+    // runs on the thread that created it, so the hide cannot race with the
+    // render path that uploads the layered bitmap.
     unsafe fn hide(&mut self) {
         if self.visible {
+            // SAFETY: `self.hwnd` is the window this `Window` owns and it stays
+            // alive until `Drop` destroys it; SW_HIDE only changes the
+            // visibility state of that same window.
             unsafe {
                 ShowWindow(self.hwnd, SW_HIDE);
             }
@@ -558,7 +687,16 @@ impl Window {
         }
     }
 
+    // SAFETY: `cursor` must stay a live system cursor handle for the call,
+    // because it is measured and drawn synchronously. The window and its
+    // surface are owned by this `Window` and are only touched on the thread
+    // that created them.
     unsafe fn render(&mut self, cursor: HCURSOR, x: i32, y: i32) -> Result<()> {
+        // SAFETY: `surface.dc` is the surface's own memory DC with its 32-bpp
+        // DIB still selected, which is exactly the source that
+        // UpdateLayeredWindow reads, and the destination, extent, source point
+        // and blend function are fully initialized locals. `self.hwnd` is the
+        // live window owned by this `Window`.
         unsafe {
             let changed = cursor != self.cursor;
             if changed {
@@ -628,7 +766,14 @@ impl Window {
     }
 }
 
+// SAFETY: `cursor` must be a live cursor or icon handle for the call.
+// GetIconInfo returns bitmaps whose handles this function owns and deletes
+// before returning, so no GDI object is leaked and none is used afterwards.
 unsafe fn geometry(cursor: HCURSOR) -> ((i32, i32), (i32, i32)) {
+    // SAFETY: `icon` and `bitmap` are writable locals, and the byte count
+    // passed to GetObjectW matches `size_of::<BITMAP>()`. The bitmaps returned
+    // in `icon` are owned by this function and deleted exactly once before it
+    // returns, and a failed GetIconInfo is handled by the fallback path.
     unsafe {
         let mut icon = ICONINFO::default();
         if GetIconInfo(cursor, &mut icon) == 0 {
@@ -669,6 +814,9 @@ unsafe fn geometry(cursor: HCURSOR) -> ((i32, i32), (i32, i32)) {
 
 impl Drop for Window {
     fn drop(&mut self) {
+        // SAFETY: `self.hwnd` is the window created by `Window::create` and is
+        // destroyed exactly once here. It was created on the thread that drops
+        // it, which is what DestroyWindow requires.
         unsafe {
             DestroyWindow(self.hwnd);
         }
@@ -681,6 +829,10 @@ mod tests {
 
     #[test]
     fn native_cursor_alpha_matches_windows_rendering_on_light_and_dark_backgrounds() {
+        // SAFETY: The test runs on a single thread: the cursor handle loaded from
+        // the system is only read and never destroyed, and every surface created
+        // inside owns its own DC and DIB section until it is dropped at the end
+        // of the iteration.
         unsafe {
             for (name, id) in [
                 ("arrow", IDC_ARROW),
@@ -788,6 +940,9 @@ mod tests {
 
     #[test]
     fn pointer_window_is_hidden_click_through_and_never_activates() {
+        // SAFETY: The overlay window is created, used and destroyed on this test
+        // thread, so its handle is never used from another thread. The system
+        // cursor handle loaded here is borrowed and never destroyed.
         unsafe {
             let mut window = Window::create().unwrap();
             let handle = window.hwnd;
