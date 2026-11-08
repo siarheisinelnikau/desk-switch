@@ -2831,7 +2831,7 @@ mod tests {
         }
         // Healing the partition restores exactly one coordinator.
         cluster.blocked.clear();
-        cluster.until(|cluster| writable_leaders(&cluster).len() == 1);
+        cluster.until(|cluster| writable_leaders(cluster).len() == 1);
         assert_eq!(writable_leaders(&cluster).len(), 1);
     }
 
