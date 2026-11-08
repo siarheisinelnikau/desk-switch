@@ -69,22 +69,29 @@ fn clipboard_retry<T>(mut action: impl FnMut() -> Result<T>) -> Result<T> {
     }
 }
 
+fn ordinary_dos_path(path: &Path) -> PathBuf {
+    let text = path.as_os_str().to_string_lossy();
+    PathBuf::from(text.strip_prefix(r"\\?\").unwrap_or(&text))
+}
+
 fn check_bound(root: &Path, path: &Path) -> Result<()> {
+    let root = ordinary_dos_path(root);
+    let path = ordinary_dos_path(path);
     ensure!(
         path.is_absolute()
-            && path.starts_with(root)
+            && path.starts_with(&root)
             && path
                 .components()
                 .all(|part| !matches!(part, Component::ParentDir | Component::CurDir)),
         "A native test path escaped its fixture: {}",
         path.display()
     );
-    let mut existing = path;
+    let mut existing = path.as_path();
     while !existing.try_exists()? {
         existing = existing.parent().context("Missing fixture path ancestor")?;
     }
     ensure!(
-        existing.canonicalize()?.starts_with(root),
+        ordinary_dos_path(&existing.canonicalize()?).starts_with(&root),
         "A native test path resolves outside its fixture"
     );
     Ok(())

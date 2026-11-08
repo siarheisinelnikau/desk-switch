@@ -240,6 +240,9 @@ thread_local! {
 fn valid_path(path: &Path) -> Result<Vec<u16>> {
     let encoded = path.as_os_str().encode_wide().collect::<Vec<_>>();
     let text = String::from_utf16(&encoded).context("File clipboard path is not valid Unicode")?;
+    // Canonical paths from the standard library use the verbatim drive form.
+    // Normalize it to the ordinary DOS path the clipboard and Shell accept.
+    let text = text.strip_prefix(r"\\?\").unwrap_or(&text);
     let bytes = text.as_bytes();
     ensure!(
         bytes.len() >= 3
@@ -279,11 +282,12 @@ fn valid_path(path: &Path) -> Result<Vec<u16>> {
             });
         ensure!(!reserved, "File clipboard path names a Windows device");
     }
+    let normalized = text.encode_utf16().collect::<Vec<_>>();
     ensure!(
-        encoded.len() <= 32_767,
+        normalized.len() <= 32_767,
         "File clipboard path exceeds the Windows path limit"
     );
-    Ok(encoded)
+    Ok(normalized)
 }
 
 fn ansi_path(bytes: &[u8]) -> Result<PathBuf> {
@@ -648,13 +652,18 @@ mod tests {
         assert_eq!(encoded[16..20], 1u32.to_le_bytes());
         assert_eq!(decode_drop(&encoded).unwrap(), paths);
         assert_eq!(&encoded[encoded.len() - 4..], &[0; 4]);
+
+        let verbatim = vec![PathBuf::from(r"\\?\C:\Users\user\safe.txt")];
+        assert_eq!(
+            decode_drop(&encode_drop(&verbatim).unwrap()).unwrap(),
+            vec![PathBuf::from(r"C:\Users\user\safe.txt")]
+        );
     }
 
     #[test]
     fn native_drop_rejects_network_device_relative_and_unsafe_paths() {
         for path in [
             r"\\server\share\private.txt",
-            r"\\?\C:\private.txt",
             r"\\.\PhysicalDrive0",
             r"\??\C:\private.txt",
             r"C:relative.txt",
