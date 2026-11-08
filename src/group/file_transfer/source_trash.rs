@@ -62,6 +62,9 @@ pub struct TrashReceipt {
     pub item_identity: Identity,
 }
 
+// Receipts are short-lived status values. Boxing would add an allocation to
+// every inspection while the largest variant is only a few hundred bytes.
+#[allow(clippy::large_enum_variant)]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum TrashStatus {
     Pending,

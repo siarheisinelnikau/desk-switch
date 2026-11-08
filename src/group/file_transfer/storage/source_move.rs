@@ -587,20 +587,20 @@ impl SourceSelection {
                 );
                 break;
             }
-            if journal.roots[index].phase == RootPhase::Retained {
-                if let Err(error) = handoff_to_trash(&journals, &name, &mut journal, index) {
-                    let root = &mut journal.roots[index];
-                    if matches!(
-                        root.phase,
-                        RootPhase::TrashIntent | RootPhase::TrashCommitted
-                    ) {
-                        root.phase = RootPhase::NeedsRecovery;
-                    }
-                    root.detail = format!(
-                        "The source is retained for recovery; Trash did not produce a durable completion receipt: {error:#}"
-                    );
-                    let _ = persist_root(&journals, &name, &journal, index);
+            if journal.roots[index].phase == RootPhase::Retained
+                && let Err(error) = handoff_to_trash(&journals, &name, &mut journal, index)
+            {
+                let root = &mut journal.roots[index];
+                if matches!(
+                    root.phase,
+                    RootPhase::TrashIntent | RootPhase::TrashCommitted
+                ) {
+                    root.phase = RootPhase::NeedsRecovery;
                 }
+                root.detail = format!(
+                    "The source is retained for recovery; Trash did not produce a durable completion receipt: {error:#}"
+                );
+                let _ = persist_root(&journals, &name, &journal, index);
             }
             progress(
                 index + 1,
@@ -1226,6 +1226,8 @@ pub fn recover_source_move(
 }
 
 fn reconcile(journal: &Journal) -> Result<SourceMoveOutcome> {
+    // Local, short-lived recovery result; the receipt is moved out immediately.
+    #[allow(clippy::large_enum_variant)]
     enum RecoveredRoot {
         Original,
         Retained,
