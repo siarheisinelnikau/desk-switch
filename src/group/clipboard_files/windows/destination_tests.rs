@@ -11,7 +11,9 @@ use std::{
 };
 use windows::Win32::{
     Foundation::VARIANT_BOOL,
-    System::Com::CoAllowSetForegroundWindow,
+    System::Com::{
+        COINIT_APARTMENTTHREADED, CoAllowSetForegroundWindow, CoInitializeEx, CoUninitialize,
+    },
     UI::Shell::{IWebBrowser2, ShellBrowserWindow},
 };
 use windows::core::BSTR;
@@ -27,6 +29,21 @@ use windows_sys::Win32::{
 
 const LIMIT: Duration = Duration::from_secs(30);
 const MARKER: &str = ".desk-switch-explorer-ci-owner";
+
+struct ExplorerApartment;
+impl ExplorerApartment {
+    fn enter() -> Option<Self> {
+        unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) }
+            .ok()
+            .ok()?;
+        Some(Self)
+    }
+}
+impl Drop for ExplorerApartment {
+    fn drop(&mut self) {
+        unsafe { CoUninitialize() };
+    }
+}
 
 fn require_hosted_desktop() {
     assert_eq!(std::env::var("GITHUB_ACTIONS").as_deref(), Ok("true"));
@@ -217,8 +234,10 @@ fn folder_of(browser: &IWebBrowser2) -> Option<PathBuf> {
 }
 
 fn run_capture(fixture: Fixture, control: Arc<Mutex<Control>>) -> Result<serde_json::Value> {
+    // ShellBrowserWindow is an STA shell object; an MTA proxy can be created
+    // but fails navigation with RPC_X_NULL_REF_POINTER on a hosted runner.
     let _apartment =
-        Apartment::enter().context("The hosted Explorer COM apartment is unavailable")?;
+        ExplorerApartment::enter().context("The hosted Explorer COM apartment is unavailable")?;
     let _cancel =
         Cancellation::enter().context("The hosted Explorer COM calls cannot be bounded")?;
     control.lock().unwrap().thread = unsafe { GetCurrentThreadId() };
@@ -239,6 +258,7 @@ fn run_capture(fixture: Fixture, control: Arc<Mutex<Control>>) -> Result<serde_j
     let folder_text = folder_text.strip_prefix(r"\\?\").unwrap_or(&folder_text);
     let url = format!("file:///{}", folder_text.replace('\\', "/"));
     let target = BSTR::from(url.as_str());
+    let _ = unsafe { owned.browser.SetVisible(VARIANT_BOOL(-1)) };
     unsafe { owned.browser.Navigate(&target, None, None, None, None) }
         .context("Explorer could not navigate to the private test folder")?;
     let deadline = Instant::now() + Duration::from_secs(20);
