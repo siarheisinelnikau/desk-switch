@@ -459,6 +459,9 @@ impl SourceSelection {
     /// native Move receipt for this exact Cut, paste, export and verified bytes.
     /// A cache download, EOF, close/release, or Copy result must never call this.
     #[cfg(test)]
+    // The progress-free wrapper is only used by the Windows and Linux
+    // source-cleanup tests, so the macOS test build never calls it.
+    #[cfg_attr(target_os = "macos", allow(dead_code))]
     pub fn finalize_move(
         self,
         state_dir: &Path,
