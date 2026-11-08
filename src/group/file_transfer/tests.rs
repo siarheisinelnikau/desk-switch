@@ -44,6 +44,17 @@ impl Drop for Actor {
         let _ = self.0.wait();
     }
 }
+#[cfg(windows)]
+#[test]
+fn the_file_transfer_listener_refuses_to_share_an_occupied_port() {
+    let first = listener(0).unwrap();
+    let occupied = first.local_addr().unwrap().port();
+    assert!(
+        listener(occupied).is_err(),
+        "a second profile must not share the authenticated file-transfer port"
+    );
+}
+
 fn port() -> u16 {
     loop {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
