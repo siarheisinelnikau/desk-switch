@@ -69,10 +69,6 @@ Lower layers still produce free-form English messages that reach the interface t
 - `eframe` is built with `default-features = false` and without the `accesskit` feature, and the Windows host is a custom software renderer, so there is no screen reader integration. Enabling `accesskit` needs a decision about the software host.
 - The installers are not Authenticode-signed and the macOS apps are not notarized. Both are distribution problems rather than code problems and need certificates and a developer account.
 
-## 7. Optional rotating diagnostics log
-
-Diagnostics are currently kept in memory with a bounded history. A rotating on-disk log would help with field problems, but it may contain computer names and paths, so it must be opt-in and must say so.
-
-## 8. Typed protocol errors instead of text matching
+## 7. Typed protocol errors instead of text matching
 
 `i18n::translate` still falls back to matching a `"<key>: <value>"` prefix for dynamic messages. Typed error codes (item 5) remove the need for that fallback.
