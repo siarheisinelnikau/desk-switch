@@ -58,6 +58,32 @@ pub(crate) struct Asset {
     pub(crate) browser_download_url: String,
     pub(crate) size: u64,
     pub(crate) digest: Option<String>,
+    #[serde(default)]
+    pub(crate) id: Option<u64>,
+    #[serde(default)]
+    pub(crate) url: Option<String>,
+}
+
+/// A release asset API route is usable only when both values came from the
+/// same validated repository response. Never follow a caller-supplied host.
+pub(crate) fn asset_api_url<'a>(
+    asset: &'a Asset,
+    config: &Config,
+) -> Result<Option<&'a str>, String> {
+    match (asset.id, asset.url.as_deref()) {
+        (None, None) => Ok(None),
+        (Some(id), Some(url))
+            if id != 0
+                && url
+                    == format!(
+                        "https://api.github.com/repos/{}/{}/releases/assets/{id}",
+                        config.owner, config.repository
+                    ) =>
+        {
+            Ok(Some(url))
+        }
+        _ => Err("The release contains an unexpected asset API address.".into()),
+    }
 }
 
 #[derive(Deserialize)]
@@ -154,6 +180,7 @@ pub fn parse_release(json: &str, config: &Config) -> Result<Option<Release>, Str
         {
             return Err("The release contains an unexpected download address.".into());
         }
+        asset_api_url(asset, config)?;
         Ok(asset.clone())
     };
     let executable_name = config
@@ -251,6 +278,67 @@ mod package_tests {
         assert!(parse_release(&value.to_string(), &config).is_err());
         config.allow_asset_digest = false;
         assert!(parse_release(&good.to_string(), &config).is_err());
+    }
+
+    #[test]
+    fn asset_api_fallback_metadata_is_optional_but_bound_to_the_repository_and_numeric_id() {
+        let mut config = Config::new("owner", "app", "1.0.0", "App").unwrap();
+        config.allow_asset_digest = true;
+        let mut value = fixture(&config, "1.1.0");
+        assert!(
+            parse_release(&value.to_string(), &config)
+                .unwrap()
+                .unwrap()
+                .executable
+                .url
+                .is_none()
+        );
+        value["assets"][0]["id"] = 123.into();
+        value["assets"][0]["url"] =
+            "https://api.github.com/repos/owner/app/releases/assets/123".into();
+        let parsed = parse_release(&value.to_string(), &config).unwrap().unwrap();
+        assert_eq!(
+            asset_api_url(&parsed.executable, &config).unwrap(),
+            Some("https://api.github.com/repos/owner/app/releases/assets/123")
+        );
+        for (id, url) in [
+            (
+                serde_json::json!(0),
+                serde_json::json!("https://api.github.com/repos/owner/app/releases/assets/0"),
+            ),
+            (
+                serde_json::json!(124),
+                serde_json::json!("https://api.github.com/repos/owner/app/releases/assets/123"),
+            ),
+            (
+                serde_json::json!(123),
+                serde_json::json!("https://api.github.com/repos/other/app/releases/assets/123"),
+            ),
+            (
+                serde_json::json!(123),
+                serde_json::json!(
+                    "https://api.github.com/repos/owner/app/releases/assets/123?download=1"
+                ),
+            ),
+            (
+                serde_json::json!(123),
+                serde_json::json!("https://example.invalid/repos/owner/app/releases/assets/123"),
+            ),
+            (
+                serde_json::json!("123"),
+                serde_json::json!("https://api.github.com/repos/owner/app/releases/assets/123"),
+            ),
+            (
+                serde_json::Value::Null,
+                serde_json::json!("https://api.github.com/repos/owner/app/releases/assets/123"),
+            ),
+            (serde_json::json!(123), serde_json::Value::Null),
+        ] {
+            let mut damaged = value.clone();
+            damaged["assets"][0]["id"] = id;
+            damaged["assets"][0]["url"] = url;
+            assert!(parse_release(&damaged.to_string(), &config).is_err());
+        }
     }
 }
 

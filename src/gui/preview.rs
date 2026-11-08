@@ -827,6 +827,8 @@ impl Desktop {
                 },
                 members,
                 active_input: Some("11".repeat(32)),
+                input_intent: None,
+                input_request: 0,
                 active_input_entry: None,
                 activation: 1,
                 active_monitor: Some("11".repeat(32)),
@@ -880,8 +882,36 @@ impl Desktop {
             self.group.workspace = Some(state);
             self.group.preview = true;
             self.group.selected = self.public_key.clone();
-            if matches!(case, "shared-four-settings" | "shared-four-settings-error") {
+            if matches!(
+                case,
+                "shared-four-settings"
+                    | "shared-four-settings-error"
+                    | "shared-four-update-download-error"
+            ) {
                 self.page = Page::Application;
+            }
+            if case == "shared-four-update-download-error" {
+                let status = super::update_failure_status(
+                    true,
+                    &anyhow::anyhow!("Could not contact GitHub: http status: 504"),
+                );
+                let update = &mut self
+                    .group
+                    .workspace
+                    .as_mut()
+                    .unwrap()
+                    .members
+                    .get_mut(&self.public_key)
+                    .unwrap()
+                    .node
+                    .management
+                    .as_mut()
+                    .unwrap()
+                    .update;
+                update.failed = true;
+                update.status = status;
+                update.ready = true;
+                update.version = Some("99.0.0".into());
             }
             if case == "shared-four-settings-error" {
                 self.notice = Some(("The selected monitor is unavailable".into(), true));

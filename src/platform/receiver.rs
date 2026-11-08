@@ -1,6 +1,7 @@
 use crate::{
     config::{Identity, Key},
     edge::{Crossing, Entry, Routes},
+    lifecycle::RecoveryReason,
     transport::{LEASE, Pipe},
     video::{Inputs, Job, SETTLE, VideoResult, VideoWorker},
     wire::{Input, Message, Mode},
@@ -141,6 +142,9 @@ pub async fn run(
         };
         drop(pipe);
         if let Some(Err(error)) = &result {
+            crate::lifecycle::report(crate::lifecycle::Event::InputRecovery {
+                reason: crate::lifecycle::recovery_reason(error),
+            });
             eprintln!("Session ended: {error:#}");
             if transfer.is_some() {
                 crate::lifecycle::report(crate::lifecycle::Event::Switch {
@@ -177,9 +181,7 @@ async fn session(
         routes.borrow_and_update().clone(),
         &mut last_generation,
     )?;
-    crate::lifecycle::report(crate::lifecycle::Event::Input(
-        crate::lifecycle::InputStatus::Peer,
-    ));
+    crate::lifecycle::input_authenticated(crate::lifecycle::InputStatus::Peer);
     let mut lease = Instant::now() + LEASE;
     let mut settle_until = Instant::now();
     let mut job: Option<oneshot::Receiver<Result<VideoResult>>> = None;
@@ -187,7 +189,10 @@ async fn session(
     tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
     loop {
         let now = Instant::now();
-        ensure!(now < lease, "host heartbeat timed out");
+        if now >= lease {
+            return Err(anyhow::Error::new(RecoveryReason::HeartbeatTimeout)
+                .context("host heartbeat timed out"));
+        }
         ensure!(
             transfer.as_ref().is_none_or(|active| matches!(
                 active.stage,
@@ -202,7 +207,7 @@ async fn session(
                 Ok(crate::lifecycle::Command::SwitchEdge(_) | crate::lifecycle::Command::EnterEdge(_)) => {},
                 Ok(crate::lifecycle::Command::RoutesChanged) => install_routes(sink, transfer, routes.borrow_and_update().clone(), &mut last_generation)?,
                 Ok(crate::lifecycle::Command::SwitchDisplay(_) | crate::lifecycle::Command::EnterDisplay(_) | crate::lifecycle::Command::ReturnInput(_)) => {},
-                Ok(crate::lifecycle::Command::Emergency) => bail!("local emergency recovery requested"),
+                Ok(crate::lifecycle::Command::Emergency) => return Err(anyhow::Error::new(RecoveryReason::EmergencyKey).context("local emergency recovery requested")),
                 Ok(crate::lifecycle::Command::MicrophoneVolume(_)) | Err(_) => {}
             },
             _ = tick.tick() => {

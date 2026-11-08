@@ -567,10 +567,18 @@ impl WorkspaceVisual {
                 .as_ref()
                 .filter(|source| match index {
                     0 | 1 => state.active_input.as_deref().unwrap_or(&source.key) == key,
-                    2 => source.key == key,
+                    // Every compatible computer sends to the selected output.
+                    2 => true,
                     _ => source.key == key || member.node.hardware.microphone_receive,
                 })
                 .cloned()
+                .map(|mut source| {
+                    if index == DeviceIcon::Headphones.index() && source.key != key {
+                        source.muted |=
+                            member.preferences.audio.muted || member.preferences.audio.volume == 0;
+                    }
+                    source
+                })
         })
     }
 }
@@ -2589,5 +2597,115 @@ impl Desktop {
                 note(ui, "Original files are saved in Downloads / Desk Switch and remain available for manual installation. Follow the included readme; a computer restart may be required.");
             });
         self.cable_open = open;
+    }
+}
+
+#[cfg(test)]
+mod workspace_visual_tests {
+    use super::*;
+    use crate::{group::model::tests::fixture, workspace::Selection};
+
+    fn key(index: usize) -> String {
+        format!("{index:064x}")
+    }
+
+    #[test]
+    fn every_audio_route_shows_the_selected_headphones_on_its_computer_card() {
+        let mut workspace = fixture(4);
+        for output in [key(2), key(3)] {
+            workspace.settings.audio = Selection::Computer(output.clone());
+            let visual = WorkspaceVisual::from_workspace(&workspace);
+            let selected = visual.devices[DeviceIcon::Headphones.index()]
+                .as_ref()
+                .unwrap();
+            assert_eq!(selected.key, output);
+            for member in workspace.members.keys() {
+                let routes = workspace.routes(member);
+                if member != &output {
+                    assert_eq!(routes.audio_output.unwrap().key, output);
+                }
+                let devices = visual.member_devices(&workspace, member);
+                assert!(devices[DeviceIcon::Headphones.index()].as_ref() == Some(selected));
+            }
+        }
+    }
+
+    #[test]
+    fn relative_mute_dims_only_that_sender_and_system_mute_dims_every_route() {
+        let mut workspace = fixture(4);
+        let sender = key(1);
+        let output = key(2);
+        let headphones = DeviceIcon::Headphones.index();
+        for relative in [
+            crate::workspace::AudioLevel {
+                volume: 50,
+                muted: true,
+            },
+            crate::workspace::AudioLevel {
+                volume: 0,
+                muted: false,
+            },
+        ] {
+            workspace
+                .members
+                .get_mut(&sender)
+                .unwrap()
+                .preferences
+                .audio = relative;
+            let visual = WorkspaceVisual::from_workspace(&workspace);
+            for member in workspace.members.keys() {
+                let devices = visual.member_devices(&workspace, member);
+                let source = devices[headphones].as_ref().unwrap();
+                assert_eq!(source.key, output);
+                assert_eq!(source.muted, member == &sender);
+            }
+        }
+        for system in [
+            crate::workspace::AudioLevel {
+                volume: 90,
+                muted: true,
+            },
+            crate::workspace::AudioLevel {
+                volume: 0,
+                muted: false,
+            },
+        ] {
+            workspace.members.get_mut(&output).unwrap().native_output = Some(system);
+            let visual = WorkspaceVisual::from_workspace(&workspace);
+            assert!(visual.devices[headphones].as_ref().unwrap().muted);
+            for member in workspace.members.keys() {
+                assert!(
+                    visual.member_devices(&workspace, member)[headphones]
+                        .as_ref()
+                        .unwrap()
+                        .muted
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn disabled_or_unavailable_audio_routes_stay_unshared() {
+        let mut workspace = fixture(4);
+        let headphones = DeviceIcon::Headphones.index();
+        workspace.settings.audio = Selection::Computer(key(2));
+        workspace.members.get_mut(&key(3)).unwrap().online = false;
+        workspace.members.get_mut(&key(4)).unwrap().node.version = None;
+        let visual = WorkspaceVisual::from_workspace(&workspace);
+        for unavailable in [key(3), key(4)] {
+            assert!(visual.member_devices(&workspace, &unavailable)[headphones].is_none());
+        }
+        workspace.settings.audio_enabled = false;
+        let visual = WorkspaceVisual::from_workspace(&workspace);
+        assert!(visual.devices[headphones].is_none());
+        for member in workspace.members.keys() {
+            assert!(visual.member_devices(&workspace, member)[headphones].is_none());
+        }
+        workspace.settings.audio_enabled = true;
+        workspace.members.get_mut(&key(2)).unwrap().online = false;
+        let visual = WorkspaceVisual::from_workspace(&workspace);
+        for member in workspace.members.keys() {
+            assert!(visual.member_devices(&workspace, member)[headphones].is_none());
+        }
     }
 }

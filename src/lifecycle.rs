@@ -44,6 +44,77 @@ pub enum InputStatus {
     Recovering,
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub enum RecoveryReason {
+    ConnectionLost,
+    HeartbeatTimeout,
+    LeaseExpired,
+    EmergencyKey,
+    InputOverflow,
+    ControlOverflow,
+    SwitchFailed,
+}
+impl std::fmt::Display for RecoveryReason {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::ConnectionLost => "The input connection was lost",
+            Self::HeartbeatTimeout => "The peer heartbeat timed out",
+            Self::LeaseExpired => "The local input lease expired",
+            Self::EmergencyKey => "The emergency key was pressed",
+            Self::InputOverflow => "The input event queue overflowed",
+            Self::ControlOverflow => "The input control queue overflowed",
+            Self::SwitchFailed => "The native input operation failed",
+        })
+    }
+}
+impl std::error::Error for RecoveryReason {}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum InputSession {
+    Authenticated,
+    Recovery(RecoveryReason),
+}
+
+pub fn recovery_reason(error: &anyhow::Error) -> RecoveryReason {
+    if let Some(reason) = error.downcast_ref::<RecoveryReason>() {
+        return *reason;
+    }
+    if let Some(error) = error.downcast_ref::<std::io::Error>()
+        && matches!(
+            error.kind(),
+            std::io::ErrorKind::UnexpectedEof
+                | std::io::ErrorKind::ConnectionAborted
+                | std::io::ErrorKind::ConnectionReset
+                | std::io::ErrorKind::BrokenPipe
+                | std::io::ErrorKind::NotConnected
+                | std::io::ErrorKind::TimedOut
+        )
+    {
+        return RecoveryReason::ConnectionLost;
+    }
+    if error
+        .downcast_ref::<tokio::time::error::Elapsed>()
+        .is_some()
+    {
+        return RecoveryReason::ConnectionLost;
+    }
+    RecoveryReason::SwitchFailed
+}
+
+fn authenticated_events(status: InputStatus) -> [Event; 3] {
+    [
+        Event::Switch { error: None },
+        Event::InputAuthenticated,
+        Event::Input(status),
+    ]
+}
+
+pub fn input_authenticated(status: InputStatus) {
+    for event in authenticated_events(status) {
+        report(event);
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub enum Event {
     CycleInput,
@@ -56,6 +127,10 @@ pub enum Event {
     InputReturned {
         activation: u64,
         completed: bool,
+    },
+    InputAuthenticated,
+    InputRecovery {
+        reason: RecoveryReason,
     },
     PeerVersion {
         app: Option<String>,
@@ -261,5 +336,47 @@ pub fn report(event: Event) {
     {
         // A closed GUI log pipe must not interrupt input/video recovery.
         let _ = writeln!(io::stdout().lock(), "@desk-switch {json}");
+    }
+}
+
+#[cfg(test)]
+mod input_session_tests {
+    use super::*;
+
+    #[test]
+    fn authenticated_readiness_clears_current_error_before_publishing_the_session() {
+        for status in [InputStatus::Here, InputStatus::Peer] {
+            let events = authenticated_events(status);
+            assert!(matches!(events[0], Event::Switch { error: None }));
+            assert!(matches!(events[1], Event::InputAuthenticated));
+            assert!(matches!(events[2], Event::Input(value) if value == status));
+        }
+    }
+
+    #[test]
+    fn recovery_intent_uses_typed_causes_instead_of_error_text() {
+        let disconnected =
+            anyhow::Error::new(std::io::Error::from(std::io::ErrorKind::UnexpectedEof))
+                .context("The encrypted input stream ended");
+        assert_eq!(
+            recovery_reason(&disconnected),
+            RecoveryReason::ConnectionLost
+        );
+        for reason in [
+            RecoveryReason::EmergencyKey,
+            RecoveryReason::HeartbeatTimeout,
+            RecoveryReason::LeaseExpired,
+            RecoveryReason::InputOverflow,
+            RecoveryReason::ControlOverflow,
+        ] {
+            let error = anyhow::Error::new(reason).context("Native input was restored");
+            assert_eq!(recovery_reason(&error), reason);
+        }
+        assert_eq!(
+            recovery_reason(&anyhow::anyhow!(
+                "the emergency key was pressed; peer heartbeat timed out"
+            )),
+            RecoveryReason::SwitchFailed
+        );
     }
 }

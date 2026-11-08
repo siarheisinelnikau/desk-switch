@@ -1,6 +1,6 @@
 use crate::transport::LEASE;
 use std::{
-    sync::atomic::{AtomicU8, AtomicU64, Ordering::SeqCst},
+    sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering::SeqCst},
     time::Instant,
 };
 
@@ -16,6 +16,8 @@ pub struct Gate {
     deadline: AtomicU64,
     origin: Instant,
     reason: AtomicU8,
+    manual: AtomicBool,
+    manual_changed: tokio::sync::Notify,
 }
 
 impl Gate {
@@ -25,6 +27,8 @@ impl Gate {
             deadline: AtomicU64::new(0),
             origin: Instant::now(),
             reason: AtomicU8::new(0),
+            manual: AtomicBool::new(false),
+            manual_changed: tokio::sync::Notify::new(),
         }
     }
 
@@ -104,7 +108,36 @@ impl Gate {
 
     pub fn emergency(&self) {
         self.reason.store(2, SeqCst);
+        self.restore_local();
+        // Hooks only publish an atomic observation and wake the coordinator.
+        // They never block on a log pipe or invoke the GUI.
+        self.manual.store(true, SeqCst);
+        self.manual_changed.notify_one();
+    }
+    pub fn restore_local(&self) {
         self.local(self.state.load(SeqCst) >> 2);
+    }
+    pub fn take_manual_emergency(&self) -> bool {
+        self.manual.swap(false, SeqCst)
+    }
+    pub async fn manual_emergency(&self) {
+        loop {
+            let changed = self.manual_changed.notified();
+            if self.take_manual_emergency() {
+                return;
+            }
+            changed.await;
+        }
+    }
+    pub fn recovery_reason(&self) -> crate::lifecycle::RecoveryReason {
+        use crate::lifecycle::RecoveryReason;
+        match self.reason.load(SeqCst) {
+            1 => RecoveryReason::LeaseExpired,
+            2 => RecoveryReason::EmergencyKey,
+            3 => RecoveryReason::InputOverflow,
+            4 => RecoveryReason::ControlOverflow,
+            _ => RecoveryReason::SwitchFailed,
+        }
     }
     pub fn input_overflow(&self, token: u64) {
         self.reason.store(3, SeqCst);
@@ -158,5 +191,41 @@ mod tests {
         gate.deadline.store(0, SeqCst);
         assert!(gate.current().1 == Route::Local);
         assert!(!gate.forward(token));
+    }
+
+    #[test]
+    fn cleanup_preserves_a_lease_failure_without_manufacturing_manual_recovery() {
+        let gate = Gate::new();
+        let token = gate.begin().unwrap();
+        assert!(gate.forward(token));
+        gate.deadline.store(0, SeqCst);
+        assert!(gate.current().1 == Route::Local);
+        gate.restore_local();
+        assert_eq!(
+            gate.recovery_reason(),
+            crate::lifecycle::RecoveryReason::LeaseExpired
+        );
+        assert!(!gate.take_manual_emergency());
+        gate.emergency();
+        gate.restore_local();
+        assert_eq!(
+            gate.recovery_reason(),
+            crate::lifecycle::RecoveryReason::EmergencyKey
+        );
+        assert!(gate.take_manual_emergency());
+        assert!(!gate.take_manual_emergency());
+    }
+
+    #[tokio::test]
+    async fn a_manual_emergency_before_authentication_remains_observable() {
+        let gate = Gate::new();
+        gate.emergency();
+        tokio::time::timeout(
+            std::time::Duration::from_millis(50),
+            gate.manual_emergency(),
+        )
+        .await
+        .unwrap();
+        assert!(!gate.take_manual_emergency());
     }
 }

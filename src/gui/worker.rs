@@ -1,4 +1,4 @@
-use crate::lifecycle::{Event, InputStatus};
+use crate::lifecycle::{Event, InputSession, InputStatus, RecoveryReason};
 use anyhow::{Context, Result, ensure};
 use std::{
     collections::VecDeque,
@@ -57,6 +57,8 @@ pub struct Worker {
     events: Receiver<String>,
     pub logs: VecDeque<String>,
     pub input_status: Option<InputStatus>,
+    pub input_authenticated: bool,
+    pub input_sessions: VecDeque<InputSession>,
     pub monitor_input: Option<u16>,
     pub monitoring: bool,
     pub switch_error: Option<String>,
@@ -184,6 +186,8 @@ impl Worker {
             events,
             logs: VecDeque::new(),
             input_status: None,
+            input_authenticated: false,
+            input_sessions: VecDeque::new(),
             monitor_input: None,
             monitoring: false,
             switch_error: None,
@@ -386,7 +390,26 @@ impl Worker {
                         )
                     };
                 }
-                Event::Input(status) => self.input_status = Some(status),
+                Event::Input(status) => {
+                    self.input_status = Some(status);
+                    if matches!(status, InputStatus::Waiting | InputStatus::Recovering) {
+                        self.input_authenticated = false;
+                    }
+                }
+                Event::InputAuthenticated => {
+                    self.input_authenticated = true;
+                    self.switch_error = None;
+                    self.new_switch_error = None;
+                    self.input_session(InputSession::Authenticated);
+                }
+                Event::InputRecovery { reason } => {
+                    // F11 while already local may leave the pinned session
+                    // alive. Its explicit intent still has to reach the planner.
+                    if reason != RecoveryReason::EmergencyKey {
+                        self.input_authenticated = false;
+                    }
+                    self.input_session(InputSession::Recovery(reason));
+                }
                 Event::Monitor(input) => self.monitor_input = input,
                 Event::Switch { error } => {
                     self.switch_error = error.clone();
@@ -413,6 +436,13 @@ impl Worker {
             self.logs.pop_front();
         }
         self.logs.push_back(line);
+    }
+
+    fn input_session(&mut self, event: InputSession) {
+        if self.input_sessions.len() == 32 {
+            self.input_sessions.pop_front();
+        }
+        self.input_sessions.push_back(event);
     }
 
     pub fn poll(&mut self) -> bool {
@@ -456,6 +486,7 @@ impl Worker {
                     self.child.take();
                     self.input.take();
                     self.audio_playing = false;
+                    self.input_authenticated = false;
                 }
                 Ok(None) => {}
                 Err(error) => {
@@ -571,6 +602,39 @@ mod tests {
             serde_json::to_string(&Event::Input(InputStatus::Peer)).unwrap()
         ));
         assert_eq!(worker.input_status, Some(InputStatus::Peer));
+    }
+
+    #[test]
+    fn authenticated_recovery_clears_current_error_but_preserves_history_and_manual_order() {
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        command.arg("--help");
+        let mut worker = Worker::spawn(Kind::Query, command).unwrap();
+        let report = |event| format!("@desk-switch {}", serde_json::to_string(&event).unwrap());
+        worker.line(report(Event::Switch {
+            error: Some("peer heartbeat timed out (last reply 1761 ms ago)".into()),
+        }));
+        worker.line("peer authenticated.".into());
+        worker.line(report(Event::Input(InputStatus::Here)));
+        assert!(worker.switch_error.is_some());
+        assert!(!worker.input_authenticated);
+        worker.line(report(Event::InputRecovery {
+            reason: RecoveryReason::EmergencyKey,
+        }));
+        worker.line(report(Event::InputRecovery {
+            reason: RecoveryReason::ConnectionLost,
+        }));
+        worker.line(report(Event::InputAuthenticated));
+        assert!(worker.input_authenticated);
+        assert!(worker.switch_error.is_none() && worker.new_switch_error.is_none());
+        assert!(worker.logs.iter().any(|line| line.contains("1761 ms")));
+        assert_eq!(
+            worker.input_sessions.iter().copied().collect::<Vec<_>>(),
+            vec![
+                InputSession::Recovery(RecoveryReason::EmergencyKey),
+                InputSession::Recovery(RecoveryReason::ConnectionLost),
+                InputSession::Authenticated,
+            ]
+        );
     }
 
     #[cfg(unix)]

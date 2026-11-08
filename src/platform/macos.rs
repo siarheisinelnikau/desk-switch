@@ -1,6 +1,7 @@
 //! CoreGraphics input workers. No custom cursor overlay is needed on macOS.
 use crate::{
     config::{Edge, Identity, InputSharing, Key},
+    edge::{Crossing, Entry, Hit, NativeScreen, Router, Routes},
     gate::{Gate, Route},
     video::{Inputs, VideoWorker},
     wire::{Input, Mode},
@@ -8,7 +9,7 @@ use crate::{
 use anyhow::{Context, Result, ensure};
 use serde::Deserialize;
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeSet, VecDeque},
     io::{BufRead, BufReader, Write},
     net::SocketAddr,
     os::fd::AsRawFd,
@@ -19,6 +20,10 @@ use std::{
     },
 };
 use tokio::sync::mpsc;
+
+#[path = "macos_geometry.rs"]
+pub(super) mod geometry;
+use geometry::Screen;
 
 struct Process {
     child: Child,
@@ -127,6 +132,15 @@ struct NativeEvent {
     dy: Option<i32>,
     remote: Option<bool>,
     position: Option<u16>,
+    crossing: Option<Crossing>,
+}
+struct PendingEntry(Arc<Mutex<bool>>);
+impl Drop for PendingEntry {
+    fn drop(&mut self) {
+        if let Ok(mut canceled) = self.0.lock() {
+            *canceled = true;
+        }
+    }
 }
 struct Cursor(Arc<Mutex<ChildStdin>>);
 impl super::host::Cursor for Cursor {
@@ -141,6 +155,16 @@ impl super::host::Cursor for Cursor {
             &self.0,
             serde_json::json!({"kind":"enter","position":position,"screen":edge.screen,"side":side(if crate::lifecycle::group_input(){crate::edge::Side::Left}else{edge.side})}),
         )
+    }
+    async fn enter_display(&self, activation: u64, entry: Entry) -> Result<()> {
+        let routes = crate::lifecycle::routes();
+        let canceled = Arc::new(Mutex::new(false));
+        let _pending = PendingEntry(canceled.clone());
+        tokio::task::spawn_blocking(move || {
+            geometry::enter_current(entry, activation, &routes, &canceled)
+        })
+        .await??;
+        command(&self.0, serde_json::json!({"kind":"reset-entry"}))
     }
     async fn resume(&self) -> Result<()> {
         command(&self.0, serde_json::json!({"kind":"mode","value":"local"}))
@@ -159,6 +183,9 @@ pub fn run(
     if let Some(edge) = &edge {
         arguments.push(edge.screen.clone());
         arguments.push(side(edge.side).into());
+    }
+    if crate::lifecycle::group_input() {
+        arguments.push("--group".into());
     }
     let (mut process, output) = Process::start("input-capture", &arguments)?;
     let gate = Arc::new(Gate::new());
@@ -180,6 +207,18 @@ pub fn run(
                 };
                 if event.kind == "emergency" {
                     reader_gate.emergency();
+                    continue;
+                }
+                if event.kind == "boundary" {
+                    let (token, route) = reader_gate.current();
+                    if route == Route::Local
+                        && let Some(crossing) = event.crossing
+                        && control_send
+                            .try_send(super::host::Control::Boundary { token, crossing })
+                            .is_err()
+                    {
+                        reader_gate.control_overflow(token);
+                    }
                     continue;
                 }
                 if event.kind == "edge" {
@@ -248,7 +287,7 @@ pub fn run(
                     reader_gate.input_overflow(token);
                 }
             }
-            reader_gate.emergency();
+            reader_gate.restore_local();
             reader_alive.store(false, Ordering::Release);
         })?;
     println!(
@@ -258,14 +297,43 @@ pub fn run(
         let coordinator=super::host::connect(address,identity,peer,super::host::Coordinator {gate:gate.clone(),edge,video,controls,events,cursor:Cursor(process.writer.clone()),monitor_required:crate::lifecycle::monitor_required});
         let lease=async {
             let mut tick=tokio::time::interval(std::time::Duration::from_millis(20));tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-            loop {tick.tick().await;ensure!(alive.load(Ordering::Acquire),"The macOS event tap stopped");ensure!(process.child.try_wait()?.is_none(),"The macOS input helper stopped");let route=gate.current().1;process.command(serde_json::json!({"kind":"mode","value":match route{Route::Local=>"local",Route::Hold=>"hold",Route::Remote=>"remote"}}))?;}
+            let mut routes = crate::lifecycle::routes();
+            let mut policy = route_commands(&routes.borrow().clone());
+            loop {
+                tick.tick().await;
+                ensure!(alive.load(Ordering::Acquire),"The macOS event tap stopped");
+                ensure!(process.child.try_wait()?.is_none(),"The macOS input helper stopped");
+                let route=gate.current().1;
+                process.command(serde_json::json!({"kind":"mode","value":match route{Route::Local=>"local",Route::Hold=>"hold",Route::Remote=>"remote"}}))?;
+                if routes.has_changed().unwrap_or(false) { policy = route_commands(&routes.borrow_and_update().clone()); }
+                // Route records fit PIPE_BUF individually. Bounded batches
+                // keep large layouts off the hot lease/network path.
+                for _ in 0..8 {
+                    let Some(next) = policy.front() else {break};
+                    match process.command(next.clone()) {
+                        Ok(()) => {policy.pop_front();}
+                        Err(error) if error.downcast_ref::<std::io::Error>().is_some_and(|error| error.kind()==std::io::ErrorKind::WouldBlock) => break,
+                        Err(error) => return Err(error),
+                    }
+                }
+            }
             #[allow(unreachable_code)] Ok::<(),anyhow::Error>(())
         };
         tokio::select!{result=coordinator=>result,result=lease=>result}
     });
-    gate.emergency();
+    gate.restore_local();
     let _ = process.command(serde_json::json!({"kind":"mode","value":"local"}));
     result
+}
+
+fn route_commands(routes: &Routes) -> VecDeque<serde_json::Value> {
+    if !crate::lifecycle::group_input() {
+        return VecDeque::new();
+    }
+    std::iter::once(serde_json::json!({"kind":"routes-start"}))
+        .chain(routes.boundaries.iter().map(|boundary| serde_json::json!({"kind":"routes-add","boundary":boundary})))
+        .chain(std::iter::once(serde_json::json!({"kind":"routes-commit","revision":routes.revision,"activation":routes.activation})))
+        .collect()
 }
 
 fn side(side: crate::edge::Side) -> &'static str {
@@ -277,30 +345,9 @@ fn side(side: crate::edge::Side) -> &'static str {
     }
 }
 #[derive(Deserialize)]
-struct Screen {
-    id: String,
-    x: f64,
-    y: f64,
-    width: f64,
-    height: f64,
-}
-impl Screen {
-    fn rect(&self) -> crate::edge::Rect {
-        crate::edge::Rect {
-            x: self.x,
-            y: self.y,
-            width: self.width,
-            height: self.height,
-        }
-    }
-}
-#[derive(Deserialize)]
 struct Point {
     x: f64,
     y: f64,
-}
-fn screens() -> Result<Vec<Screen>> {
-    crate::macos_native::query("screen-geometry", &[])
 }
 pub struct NativeSink {
     process: Process,
@@ -314,10 +361,16 @@ pub struct NativeSink {
     alive: Arc<AtomicBool>,
     emergency: Arc<AtomicBool>,
     lease: std::time::Instant,
+    router: Router,
+    native: Vec<NativeScreen>,
+    generation: u64,
+    crossing: Option<Crossing>,
 }
 impl NativeSink {
     pub fn new(edge: Option<Edge>) -> Result<Self> {
-        let geometry = Arc::new(Mutex::new(screens()?));
+        let initial = geometry::screens()?;
+        let native = geometry::validate(&initial)?;
+        let geometry = Arc::new(Mutex::new(initial));
         let (process, output) = Process::start("input-playback", &[])?;
         let alive = Arc::new(AtomicBool::new(true));
         let emergency = Arc::new(AtomicBool::new(false));
@@ -340,14 +393,7 @@ impl NativeSink {
                             && let Ok(screens) =
                                 serde_json::from_value::<Vec<Screen>>(value["screens"].clone())
                             && screens.len() <= 128
-                            && screens.iter().all(|screen| {
-                                screen.x.is_finite()
-                                    && screen.y.is_finite()
-                                    && screen.width.is_finite()
-                                    && screen.height.is_finite()
-                                    && screen.width > 0.
-                                    && screen.height > 0.
-                            })
+                            && geometry::validate(&screens).is_ok()
                         {
                             *reader_geometry.lock().unwrap() = screens;
                         }
@@ -367,6 +413,10 @@ impl NativeSink {
             alive,
             emergency,
             lease: std::time::Instant::now(),
+            router: Router::default(),
+            native,
+            generation: 0,
+            crossing: None,
         })
     }
     fn edge_screen(&self) -> Result<crate::edge::Rect> {
@@ -380,6 +430,36 @@ impl NativeSink {
             .find(|screen| edge.screen == "auto" || screen.id == edge.screen)
             .map(Screen::rect)
             .context("The selected macOS return screen is unavailable")
+    }
+    fn refresh_geometry(&mut self) -> Result<()> {
+        let geometry = self.geometry.lock().unwrap();
+        if geometry.len() == self.native.len()
+            && geometry.first().map(|screen| screen.epoch)
+                == self.native.first().map(|screen| screen.epoch)
+        {
+            return Ok(());
+        }
+        let native = geometry::validate(&geometry)?;
+        if native != self.native {
+            self.native = native;
+            self.crossing = None;
+            self.router
+                .configure(self.router.routes().clone(), &self.native)?;
+        }
+        Ok(())
+    }
+    fn position_display(&mut self, entry: Entry) -> Result<()> {
+        self.refresh_geometry()?;
+        entry.resolve(&self.native)?;
+        let (x, y) = entry.point();
+        geometry::position(x, y)?;
+        self.process
+            .command(serde_json::json!({"kind":"activate","x":x,"y":y,"warp":false}))?;
+        self.position = Point { x, y };
+        self.return_edge = false;
+        self.crossing = None;
+        self.router.reset_entry();
+        Ok(())
     }
 }
 impl super::receiver::Sink for NativeSink {
@@ -401,6 +481,7 @@ impl super::receiver::Sink for NativeSink {
         }
     }
     fn prepare(&self, position: Option<u16>, mode: Mode) -> Result<()> {
+        ensure!(!self.active, "macOS input is already active");
         if position.is_some() {
             ensure!(
                 self.edge.as_ref().is_some_and(|edge| edge.mode == mode)
@@ -421,20 +502,95 @@ impl super::receiver::Sink for NativeSink {
         } else {
             // The existing native worker adopts the cursor in place. No
             // process launch or WindowServer query blocks network heartbeats.
+            let (x, y) = geometry::cursor()?;
+            self.position = Point { x, y };
             self.process
-                .command(serde_json::json!({"kind":"activate"}))?;
+                .command(serde_json::json!({"kind":"activate","x":x,"y":y,"warp":false}))?;
         }
         self.active = true;
         self.return_edge = position.is_some();
         Ok(())
+    }
+    fn prepare_display(
+        &self,
+        position: Option<u16>,
+        entry: Option<Entry>,
+        mode: Mode,
+    ) -> Result<()> {
+        ensure!(
+            !(position.is_some() && entry.is_some()),
+            "A display entry cannot also use a legacy edge"
+        );
+        self.prepare(position, mode)?;
+        if let Some(entry) = entry {
+            entry.resolve(&geometry::validate(&self.geometry.lock().unwrap())?)?;
+        }
+        Ok(())
+    }
+    fn activate_display(
+        &mut self,
+        position: Option<u16>,
+        entry: Option<Entry>,
+        mode: Mode,
+    ) -> Result<()> {
+        self.prepare_display(position, entry, mode)?;
+        if let Some(entry) = entry {
+            self.position_display(entry)?;
+            self.active = true;
+            Ok(())
+        } else {
+            self.activate(position, mode)
+        }
+    }
+    fn reposition(&mut self, entry: Entry) -> Result<()> {
+        ensure!(self.active, "macOS input is not active");
+        self.position_display(entry)
+    }
+    fn set_routes(&mut self, routes: Routes) -> Result<()> {
+        self.refresh_geometry()?;
+        self.crossing = None;
+        self.router.configure(routes, &self.native)
+    }
+    fn set_generation(&mut self, generation: u64) {
+        if self.generation != generation {
+            self.generation = generation;
+            self.crossing = None;
+            self.router.reset_entry();
+        }
+    }
+    fn take_crossing(&mut self) -> Option<Crossing> {
+        self.crossing.take()
     }
     fn event(&mut self, input: Input) -> Result<Option<u16>> {
         ensure!(
             self.active && input.valid(),
             "Input arrived outside an active macOS lease"
         );
+        self.refresh_geometry()?;
         if let Input::Move { dx, dy } = input {
-            if self.return_edge && self.keys.is_empty() && self.buttons.is_empty() {
+            let group = crate::lifecycle::group_input();
+            let blocked = if group {
+                let allow = self.keys.is_empty()
+                    && self.buttons.is_empty()
+                    && self.generation == self.router.routes().activation;
+                match self.router.crossing_if(
+                    self.position.x,
+                    self.position.y,
+                    dx.into(),
+                    dy.into(),
+                    allow,
+                ) {
+                    Some(Hit::Cross(crossing)) => {
+                        self.crossing = Some(crossing);
+                        true
+                    }
+                    Some(Hit::Block) => true,
+                    None => false,
+                }
+            } else {
+                false
+            };
+            if !group && self.return_edge && self.keys.is_empty() && self.buttons.is_empty() {
                 let edge = self.edge.as_ref().unwrap();
                 if let Some(position) = edge.side.crossing(
                     self.edge_screen()?,
@@ -446,28 +602,34 @@ impl super::receiver::Sink for NativeSink {
                     return Ok(Some(position));
                 }
             }
-            self.position.x += f64::from(dx);
-            self.position.y += f64::from(dy);
-            let geometry = self.geometry.lock().unwrap();
-            let min_x = geometry
-                .iter()
-                .map(|screen| screen.x)
-                .fold(f64::INFINITY, f64::min);
-            let min_y = geometry
-                .iter()
-                .map(|screen| screen.y)
-                .fold(f64::INFINITY, f64::min);
-            let max_x = geometry
-                .iter()
-                .map(|screen| screen.x + screen.width)
-                .fold(f64::NEG_INFINITY, f64::max);
-            let max_y = geometry
-                .iter()
-                .map(|screen| screen.y + screen.height)
-                .fold(f64::NEG_INFINITY, f64::max);
-            if min_x < max_x && min_y < max_y {
-                self.position.x = self.position.x.clamp(min_x, max_x - 1.);
-                self.position.y = self.position.y.clamp(min_y, max_y - 1.);
+            let current = self.native.iter().find(|screen| {
+                screen
+                    .rect
+                    .rect()
+                    .contains(self.position.x, self.position.y)
+            });
+            let next = (
+                self.position.x + f64::from(dx),
+                self.position.y + f64::from(dy),
+            );
+            let target = if blocked {
+                None
+            } else {
+                self.native
+                    .iter()
+                    .find(|screen| screen.rect.rect().contains(next.0, next.1))
+            };
+            if let Some(target) = target.or(current) {
+                let rect = target.rect.rect();
+                self.position = Point {
+                    x: next.0.clamp(rect.x, rect.right() - 1.),
+                    y: next.1.clamp(rect.y, rect.bottom() - 1.),
+                };
+            } else {
+                self.position = Point {
+                    x: next.0,
+                    y: next.1,
+                };
             }
         }
         let value = match input {
@@ -489,7 +651,9 @@ impl super::receiver::Sink for NativeSink {
                 }
                 serde_json::json!({"kind":"button","code":code-272,"down":down})
             }
-            Input::Move { dx, dy } => serde_json::json!({"kind":"move","dx":dx,"dy":dy}),
+            Input::Move { .. } => {
+                serde_json::json!({"kind":"move","x":self.position.x,"y":self.position.y})
+            }
             Input::Scroll { dx, dy } => serde_json::json!({"kind":"scroll","dx":dx,"dy":dy}),
         };
         self.process.command(value)?;
@@ -498,6 +662,7 @@ impl super::receiver::Sink for NativeSink {
     fn release(&mut self) -> Result<()> {
         self.active = false;
         self.return_edge = false;
+        self.crossing = None;
         self.keys.clear();
         self.buttons.clear();
         self.process.command(serde_json::json!({"kind":"release"}))
@@ -506,5 +671,29 @@ impl super::receiver::Sink for NativeSink {
 impl Drop for NativeSink {
     fn drop(&mut self) {
         let _ = super::receiver::Sink::release(self);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn largest_boundary_control_fits_an_atomic_pipe_write() {
+        let boundary = crate::edge::Boundary {
+            id: u64::MAX,
+            geometry: u64::MAX,
+            screen: crate::edge::ScreenRect {
+                x: i32::MIN,
+                y: i32::MIN,
+                width: u32::MAX,
+                height: u32::MAX,
+            },
+            side: crate::edge::Side::Bottom,
+            start: u16::MAX - 1,
+            end: u16::MAX,
+        };
+        boundary.validate().unwrap();
+        let value = serde_json::json!({"kind":"routes-add","boundary":boundary});
+        assert!(serde_json::to_vec(&value).unwrap().len() < 512);
+        assert!(serde_json::to_vec(&serde_json::json!({"kind":"routes-commit","revision":u64::MAX,"activation":u64::MAX})).unwrap().len()<512);
     }
 }

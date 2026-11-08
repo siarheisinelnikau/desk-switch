@@ -62,6 +62,14 @@ enum QueryKind {
     InputAccess,
 }
 
+fn update_failure_status(preparing: bool, error: &anyhow::Error) -> String {
+    if preparing {
+        format!("Could not download or verify the update: {error:#}")
+    } else {
+        format!("Could not check for updates: {error:#}")
+    }
+}
+
 pub struct Desktop {
     group: group::Group,
     ctx: egui::Context,
@@ -754,7 +762,11 @@ impl Desktop {
             }
         }
         self.last_version_error = version_error;
-        if let Some(result) = self.update_job.as_ref().and_then(crate::updater::Job::poll) {
+        if let Some((preparing, result)) = self
+            .update_job
+            .as_ref()
+            .and_then(|job| job.poll().map(|result| (job.is_preparing(), result)))
+        {
             self.update_job = None;
             let download_action = self.download_action.take();
             let downloaded = matches!(
@@ -825,8 +837,8 @@ impl Desktop {
                 }
                 Err(error) => {
                     self.update_failed = true;
-                    self.update_status = format!("Не удалось проверить обновления: {error:#}");
                     self.fail_paired_download(format!("{error:#}"), ctx);
+                    self.update_status = update_failure_status(preparing, &error);
                 }
             }
             if downloaded {
@@ -1104,7 +1116,7 @@ impl Desktop {
             }
             Err(error) => {
                 self.update_failed = true;
-                self.update_status = error.to_string();
+                self.update_status = update_failure_status(false, &error);
             }
         }
     }
@@ -1142,8 +1154,8 @@ impl Desktop {
             Err(error) => {
                 self.download_action = None;
                 self.update_failed = true;
-                self.update_status = error.to_string();
                 self.fail_paired_download(error.to_string(), ctx);
+                self.update_status = update_failure_status(true, &error);
             }
         }
     }
@@ -1258,5 +1270,22 @@ impl software::App for Desktop {
         self.paired_update_dialog(ui.ctx());
         self.cable_dialog(ui.ctx());
         self.presented = true;
+    }
+}
+
+#[cfg(test)]
+mod update_error_tests {
+    use super::update_failure_status;
+
+    #[test]
+    fn the_same_gateway_error_is_labelled_by_operation_and_keeps_its_cause_chain() {
+        let error = anyhow::anyhow!("HTTP 504 Gateway Timeout").context("GitHub request failed");
+        let check = update_failure_status(false, &error);
+        let prepare = update_failure_status(true, &error);
+        assert!(check.starts_with("Could not check for updates: "));
+        assert!(prepare.starts_with("Could not download or verify the update: "));
+        for status in [check, prepare] {
+            assert!(status.contains("GitHub request failed: HTTP 504 Gateway Timeout"));
+        }
     }
 }

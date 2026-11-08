@@ -3,6 +3,7 @@ use crate::{
     controller::{Controller, Effect, Transfer},
     edge::{Crossing, Entry},
     gate::{Gate, Route},
+    lifecycle::RecoveryReason,
     transport::{LEASE, PING_PERIOD, Pipe},
     video::{Inputs, Job, SETTLE, VideoResult, VideoWorker},
     wire::{Input, Message, Mode},
@@ -59,7 +60,7 @@ pub async fn connect<C: Cursor>(
 ) -> Result<()> {
     let gate = io.gate.clone();
     let result = connect_mode(address, identity, peer, io, crate::lifecycle::group_input()).await;
-    gate.emergency();
+    gate.restore_local();
     result
 }
 
@@ -84,6 +85,7 @@ async fn connect_mode<C: Cursor>(
                 control = io.controls.recv(), if group => {
                     waiting_group_control(control.context("host hook stopped")?, &io.gate);
                 }
+                _ = io.gate.manual_emergency() => report_recovery(RecoveryReason::EmergencyKey),
                 result = &mut connection => break result,
             }
         };
@@ -96,7 +98,15 @@ async fn connect_mode<C: Cursor>(
                     result = &mut shutdown => { result?; None }
                     result = handoff.run(&mut pipe, &mut io) => Some(result),
                 };
-                io.gate.emergency();
+                if let Some(Err(error)) = &result {
+                    let reason = if io.gate.take_manual_emergency() {
+                        RecoveryReason::EmergencyKey
+                    } else {
+                        crate::lifecycle::recovery_reason(error)
+                    };
+                    report_recovery(reason);
+                }
+                io.gate.restore_local();
                 crate::lifecycle::report(crate::lifecycle::Event::Input(
                     crate::lifecycle::InputStatus::Recovering,
                 ));
@@ -124,7 +134,7 @@ async fn connect_mode<C: Cursor>(
                 // may already be queued with Hold, so leave that token for the
                 // waiting-control handler instead of invalidating its cycle.
                 if !group {
-                    io.gate.emergency();
+                    io.gate.restore_local();
                 }
                 crate::lifecycle::report(crate::lifecycle::Event::Input(
                     crate::lifecycle::InputStatus::Waiting,
@@ -140,11 +150,16 @@ async fn connect_mode<C: Cursor>(
                 control = io.controls.recv(), if group => {
                     waiting_group_control(control.context("host hook stopped")?, &io.gate);
                 }
+                _ = io.gate.manual_emergency() => report_recovery(RecoveryReason::EmergencyKey),
                 _ = &mut backoff => break,
             }
         }
     }
     Ok(())
+}
+
+fn report_recovery(reason: RecoveryReason) {
+    crate::lifecycle::report(crate::lifecycle::Event::InputRecovery { reason });
 }
 
 fn waiting_group_control(control: Control, gate: &Gate) {
@@ -215,11 +230,14 @@ impl Heartbeat {
         }
     }
     fn check(&self) -> Result<()> {
-        ensure!(
-            Instant::now() < self.lease,
-            "peer heartbeat timed out (last reply {} ms ago)",
-            self.last_reply.elapsed().as_millis()
-        );
+        if Instant::now() >= self.lease {
+            return Err(
+                anyhow::Error::new(RecoveryReason::HeartbeatTimeout).context(format!(
+                    "peer heartbeat timed out (last reply {} ms ago)",
+                    self.last_reply.elapsed().as_millis()
+                )),
+            );
+        }
         Ok(())
     }
     async fn ping(&mut self, pipe: &mut Pipe) -> Result<()> {
@@ -255,6 +273,7 @@ impl Heartbeat {
             tokio::select! {
                 biased;
                 result = &mut operation => return result,
+                _ = gate.manual_emergency() => return Err(RecoveryReason::EmergencyKey.into()),
                 _ = &mut deadline => bail!("Windows/Wayland cursor operation timed out while the peer remained connected"),
                 _ = ping.tick() => self.ping(pipe).await?,
                 message = pipe.messages.recv() => match message.context("peer disconnected during cursor positioning")?? {
@@ -339,24 +358,33 @@ impl Handoff {
         tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
         ping.set_missed_tick_behavior(MissedTickBehavior::Skip);
         let mut commands = crate::lifecycle::commands();
-        crate::lifecycle::report(crate::lifecycle::Event::Input(
-            crate::lifecycle::InputStatus::Here,
-        ));
+        crate::lifecycle::input_authenticated(crate::lifecycle::InputStatus::Here);
         let mut heartbeat = Heartbeat::new();
         loop {
+            if io.gate.take_manual_emergency() {
+                report_recovery(RecoveryReason::EmergencyKey);
+            }
             heartbeat.check()?;
             ensure!(
                 self.deadline.is_none_or(|time| Instant::now() < time),
                 "switch confirmation timed out"
             );
-            if let Some(token) = self.token {
-                ensure!(
-                    io.gate.current().0 == token,
-                    "host input route was revoked: {}",
-                    io.gate.reason()
+            if let Some(token) = self.token
+                && io.gate.current().0 != token
+            {
+                return Err(
+                    anyhow::Error::new(io.gate.recovery_reason()).context(format!(
+                        "host input route was revoked: {}",
+                        io.gate.reason()
+                    )),
                 );
             }
             let effect = tokio::select! {
+                _ = io.gate.manual_emergency() => {
+                    if self.logic.id().is_some() { return Err(RecoveryReason::EmergencyKey.into()); }
+                    report_recovery(RecoveryReason::EmergencyKey);
+                    continue;
+                }
                 command = commands.recv() => {
                     match command {
                         Ok(crate::lifecycle::Command::Switch) => { self.group_requested = true; self.group_entry = None; self.display_switch = None; io.cursor.request_toggle().await?; }
@@ -821,6 +849,18 @@ mod tests {
     use std::sync::atomic::{AtomicU16, AtomicUsize, Ordering::SeqCst};
     use tokio::net::TcpListener;
 
+    #[test]
+    fn expired_peer_heartbeat_has_a_typed_transient_reason() {
+        let mut heartbeat = Heartbeat::new();
+        heartbeat.lease = Instant::now() - Duration::from_millis(1);
+        let error = heartbeat.check().unwrap_err();
+        assert_eq!(
+            crate::lifecycle::recovery_reason(&error),
+            RecoveryReason::HeartbeatTimeout
+        );
+        assert!(format!("{error:#}").contains("last reply"));
+    }
+
     struct FixtureCursor {
         gate: Arc<Gate>,
         controls: mpsc::Sender<Control>,
@@ -1062,10 +1102,21 @@ mod tests {
             )
             .await
             .unwrap();
+            // Observe cleanup through a pending route, rather than treating
+            // ordinary network loss as if the user had pressed F11.
+            let disconnected = gate.begin().unwrap();
             drop(pipe);
-            while gate.reason() != "the emergency key was pressed" {
-                sleep(Duration::from_millis(1)).await;
-            }
+            timeout(Duration::from_secs(1), async {
+                while gate.current().0 == disconnected || gate.current().1 != Route::Local {
+                    sleep(Duration::from_millis(1)).await;
+                }
+            })
+            .await
+            .expect("disconnect cleanup did not restore the pending route");
+            assert!(
+                !gate.take_manual_emergency(),
+                "network cleanup manufactured a manual F11 request"
+            );
             let token = gate.begin().unwrap();
             send.send(Control::Toggle(token)).await.unwrap();
             timeout(Duration::from_millis(250), async {

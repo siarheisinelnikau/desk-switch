@@ -202,6 +202,8 @@
   "Не удалось включить доступность в сети. Возможно, Desk Switch уже запущен.": "Netzwerksichtbarkeit konnte nicht aktiviert werden. Desk Switch läuft möglicherweise bereits.",
   "Не удалось найти второй ПК": "Der andere PC ist nicht erreichbar",
   "Не удалось проверить обновления: {error:#}": "Updates konnten nicht geprüft werden: {error:#}",
+  "Could not check for updates: {error:#}": "Es konnte nicht nach Updates gesucht werden: {error:#}",
+  "Could not download or verify the update: {error:#}": "Das Update konnte nicht heruntergeladen oder überprüft werden: {error:#}",
   "Не удалось проверить устройства ввода": "Eingabegeräte konnten nicht geprüft werden",
   "Не удалось прочитать текущее подключение. Включите DDC/CI в меню монитора.": "Aktueller Anschluss konnte nicht gelesen werden. Aktivieren Sie DDC/CI im Monitormenü.",
   "Не удалось разорвать пару": "Computer konnten nicht getrennt werden",

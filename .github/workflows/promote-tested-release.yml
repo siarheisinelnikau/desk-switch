@@ -32,8 +32,10 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           python3 - <<'PY'
-          import json, os, re, subprocess, tomllib
+          import json, os, re, subprocess, sys, tomllib
           from pathlib import Path
+          sys.path.insert(0, 'tools')
+          from release_assets import asset_names
 
           request = json.loads(Path('release/promotion-request.json').read_text())
           assert set(request) == {'tag', 'source_sha', 'run_id'}, 'Unexpected promotion request fields'
@@ -64,7 +66,12 @@ jobs:
               'build (ubuntu-24.04, linux, desk-switch)',
               'build (windows-2022, windows, desk-switch.exe, -C target-feature=+crt-static)',
           }
-          assert {name for name in by_name if name.startswith('build (')} == builds, 'Expected exactly the Windows and Ubuntu builds'
+          if 'macos-arm64-app' in asset_names(version):
+              builds.update({
+                  'build (macos-15, aarch64-apple-darwin)',
+                  'build (macos-15-intel, x86_64-apple-darwin)',
+              })
+          assert {name for name in by_name if name.startswith('build (')} == builds, 'Native build jobs do not match the release artifact matrix'
           for name in builds | {'request', 'sign'}:
               job = by_name[name]
               assert job['run_id'] == run_id and job['run_attempt'] == 1 and job['head_sha'] == source, f'Wrong provenance for {name}'
