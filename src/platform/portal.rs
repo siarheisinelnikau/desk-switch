@@ -27,12 +27,14 @@ struct Screen {
     device: Device,
 }
 
+type RefreshedGeometry = (Option<Vec<NativeScreen>>, Option<(i32, i32)>);
+
 struct Refresh {
     geometry: bool,
     pointer: bool,
     geometry_stamp: u64,
     pointer_stamp: u64,
-    task: tokio::task::JoinHandle<(Option<Vec<NativeScreen>>, Option<(i32, i32)>)>,
+    task: tokio::task::JoinHandle<RefreshedGeometry>,
 }
 
 /// Both sources must identify exactly one region. Mirrored outputs and stale
