@@ -33,14 +33,14 @@ def macho(architecture="arm64", extra=b""):
     return bytes(header) + extra
 
 
-def bundle(architecture="arm64"):
+def bundle(architecture="arm64", version=VERSION, protocol=PROTOCOL):
     native = macho(architecture, b"synthetic-native-helper")
     ddc = macho(architecture, b"synthetic-ddc-helper")
-    stamp = b"DESK-SWITCH-BUILD:" + json.dumps({"app": VERSION, "protocol": PROTOCOL}, separators=(",", ":")).encode()
+    stamp = b"DESK-SWITCH-BUILD:" + json.dumps({"app": version, "protocol": protocol}, separators=(",", ":")).encode()
     return {
         PLIST: (plistlib.dumps({
             "CFBundleExecutable": "desk-switch", "CFBundleIdentifier": "com.deskswitch.Desktop",
-            "CFBundlePackageType": "APPL", "CFBundleShortVersionString": VERSION, "CFBundleVersion": VERSION,
+            "CFBundlePackageType": "APPL", "CFBundleShortVersionString": version, "CFBundleVersion": version,
         }), stat.S_IFREG | 0o644),
         EXECUTABLE: (macho(architecture, stamp + native + ddc), stat.S_IFREG | 0o755),
         NATIVE: (native, stat.S_IFREG | 0o755), DDC: (ddc, stat.S_IFREG | 0o755),
@@ -93,8 +93,8 @@ class ReleaseAssetsTests(unittest.TestCase):
             with self.subTest(value=value), self.assertRaises(ValueError):
                 asset_names(value)
 
-    def test_current_releases_only_include_windows_and_ubuntu(self):
-        for version in ["0.5.1", "0.5.2", "1.0.0"]:
+    def test_historical_two_platform_releases_preserve_their_signed_matrix(self):
+        for version in ["0.5.1", "0.5.2", "0.5.11", "0.6.0", "0.6.1"]:
             with self.subTest(version=version):
                 names = asset_names(version)
                 self.assertEqual(names, {
@@ -108,18 +108,39 @@ class ReleaseAssetsTests(unittest.TestCase):
                 with self.assertRaises(AssertionError):
                     candidate_updates(candidate, version)
 
-    def test_current_release_rejects_mac_archives_before_signing(self):
+    def test_macos_returns_at_062_with_numeric_version_ordering(self):
+        for version in ["0.6.2", "0.6.10", "0.7.0", "0.10.0", "1.0.0"]:
+            with self.subTest(version=version):
+                self.assertEqual(asset_names(version), {
+                    "windows-x86_64": f"desk-switch-v{version}-windows-x86-64.exe",
+                    "linux-x86_64-deb": f"desk-switch-v{version}-linux-x86-64.deb",
+                    "macos-arm64-app": f"desk-switch-v{version}-macos-arm64.zip",
+                    "macos-x86_64-app": f"desk-switch-v{version}-macos-x86-64.zip",
+                })
+
+    def test_historical_two_platform_releases_reject_mac_archives_before_signing(self):
         root = self.directory
         (root / "src").mkdir()
-        (root / "Cargo.toml").write_text('[package]\nversion = "0.5.1"\n')
         (root / "src/compatibility.rs").write_text("pub const PROTOCOL: u16 = 7;")
-        with patch.object(prepare_release, "ROOT", root), patch("sys.argv", ["prepare_release.py", "--windows", "missing.exe", "--deb", "missing.deb", "--tag", "v0.5.1", "--macos-arm64", "unexpected.zip"]), patch.object(prepare_release.subprocess, "check_output", side_effect=AssertionError("Signing key must not be accessed")), self.assertRaisesRegex(ValueError, "This release does not include macOS"):
-            prepare_release.main()
+        for version in ["0.5.1", "0.6.0", "0.6.1"]:
+            (root / "Cargo.toml").write_text(f'[package]\nversion = "{version}"\n')
+            with self.subTest(version=version), patch.object(prepare_release, "ROOT", root), patch("sys.argv", ["prepare_release.py", "--windows", "missing.exe", "--deb", "missing.deb", "--tag", f"v{version}", "--macos-arm64", "unexpected.zip"]), patch.object(prepare_release.subprocess, "check_output", side_effect=AssertionError("Signing key must not be accessed")), self.assertRaisesRegex(ValueError, "This release does not include macOS"):
+                prepare_release.main()
 
     def test_both_mac_architectures_pass_without_executing_the_bundle(self):
         for architecture in ["arm64", "x86_64"]:
             with self.subTest(architecture=architecture):
                 self.check(bundle(architecture), architecture)
+
+    def test_restored_mac_archives_require_the_current_version_and_protocol(self):
+        for architecture in ["arm64", "x86_64"]:
+            with self.subTest(architecture=architecture):
+                current = archive(bundle(architecture, version="0.6.2", protocol=8))
+                self.path.write_bytes(current)
+                self.assertEqual(checked_macos_archive(self.path, f"macos-{architecture}-app", "0.6.2", 8), current)
+                self.path.write_bytes(archive(bundle(architecture)))
+                with self.assertRaises(ValueError):
+                    checked_macos_archive(self.path, f"macos-{architecture}-app", "0.6.2", 8)
 
     def test_wrong_architecture_and_non_executable_macho_are_rejected(self):
         self.reject(bundle("x86_64"), "arm64")
@@ -210,19 +231,33 @@ class ReleaseAssetsTests(unittest.TestCase):
     def test_missing_mac_target_fails_before_accessing_the_signing_key(self):
         root = self.directory
         (root / "src").mkdir()
-        (root / "Cargo.toml").write_text('[package]\nversion = "0.5.0"\n')
         (root / "src/compatibility.rs").write_text("pub const PROTOCOL: u16 = 7;")
-        with patch.object(prepare_release, "ROOT", root), patch("sys.argv", ["prepare_release.py", "--windows", "missing.exe", "--deb", "missing.deb", "--tag", "v0.5.0"]), patch.object(prepare_release.subprocess, "check_output", side_effect=AssertionError("Signing key must not be accessed")), self.assertRaisesRegex(ValueError, "Missing required macos-arm64-app"):
+        for version in ["0.5.0", "0.6.2", "1.0.0"]:
+            (root / "Cargo.toml").write_text(f'[package]\nversion = "{version}"\n')
+            with self.subTest(version=version), patch.object(prepare_release, "ROOT", root), patch("sys.argv", ["prepare_release.py", "--windows", "missing.exe", "--deb", "missing.deb", "--tag", f"v{version}"]), patch.object(prepare_release.subprocess, "check_output", side_effect=AssertionError("Signing key must not be accessed")), self.assertRaisesRegex(ValueError, "Missing required macos-arm64-app"):
+                prepare_release.main()
+
+    def test_restored_release_requires_intel_archive_before_accessing_the_signing_key(self):
+        root = self.directory
+        (root / "src").mkdir()
+        (root / "Cargo.toml").write_text('[package]\nversion = "0.6.2"\n')
+        (root / "src/compatibility.rs").write_text("pub const PROTOCOL: u16 = 8;")
+        self.path.write_bytes(archive(bundle(version="0.6.2", protocol=8)))
+        with patch.object(prepare_release, "ROOT", root), patch("sys.argv", ["prepare_release.py", "--windows", "missing.exe", "--deb", "missing.deb", "--tag", "v0.6.2", "--macos-arm64", str(self.path)]), patch.object(prepare_release.subprocess, "check_output", side_effect=AssertionError("Signing key must not be accessed")), self.assertRaisesRegex(ValueError, "Missing required macos-x86_64-app"):
             prepare_release.main()
 
     def test_new_candidates_require_all_four_assets_without_renaming_mac_archives(self):
-        names = asset_names(VERSION)
-        candidate = {"tag_name": "v0.5.0", "prerelease": True, "draft": False,
-                     "body": "Notes", "assets": [{"id": index, "name": name, "state": "uploaded", "size": 10, "digest": "sha256:" + "11" * 32} for index, name in enumerate(names.values(), 1)]}
-        self.assertEqual(candidate_updates(candidate, VERSION), [])
-        incomplete = copy.deepcopy(candidate); incomplete["assets"].pop()
-        with self.assertRaises(AssertionError):
-            candidate_updates(incomplete, VERSION)
+        for version in ["0.5.0", "0.6.2", "1.0.0"]:
+            names = asset_names(version)
+            candidate = {"tag_name": f"v{version}", "prerelease": True, "draft": False,
+                         "body": "Notes", "assets": [{"id": index, "name": name, "state": "uploaded", "size": 10, "digest": "sha256:" + "11" * 32} for index, name in enumerate(names.values(), 1)]}
+            with self.subTest(version=version):
+                self.assertEqual(candidate_updates(candidate, version), [])
+                for missing in range(len(names)):
+                    incomplete = copy.deepcopy(candidate)
+                    incomplete["assets"].pop(missing)
+                    with self.assertRaises(AssertionError):
+                        candidate_updates(incomplete, version)
 
 
 if __name__ == "__main__":

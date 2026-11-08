@@ -77,9 +77,15 @@ impl Monitor for Ddc {
     }
 }
 pub fn list_displays() -> Result<Vec<super::MonitorInfo>> {
+    // Geometry discovery is read-only; it never contacts a DDC/CI bus.
+    let native = super::macos::geometry::snapshot()?;
     Ok(displays()?
         .into_iter()
         .map(|display| super::MonitorInfo {
+            native: native
+                .iter()
+                .find(|screen| screen.native_id == display.screen)
+                .cloned(),
             id: display.id,
             name: display.name,
             screen: display.screen,
@@ -89,7 +95,6 @@ pub fn list_displays() -> Result<Vec<super::MonitorInfo>> {
                 .builtin
                 .then(|| "The built-in display has no switchable input".into()),
             fingerprint: crate::config::hex(&Sha256::digest(display.fingerprint.as_bytes())),
-            native: None,
         })
         .collect())
 }
