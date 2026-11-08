@@ -9,6 +9,7 @@ mod cable;
 mod compatibility;
 mod config;
 mod controller;
+mod crash;
 mod discovery;
 mod edge;
 mod gate;
@@ -32,19 +33,38 @@ mod workspace;
 
 const USAGE: &str = "Desk Switch\n\
     gui [--tray]         Open the desktop window, optionally in the system tray\n\
+    gui --state-dir PATH  Open the desktop window with an explicit profile\n\
+    gui --tray --state-dir PATH  Open in the system tray with an explicit profile\n\
+    --version, -V        Print the application and protocol versions\n\
+    --build-info         Print build and protocol compatibility information\n\
     --licenses           Print the bundled open-source license notices\n\
     init                 Create this computer's identity and print its public key\n\
     public-key           Print the existing public key\n\
     pair PUBLIC_KEY      Pin the other computer's public key\n\
     state-dir            Print the settings and identity directory\n\
     probe [MONITOR_ID]   Read DDC/CI VCP 0x60 and enumerate advertised inputs\n\
+    probe --json         Enumerate monitors and inputs as JSON\n\
+    monitor-select ID INPUT  Select a monitor input\n\
+    monitor-read ID      Read monitor details as JSON\n\
+    monitor-service ID HOST OTHER host|receiver IP:PORT  Run the monitor service\n\
     portal-check         Ubuntu only; query Wayland portal capabilities\n\
     portal-check --consent  Ubuntu only; open EIS and list edge regions, without injecting input\n\
     run [--role host|receiver] IP:PORT  Select the keyboard host or receiving PC\n\
     audio help           Opt in to independent system audio between either OS\n\
-    microphone help      Opt in to a shared physical microphone";
+    microphone help      Opt in to a shared physical microphone\n\
+\n\
+    Internal helper commands (not for interactive use):\n\
+    internal-update-apply DIR  Apply a staged update\n\
+    --apply-update         Apply an update from the shared installation\n\
+    input-access PATH...   Grant selected input access (Linux)\n\
+    macos-export-helper NAME DESTINATION  Export a helper (macOS)\n\
+    gui-preview CASE --state-dir PATH  Render a preview (debug builds)";
 
 fn main() {
+    #[cfg(not(test))]
+    if let Ok(dir) = config::state_dir() {
+        crash::install(&dir);
+    }
     #[cfg(windows)]
     if std::env::args().len() > 1
         && !std::env::args().nth(1).is_some_and(|arg| {

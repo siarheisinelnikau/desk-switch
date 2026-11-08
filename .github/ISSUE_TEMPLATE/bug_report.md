@@ -29,7 +29,7 @@ What you expected to happen.
 
 ## Diagnostics
 
-Attach the in-app **Copy diagnostics** output if available. Remove any computer names, paths or keys you do not want to share. If the app crashed, include `last-error.txt` from the state directory (`state-dir`).
+Attach the in-app **Copy diagnostics** output if available. Remove any computer names, paths or keys you do not want to share. If the app crashed, include `panic-report.txt` from the state directory (`state-dir`); it holds the panic message, its location and a backtrace.
 
 ## Additional context
 
