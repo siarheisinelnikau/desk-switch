@@ -30,7 +30,7 @@ pub struct Preferences {
 impl Default for Preferences {
     fn default() -> Self {
         Self {
-            language: "en".into(),
+            language: crate::i18n::system_language().into(),
             theme: "dark".into(),
             discovery: false,
             autostart: true,

@@ -848,5 +848,6 @@
   "The previous application could not be restored": "No se pudo restaurar la aplicación anterior",
   "Installing the new application failed; the previous bundle was restored": "La instalación de la nueva aplicación falló; se restauró el paquete anterior",
   "Restoring the previous complete application bundle": "Restauración del paquete completo de la aplicación anterior",
-  "The updated application did not confirm startup; the previous bundle was restored": "La aplicación actualizada no confirmó el inicio; se restauró el paquete anterior"
+  "The updated application did not confirm startup; the previous bundle was restored": "La aplicación actualizada no confirmó el inicio; se restauró el paquete anterior",
+  "Desk Switch crashed last time: {}": "Desk Switch se bloqueó la última vez: {}"
 }

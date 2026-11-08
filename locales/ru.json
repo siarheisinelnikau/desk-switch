@@ -848,5 +848,6 @@
   "The previous application could not be restored": "Не удалось восстановить предыдущую версию приложения",
   "Installing the new application failed; the previous bundle was restored": "Установка новой версии не удалась; предыдущий пакет восстановлен",
   "Restoring the previous complete application bundle": "Восстановление предыдущего полного пакета приложения",
-  "The updated application did not confirm startup; the previous bundle was restored": "Обновлённое приложение не подтвердило запуск; предыдущий пакет восстановлен"
+  "The updated application did not confirm startup; the previous bundle was restored": "Обновлённое приложение не подтвердило запуск; предыдущий пакет восстановлен",
+  "Desk Switch crashed last time: {}": "В прошлый раз Desk Switch аварийно завершился: {}"
 }
