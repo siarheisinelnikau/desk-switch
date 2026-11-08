@@ -792,6 +792,7 @@ mod tests {
                 [(view.id.clone(), view.clone())].into(),
                 start + SHOW_DELAY,
             );
+            progress.show(ui.ctx());
         });
         assert!(progress.state.lock().unwrap().open);
         assert!(
@@ -811,6 +812,7 @@ mod tests {
                 [(view.id.clone(), view.clone())].into(),
                 start + SHOW_DELAY * 2,
             );
+            progress.show(ui.ctx());
         });
         assert!(
             !output
