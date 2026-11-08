@@ -11,7 +11,8 @@ Download matching versions from [Releases](https://github.com/siarheisinelnikau/
 - Keyboard/mouse sharing, arranged screen edges, crossing delay, protected corners and pause.
 - All computers' sound on one output, with system and relative volume.
 - One physical microphone delivered to virtual microphones.
-- Optional text/image/file/folder clipboard; direct file sends with cancel and resume.
+- Shared text/images; file and folder copies or moves start when pasted, with progress, pause and cancel.
+- Direct file sends with cancel and resume.
 - Shared HDMI/DisplayPort monitor switching.
 - Device choices, preferences and updates from any member.
 
@@ -36,4 +37,4 @@ On Ubuntu GNOME, enable **Desk Switch Tray** in **Extensions**.
 
 A good friend shared this idea and showed me [Hotseat](https://github.com/muspelheim/hotseat), his project for switching monitor inputs on macOS. I built Desk Switch for my Ubuntu and Windows computers, extending the idea to keyboards, mice, speakers, headphones and microphones. Thank you, my friend, for the idea and inspiration.
 
-macOS support is experimental and **has not been tested on physical hardware**. Bundles are ad-hoc signed, not notarized. **macOS testing and pull requests are warmly appreciated.**
+macOS support is experimental and **has not been tested on physical hardware**. Native file paste into Finder is unavailable; use **Send files…** to receive files on a Mac. Bundles are ad-hoc signed, not notarized. **macOS testing and pull requests are warmly appreciated.**
