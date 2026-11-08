@@ -99,6 +99,7 @@ def main():
         run("/usr/bin/iconutil", "-c", "icns", str(iconset), "-o", str(contents / "Resources/DeskSwitch.icns"))
         notices = {
             "LICENSE.txt": ROOT / "LICENSE",
+            "THIRD-PARTY-NOTICES.md": ROOT / "THIRD-PARTY-NOTICES.md",
             "m1ddc-LICENSE.txt": ROOT / "vendor/m1ddc/LICENSE",
             "VB-CABLE-NOTICE.txt": ROOT / "assets/third-party/vb-cable/NOTICE.txt",
             "cap-std-LICENSE-MIT.txt": ROOT / "assets/third-party/file-transfer/cap-std-LICENSE-MIT",

@@ -44,6 +44,7 @@ def main():
             "usr/share/icons/hicolor/scalable/apps/com.deskswitch.Desktop.svg": ROOT / "packaging/linux/com.deskswitch.Desktop.svg",
             "usr/share/doc/desk-switch/VB-CABLE-NOTICE.txt": ROOT / "assets/third-party/vb-cable/NOTICE.txt",
             "usr/share/doc/desk-switch/copyright": ROOT / "LICENSE",
+            "usr/share/doc/desk-switch/THIRD-PARTY-NOTICES.md": ROOT / "THIRD-PARTY-NOTICES.md",
             "usr/share/doc/desk-switch/rust-auto-updator-LICENSE": ROOT / "vendor/rust-auto-updator/LICENSE",
             "usr/share/doc/desk-switch/cap-std-LICENSE-MIT": ROOT / "assets/third-party/file-transfer/cap-std-LICENSE-MIT",
             "usr/share/doc/desk-switch/rfd-LICENSE": ROOT / "assets/third-party/file-transfer/rfd-LICENSE",
