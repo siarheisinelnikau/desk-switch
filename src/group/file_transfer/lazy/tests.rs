@@ -263,6 +263,34 @@ fn a_full_completion_queue_leaves_the_result_retryable_and_queues_it_once() {
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn dropping_the_last_fetch_removes_its_native_cache() {
+    let mut harness = Harness::new(4);
+    let provider = harness.provider();
+    let session = provider.begin(intent()).unwrap();
+    let fetch = harness.take_begin();
+    let manifest = Manifest {
+        version: protocol::MANIFEST_VERSION,
+        id: "34".repeat(16),
+        name: "Files".into(),
+        roots: vec!["Files".into()],
+        entries: vec![protocol::Entry {
+            path: vec!["Files".into()],
+            kind: Kind::Directory,
+        }],
+        total: 0,
+    };
+    let cache = harness.core.dir.join("file-transfer/native-cache");
+    let stage = cache.join(format!(".partial-{}", manifest.id));
+    let receive = storage::Receive::open(&cache, manifest, "peer", "workspace").unwrap();
+    fetch.state.lock().unwrap().verified = Some(Arc::new(Mutex::new(receive)));
+    assert!(stage.exists());
+    drop(session);
+    *provider.remote.fetch.lock().unwrap() = None;
+    drop(fetch);
+    assert!(!stage.exists());
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn offline_peers_are_not_announced_and_never_make_file_sharing_fatal() {
     let harness = Harness::new(4);
     for peer in harness.core.trust.lock().unwrap().peers.values_mut() {
