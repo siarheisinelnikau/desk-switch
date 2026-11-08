@@ -320,6 +320,8 @@ pub(super) fn require_private_dir(directory: &Dir) -> Result<()> {
     {
         use cap_std::fs::MetadataExt;
         ensure!(
+            // SAFETY: the call takes no arguments and only reads the calling process
+            // credentials.
             metadata.uid() == unsafe { libc::geteuid() } && metadata.mode() & 0o077 == 0,
             "Source Trash storage must be private to this user"
         );
@@ -730,8 +732,12 @@ fn deletion_date() -> Result<String> {
             .duration_since(std::time::UNIX_EPOCH)?
             .as_secs();
         let stamp = libc::time_t::try_from(now)?;
+        // SAFETY: `libc::tm` is a plain C structure of integers and pointers, so
+        // the all-zero bit pattern is a valid value.
         let mut local: libc::tm = unsafe { std::mem::zeroed() };
         ensure!(
+            // SAFETY: `stamp` is a live time value and `local` is a live structure of
+            // the size the call writes.
             !unsafe { libc::localtime_r(&stamp, &mut local) }.is_null(),
             "The local Trash timestamp is unavailable"
         );

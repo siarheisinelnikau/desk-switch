@@ -32,10 +32,14 @@ pub(crate) fn read() -> Result<Option<Selection>> {
 pub(crate) fn sequence() -> Option<u64> {
     #[cfg(windows)]
     {
+        // SAFETY: the function takes no arguments, returns a plain counter and
+        // transfers no ownership.
         #[link(name = "user32")]
         unsafe extern "system" {
             fn GetClipboardSequenceNumber() -> u32;
         }
+        // SAFETY: the call has no pointer arguments and only reads the clipboard
+        // sequence counter.
         let sequence = unsafe { GetClipboardSequenceNumber() };
         (sequence != 0).then_some(u64::from(sequence))
     }

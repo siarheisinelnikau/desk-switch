@@ -541,6 +541,8 @@ fn set_window_icons(window: &Window) -> Result<(), String> {
     use winit::platform::windows::WindowExtWindows;
     let dpi = (window.scale_factor() * 96.0).round().clamp(96.0, 768.0) as u32;
     let icon = |metric| {
+        // SAFETY: the call only reads a system metric for the given DPI and
+        // touches no memory.
         let size = unsafe { GetSystemMetricsForDpi(metric, dpi) }.clamp(16, 256) as u32;
         winit::window::Icon::from_rgba(icon_pixels(size), size, size)
             .map_err(|error| error.to_string())

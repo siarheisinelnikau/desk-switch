@@ -114,9 +114,11 @@ pub(in crate::platform) fn cursor() -> Result<(f64, f64)> {
     // SAFETY: `event` was checked to be non-null and is still owned here, so
     // the call reads a live event.
     let point = unsafe { event_location(event) };
+    // SAFETY: `event` came from event_create, is owned by this function and
+    // is released exactly once.
+    // SAFETY: `event` came from event_create, is owned by this function and
+    // is released exactly once.
     unsafe {
-        // SAFETY: `event` came from event_create, is owned by this function
-        // and is released exactly once.
         release(event);
     }
     ensure!(

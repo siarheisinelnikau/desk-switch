@@ -42,9 +42,11 @@ impl AudioScheduling {
 impl Drop for AudioScheduling {
     fn drop(&mut self) {
         if !self.0.is_null() {
+            // SAFETY: the handle was returned by
+            // AvSetMmThreadCharacteristicsW and is reverted exactly once.
+            // SAFETY: the handle was returned by AvSetMmThreadCharacteristicsW and is
+            // reverted exactly once.
             unsafe {
-                // SAFETY: the handle was returned by
-                // AvSetMmThreadCharacteristicsW and is reverted exactly once.
                 AvRevertMmThreadCharacteristics(self.0);
             }
         }
@@ -232,9 +234,11 @@ impl Output {
             // SAFETY: the returned interface is owned by this playback loop
             // and is released when it ends.
             unsafe { audio.as_iaudioclient().GetService()? };
+        // SAFETY: the session interface is owned by this loop and the null
+        // event pointer is allowed by the API.
+        // SAFETY: the session interface is owned by this loop and the null event
+        // pointer is allowed by the API.
         unsafe {
-            // SAFETY: the session interface is owned by this loop and the
-            // null event pointer is allowed by the API.
             session.SetGroupingParam(&super::SESSION_GROUP, std::ptr::null())?;
         }
         let event = audio.set_get_eventhandle()?;
