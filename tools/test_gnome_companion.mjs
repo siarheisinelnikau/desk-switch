@@ -280,6 +280,15 @@ windows.splice(windows.indexOf(quick), 1);
 const timeoutFocus = new Invocation(); await extension.ActivateWindowAsync(['quick'], timeoutFocus);
 for (const [id, callback] of timeouts) { timeouts.delete(id); callback(); }
 assert.equal(extension._focusRequests.size, 0); assert.equal(display.handlers.size, 0);
+const transfer = window(4200, 'Desk Switch file transfer'); windows.push(transfer);
+const deniedTransfer = new Invocation(':1.99');
+await extension.ActivateWindowAsync(['transfer'], deniedTransfer);
+assert(deniedTransfer.error); assert.equal(focused.length, 2);
+const activateTransfer = new Invocation();
+await extension.ActivateWindowAsync(['transfer'], activateTransfer);
+assert(activateTransfer.result); assert.equal(focused.length, 3);
+assert.equal(focused[2].window, transfer, 'only the authorized fixed transfer window is raised');
+assert.equal(timeouts.size, 0); assert.equal(display.handlers.size, 0);
 const pendingFocus = new Invocation(); await extension.ActivateWindowAsync(['quick'], pendingFocus);
 assert.equal(timeouts.size, 1);
 extension._queueScan(); assert.equal(idle.size, 1);
@@ -370,7 +379,10 @@ assert(concurrentReadA.result); assert(concurrentReadB.result);
 assert.equal(fileReads, beforeConcurrent + 1, 'concurrent authorized reads share one bounded native allocation');
 setFileData(copiedFiles, 'cut\nfile:///tmp/a');
 const cutFiles = new Invocation(); await fileExtension.ReadFilesAsync([0], cutFiles);
-assert(cutFiles.result); assert.equal(cutFiles.result.data[1], copiedFiles, 'cut metadata remains recognizable for suppression without authorizing a move');
+assert(cutFiles.result); assert.equal(cutFiles.result.data[1], copiedFiles, 'explicit cut metadata is preserved without reading file contents');
+setFileData(copiedFiles, 'cut\nfile://untrusted.invalid/tmp/a');
+const invalidCut = new Invocation(); await fileExtension.ReadFilesAsync([0], invalidCut);
+assert(invalidCut.error, 'cut URI metadata is subject to the same local path validation');
 setFileData(uriList, 'file:///tmp/' + 'x'.repeat(1024 * 1024));
 const excessive = new Invocation(); await fileExtension.ReadFilesAsync([0], excessive);
 assert(excessive.error); const excessiveReads = fileReads;
@@ -390,7 +402,7 @@ const lateFileOperation = fileExtension.WriteFilesAsync([new TextEncoder().encod
 fileExtension.disable(); await lateFileOperation;
 assert(lateFileWrite.error); assert.equal(writes, preFileWrite + 1, 'disable cancels pending authorized file clipboard writes');
 assert.equal(exports, 0); assert.equal(owned, 0); assert.equal(idle.size, 0);
-console.log('PASS: native file clipboard reads/writes are GUI-authorized, bounded, copy-only, local-URI-only and isolated from text sharing. No physical clipboard was touched.');
+console.log('PASS: native file clipboard reads/writes are GUI-authorized, bounded, local-URI-only and isolated from text sharing. Explicit copy/cut metadata never reads file contents. No physical clipboard was touched.');
 
 // Conditional publication cannot replace an explicit newer local copy, even
 // when that copy contains exactly the same text as its preceding selection.
@@ -418,6 +430,22 @@ await conditionalExtension.WriteFilesIfCurrentAsync([newerSerial, stagedUris], a
 assert.equal(acceptedReservation.result.signature, '(bu)');
 assert.equal(acceptedReservation.result.data[0], true); assert.equal(writes, beforeNewer + 1);
 assert.equal(new TextDecoder().decode(png), 'copy\nfile:///tmp/verified%20download');
+const fileBridgeVersion = new Invocation(); conditionalExtension.VersionAsync([], fileBridgeVersion);
+assert.deepEqual(Array.from(fileBridgeVersion.result.data), [2], 'ABI 2 advertises deferred file copy/move and transfer-window activation');
+const moveReservation = new Invocation();
+await conditionalExtension.WriteFilesWithOperationIfCurrentAsync([conditionalExtension._clipboardSerial, 1, stagedUris], moveReservation);
+assert.equal(moveReservation.result.data[0], true);
+assert.equal(new TextDecoder().decode(png), 'cut\nfile:///tmp/verified%20download');
+const beforeBadOperation = writes;
+const invalidOperation = new Invocation();
+await conditionalExtension.WriteFilesWithOperationIfCurrentAsync([conditionalExtension._clipboardSerial, 2, stagedUris], invalidOperation);
+assert(invalidOperation.error); assert.equal(writes, beforeBadOperation);
+const staleMove = new Invocation();
+await conditionalExtension.WriteFilesWithOperationIfCurrentAsync([newerSerial, 1, stagedUris], staleMove);
+assert.equal(staleMove.result.data[0], false); assert.equal(writes, beforeBadOperation);
+const unauthorizedMove = new Invocation(':1.6');
+await conditionalExtension.WriteFilesWithOperationIfCurrentAsync([conditionalExtension._clipboardSerial, 1, stagedUris], unauthorizedMove);
+assert(unauthorizedMove.error); assert.equal(writes, beforeBadOperation);
 const forbiddenConditional = new Invocation(':1.6'); const beforeConditionalDenial = writes;
 await conditionalExtension.WriteFilesIfCurrentAsync([conditionalExtension._clipboardSerial, stagedUris], forbiddenConditional);
 assert(forbiddenConditional.error); assert.equal(writes, beforeConditionalDenial);

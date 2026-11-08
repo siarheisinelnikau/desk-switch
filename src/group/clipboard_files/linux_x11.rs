@@ -1,6 +1,9 @@
 //! Event-driven native X11 file selection owner. Conditional publication uses
 //! one connection for the server-serialized revision check and ownership change.
-use super::{GNOME_MIME, LIMIT, Selection, URI_MIME, encode_paths, parse_selection};
+use super::{
+    GNOME_MIME, LIMIT, Operation, Selection, URI_MIME, encode_paths, parse_selection,
+    selection_operation,
+};
 use anyhow::{Context, Result, bail, ensure};
 use std::{
     collections::{BTreeMap, VecDeque},
@@ -101,13 +104,27 @@ impl X11 {
     }
     #[cfg(test)]
     pub(super) fn write(&mut self, paths: &[PathBuf]) -> Result<()> {
-        self.publish(paths, None).map(|_| ())
+        self.publish(paths, None, Operation::Copy).map(|_| ())
     }
+    #[cfg(test)]
     pub(super) fn write_if_current(&mut self, paths: &[PathBuf], expected: u64) -> Result<bool> {
-        self.publish(paths, Some(expected))
+        self.publish(paths, Some(expected), Operation::Copy)
     }
-    fn publish(&mut self, paths: &[PathBuf], expected: Option<u64>) -> Result<bool> {
-        let value = Prepared::new(paths)?;
+    pub(super) fn write_operation_if_current(
+        &mut self,
+        paths: &[PathBuf],
+        expected: u64,
+        operation: Operation,
+    ) -> Result<bool> {
+        self.publish(paths, Some(expected), operation)
+    }
+    fn publish(
+        &mut self,
+        paths: &[PathBuf],
+        expected: Option<u64>,
+        operation: Operation,
+    ) -> Result<bool> {
+        let value = Prepared::new(paths, operation)?;
         let (send, reply) = mpsc::sync_channel(1);
         self.queue(
             Command::Publish {
@@ -137,7 +154,7 @@ impl X11 {
         // The normal public call supplies its real five-second deadline. Its
         // request must remain rejected when the synthetic delayed read ends.
         ensure!(
-            self.publish(paths, None).is_err(),
+            self.publish(paths, None, Operation::Copy).is_err(),
             "The queued publication did not time out"
         );
         Ok(())
@@ -226,9 +243,10 @@ struct Prepared {
     uri: Arc<Vec<u8>>,
     gnome: Arc<Vec<u8>>,
     timestamp: u32,
+    operation: Operation,
 }
 impl Prepared {
-    fn new(paths: &[PathBuf]) -> Result<Self> {
+    fn new(paths: &[PathBuf], operation: Operation) -> Result<Self> {
         // All filesystem work is complete before acquiring a server grab.
         for path in paths {
             let info = std::fs::symlink_metadata(path)?;
@@ -243,7 +261,12 @@ impl Prepared {
         }
         let uri = encode_paths(paths)?;
         let text = std::str::from_utf8(&uri)?;
-        let gnome = format!("copy\n{}", text.replace("\r\n", "\n")).into_bytes();
+        let action = if operation == Operation::Move {
+            "cut"
+        } else {
+            "copy"
+        };
+        let gnome = format!("{action}\n{}", text.replace("\r\n", "\n")).into_bytes();
         ensure!(
             gnome.len() <= LIMIT,
             "File clipboard exceeds the 1 MiB metadata limit"
@@ -253,6 +276,7 @@ impl Prepared {
             uri: Arc::new(uri),
             gnome: Arc::new(gnome),
             timestamp: 0,
+            operation,
         })
     }
 }
@@ -301,6 +325,7 @@ struct Owner {
     sequence: u64,
     dirty: bool,
     paths: Option<Vec<PathBuf>>,
+    operation: Operation,
     last_owner: Option<Window>,
     owned: Option<Prepared>,
     inline: usize,
@@ -353,6 +378,7 @@ impl Owner {
             sequence: 1,
             dirty: true,
             paths: None,
+            operation: Operation::Copy,
             last_owner: None,
             owned: None,
             inline,
@@ -541,6 +567,7 @@ impl Owner {
     ) -> Result<bool> {
         self.drain()?;
         let paths = value.paths.clone();
+        let operation = value.operation;
         // Only our connection is used while grabbed. This short critical region
         // contains native synchronization/check/set requests and bounded event
         // bookkeeping; no file access, other client call, or await is involved.
@@ -579,6 +606,7 @@ impl Owner {
             return Err(error);
         }
         self.paths = Some(paths);
+        self.operation = operation;
         self.last_owner = Some(self.window);
         self.dirty = false;
         drop(grab);
@@ -607,6 +635,7 @@ impl Owner {
         self.paths.clone().map(|paths| Selection {
             sequence: self.sequence,
             paths,
+            operation: self.operation,
         })
     }
     fn read(&mut self) -> Result<Option<Selection>> {
@@ -621,6 +650,7 @@ impl Owner {
             .owner;
         if owner == x11rb::NONE {
             self.paths = None;
+            self.operation = Operation::Copy;
             self.last_owner = Some(owner);
             self.dirty = false;
             return Ok(None);
@@ -629,17 +659,21 @@ impl Owner {
             && let Some(value) = &self.owned
         {
             self.paths = Some(value.paths.clone());
+            self.operation = value.operation;
             self.last_owner = Some(owner);
             self.dirty = false;
             return Ok(self.selection());
         }
         let initial = self.sequence;
-        let value = if let Some(bytes) = self.convert(self.atoms.gnome_files)? {
-            parse_selection(GNOME_MIME, &bytes)?
+        let (value, operation) = if let Some(bytes) = self.convert(self.atoms.gnome_files)? {
+            (
+                parse_selection(GNOME_MIME, &bytes)?,
+                selection_operation(GNOME_MIME, &bytes)?,
+            )
         } else if let Some(bytes) = self.convert(self.atoms.uri_list)? {
-            parse_selection(URI_MIME, &bytes)?
+            (parse_selection(URI_MIME, &bytes)?, Operation::Copy)
         } else {
-            None
+            (None, Operation::Copy)
         };
         self.drain()?;
         ensure!(
@@ -653,6 +687,7 @@ impl Owner {
             "The clipboard changed; retry the file copy"
         );
         self.paths = value;
+        self.operation = operation;
         self.last_owner = Some(owner);
         self.dirty = false;
         Ok(self.selection())

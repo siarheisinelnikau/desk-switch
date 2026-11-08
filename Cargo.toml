@@ -1,6 +1,6 @@
 [package]
 name = "desk-switch"
-version = "0.7.0"
+version = "0.8.0"
 edition = "2024"
 rust-version = "1.99"
 license = "MIT"
@@ -44,6 +44,7 @@ reis = { version = "0.7", features = ["tokio"] }
 rustix = { version = "1.1", features = ["time", "process"] }
 ksni = { version = "0.3.6", features = ["blocking"] }
 x11rb = { version = "=0.13.2", features = ["xfixes"] }
+fuser = { version = "=0.18.0", default-features = false }
 tokio = { version = "1.48", features = ["process"] }
 
 [target.'cfg(windows)'.dependencies]
@@ -54,7 +55,8 @@ winit = { version = "=0.30.13", default-features = false, features = ["rwh_06"] 
 bytemuck = "1"
 tray-icon = { version = "0.25", default-features = false }
 wasapi = "0.26"
-windows = { version = "0.62", features = ["Win32_Media_Audio", "Win32_Media_Audio_Endpoints", "Win32_System_Com"] }
+windows = { version = "0.62", features = ["Win32_Media_Audio", "Win32_Media_Audio_Endpoints", "Win32_Security", "Win32_Security_Authorization", "Win32_Storage_CloudFilters", "Win32_Storage_FileSystem", "Win32_System_Com", "Win32_System_CorrelationVector", "Win32_System_IO", "Win32_System_Ole", "Win32_System_Threading", "Win32_System_Variant", "Win32_UI_Shell", "Win32_UI_Shell_Common"] }
+windows-core = "=0.62.2"
 windows-sys = { version = "0.61", features = [
     "Win32_Devices_Display",
     "Win32_Devices_DeviceAndDriverInstallation",

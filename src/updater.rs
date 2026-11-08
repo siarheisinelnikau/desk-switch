@@ -267,6 +267,13 @@ fn fetch_release_at(
     unreachable!("each final request either returns a response or an error")
 }
 
+fn artifact<'a>(release: &'a Release, target: &str) -> Result<&'a Artifact> {
+    release
+        .targets
+        .get(target)
+        .with_context(|| format!("The signed release does not contain an update for {target}"))
+}
+
 fn sibling(executable: &Path, suffix: &str) -> Result<PathBuf> {
     let mut name = executable
         .file_name()
@@ -851,7 +858,7 @@ fn pending(dir: &Path) -> Result<(Pending, Release)> {
             > semver::Version::parse(crate::compatibility::VERSION)?,
         "refusing an old update"
     );
-    checksum(&pending.payload, &release.targets[target()?])?;
+    checksum(&pending.payload, artifact(&release, target()?)?)?;
     binary_version(&pending.payload, &release)?;
     Ok((pending, release))
 }
@@ -972,7 +979,7 @@ fn apply_inner(dir: &Path) -> Result<()> {
     let _update_lock = binary_lock(&pending.executable)?;
     let backup = sibling(&pending.executable, ".desk-switch-previous")?;
     fs::copy(&pending.executable, &backup).context("создание резервной копии приложения")?;
-    checksum(&pending.payload, &release.targets[target()?])?;
+    checksum(&pending.payload, artifact(&release, target()?)?)?;
     replace(&pending.payload, &pending.executable)?;
     drop(locks);
     let mut child = match restart(&pending.executable, dir) {
@@ -1173,6 +1180,17 @@ mod tests {
         envelope.payload = envelope.payload.replace("0.3.0", "9.0.0");
         assert!(verified(&envelope, &key).is_err());
     }
+    #[test]
+    fn a_release_without_this_platform_target_is_rejected_without_panicking() {
+        let release = Release {
+            version: "0.3.0".into(),
+            protocol: 3,
+            targets: BTreeMap::new(),
+        };
+        let error = artifact(&release, target().unwrap()).unwrap_err();
+        assert!(error.to_string().contains("does not contain an update"));
+    }
+
     #[test]
     fn hash_and_size_must_both_match() {
         let path = std::env::temp_dir().join(format!("desk-switch-hash-{}", std::process::id()));

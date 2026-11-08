@@ -38,9 +38,11 @@ pub(super) struct Transfers {
 
 enum Command {
     Send { target: String, paths: Vec<PathBuf> },
+    Pause(String),
     Cancel(String),
     Resume(String),
     OpenFolder(PathBuf),
+    OpenRecovery(PathBuf),
     RetryService,
     ChooseAgain(String),
 }
@@ -325,7 +327,7 @@ fn progress(transfer: &Transfer) -> f32 {
     }
 }
 
-fn bytes(value: u64) -> String {
+pub(super) fn bytes(value: u64) -> String {
     const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
     let mut value = value as f64;
     let mut index = 0;
@@ -340,7 +342,18 @@ fn bytes(value: u64) -> String {
     }
 }
 
-fn active(transfer: &Transfer) -> bool {
+pub(super) fn active(transfer: &Transfer) -> bool {
+    if !transfer.recovery_paths.is_empty()
+        || transfer.paste.as_ref().is_some_and(|paste| {
+            paste.stage == crate::group::file_transfer::PasteStage::OriginalsRetained
+        })
+    {
+        return true;
+    }
+    if let Some(paste) = &transfer.paste {
+        return !super::file_progress::terminal(transfer)
+            && paste.stage != crate::group::file_transfer::PasteStage::Failed;
+    }
     matches!(
         transfer.phase,
         Phase::Preparing | Phase::Connecting | Phase::Transferring | Phase::Verifying
@@ -359,6 +372,9 @@ fn ordered_transfers(transfers: &[Transfer]) -> Vec<&Transfer> {
 }
 
 fn phase(transfer: &Transfer) -> &'static str {
+    if transfer.paste.is_some() {
+        return super::file_progress::status(transfer);
+    }
     match transfer.phase {
         Phase::Preparing => "Preparing…",
         Phase::Connecting => "Connecting…",
@@ -429,10 +445,20 @@ fn transfer_row(
         );
     }
     if let Some(error) = &transfer.error {
-        error_feedback(ui, error);
+        if transfer.paste.as_ref().is_some_and(|paste| {
+            paste.stage == crate::group::file_transfer::PasteStage::OriginalsRetained
+        }) {
+            ui.weak(tr(
+                "The received files are kept. The originals remain on the source computer.",
+            ));
+            error_details(ui, error);
+        } else {
+            error_feedback(ui, error);
+        }
     }
     ui.horizontal_wrapped(|ui| {
-        let clipboard = transfer.phase == Phase::Completed
+        let clipboard = transfer.paste.is_none()
+            && transfer.phase == Phase::Completed
             && transfer.direction == Direction::Receiving
             && transfer.origin == Origin::Clipboard;
         if clipboard
@@ -453,7 +479,12 @@ fn transfer_row(
         {
             commands.push(Command::Resume(transfer.id.clone()));
         }
-        if !matches!(transfer.phase, Phase::Completed | Phase::Cancelled)
+        if super::file_progress::can_pause(transfer)
+            && ui.small_button(tr("Pause transfer")).clicked()
+        {
+            commands.push(Command::Pause(transfer.id.clone()));
+        }
+        if super::file_progress::can_cancel(transfer)
             && ui.small_button(tr("Cancel transfer")).clicked()
         {
             commands.push(Command::Cancel(transfer.id.clone()));
@@ -471,12 +502,16 @@ fn transfer_row(
         {
             commands.push(Command::ChooseAgain(transfer.peer.clone()));
         }
-        if transfer.phase == Phase::Completed
+        if transfer.paste.is_none()
+            && transfer.phase == Phase::Completed
             && transfer.direction == Direction::Receiving
             && let Some(path) = transfer.paths.first().and_then(|path| path.parent())
             && ui.small_button(tr("Open folder")).clicked()
         {
             commands.push(Command::OpenFolder(path.into()));
+        }
+        if let Some(directory) = recovery_button(ui, &transfer.recovery_paths) {
+            commands.push(Command::OpenRecovery(directory));
         }
     });
     ui.add_space(6.0);
@@ -510,6 +545,8 @@ fn error_summary(error: &str) -> &'static str {
         "The received folder is no longer available"
     } else if error.starts_with("Could not open the received folder") {
         "Could not open the received folder"
+    } else if error.starts_with("Could not open the recovery folder") {
+        "Could not open the recovery folder"
     } else if error.starts_with("Could not open the file picker") {
         "Could not open the file picker"
     } else if error.starts_with("Choose up to 256 files or folders") {
@@ -525,8 +562,12 @@ fn error_summary(error: &str) -> &'static str {
     }
 }
 
-fn error_feedback(ui: &mut egui::Ui, error: &str) {
+pub(super) fn error_feedback(ui: &mut egui::Ui, error: &str) {
     ui.colored_label(ui.visuals().error_fg_color, tr(error_summary(error)));
+    error_details(ui, error);
+}
+
+pub(super) fn error_details(ui: &mut egui::Ui, error: &str) {
     egui::CollapsingHeader::new(tr("Details"))
         .id_salt(("file-error-details", error))
         .show(ui, |ui| {
@@ -560,6 +601,10 @@ impl Desktop {
             clipboard_ready,
             clipboard_pending: false,
             clipboard_skipped: false,
+            paste: None,
+            pause_reason: None,
+            current_name: None,
+            recovery_paths: Vec::new(),
         };
         self.transfers.preview = vec![
             transfer(
@@ -671,7 +716,7 @@ impl Desktop {
         self.page = Page::Overview;
     }
 
-    fn transfer_snapshot(&self) -> Vec<Transfer> {
+    pub(super) fn transfer_snapshot(&self) -> Vec<Transfer> {
         #[cfg(debug_assertions)]
         if self.group.preview {
             return self.transfers.preview.clone();
@@ -732,6 +777,14 @@ impl Desktop {
         if let Some(error) = &runtime_error {
             self.transfers.service_error = Some(format!("File sharing is unavailable: {error}"));
         }
+        if let Some(notice) = self
+            .group
+            .file_transfer
+            .as_ref()
+            .and_then(|service| service.take_notice())
+        {
+            self.transfers.error = Some(notice);
+        }
         let available = (self.group.file_transfer.is_some()
             && runtime_error.is_none()
             && workspace.authority.is_some())
@@ -758,13 +811,22 @@ impl Desktop {
                 .show(ctx, workspace, &self.public_key, &capabilities, &snapshot);
         for command in commands {
             let result = match command {
+                Command::Pause(id) => self
+                    .group
+                    .file_transfer
+                    .as_ref()
+                    .context("File sharing is unavailable")
+                    .and_then(|service| service.pause(&id)),
                 Command::Send { target, paths } => self
                     .group
                     .file_transfer
                     .as_ref()
                     .context("File sharing is unavailable")
                     .and_then(|service| service.send(target, paths))
-                    .map(|_| self.transfers.selection.clear()),
+                    .map(|_| {
+                        self.transfers.selection.clear();
+                        self.transfers.close();
+                    }),
                 Command::Cancel(id) => self
                     .group
                     .file_transfer
@@ -778,6 +840,7 @@ impl Desktop {
                     .context("File sharing is unavailable")
                     .and_then(|service| service.resume(&id)),
                 Command::OpenFolder(path) => open_folder(&path),
+                Command::OpenRecovery(path) => open_recovery_folder(&path),
                 Command::RetryService => {
                     self.start_file_transfers(ctx);
                     if let Some(error) = &self.transfers.service_error {
@@ -794,10 +857,132 @@ impl Desktop {
             self.transfers.error = result.err().map(|error| format!("{error:#}"));
         }
     }
+
+    pub(super) fn transfer_progress(&mut self, ctx: &egui::Context) {
+        use crate::group::file_transfer::FileEvent;
+        if self.quitting {
+            self.file_progress.close(ctx);
+            return;
+        }
+        if let Some(service) = &self.group.file_transfer {
+            for event in service.take_events() {
+                match event {
+                    FileEvent::PasteStarted { id } => self.file_progress.started(id, ctx),
+                    FileEvent::SendStarted { id } => self.file_progress.started(id, ctx),
+                }
+            }
+        }
+        for command in self.file_progress.take_commands() {
+            let mut close = false;
+            let result = self
+                .group
+                .file_transfer
+                .as_ref()
+                .context("File sharing is unavailable")
+                .and_then(|service| match command {
+                    super::file_progress::Command::Pause(id) => service.pause(&id),
+                    super::file_progress::Command::Resume(id) => service.resume(&id),
+                    super::file_progress::Command::Cancel(id) => service.cancel(&id),
+                    super::file_progress::Command::Close(ids) => {
+                        for id in ids {
+                            service.cancel(&id)?;
+                        }
+                        close = true;
+                        Ok(())
+                    }
+                    super::file_progress::Command::OpenRecovery(path) => {
+                        open_recovery_folder(&path)
+                    }
+                });
+            if let Err(error) = result {
+                self.file_progress.error(format!("{error:#}"), ctx);
+            } else if close {
+                self.file_progress.close(ctx);
+            }
+        }
+        let Some(workspace) = self.group.workspace.as_ref() else {
+            self.file_progress.close(ctx);
+            return;
+        };
+        let snapshot = self.transfer_snapshot();
+        let resumable = snapshot
+            .iter()
+            .filter(|transfer| {
+                self.group
+                    .file_transfer
+                    .as_ref()
+                    .is_some_and(|service| service.can_resume(&transfer.id))
+            })
+            .map(|transfer| transfer.id.clone())
+            .collect();
+        self.file_progress
+            .update(ctx, workspace, &snapshot, &resumable);
+        self.file_progress.show(ctx);
+    }
+
+    pub(super) fn reopen_transfer_progress(&mut self, ctx: &egui::Context) {
+        let ids = self
+            .transfer_snapshot()
+            .into_iter()
+            .filter(active)
+            .map(|transfer| transfer.id)
+            .collect::<Vec<_>>();
+        if ids.is_empty() {
+            self.open_transfers(None);
+            self.action(super::Action::Show, ctx);
+        } else {
+            for id in ids {
+                self.file_progress.reopen(id, ctx);
+            }
+        }
+    }
 }
 
 fn open_folder(path: &std::path::Path) -> Result<()> {
-    ensure!(path.is_dir(), "The received folder is no longer available");
+    open_directory(
+        path,
+        "The received folder is no longer available",
+        "Could not open the received folder",
+    )
+}
+
+pub(super) fn recovery_button(ui: &mut egui::Ui, paths: &[PathBuf]) -> Option<PathBuf> {
+    match paths {
+        [] => None,
+        [path] => ui
+            .button(tr("Open recovery folder"))
+            .on_hover_text(path.display().to_string())
+            .clicked()
+            .then(|| path.clone()),
+        _ => {
+            let mut selected = None;
+            ui.menu_button(tr("Open recovery folder"), |ui| {
+                for path in paths {
+                    if ui.button(path.display().to_string()).clicked() {
+                        selected = Some(path.clone());
+                        ui.close();
+                    }
+                }
+            });
+            selected
+        }
+    }
+}
+
+fn open_recovery_folder(path: &std::path::Path) -> Result<()> {
+    open_directory(
+        path,
+        "The recovery folder is no longer available",
+        "Could not open the recovery folder",
+    )
+}
+
+fn open_directory(
+    path: &std::path::Path,
+    missing: &'static str,
+    failed: &'static str,
+) -> Result<()> {
+    ensure!(path.is_dir(), "{missing}");
     #[cfg(windows)]
     let mut command = {
         let mut command = std::process::Command::new("explorer.exe");
@@ -816,9 +1001,7 @@ fn open_folder(path: &std::path::Path) -> Result<()> {
         command.arg(path);
         command
     };
-    command
-        .spawn()
-        .context("Could not open the received folder")?;
+    command.spawn().context(failed)?;
     Ok(())
 }
 
@@ -846,6 +1029,10 @@ mod tests {
             clipboard_ready: false,
             clipboard_pending: true,
             clipboard_skipped: false,
+            paste: None,
+            pause_reason: None,
+            current_name: None,
+            recovery_paths: Vec::new(),
         }
     }
 
