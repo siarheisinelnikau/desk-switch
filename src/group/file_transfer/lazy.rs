@@ -540,6 +540,22 @@ impl PasteSession for Session {
     }
 }
 
+#[cfg(test)]
+pub(super) fn test_remote_state(core: &Core, handle: &str) -> Option<(Option<String>, u64, bool)> {
+    let state = core.lazy.lock().unwrap();
+    let remote = state.remotes.get(handle)?;
+    Some((
+        state.remote.clone(),
+        remote.stamp.counter,
+        remote.active.load(Ordering::Acquire),
+    ))
+}
+
+#[cfg(test)]
+pub(super) fn test_remote_count(core: &Core) -> usize {
+    core.lazy.lock().unwrap().remotes.len()
+}
+
 pub(super) fn fetch(core: &Core, id: &str) -> Option<Arc<Fetch>> {
     core.lazy
         .lock()
