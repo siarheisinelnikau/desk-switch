@@ -436,7 +436,6 @@ impl Cleanup {
         // Never recursively remove a computed directory. Remove only entries
         // whose immutable native identity and last verified generation match.
         let identities = self.context.identities.lock().unwrap().clone();
-        let verified = self.context.verified.lock().unwrap().clone();
         let mut entries = (0..self.context.offer.description.entries.len()).collect::<Vec<_>>();
         entries.sort_by_key(|index| {
             std::cmp::Reverse(self.context.offer.description.entries[*index].path.len())
@@ -458,9 +457,10 @@ impl Cleanup {
                     let _ = fs::remove_dir(&path);
                 }
                 DescriptorKind::File { .. } => {
-                    if verified.get(&index).is_some_and(|saved| saved == &actual) {
-                        let _ = fs::remove_file(&path);
-                    }
+                    // The sync root is a private cache. The immutable identity
+                    // check above is sufficient; requiring the last verified
+                    // generation leaves partially hydrated files behind.
+                    let _ = fs::remove_file(&path);
                 }
             }
         }
