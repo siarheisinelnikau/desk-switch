@@ -4,5 +4,5 @@
   "description": "Left-click opens Desk Switch quick controls; right-click keeps the native GNOME menu. Provides opt-in clipboard sharing and read-only pointer state for GNOME Wayland screen edges.",
   "shell-version": ["45", "46", "47", "48", "49", "50", "51"],
   "url": "https://github.com/siarheisinelnikau/desk-switch",
-  "version": 3
+  "version": 4
 }

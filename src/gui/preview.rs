@@ -131,6 +131,7 @@ fn render_probe(
     causes: std::sync::Arc<std::sync::Mutex<std::collections::BTreeMap<String, u64>>>,
     output: PathBuf,
     send: std::sync::mpsc::Sender<Action>,
+    file_progress: bool,
 ) -> Result<()> {
     anyhow::ensure!(
         output.is_absolute(),
@@ -144,20 +145,31 @@ fn render_probe(
                 time::{Duration, Instant},
             };
             let mut samples = Vec::new();
-            for state in ["visible-idle", "hidden", "restored-idle"] {
-                if state != "visible-idle" {
+            let states: &[&str] = if file_progress { &["visible-idle", "minimized", "hidden", "restored-idle"] } else { &["visible-idle", "hidden", "restored-idle"] };
+            for &state in states {
+                if file_progress {
+                    let progress = super::file_progress::id();
+                    if state == "hidden" {
+                        ctx.send_viewport_cmd_to(progress, egui::ViewportCommand::Minimized(false));
+                        ctx.send_viewport_cmd_to(progress, egui::ViewportCommand::Visible(false));
+                    } else {
+                        ctx.send_viewport_cmd_to(progress, egui::ViewportCommand::Visible(true));
+                        ctx.send_viewport_cmd_to(progress, egui::ViewportCommand::Minimized(state == "minimized"));
+                    }
+                } else if state != "visible-idle" {
                     ctx.send_viewport_cmd(egui::ViewportCommand::Visible(state != "hidden"));
                 }
                 // Resize, font uploads and finite scroll-bar animations can outlive
                 // the first frame. Measure only after two seconds without UI work.
                 let warm = Instant::now();
                 let mut quiet = Instant::now();
-                let mut previous = frames.load(Ordering::Relaxed);
-                while warm.elapsed() < Duration::from_secs(8)
+                let frame_count = || frames.load(Ordering::Relaxed) + super::popup::FRAMES.load(Ordering::Relaxed) + super::file_progress::FRAMES.load(Ordering::Relaxed);
+                let mut previous = frame_count();
+                while warm.elapsed() < Duration::from_secs(if file_progress { 6 } else { 8 })
                     && quiet.elapsed() < Duration::from_secs(2)
                 {
                     std::thread::sleep(Duration::from_millis(100));
-                    let current = frames.load(Ordering::Relaxed);
+                    let current = frame_count();
                     if current != previous {
                         previous = current;
                         quiet = Instant::now();
@@ -166,6 +178,7 @@ fn render_probe(
                 let settled = quiet.elapsed() >= Duration::from_secs(2);
                 let start = frames.load(Ordering::Relaxed);
                 let popup_start = super::popup::FRAMES.load(Ordering::Relaxed);
+                let progress_start = super::file_progress::FRAMES.load(Ordering::Relaxed);
                 let input_start: u64 = causes.lock().unwrap().iter().filter(|(key, _)| key.starts_with("input:")).map(|(_, count)| count).sum();
                 let since = Instant::now();
                 std::thread::sleep(Duration::from_secs(6));
@@ -174,11 +187,14 @@ fn render_probe(
                     "settled": settled, "warm_seconds": warm.elapsed().as_secs_f64() - since.elapsed().as_secs_f64(),
                     "ui_frames": frames.load(Ordering::Relaxed) - start,
                     "popup_ui_frames": super::popup::FRAMES.load(Ordering::Relaxed) - popup_start,
+                    "file_progress_ui_frames": super::file_progress::FRAMES.load(Ordering::Relaxed) - progress_start,
+                    "file_progress_minimized": file_progress.then(|| ctx.input(|input| input.raw.viewports.get(&super::file_progress::id()).and_then(|viewport| viewport.minimized))),
                     "input_events": causes.lock().unwrap().iter().filter(|(key, _)| key.starts_with("input:")).map(|(_, count)| count).sum::<u64>() - input_start,
                 }));
             }
             let result = serde_json::to_string_pretty(&serde_json::json!({
                 "backend": backend, "fixture": true, "isolated_offscreen": true, "samples": samples,
+                "file_progress_viewport": file_progress,
                 "total_ui_frames": frames.load(Ordering::Relaxed),
                 "repaint_causes": *causes.lock().unwrap(),
             }))
@@ -224,7 +240,16 @@ pub fn run(case: &str, dir: PathBuf) -> Result<()> {
         viewport: egui::ViewportBuilder::default()
             .with_title("Desk Switch")
             .with_active(false)
-            .with_inner_size(if case.ends_with("quick-controls") {
+            .with_inner_size(if case.starts_with("shared-four-file-progress") {
+                [
+                    480.0,
+                    if case.ends_with("multiple") {
+                        600.0
+                    } else {
+                        370.0
+                    },
+                ]
+            } else if case.ends_with("quick-controls") {
                 let size = super::popup::preferred_size();
                 [size.x, size.y]
             } else if capturing || std::env::var_os("EFRAME_SCREENSHOT_TO").is_some() {
@@ -232,7 +257,9 @@ pub fn run(case: &str, dir: PathBuf) -> Result<()> {
             } else {
                 [1080.0, 760.0]
             })
-            .with_min_inner_size(if case.ends_with("quick-controls") {
+            .with_min_inner_size(if case.starts_with("shared-four-file-progress") {
+                [400.0, 240.0]
+            } else if case.ends_with("quick-controls") {
                 let size = super::popup::preferred_size();
                 [size.x, size.y]
             } else {
@@ -284,6 +311,7 @@ pub fn run(case: &str, dir: PathBuf) -> Result<()> {
                 causes.clone(),
                 output.into(),
                 app.quick.sender(),
+                case == "shared-four-file-progress-native",
             )?;
         }
         Ok(PreviewApp {
@@ -384,6 +412,8 @@ impl Desktop {
             tray.preview_label();
         }
         self.preview_popup = case.ends_with("quick-controls");
+        self.preview_file_progress =
+            case.starts_with("shared-four-file-progress") && !case.ends_with("native");
         let case = if case == "quick-controls" {
             "shared-audio"
         } else {
@@ -957,6 +987,35 @@ impl Desktop {
             }
             if case.starts_with("shared-four-transfers") {
                 self.preview_transfers(case);
+            }
+            if case == "shared-four-file-progress-native" {
+                self.preview_transfers("shared-four-transfers");
+                self.transfers.close();
+                self.transfers
+                    .preview
+                    .retain(|transfer| transfer.id == "active-fixture");
+                let transfer = self.transfers.preview.first_mut().unwrap();
+                transfer.direction = crate::group::file_transfer::Direction::Receiving;
+                transfer.origin = crate::group::file_transfer::Origin::Clipboard;
+                transfer.phase = crate::group::file_transfer::Phase::Paused;
+                transfer.pause_reason = Some(crate::group::file_transfer::PauseReason::User);
+                transfer.paste = Some(crate::group::file_transfer::PasteView {
+                    operation: crate::group::file_transfer::Operation::Copy,
+                    stage: crate::group::file_transfer::PasteStage::Paused,
+                    destination: None,
+                    reports_completion: false,
+                });
+                self.file_progress.started(transfer.id.clone(), &self.ctx);
+                if std::env::var_os("DESK_SWITCH_RENDER_PROBE").is_some() {
+                    self.file_progress.native_probe_offscreen();
+                }
+                self.hidden = true;
+                self.ctx.send_viewport_cmd_to(
+                    egui::ViewportId::ROOT,
+                    egui::ViewportCommand::Visible(false),
+                );
+            } else if case.starts_with("shared-four-file-progress") {
+                self.file_progress.set_preview(case);
             }
             if case == "shared-four-diagnostics" {
                 self.page = Page::Diagnostics;

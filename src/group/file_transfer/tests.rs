@@ -44,6 +44,17 @@ impl Drop for Actor {
         let _ = self.0.wait();
     }
 }
+#[cfg(windows)]
+#[test]
+fn the_file_transfer_listener_refuses_to_share_an_occupied_port() {
+    let first = listener(0).unwrap();
+    let occupied = first.local_addr().unwrap().port();
+    assert!(
+        listener(occupied).is_err(),
+        "a second profile must not share the authenticated file-transfer port"
+    );
+}
+
 fn port() -> u16 {
     loop {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -332,6 +343,14 @@ async fn crash_receiver(root: &Path, port: u16, peer: &str, workspace: &str) -> 
         created: millis(),
         manifest: Some(manifest.clone()),
         cancel_notified: false,
+        user_paused: false,
+        peer_paused: false,
+        offer: None,
+        operation: Operation::Copy,
+        native_move: None,
+        move_binding: None,
+        move_outcome: None,
+        move_grant: None,
         view: Transfer {
             id: job_id(&manifest.id, &source),
             peer: source.clone(),
@@ -347,6 +366,10 @@ async fn crash_receiver(root: &Path, port: u16, peer: &str, workspace: &str) -> 
             clipboard_ready: false,
             clipboard_pending: false,
             clipboard_skipped: false,
+            paste: None,
+            pause_reason: None,
+            current_name: None,
+            recovery_paths: vec![],
         },
     };
     config::write_atomic(
@@ -474,7 +497,7 @@ fn cancellation_between_the_first_marker_read_and_registration_rejects_the_new_j
         // while this already-validated Offer is suspended before insertion.
         storage::remember_cancel(&fixture.path("bob"), &workspace, &peer, &id).unwrap();
         let manifest = Manifest {
-            version: protocol::VERSION,
+            version: protocol::MANIFEST_VERSION,
             id: id.clone(),
             name: "Empty folder".into(),
             roots: vec!["Empty folder".into()],
@@ -500,6 +523,14 @@ fn cancellation_between_the_first_marker_read_and_registration_rejects_the_new_j
                     None
                 },
                 cancel_notified: false,
+                user_paused: false,
+                peer_paused: false,
+                offer: None,
+                operation: Operation::Copy,
+                native_move: None,
+                move_binding: None,
+                move_outcome: None,
+                move_grant: None,
                 view: Transfer {
                     id: job_id(&id, &peer),
                     peer: peer.clone(),
@@ -515,6 +546,10 @@ fn cancellation_between_the_first_marker_read_and_registration_rejects_the_new_j
                     clipboard_ready: false,
                     clipboard_pending: false,
                     clipboard_skipped: false,
+                    paste: None,
+                    pause_reason: None,
+                    current_name: None,
+                    recovery_paths: vec![],
                 },
             })
             .unwrap();
@@ -543,7 +578,7 @@ fn cancellation_between_the_first_marker_read_and_registration_rejects_the_new_j
 }
 
 #[test]
-fn a_newer_clipboard_copy_during_preparation_is_not_renewed_by_a_repeated_announcement() {
+fn repeated_clipboard_offers_do_not_replace_a_newer_local_copy() {
     let fixture = Fixture::new();
     fs::create_dir(fixture.path("alice")).unwrap();
     fs::create_dir(fixture.path("bob")).unwrap();
@@ -573,141 +608,85 @@ fn a_newer_clipboard_copy_during_preparation_is_not_renewed_by_a_repeated_announ
         clipboard_enabled: true,
     });
     wait(|| service.core.trust.lock().unwrap().workspace_id == workspace);
-    let export_id = "ab".repeat(16);
-    let handle = job_id(&export_id, &a);
-    let stamp = Stamp {
-        counter: millis(),
-        author: a,
+    let first_id = "ab".repeat(16);
+    let second_id = "cd".repeat(16);
+    let offer = |id: &str, counter: u64, name: &str| Packet::ClipboardOffer {
+        id: id.into(),
+        description: protocol::Description {
+            name: name.into(),
+            roots: vec![name.into()],
+            entries: vec![protocol::Descriptor {
+                path: vec![name.into()],
+                kind: protocol::DescriptorKind::Directory,
+            }],
+            total: 0,
+        },
+        stamp: Stamp {
+            counter,
+            author: a.clone(),
+        },
+        operation: Operation::Copy,
     };
+    let first_handle = job_id(&first_id, &a);
+    let second_handle = job_id(&second_id, &a);
     crate::runtime().unwrap().block_on(async {
         let address = SocketAddr::from(([127, 0, 0, 1], receiver_port));
         let mut pipe = transport::connect(address, &alice, &b, &workspace)
             .await
             .unwrap();
-        pipe.send(&Packet::Announce {
-            id: export_id.clone(),
-            name: "Files".into(),
-            stamp: stamp.clone(),
-        })
-        .await
-        .unwrap();
+        pipe.send(&offer(&first_id, 1, "Files")).await.unwrap();
         assert!(matches!(pipe.receive().await.unwrap(), Packet::Queued));
-        let events = service
-            .core
-            .clipboard
-            .lock()
-            .unwrap()
-            .drain(..)
-            .collect::<Vec<_>>();
-        assert!(matches!(events.as_slice(),[ClipboardEvent::Begin(id)] if id==&handle));
-        // The native worker rejects the original reservation after a newer local
-        // text/file copy; this is the public bridge acknowledgement, not a fake
-        // delivery flag invented by the transport.
-        service
-            .commands
-            .try_send(Command::ClipboardReady(handle.clone(), false))
-            .unwrap();
-        wait(|| {
-            service
-                .snapshot()
-                .iter()
-                .any(|v| v.id == handle && v.clipboard_skipped)
-        });
-        fs::write(
-            fixture.path("copied.txt"),
-            b"copied before the newer local clipboard action",
-        )
-        .unwrap();
-        let export = storage::Export::prepare(
-            &fixture.path("alice"),
-            &export_id,
-            &[fixture.path("copied.txt")],
-            &AtomicBool::new(false),
-            |_| {},
-        )
-        .unwrap();
-        let mut repeated = transport::connect(address, &alice, &b, &workspace)
-            .await
-            .unwrap();
-        repeated
-            .send(&Packet::Announce {
-                id: export_id,
-                name: "Files".into(),
-                stamp: stamp.clone(),
-            })
-            .await
-            .unwrap();
-        assert!(matches!(repeated.receive().await.unwrap(), Packet::Queued));
-        assert!(
-            service.core.clipboard.lock().unwrap().is_empty(),
-            "A reconnect must not renew the old clipboard reservation"
-        );
         let mut pipe = transport::connect(address, &alice, &b, &workspace)
             .await
             .unwrap();
-        pipe.send(&Packet::Offer {
-            manifest: export.manifest.clone(),
-            origin: Origin::Clipboard,
-            stamp: Some(stamp),
-        })
-        .await
-        .unwrap();
-        loop {
-            if !matches!(pipe.receive().await.unwrap(), Packet::Working) {
-                break;
-            }
+        pipe.send(&offer(&first_id, 1, "Files")).await.unwrap();
+        assert!(matches!(pipe.receive().await.unwrap(), Packet::Queued));
+        {
+            let (current, counter, active) =
+                lazy::test_remote_state(&service.core, &first_handle).unwrap();
+            assert_eq!(current.as_deref(), Some(first_handle.as_str()));
+            assert_eq!(lazy::test_remote_count(&service.core), 1);
+            assert_eq!(counter, 1);
+            assert!(active);
         }
-        let ready = loop {
-            let packet = pipe.receive().await.unwrap();
-            if !matches!(packet, Packet::Working) {
-                break packet;
-            }
-        };
-        assert!(matches!(
-            ready,
-            Packet::Ready {
-                index: 0,
-                offset: 0,
-                ..
-            }
-        ));
-        let bytes = export.read(0, 0, CHUNK).unwrap();
-        let digest = protocol::hash(&bytes);
-        pipe.send(&Packet::Chunk {
-            index: 0,
-            offset: 0,
-            bytes: bytes.clone(),
-            digest,
-        })
-        .await
-        .unwrap();
-        let ack = loop {
-            let packet = pipe.receive().await.unwrap();
-            if !matches!(packet, Packet::Working) {
-                break packet;
-            }
-        };
-        assert!(matches!(ack,Packet::Ack{index:0,offset} if offset==bytes.len()as u64));
-        pipe.send(&Packet::Finish).await.unwrap();
-        let done = loop {
-            let packet = pipe.receive().await.unwrap();
-            if !matches!(packet, Packet::Working) {
-                break packet;
-            }
-        };
-        assert!(matches!(done, Packet::Complete));
-        let received = service
-            .snapshot()
-            .into_iter()
-            .find(|v| v.id == handle)
+        let mut pipe = transport::connect(address, &alice, &b, &workspace)
+            .await
             .unwrap();
-        assert_eq!(received.phase, Phase::Completed);
-        assert!(received.clipboard_skipped);
-        assert!(!received.clipboard_pending && !received.clipboard_ready);
-        assert_eq!(fs::read(&received.paths[0]).unwrap(), bytes);
-        assert!(
-            service.core.clipboard.lock().unwrap().is_empty(),
-            "Saved stale files must not publish an old native selection"
-        );
+        pipe.send(&offer(&second_id, 2, "New files")).await.unwrap();
+        assert!(matches!(pipe.receive().await.unwrap(), Packet::Queued));
+        {
+            let (current, counter, active) =
+                lazy::test_remote_state(&service.core, &second_handle).unwrap();
+            assert_eq!(current.as_deref(), Some(second_handle.as_str()));
+            assert_eq!(counter, 2);
+            assert!(active);
+            let (_, _, first_active) =
+                lazy::test_remote_state(&service.core, &first_handle).unwrap();
+            assert!(!first_active);
+        }
+        let mut pipe = transport::connect(address, &alice, &b, &workspace)
+            .await
+            .unwrap();
+        pipe.send(&offer(&first_id, 1, "Files")).await.unwrap();
+        assert!(matches!(pipe.receive().await.unwrap(), Packet::Queued));
+        {
+            let (current, counter, active) =
+                lazy::test_remote_state(&service.core, &second_handle).unwrap();
+            assert_eq!(current.as_deref(), Some(second_handle.as_str()));
+            assert_eq!(counter, 2);
+            assert!(active);
+        }
     });
+    let offers = service
+        .core
+        .clipboard
+        .lock()
+        .unwrap()
+        .drain(..)
+        .filter(|event| matches!(event, ClipboardEvent::Offer(_)))
+        .count();
+    assert_eq!(
+        offers, 2,
+        "only the two distinct offers should reach the clipboard"
+    );
 }

@@ -2,6 +2,13 @@ name: Checks
 
 on: [push, pull_request]
 
+permissions:
+  contents: read
+
+concurrency:
+  group: checks-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   checks:
     strategy:
@@ -10,29 +17,51 @@ jobs:
         os: [ubuntu-24.04, windows-2022]
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v7.0.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - if: runner.os == 'Linux'
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y pkg-config libssl-dev dpkg-dev desktop-file-utils python3-gi dbus udev openssl polkitd xvfb openbox wmctrl x11-utils libgl1-mesa-dri libxkbcommon-x11-0
+          sudo apt-get install -y pkg-config libssl-dev dpkg-dev desktop-file-utils python3-gi dbus udev openssl polkitd fuse3 xvfb openbox wmctrl x11-utils nautilus xdotool libgl1-mesa-dri libxkbcommon-x11-0
       - run: rustup show active-toolchain
       - run: cargo fmt --all --check
       - run: cargo clippy --locked --all-targets -- -D warnings
       - run: cargo test --locked
       - run: cargo test --locked -p rust-auto-updator --lib
+      - name: Check real Ubuntu file paste on an isolated desktop
+        if: runner.os == 'Linux'
+        timeout-minutes: 2
+        run: /usr/bin/python3 tools/test_linux_file_paste.py --out target/native-file-paste-proof
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: runner.os == 'Linux' && always()
+        with:
+          name: ubuntu-native-file-paste-proof
+          path: target/native-file-paste-proof
+          if-no-files-found: error
       - name: Check native file clipboard on an isolated Windows runner
         if: runner.os == 'Windows'
         timeout-minutes: 2
         env:
           DESK_SWITCH_NATIVE_CLIPBOARD_TEST: "1"
         run: cargo test --locked group::clipboard_files::windows::tests::isolated_ci_native_file_clipboard_roundtrip -- --ignored --exact --nocapture
+      - name: Check native Windows file paste and recoverable Move
+        if: runner.os == 'Windows'
+        timeout-minutes: 7
+        run: python tools/test_windows_file_paste.py --out target/windows-native-file-paste-proof
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: runner.os == 'Windows' && always()
+        with:
+          name: windows-native-file-paste-proof
+          path: target/windows-native-file-paste-proof
+          if-no-files-found: error
       - name: Check Ubuntu tray window lifecycle on an isolated desktop
         if: runner.os == 'Linux'
         timeout-minutes: 15
         run: |
           cargo build --locked --profile diagnostic
           timeout 90s xvfb-run -a -s '-screen 0 1920x1080x24' /usr/bin/python3 tools/test_linux_tray.py --binary target/diagnostic/desk-switch --out target/linux-tray-proof
-      - uses: actions/upload-artifact@v7.0.2
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: runner.os == 'Linux' && always()
         with:
           name: ubuntu-tray-lifecycle-proof

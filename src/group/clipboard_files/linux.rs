@@ -1,6 +1,8 @@
 //! Native file copies on GNOME Wayland and X11. URI data is never interpreted
 //! as a shell command, and plain text is never treated as a file selection.
 use super::Selection;
+use super::provider::{PublishedOffer, RemoteOffer};
+use crate::group::file_transfer::protocol::Operation;
 use anyhow::{Context, Result, bail, ensure};
 use std::{
     cell::RefCell,
@@ -44,6 +46,21 @@ pub(super) fn sequence() -> Option<u64> {
 }
 
 pub(super) fn write_if_current(paths: &[PathBuf], expected: u64) -> Result<bool> {
+    write_operation_if_current(paths, expected, Operation::Copy)
+}
+
+pub(super) fn clear_cut_if_current(_paths: &[PathBuf], _expected: u64) -> Result<bool> {
+    // Neither native bridge exposes an atomic exact-Cut clear. The transfer
+    // service retires the consumed offer; never race a newer user clipboard
+    // by implementing this as a separate metadata read followed by clear.
+    Ok(false)
+}
+
+fn write_operation_if_current(
+    paths: &[PathBuf],
+    expected: u64,
+    operation: Operation,
+) -> Result<bool> {
     let bytes = encode_paths(paths)?;
     NATIVE.with(|native| {
         let mut native = native.borrow_mut();
@@ -52,8 +69,8 @@ pub(super) fn write_if_current(paths: &[PathBuf], expected: u64) -> Result<bool>
             return Ok(false);
         };
         match native {
-            Native::Gnome(native) => native.write_if_current(paths, bytes, expected),
-            Native::X11(native) => native.write_if_current(paths, expected),
+            Native::Gnome(native) => native.write_if_current(paths, bytes, expected, operation),
+            Native::X11(native) => native.write_operation_if_current(paths, expected, operation),
         }
     })
 }
@@ -92,17 +109,25 @@ struct Gnome {
     serial: u32,
     paths: Option<Vec<PathBuf>>,
     refresh: bool,
+    operation: Operation,
 }
 impl Gnome {
     fn new() -> Result<Self> {
         let connection = zbus::blocking::connection::Builder::session()?
             .method_timeout(Duration::from_secs(2))
             .build()?;
+        let proxy = zbus::blocking::Proxy::new(&connection, COMPANION, COMPANION_PATH, COMPANION)?;
+        let version: u32 = proxy.call("Version", &())?;
+        ensure!(
+            version >= 2,
+            "Reload Desk Switch Tray in GNOME Extensions to enable on-demand file copy and move"
+        );
         Ok(Self {
             connection,
             serial: 0,
             paths: None,
             refresh: true,
+            operation: Operation::Copy,
         })
     }
     fn read(&mut self) -> Result<Option<Selection>> {
@@ -126,6 +151,7 @@ impl Gnome {
             "The clipboard companion returned an invalid revision"
         );
         if self.refresh || serial != self.serial || !mime.is_empty() {
+            self.operation = selection_operation(&mime, &bytes)?;
             self.paths = if mime.is_empty() {
                 None
             } else {
@@ -137,6 +163,7 @@ impl Gnome {
         Ok(self.paths.clone().map(|paths| Selection {
             sequence: u64::from(serial),
             paths,
+            operation: self.operation,
         }))
     }
     fn write_if_current(
@@ -144,6 +171,7 @@ impl Gnome {
         paths: &[PathBuf],
         bytes: Vec<u8>,
         expected: u64,
+        operation: Operation,
     ) -> Result<bool> {
         let Ok(expected) = u32::try_from(expected) else {
             return Ok(false);
@@ -153,17 +181,24 @@ impl Gnome {
         }
         let proxy =
             zbus::blocking::Proxy::new(&self.connection, COMPANION, COMPANION_PATH, COMPANION)?;
-        let (accepted, serial): (bool, u32) = proxy
-            .call("WriteFilesIfCurrent", &(expected, bytes))
-            .context(
-                "Enable or reload Desk Switch Tray in GNOME Extensions to share files on Wayland",
-            )?;
+        let result = if operation == Operation::Copy {
+            proxy.call("WriteFilesIfCurrent", &(expected, bytes))
+        } else {
+            proxy.call(
+                "WriteFilesWithOperationIfCurrent",
+                &(expected, 1_u32, bytes),
+            )
+        };
+        let (accepted, serial): (bool, u32) = result.context(
+            "Enable or reload Desk Switch Tray in GNOME Extensions to share files on Wayland",
+        )?;
         ensure!(
             serial != 0,
             "The clipboard companion returned an invalid revision"
         );
         self.serial = serial;
         self.paths = accepted.then(|| paths.to_vec());
+        self.operation = operation;
         // A rejection reveals only the revision. Refetch the newer selection's
         // MIME and paths instead of treating it as an empty clipboard.
         self.refresh = !accepted;
@@ -238,10 +273,8 @@ fn parse_selection(mime: &str, bytes: &[u8]) -> Result<Option<Vec<PathBuf>>> {
     let mut lines = text.lines();
     if mime == GNOME_MIME {
         match lines.next() {
-            Some("copy") => {}
-            // A cut operation never authorizes moving or deleting the originals.
-            Some("cut") => return Ok(Some(Vec::new())),
-            _ => bail!("File clipboard does not contain a copy operation"),
+            Some("copy" | "cut") => {}
+            _ => bail!("File clipboard does not contain a copy or cut operation"),
         }
     } else {
         ensure!(mime == URI_MIME, "Unsupported file clipboard format");
@@ -265,6 +298,17 @@ fn parse_selection(mime: &str, bytes: &[u8]) -> Result<Option<Vec<PathBuf>>> {
     }
     ensure!(!paths.is_empty(), "File clipboard contains no local files");
     Ok(Some(paths))
+}
+
+fn selection_operation(mime: &str, bytes: &[u8]) -> Result<Operation> {
+    if mime != GNOME_MIME {
+        return Ok(Operation::Copy);
+    }
+    match std::str::from_utf8(bytes)?.lines().next() {
+        Some("copy") => Ok(Operation::Copy),
+        Some("cut") => Ok(Operation::Move),
+        _ => bail!("File clipboard does not contain a copy or cut operation"),
+    }
 }
 
 fn encode_paths(paths: &[PathBuf]) -> Result<Vec<u8>> {
@@ -303,6 +347,20 @@ fn encode_paths(paths: &[PathBuf]) -> Result<Vec<u8>> {
 mod x11;
 use x11::X11;
 
+#[path = "linux_vfs.rs"]
+mod vfs;
+
+pub(super) fn publish_offer_if_current(
+    offer: RemoteOffer,
+    expected: u64,
+) -> Result<Option<Box<dyn PublishedOffer>>> {
+    vfs::publish_offer_if_current(offer, expected)
+}
+
+pub(super) fn is_provider_path(path: &Path) -> bool {
+    vfs::is_provider_path(path)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -327,7 +385,7 @@ mod tests {
     }
 
     #[test]
-    fn no_remote_urls_paths_text_or_cut_operations_are_exported() {
+    fn local_file_metadata_preserves_explicit_copy_or_cut_operations() {
         for value in [
             "https://example.invalid/a",
             "file://server/tmp/a",
@@ -354,8 +412,18 @@ mod tests {
         );
         assert_eq!(
             parse_selection(GNOME_MIME, b"cut\nfile:///tmp/a").unwrap(),
-            Some(Vec::new())
+            Some(vec![PathBuf::from("/tmp/a")])
         );
+        assert_eq!(
+            selection_operation(GNOME_MIME, b"cut\nfile:///tmp/a").unwrap(),
+            Operation::Move
+        );
+        assert_eq!(
+            selection_operation(GNOME_MIME, b"copy\nfile:///tmp/a").unwrap(),
+            Operation::Copy
+        );
+        assert!(parse_selection(GNOME_MIME, b"cut\nfile://server/tmp/a").is_err());
+        assert!(parse_selection(GNOME_MIME, b"link\nfile:///tmp/a").is_err());
         assert_eq!(
             parse_selection(GNOME_MIME, b"copy\nfile:///tmp/a").unwrap(),
             Some(vec![PathBuf::from("/tmp/a")])

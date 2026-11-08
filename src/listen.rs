@@ -47,7 +47,7 @@ fn bind_socket(address: SocketAddr, dual_stack: bool) -> io::Result<Socket> {
     Ok(socket)
 }
 
-fn ipv6_unavailable(error: &io::Error) -> bool {
+pub(crate) fn ipv6_unavailable(error: &io::Error) -> bool {
     if matches!(
         error.kind(),
         io::ErrorKind::Unsupported | io::ErrorKind::AddrNotAvailable
