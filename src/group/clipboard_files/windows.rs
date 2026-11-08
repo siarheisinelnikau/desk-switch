@@ -703,7 +703,7 @@ mod tests {
                 })
                 .transpose()?;
             let effect_format = preferred_format()?;
-            OWNER.with(|slot| {
+            OWNER.with(|slot| -> Result<()> {
                 let mut slot = slot.borrow_mut();
                 if slot.is_none() {
                     *slot = Some(Owner::create()?);
@@ -731,8 +731,12 @@ mod tests {
                     unsafe { GetClipboardOwner() } == owner,
                     "Fixture HWND did not own clipboard"
                 );
-                Ok(self.remember())
-            })
+                Ok(())
+            })?;
+            // Closing a text publication can add synthesized Windows formats
+            // and advance its sequence. Acknowledge the completed publication
+            // after the native guard has closed, like production write().
+            Ok(self.remember())
         }
         fn assert_formats(&self, expect_files: bool, expect_text: bool) -> Result<()> {
             let clipboard = Clipboard::open(ptr::null_mut())?;
