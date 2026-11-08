@@ -399,7 +399,7 @@ impl State {
     }
     fn next_serial(&self) -> Result<u64> {
         self.serial
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |next| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |next| {
                 next.checked_add(1)
             })
             .map_err(|_| anyhow::anyhow!("The file paste handle limit was reached"))
@@ -924,7 +924,10 @@ impl NativeFilesystem {
         };
         if let Err(error) = pool.sender.try_send(work) {
             self.0.pending.fetch_sub(1, Ordering::AcqRel);
-            let Work::Remove { reply, .. } = error.into_inner() else {
+            let failed = match error {
+                mpsc::TrySendError::Full(work) | mpsc::TrySendError::Disconnected(work) => work,
+            };
+            let Work::Remove { reply, .. } = failed else {
                 unreachable!();
             };
             reply.error(Errno::EAGAIN);
@@ -1048,7 +1051,10 @@ impl Filesystem for NativeFilesystem {
         };
         if let Err(error) = pool.sender.try_send(work) {
             self.0.pending.fetch_sub(1, Ordering::AcqRel);
-            let Work::Read { reply, .. } = error.into_inner() else {
+            let failed = match error {
+                mpsc::TrySendError::Full(work) | mpsc::TrySendError::Disconnected(work) => work,
+            };
+            let Work::Read { reply, .. } = failed else {
                 unreachable!();
             };
             reply.error(Errno::EAGAIN);
