@@ -910,7 +910,13 @@ pub(super) async fn capture(
         state.locals.insert(offer.id.clone(), offer.clone());
     }
     *core.error.lock().unwrap() = None;
-    for peer in trust.peers.keys().cloned().collect::<Vec<_>>() {
+    for peer in trust
+        .peers
+        .iter()
+        .filter(|(_, peer)| peer.online)
+        .map(|(key, _)| key.clone())
+        .collect::<Vec<_>>()
+    {
         let c = core.clone();
         let offer = offer.clone();
         let workspace = trust.workspace_id.clone();
@@ -932,8 +938,7 @@ pub(super) async fn capture(
             }
             .await;
             if let Err(error) = result {
-                *c.error.lock().unwrap() = Some(format!("Shared files: {error:#}"));
-                c.wake();
+                c.note(format!("Shared files with another computer: {error:#}"));
             }
         });
     }
