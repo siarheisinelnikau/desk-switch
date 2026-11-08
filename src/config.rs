@@ -69,6 +69,31 @@ pub fn lock(dir: &Path, name: &str) -> Result<fs::File> {
     Ok(file)
 }
 
+#[cfg(unix)]
+fn sync_directory(path: &Path) -> Result<()> {
+    let directory = fs::File::open(path)?;
+    match directory.sync_all() {
+        Ok(()) => Ok(()),
+        // Some filesystems do not support fsync on a directory. The file
+        // contents are already durable; do not make an otherwise valid save
+        // fail on such a mount.
+        Err(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::InvalidInput | std::io::ErrorKind::Unsupported
+            ) =>
+        {
+            Ok(())
+        }
+        Err(error) => Err(error.into()),
+    }
+}
+
+#[cfg(not(unix))]
+fn sync_directory(_: &Path) -> Result<()> {
+    Ok(())
+}
+
 fn create_private(path: &Path, contents: &str) -> Result<()> {
     let directory = path.parent().context("state path has no parent")?;
     let mut builder = fs::DirBuilder::new();
@@ -96,6 +121,11 @@ fn create_private(path: &Path, contents: &str) -> Result<()> {
         drop(file);
         let _ = fs::remove_file(path);
         return Err(error.into());
+    }
+    drop(file);
+    if let Err(error) = sync_directory(directory) {
+        let _ = fs::remove_file(path);
+        return Err(error);
     }
     Ok(())
 }
@@ -255,7 +285,12 @@ pub fn write_atomic(path: &Path, contents: &str) -> Result<()> {
         builder.mode(0o700);
     }
     builder.create(directory)?;
-    let temp = path.with_extension(format!("{}.tmp", std::process::id()));
+    static TEMP_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let temp = path.with_extension(format!(
+        "{}.{}.tmp",
+        std::process::id(),
+        TEMP_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
     let result = (|| {
         let mut options = OpenOptions::new();
         options.write(true).create_new(true);
@@ -269,6 +304,7 @@ pub fn write_atomic(path: &Path, contents: &str) -> Result<()> {
         file.sync_all()?;
         drop(file);
         fs::rename(&temp, path)?;
+        sync_directory(directory)?;
         Ok::<_, anyhow::Error>(())
     })();
     if result.is_err() {
@@ -406,5 +442,27 @@ mod tests {
         assert_eq!(Role::parse("host").unwrap(), Role::Host);
         assert_eq!(Role::parse("receiver").unwrap(), Role::Receiver);
         assert!(Role::parse("windows").is_err());
+    }
+
+    #[test]
+    fn atomic_writes_replace_the_target_without_leaving_temporary_files() {
+        let dir = std::env::temp_dir().join(format!(
+            "desk-switch-atomic-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let path = dir.join("settings.toml");
+        write_atomic(&path, "first").unwrap();
+        write_atomic(&path, "second").unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), "second");
+        let names = fs::read_dir(&dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect::<Vec<_>>();
+        assert_eq!(names, vec![std::ffi::OsString::from("settings.toml")]);
+        fs::remove_dir_all(dir).unwrap();
     }
 }
