@@ -1216,6 +1216,24 @@ mod tests {
     include!("net/reconnect_tests.rs");
     include!("net/failover_tests.rs");
 
+    fn remove_test_root(root: &Path) {
+        // Service shutdown is asynchronous on Windows; a late handle can keep
+        // the temp directory non-empty briefly.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            match std::fs::remove_dir_all(root) {
+                Ok(()) => break,
+                Err(error) if Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+                Err(error) => {
+                    eprintln!("could not remove {}: {error}", root.display());
+                    break;
+                }
+            }
+        }
+    }
+
     fn synthetic_session(generation: u8) -> (Session, queue::Receiver<Packet>) {
         let (commands, receive) = queue::channel(1);
         let (clipboard, _clips) = tokio::sync::watch::channel(None);
@@ -1675,7 +1693,7 @@ mod tests {
             reloaded.members[&peer].preferences,
             state.members[&peer].preferences
         );
-        std::fs::remove_dir_all(root).unwrap();
+        remove_test_root(&root);
     }
 
     #[test]
@@ -1855,7 +1873,7 @@ mod tests {
         }
         drop(computers);
         std::thread::sleep(Duration::from_millis(100));
-        std::fs::remove_dir_all(root).unwrap();
+        remove_test_root(&root);
     }
 
     struct Computer {
@@ -2169,6 +2187,6 @@ mod tests {
         }
         drop(computers);
         std::thread::sleep(Duration::from_millis(100));
-        std::fs::remove_dir_all(root).unwrap();
+        remove_test_root(&root);
     }
 }
