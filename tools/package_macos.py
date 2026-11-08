@@ -75,7 +75,12 @@ def main():
             "NSHighResolutionCapable": True,
             "NSMicrophoneUsageDescription": "Share the selected microphone with computers you paired in Desk Switch.",
             "NSAudioCaptureUsageDescription": "Share system audio with computers you paired in Desk Switch.",
-            "NSLocalNetworkUsageDescription": "Find your computers and securely share input, audio, clipboard and settings on your local network.",
+            "NSLocalNetworkUsageDescription": "Find your computers and securely share input, audio, clipboard, files and settings on your local network.",
+            "NSDesktopFolderUsageDescription": "Transfer files and folders you choose or copy from your Desktop to your trusted computers.",
+            "NSDocumentsFolderUsageDescription": "Transfer files and folders you choose or copy from Documents to your trusted computers.",
+            "NSDownloadsFolderUsageDescription": "Save verified transfers from your trusted computers and share files you choose or copy from Downloads.",
+            "NSNetworkVolumesUsageDescription": "Transfer files and folders you choose or copy from a mounted network volume.",
+            "NSRemovableVolumesUsageDescription": "Transfer files and folders you choose or copy from a removable drive.",
             "NSBonjourServices": ["_desk-switch._tcp"],
             "NSHumanReadableCopyright": "Copyright Desk Switch contributors. MIT license.",
         }
@@ -96,6 +101,9 @@ def main():
             "LICENSE.txt": ROOT / "LICENSE",
             "m1ddc-LICENSE.txt": ROOT / "vendor/m1ddc/LICENSE",
             "VB-CABLE-NOTICE.txt": ROOT / "assets/third-party/vb-cable/NOTICE.txt",
+            "cap-std-LICENSE-MIT.txt": ROOT / "assets/third-party/file-transfer/cap-std-LICENSE-MIT",
+            "rfd-LICENSE.txt": ROOT / "assets/third-party/file-transfer/rfd-LICENSE",
+            "rfd-window-identifier-LICENSE.txt": ROOT / "assets/third-party/file-transfer/rfd-window-identifier-LICENSE",
         }
         for name, source in notices.items():
             shutil.copyfile(source, contents / "Resources" / name)

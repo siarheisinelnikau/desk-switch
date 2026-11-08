@@ -10,4 +10,11 @@ pub const NOTICES: &str = concat!(
     "\n\nm1ddc — waydabber\nhttps://github.com/waydabber/m1ddc\n",
     "Included in the macOS Apple Silicon DDC transport.\n\n",
     include_str!("../vendor/m1ddc/LICENSE"),
+    "\n\ncap-std/cap-fs-ext 4.0.3 — https://github.com/bytecodealliance/cap-std\n",
+    "Distributed under the MIT option of the project license.\n\n",
+    include_str!("../assets/third-party/file-transfer/cap-std-LICENSE-MIT"),
+    "\n\nrfd 0.18.0 — https://github.com/PolyMeilex/rfd\n\n",
+    include_str!("../assets/third-party/file-transfer/rfd-LICENSE"),
+    "\n\nrfd's XDG portal window identifier — https://github.com/PolyMeilex/rfd\n\n",
+    include_str!("../assets/third-party/file-transfer/rfd-window-identifier-LICENSE"),
 );

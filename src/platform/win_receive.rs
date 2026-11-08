@@ -35,6 +35,7 @@ const PENDING_MOTION: usize = 256;
 struct MotionIntent {
     tag: usize,
     generation: u64,
+    route_epoch: u64,
     dx: i32,
     dy: i32,
 }
@@ -44,6 +45,7 @@ struct MotionIntent {
 struct MotionState {
     router: Router,
     generation: u64,
+    route_epoch: u64,
     active: bool,
     point: (i32, i32),
     keys: [bool; 256],
@@ -58,6 +60,7 @@ impl MotionState {
         Self {
             router: Router::default(),
             generation: 0,
+            route_epoch: 0,
             active: false,
             point,
             keys,
@@ -76,6 +79,7 @@ impl MotionState {
         *slot = Some(MotionIntent {
             tag,
             generation: self.generation,
+            route_epoch: self.route_epoch,
             dx,
             dy,
         });
@@ -86,6 +90,22 @@ impl MotionState {
         let slot = &mut self.pending[(tag & !MOTION_MASK) % PENDING_MOTION];
         if slot.is_some_and(|intent| intent.tag == tag) {
             *slot = None;
+        }
+    }
+
+    fn configure(&mut self, routes: Routes, screens: &[crate::edge::NativeScreen]) -> Result<()> {
+        self.router.configure(routes, screens)?;
+        // Keep old slots recognizable until the OS delivers them. Clearing the
+        // ring would mistake a delayed Desk Switch event for foreign input.
+        self.route_epoch = self.route_epoch.wrapping_add(1).max(1);
+        self.crossing = None;
+        Ok(())
+    }
+
+    fn key(&mut self, code: u32, down: bool) {
+        self.router.cancel_dwell();
+        if let Some(held) = self.keys.get_mut(code as usize) {
+            *held = down;
         }
     }
 
@@ -102,6 +122,7 @@ impl MotionState {
             _ => None,
         };
         if let Some((button, down)) = button {
+            self.router.cancel_dwell();
             self.buttons[button] = down;
         }
         if message != WM_MOUSEMOVE {
@@ -109,11 +130,13 @@ impl MotionState {
         }
         let target = (data.pt.x, data.pt.y);
         if data.flags & LLMHF_INJECTED == 0 || data.dwExtraInfo & MOTION_MASK != MOTION_TAG {
+            self.router.cancel_dwell();
             self.point = target;
             return false;
         }
         let slot = &mut self.pending[(data.dwExtraInfo & !MOTION_MASK) % PENDING_MOTION];
         let Some(intent) = slot.filter(|intent| intent.tag == data.dwExtraInfo) else {
+            self.router.cancel_dwell();
             self.point = target;
             return false;
         };
@@ -122,7 +145,11 @@ impl MotionState {
     }
 
     fn actual_motion(&mut self, intent: MotionIntent, target: (i32, i32)) -> bool {
-        if !self.active || intent.generation != self.generation {
+        if !self.active
+            || intent.generation != self.generation
+            || intent.route_epoch != self.route_epoch
+        {
+            self.router.cancel_dwell();
             return true;
         }
         let (x, y) = (f64::from(self.point.0), f64::from(self.point.1));
@@ -227,9 +254,7 @@ unsafe extern "system" fn native_key_hook(code: i32, message: WPARAM, data: LPAR
                     .state
                     .lock()
                     .unwrap_or_else(|poison| poison.into_inner());
-                if let Some(held) = state.keys.get_mut(data.vkCode as usize) {
-                    *held = data.flags & LLKHF_UP == 0;
-                }
+                state.key(data.vkCode, data.flags & LLKHF_UP == 0);
             }
         });
     }
@@ -345,9 +370,7 @@ impl MotionGuard {
             .state
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
-        state.router.configure(routes, screens)?;
-        state.crossing = None;
-        Ok(())
+        state.configure(routes, screens)
     }
 
     fn active(&self, active: bool) -> Result<()> {
@@ -750,6 +773,7 @@ impl Sink for NativeSink {
                 .unwrap_or_else(|poison| poison.into_inner());
             state.generation = generation;
             state.crossing = None;
+            state.router.cancel_dwell();
         }
     }
 
@@ -856,7 +880,7 @@ impl Drop for NativeSink {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::edge::{Boundary, NativeScreen, ScreenRect, Side};
+    use crate::edge::{Boundary, NativeScreen, Policy, ScreenRect, Side};
     use std::sync::Mutex;
 
     fn routed_state() -> MotionState {
@@ -873,6 +897,10 @@ mod tests {
         let routes = Routes {
             revision: 7,
             activation: 9,
+            policy: Policy {
+                dwell_ms: 0,
+                ..Policy::default()
+            },
             boundaries: vec![
                 Boundary {
                     id: 1,
@@ -892,10 +920,8 @@ mod tests {
                 },
             ],
         };
-        let mut router = Router::default();
-        router.configure(routes, &[screen]).unwrap();
         let mut state = MotionState::new((-4, 300), [false; 256], [false; 5]);
-        state.router = router;
+        state.configure(routes, &[screen]).unwrap();
         state.active = true;
         state.generation = 9;
         state
@@ -917,17 +943,34 @@ mod tests {
         )
     }
 
+    fn reconfigure_policy(state: &mut MotionState, policy: Policy) {
+        let mut routes = state.router.routes().clone();
+        routes.revision += 1;
+        routes.policy = policy;
+        let boundary = routes.boundaries[0];
+        state
+            .configure(
+                routes,
+                &[NativeScreen {
+                    native_id: "test-display".into(),
+                    rect: boundary.screen,
+                    epoch: boundary.geometry,
+                }],
+            )
+            .unwrap();
+    }
+
     #[test]
     fn typed_edges_work_without_legacy_edge_entry_and_wait_for_held_inputs() {
         let mut state = routed_state();
-        state.keys[30] = true;
+        state.key(30, true);
         assert!(native_move(&mut state, 2, 0, (0, 300)));
         assert!(state.crossing.take().is_none());
-        state.keys[30] = false;
-        state.buttons[0] = true;
+        state.key(30, false);
+        assert!(!state.mouse(WM_LBUTTONDOWN, &MSLLHOOKSTRUCT::default()));
         assert!(native_move(&mut state, 2, 0, (0, 300)));
         assert!(state.crossing.take().is_none());
-        state.buttons[0] = false;
+        assert!(!state.mouse(WM_LBUTTONUP, &MSLLHOOKSTRUCT::default()));
         assert!(native_move(&mut state, 2, 0, (0, 300)));
         let crossed = state.crossing.take().unwrap();
         assert_eq!(
@@ -1043,6 +1086,115 @@ mod tests {
             }
         ));
         assert!(state.crossing.is_none());
+    }
+
+    #[test]
+    fn policy_install_clears_queued_crossing_and_does_not_reuse_queued_native_pressure() {
+        let mut state = routed_state();
+        assert!(native_move(&mut state, 2, 0, (0, 300)));
+        assert!(state.crossing.is_some());
+        let before_pause = state.register(2, 0).unwrap();
+        reconfigure_policy(
+            &mut state,
+            Policy {
+                paused: true,
+                dwell_ms: 0,
+                ..Policy::default()
+            },
+        );
+        assert!(state.crossing.is_none());
+        assert!(state.mouse(
+            WM_MOUSEMOVE,
+            &MSLLHOOKSTRUCT {
+                pt: windows_sys::Win32::Foundation::POINT { x: 0, y: 300 },
+                flags: LLMHF_INJECTED,
+                dwExtraInfo: before_pause,
+                ..Default::default()
+            }
+        ));
+        assert!(state.crossing.is_none());
+        assert_eq!(state.point, (-4, 300));
+        assert!(state.active);
+        assert!(native_move(&mut state, 2, 0, (0, 300)));
+        assert!(state.crossing.is_none());
+
+        let before_resume = state.register(2, 0).unwrap();
+        reconfigure_policy(
+            &mut state,
+            Policy {
+                dwell_ms: 0,
+                ..Policy::default()
+            },
+        );
+        assert!(state.mouse(
+            WM_MOUSEMOVE,
+            &MSLLHOOKSTRUCT {
+                pt: windows_sys::Win32::Foundation::POINT { x: 0, y: 300 },
+                flags: LLMHF_INJECTED,
+                dwExtraInfo: before_resume,
+                ..Default::default()
+            }
+        ));
+        assert!(state.crossing.is_none());
+        // Only fresh pressure after resume may create the new-revision crossing.
+        assert!(native_move(&mut state, 2, 0, (0, 300)));
+        assert_eq!(
+            state.crossing.unwrap().revision,
+            state.router.routes().revision
+        );
+    }
+
+    #[test]
+    fn receiver_corner_protection_blocks_accelerated_motion_until_policy_changes() {
+        let mut state = routed_state();
+        state.point = (-4, 878);
+        assert!(native_move(&mut state, 2, 0, (0, 878)));
+        assert!(state.crossing.is_none());
+        assert_eq!(state.point, (-4, 878));
+        reconfigure_policy(
+            &mut state,
+            Policy {
+                dwell_ms: 0,
+                protect_corners: false,
+                paused: false,
+            },
+        );
+        assert!(native_move(&mut state, 2, 0, (0, 878)));
+        assert_eq!(state.crossing.unwrap().boundary, 2);
+    }
+
+    #[test]
+    fn pause_keeps_inactive_native_output_guarded_without_deactivating_input() {
+        let mut state = routed_state();
+        let mut routes = state.router.routes().clone();
+        routes.policy.paused = true;
+        routes.boundaries[1].id = 0;
+        let boundary = routes.boundaries[0];
+        state
+            .configure(
+                routes,
+                &[NativeScreen {
+                    native_id: "test-display".into(),
+                    rect: boundary.screen,
+                    epoch: boundary.geometry,
+                }],
+            )
+            .unwrap();
+        assert!(native_move(&mut state, 2, 0, (0, 300)));
+        assert!(state.crossing.is_none());
+        assert_eq!(state.point, (-4, 300));
+        assert!(state.active);
+        assert!(!native_move(&mut state, -2, 0, (-8, 300)));
+        reconfigure_policy(
+            &mut state,
+            Policy {
+                dwell_ms: 0,
+                ..Policy::default()
+            },
+        );
+        assert!(native_move(&mut state, 2, 0, (0, 300)));
+        assert!(state.crossing.is_none());
+        assert_eq!(state.point, (-8, 300));
     }
 
     #[test]

@@ -202,23 +202,69 @@ fn release_envelope(bytes: &[u8]) -> Result<Envelope> {
 }
 
 fn fetch_release() -> Result<Option<Vec<u8>>> {
-    let response = client()?
-        .get(https(CHANNEL)?)
-        .timeout(Duration::from_secs(15))
-        .send()?;
-    if response.status() == reqwest::StatusCode::NOT_FOUND {
-        return Ok(None);
+    fetch_release_at(&client()?, &https(CHANNEL)?, std::thread::sleep)
+}
+
+fn fetch_release_at(
+    http: &reqwest::blocking::Client,
+    endpoint: &reqwest::Url,
+    mut pause: impl FnMut(Duration),
+) -> Result<Option<Vec<u8>>> {
+    const ATTEMPTS: usize = 3;
+    for attempt in 1..=ATTEMPTS {
+        let response = match http
+            .get(endpoint.clone())
+            .timeout(Duration::from_secs(15))
+            .send()
+        {
+            Ok(response) => response,
+            Err(error) if error.is_timeout() && attempt < ATTEMPTS => {
+                pause(Duration::from_millis(250 * attempt as u64));
+                continue;
+            }
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!("Update release request failed at {endpoint} after {attempt} attempts")
+                });
+            }
+        };
+        let status = response.status();
+        if status == reqwest::StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        if matches!(status.as_u16(), 502..=504) && attempt < ATTEMPTS {
+            // Retry only before accepting a body. Rate limits, authentication,
+            // malformed data and partially received bodies remain terminal.
+            drop(response);
+            pause(Duration::from_millis(250 * attempt as u64));
+            continue;
+        }
+        let request_id = response
+            .headers()
+            .get("x-github-request-id")
+            .and_then(|value| value.to_str().ok())
+            .filter(|value| value.len() <= 80)
+            .map(|value| format!(", GitHub request {value}"))
+            .unwrap_or_default();
+        let mut bytes = Vec::new();
+        response
+            .error_for_status()
+            .with_context(|| {
+                format!(
+                    "Update release request at {endpoint} failed (HTTP {}{request_id}, {attempt} attempts)",
+                    status.as_u16()
+                )
+            })?
+            .take(MAX_MANIFEST * 4 + 1)
+            .read_to_end(&mut bytes)
+            .context("The update release response was incomplete")?;
+        ensure!(
+            bytes.len() <= MAX_MANIFEST as usize * 4,
+            "release information is too large"
+        );
+        return Ok(Some(bytes));
     }
-    let mut bytes = Vec::new();
-    response
-        .error_for_status()?
-        .take(MAX_MANIFEST * 4 + 1)
-        .read_to_end(&mut bytes)?;
-    ensure!(
-        bytes.len() <= MAX_MANIFEST as usize * 4,
-        "release information is too large"
-    );
-    Ok(Some(bytes))
+    unreachable!("each final request either returns a response or an error")
 }
 
 fn sibling(executable: &Path, suffix: &str) -> Result<PathBuf> {
@@ -1176,6 +1222,54 @@ mod tests {
         assert!(binary_version(&path, &release).is_err());
         fs::remove_file(path).unwrap();
     }
+
+    #[test]
+    fn a_new_signed_protocol_can_upgrade_but_a_mismatched_binary_cannot() {
+        let signing = SigningKey::from_bytes(&[57; 32]);
+        let (bytes, public) = available_fixture();
+        let mut api: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let mut envelope = release_envelope(&bytes).unwrap();
+        let mut release: Release = serde_json::from_str(&envelope.payload).unwrap();
+        release.protocol = crate::compatibility::PROTOCOL + 1;
+        envelope.payload = serde_json::to_string(&release).unwrap();
+        envelope.signature =
+            crate::config::hex(&signing.sign(envelope.payload.as_bytes()).to_bytes());
+        api["body"] = format!(
+            "Release notes\n{SIGNED_START}\n{}\n{SIGNED_END}",
+            serde_json::to_string(&envelope).unwrap()
+        )
+        .into();
+        let executable = if cfg!(target_os = "linux") {
+            Path::new("/usr/lib/desk-switch/desk-switch")
+        } else {
+            Path::new("/not-created/Desk Switch")
+        };
+        let Outcome::Available(candidate) = metadata_outcome(
+            serde_json::to_vec(&api).unwrap(),
+            &std::env::temp_dir(),
+            executable,
+            &public,
+        )
+        .unwrap() else {
+            panic!("a signed upgrade may introduce a new device protocol");
+        };
+        let path = std::env::temp_dir().join(format!(
+            "desk-switch-protocol-upgrade-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let stamp = |protocol| {
+            format!("DESK-SWITCH-BUILD:{{\"app\":\"99.0.0\",\"protocol\":{protocol}}}\0")
+        };
+        fs::write(&path, stamp(release.protocol)).unwrap();
+        binary_version(&path, &candidate.release).unwrap();
+        fs::write(&path, stamp(crate::compatibility::PROTOCOL)).unwrap();
+        assert!(binary_version(&path, &candidate.release).is_err());
+        fs::remove_file(path).unwrap();
+    }
 }
 
 #[cfg(all(test, not(target_os = "macos")))]
@@ -1222,3 +1316,7 @@ mod shared_tests {
         assert!(verify_shared_asset(&signed, &latest, key).is_err());
     }
 }
+
+#[cfg(test)]
+#[path = "updater_metadata_tests.rs"]
+mod metadata_requests;

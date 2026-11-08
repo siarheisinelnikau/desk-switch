@@ -156,7 +156,7 @@ func displays() throws {
     json(result)
 }
 
-struct DesktopScreen {
+struct DesktopScreen: Equatable {
     let id: String, rect: CGRect, epoch: UInt64
     var value: [String:Any] { ["id":id,"x":rect.minX,"y":rect.minY,"width":rect.width,"height":rect.height,"epoch":NSNumber(value:epoch)] }
 }
@@ -184,7 +184,7 @@ struct RouteRect: Decodable, Equatable {
     let x: Int32, y: Int32, width: UInt32, height: UInt32
     var rect: CGRect {CGRect(x:Double(x),y:Double(y),width:Double(width),height:Double(height))}
 }
-struct RouteBoundary: Decodable {
+struct RouteBoundary: Decodable, Equatable {
     let id:UInt64, screen:RouteRect, geometry:UInt64, side:String, start:UInt16, end:UInt16
     func position(_ point:CGPoint,_ dx:Double,_ dy:Double)->UInt16? {
         let rect=screen.rect
@@ -206,55 +206,85 @@ struct RouteBoundary: Decodable {
         return position>=start && (position<end || end==UInt16.max && position==UInt16.max) ? position : nil
     }
 }
+struct RoutePolicy: Decodable, Equatable {
+    var dwell_ms:UInt16=150, protect_corners=true, paused=false
+    func protects(_ boundary:RouteBoundary,_ position:UInt16)->Bool {
+        guard protect_corners else {return false}
+        let rect=boundary.screen.rect
+        let span=(boundary.side=="left" || boundary.side=="right" ? rect.height : rect.width)-1
+        let corner=min(rect.width,rect.height)*0.025,offset=Double(position)/65535*span
+        return offset<corner || span-offset<corner
+    }
+}
+struct RouteDwell {
+    var boundary:RouteBoundary, since:TimeInterval, last:TimeInterval
+}
 final class CaptureRoutes {
     var enabled=false, revision:UInt64=0, activation:UInt64=0
     var staged=[RouteBoundary](), boundaries=[RouteBoundary](), screens=[DesktopScreen]()
-    var indexed=[String:[RouteBoundary]](), latch:(CGRect,String)?, cooldown=CFAbsoluteTimeGetCurrent()
+    var indexed=[String:[RouteBoundary]](), latch:(CGRect,String)?, cooldown:TimeInterval=0
+    var policy=RoutePolicy(), dwell:RouteDwell?
+    var emit:([String:Any])->Void={json($0)}
     var latched:Bool {if case .some=latch {return true};return false}
     func refresh(_ value:[DesktopScreen]) {
+        if screens != value {latch=nil;cancelDwell()}
         screens=value;indexed.removeAll()
         for boundary in boundaries {
             let matches=value.filter {$0.rect==boundary.screen.rect && $0.epoch==boundary.geometry}
             if matches.count==1 {indexed[matches[0].id,default:[]].append(boundary)}
         }
     }
-    func resetEntry() {latch=nil;cooldown=CFAbsoluteTimeGetCurrent()+0.12}
+    func cancelDwell() {dwell=nil}
+    func resetEntry() {latch=nil;cancelDwell();cooldown=ProcessInfo.processInfo.systemUptime+0.12}
     func command(_ value:[String:Any]) {
         switch value["kind"] as? String {
-        case "routes-start":staged.removeAll();boundaries.removeAll();indexed.removeAll()
+        case "routes-start":cancelDwell();staged.removeAll();boundaries.removeAll();indexed.removeAll()
         case "routes-add":
             if staged.count<4096,let object=value["boundary"],let data=try? JSONSerialization.data(withJSONObject:object),let boundary=try? JSONDecoder().decode(RouteBoundary.self,from:data),boundary.geometry != 0,boundary.start<boundary.end,boundary.screen.width>=2,boundary.screen.height>=2,["left","right","top","bottom"].contains(boundary.side) {staged.append(boundary)}
         case "routes-commit":
             guard let nextRevision=(value["revision"] as? NSNumber)?.uint64Value,let nextActivation=(value["activation"] as? NSNumber)?.uint64Value,nextRevision != 0 || staged.isEmpty else {return}
-            if activation != nextActivation {latch=nil}
+            var nextPolicy=RoutePolicy()
+            if let object=value["policy"] {
+                guard let data=try? JSONSerialization.data(withJSONObject:object),let decoded=try? JSONDecoder().decode(RoutePolicy.self,from:data),decoded.dwell_ms<=1000 else {return}
+                nextPolicy=decoded
+            }
+            if activation != nextActivation || revision != nextRevision || policy != nextPolicy || boundaries != staged {latch=nil;cancelDwell()}
+            policy=nextPolicy
             revision=nextRevision;activation=nextActivation;boundaries=staged;staged.removeAll();refresh(screens)
         default:break
         }
     }
     // All records came from Rust's validated Routes. Native geometry still
     // has to match before an edge may suppress a local physical event.
-    func clamp(_ point:CGPoint,_ dx:Double,_ dy:Double,_ allow:Bool)->CGPoint? {
-        guard enabled else {return nil}
+    func clamp(_ point:CGPoint,_ dx:Double,_ dy:Double,_ allow:Bool,now:TimeInterval=ProcessInfo.processInfo.systemUptime)->CGPoint? {
+        guard enabled else {cancelDwell();return nil}
         var match:DesktopScreen?
         for screen in screens where screen.rect.contains(point) {
-            if case .some=match {return nil}
+            if case .some=match {cancelDwell();return nil}
             match=screen
         }
-        guard let screen=match else {return nil}
+        guard let screen=match else {cancelDwell();return nil}
         let rect=screen.rect
         if let old=latch {
             let inset=old.1=="left" ? point.x-rect.minX : old.1=="right" ? rect.maxX-1-point.x : old.1=="top" ? point.y-rect.minY : rect.maxY-1-point.y
-            if old.0 != rect || inset>=16 {latch=nil}
+            let threshold=min(16,(old.1=="left" || old.1=="right" ? rect.width : rect.height)/3)
+            if old.0 != rect || inset>=threshold {latch=nil}
         }
         for boundary in indexed[screen.id] ?? [] {
             if let position=boundary.position(point,dx,dy) {
-                if boundary.id != 0 && allow && !latched && CFAbsoluteTimeGetCurrent()>=cooldown {
-                    latch=(rect,boundary.side)
-                    json(["kind":"boundary","crossing":["revision":NSNumber(value:revision),"activation":NSNumber(value:activation),"boundary":NSNumber(value:boundary.id),"position":position]])
+                let clamped=CGPoint(x:min(max(point.x+dx,rect.minX),rect.maxX-1),y:min(max(point.y+dy,rect.minY),rect.maxY-1))
+                guard boundary.id != 0,allow,!policy.paused,!policy.protects(boundary,position),!latched,now>=cooldown else {cancelDwell();return clamped}
+                if policy.dwell_ms>0 {
+                    if dwell?.boundary != boundary || now-(dwell?.last ?? now)>0.1 {dwell=RouteDwell(boundary:boundary,since:now,last:now)}
+                    dwell?.last=now
+                    if now-(dwell?.since ?? now)<Double(policy.dwell_ms)/1000 {return clamped}
                 }
-                return CGPoint(x:min(max(point.x+dx,rect.minX),rect.maxX-1),y:min(max(point.y+dy,rect.minY),rect.maxY-1))
+                cancelDwell();latch=(rect,boundary.side)
+                emit(["kind":"boundary","crossing":["revision":NSNumber(value:revision),"activation":NSNumber(value:activation),"boundary":NSNumber(value:boundary.id),"position":position]])
+                return clamped
             }
         }
+        cancelDwell()
         return nil
     }
 }
@@ -276,7 +306,51 @@ func layoutSelfTest() throws {
     guard routes.clamp(CGPoint(x:98,y:50),4,0,false)==nil else {throw fail("Stale native display geometry was accepted")}
     routes.refresh([DesktopScreen(id:"1",rect:rect.rect,epoch:UInt64.max),DesktopScreen(id:"2",rect:rect.rect,epoch:UInt64.max)])
     guard routes.indexed.isEmpty else {throw fail("Ambiguous native geometry was accepted")}
-    print("Native layout policy: projection, 64-bit generations, blocked edges, stale and ambiguous geometry passed")
+    func install(_ target:CaptureRoutes,_ delay:UInt16=150,_ protect:Bool=true,_ paused:Bool=false,_ revision:UInt64=1) {
+        target.command(["kind":"routes-start"])
+        target.command(["kind":"routes-add","boundary":object])
+        target.command(["kind":"routes-commit","revision":NSNumber(value:revision),"activation":NSNumber(value:1),"policy":["dwell_ms":delay,"protect_corners":protect,"paused":paused]])
+    }
+    let pressure=CaptureRoutes();pressure.enabled=true
+    pressure.refresh([DesktopScreen(id:"1",rect:rect.rect,epoch:UInt64.max)])
+    var hits=0
+    pressure.emit={_ in hits+=1}
+    install(pressure)
+    _=pressure.clamp(CGPoint(x:98,y:50),4,0,true,now:0)
+    _=pressure.clamp(CGPoint(x:99,y:50),4,0,true,now:0.08)
+    guard hits==0 else {throw fail("A brief native edge touch bypassed dwell")}
+    _=pressure.clamp(CGPoint(x:99,y:50),4,0,true,now:0.151)
+    guard hits==1 else {throw fail("Continued native edge pressure did not cross")}
+    install(pressure,150,true,false,2);hits=0
+    _=pressure.clamp(CGPoint(x:98,y:50),4,0,true,now:1)
+    _=pressure.clamp(CGPoint(x:99,y:50),4,0,true,now:1.08)
+    _=pressure.clamp(CGPoint(x:99,y:50),-4,0,true,now:1.1)
+    _=pressure.clamp(CGPoint(x:99,y:50),4,0,true,now:1.151)
+    guard hits==0 else {throw fail("Native pullback did not cancel dwell")}
+    pressure.cancelDwell() // A complete key press between pointer events.
+    _=pressure.clamp(CGPoint(x:99,y:50),4,0,true,now:1.231)
+    guard hits==0 else {throw fail("Native held input reused old dwell")}
+    install(pressure,150,true,true,3)
+    _=pressure.clamp(CGPoint(x:99,y:50),4,0,true,now:2)
+    install(pressure,150,true,false,4)
+    _=pressure.clamp(CGPoint(x:99,y:50),4,0,true,now:2.08)
+    _=pressure.clamp(CGPoint(x:99,y:50),4,0,true,now:4)
+    guard hits==0 else {throw fail("Native unlock or parked cursor reused old dwell")}
+    _=pressure.clamp(CGPoint(x:99,y:50),4,0,true,now:4.08)
+    _=pressure.clamp(CGPoint(x:99,y:50),4,0,true,now:4.151)
+    guard hits==1,pressure.revision==4 else {throw fail("Native policy generation did not resume with fresh dwell")}
+    install(pressure,0,true,false,5);hits=0
+    _=pressure.clamp(CGPoint(x:99,y:1),4,0,true,now:5)
+    guard hits==0 else {throw fail("A native protected corner crossed")}
+    _=pressure.clamp(CGPoint(x:99,y:50),4,0,true,now:5.01)
+    guard hits==1 else {throw fail("Native corner protection blocked the edge center")}
+    for scale in [UInt32(1),UInt32(2)] {
+        for side in ["left","right","top","bottom"] {
+            let scaled=RouteBoundary(id:1,screen:RouteRect(x:-1000,y:20,width:1000*scale,height:800*scale),geometry:1,side:side,start:0,end:UInt16.max)
+            guard RoutePolicy().protects(scaled,655),RoutePolicy().protects(scaled,64880),!RoutePolicy().protects(scaled,8192) else {throw fail("Native corner protection changed with coordinate scaling")}
+        }
+    }
+    print("Native layout policy: projection, generations, blocked edges, stale geometry, dwell, pullback, corners and pause passed")
 }
 func edgePoint(_ display:CGDirectDisplayID,_ side:String,_ position:Int)->CGPoint {
     let bounds=CGDisplayBounds(display), fraction=Double(position)/65535
@@ -446,6 +520,7 @@ final class InputCapture {
     let routes=CaptureRoutes()
     var localPosition=CGPoint.zero
     func setMode(_ value: String) {
+        if mode != value {routes.cancelDwell()}
         if mode != value && value=="local" {localPosition=CGEvent(source:nil)?.location ?? localPosition}
         mode = value; deadline = CFAbsoluteTimeGetCurrent() + 0.25
         if value == "remote" && mouse && !hidden { CGDisplayHideCursor(CGMainDisplayID()); hidden = true }
@@ -462,6 +537,7 @@ final class InputCapture {
             // IOHIDSystem's documented NX_KEYTYPE sound-up/down/mute events.
             let mapping:[Int:Int64]=[0:72,1:73,7:74], code=(native.data1>>16)&0xffff, state=(native.data1>>8)&0xff
             if let code=mapping[code],state==0x0a || state==0x0b {
+                routes.cancelDwell()
                 let down=state==0x0a
                 if keys[code]==nil && down {keys[code]=remote && keyboard}
                 let owner=keys[code] ?? false;json(["kind":"key","code":code,"down":down,"remote":owner])
@@ -471,6 +547,7 @@ final class InputCapture {
         }
         switch type {
         case .keyDown, .keyUp, .flagsChanged:
+            routes.cancelDwell()
             let code = event.getIntegerValueField(.keyboardEventKeycode)
             if code == 103 { // F11 always returns local input, even during a failed handoff.
                 if type == .keyDown { setMode("local"); json(["kind": "emergency"]) }; return nil
@@ -491,6 +568,7 @@ final class InputCapture {
             if !down { keys.removeValue(forKey: code) }
             return owner ? nil : Unmanaged.passUnretained(event)
         case .leftMouseDown, .rightMouseDown, .otherMouseDown, .leftMouseUp, .rightMouseUp, .otherMouseUp:
+            routes.cancelDwell()
             let button = event.getIntegerValueField(.mouseEventButtonNumber)
             let down = type == .leftMouseDown || type == .rightMouseDown || type == .otherMouseDown
             if buttons[button] == nil && down { buttons[button] = remote && mouse }

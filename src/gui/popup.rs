@@ -27,6 +27,7 @@ pub enum Command {
     Level { remote: bool, level: AudioLevel },
     GroupLevel { key: [u8; 32], level: AudioLevel },
     Target([u8; 32]),
+    EdgePause(bool),
 }
 
 #[derive(Clone, Default, PartialEq)]
@@ -35,6 +36,9 @@ struct Snapshot {
     targets: Vec<([u8; 32], String, bool)>,
     connected: bool,
     can_switch: bool,
+    can_edit: bool,
+    edge_available: bool,
+    edge_paused: bool,
     monitor: bool,
     target: String,
     peer: String,
@@ -196,7 +200,15 @@ impl Desktop {
     pub(super) fn quick_action(&mut self, command: Command) {
         if let Some(state) = self.group.workspace.clone() {
             use crate::group::net::Action as GroupAction;
+            if !self.group.writable() {
+                self.notice = Some((
+                    "Connect another saved computer to change shared settings.".into(),
+                    true,
+                ));
+                return;
+            }
             match command {
+                Command::EdgePause(paused) => self.group_action(GroupAction::EdgePause(paused)),
                 Command::Toggle(device, enabled) => {
                     let mut value = state.settings.clone();
                     match device {
@@ -278,7 +290,7 @@ impl Desktop {
                 let Some(key) = key else { return };
                 self.prefs.workspace.shared.audio_levels.insert(key, level);
             }
-            Command::GroupLevel { .. } | Command::Target(_) => {}
+            Command::GroupLevel { .. } | Command::Target(_) | Command::EdgePause(_) => {}
         }
         self.shared_changed();
     }
@@ -298,6 +310,7 @@ impl Desktop {
         let mut snapshot = Snapshot {
             connected: self.pair.synced,
             can_switch: self.input_switch_ready() || self.monitor_switch_ready(),
+            can_edit: true,
             monitor: self.monitor_switch_ready(),
             target: self
                 .pair
@@ -370,7 +383,11 @@ impl Desktop {
                 .filter(|member| member.compatible())
                 .count()
                 > 1
+                && self.group.writable()
                 && !workspace.switch_pending();
+            snapshot.can_edit = self.group.writable();
+            snapshot.edge_available = workspace.settings.edge;
+            snapshot.edge_paused = workspace.edge_paused;
             snapshot.audio = workspace.settings.audio_enabled;
             snapshot.keyboard = workspace.settings.keyboard_enabled;
             snapshot.mouse = workspace.settings.mouse_enabled;
@@ -405,7 +422,7 @@ impl Desktop {
                 snapshot.targets.push((
                     key,
                     member.node.name.clone(),
-                    member.compatible() && !workspace.switch_pending(),
+                    member.compatible() && self.group.writable() && !workspace.switch_pending(),
                 ));
                 let system = plan.audio.as_ref() == Some(&member.node.key);
                 snapshot.levels.push(Level {
@@ -547,7 +564,11 @@ fn content(
         .inner
 }
 
-fn body(ui: &mut egui::Ui, snapshot: &Snapshot, send: &mut impl FnMut(Action)) {
+fn body(
+    ui: &mut egui::Ui,
+    snapshot: &Snapshot,
+    send: &mut impl FnMut(Action),
+) -> (egui::Response, Option<egui::Response>) {
     let tr = crate::i18n::tr;
     ui.horizontal(|ui| {
         let color = if snapshot.connected {
@@ -585,24 +606,37 @@ fn body(ui: &mut egui::Ui, snapshot: &Snapshot, send: &mut impl FnMut(Action)) {
                 }
             });
     }
-    if ui
-        .add_enabled(
-            snapshot.can_switch,
-            egui::Button::new(tr(if snapshot.targets.is_empty() {
-                "Switch to the other PC"
-            } else {
-                "Switch to next computer"
-            }))
-            .min_size(Vec2::new(ui.available_width(), 34.0)),
-        )
-        .clicked()
-    {
+    let switch = ui.add_enabled(
+        snapshot.can_switch,
+        egui::Button::new(tr(if snapshot.targets.is_empty() {
+            "Switch to the other PC"
+        } else {
+            "Switch to next computer"
+        }))
+        .min_size(Vec2::new(ui.available_width(), 34.0)),
+    );
+    if switch.clicked() {
         send(if snapshot.monitor {
             Action::MonitorSwitch
         } else {
             Action::Switch
         });
     }
+    let edge_pause = if snapshot.edge_available {
+        let mut paused = snapshot.edge_paused;
+        let response = ui
+            .add_enabled(
+                snapshot.can_edit,
+                egui::Checkbox::new(&mut paused, tr("Pause edge switching")),
+            )
+            .on_hover_text(tr("Until you resume or switch computers"));
+        if response.changed() {
+            send(Action::Quick(Command::EdgePause(paused)));
+        }
+        Some(response)
+    } else {
+        None
+    };
     ui.separator();
     egui::Grid::new("quick-device-toggles")
         .num_columns(2)
@@ -640,12 +674,16 @@ fn body(ui: &mut egui::Ui, snapshot: &Snapshot, send: &mut impl FnMut(Action)) {
                     &mut value,
                     label,
                     snapshot.visual.devices[icon.index()].as_ref(),
-                    enabled,
+                    enabled && snapshot.can_edit,
                 )
-                .on_disabled_hover_text(format!(
-                    "{} (F11)",
-                    tr("Return control before changing shared input devices.")
-                ))
+                .on_disabled_hover_text(if snapshot.can_edit {
+                    format!(
+                        "{} (F11)",
+                        tr("Return control before changing shared input devices.")
+                    )
+                } else {
+                    tr("Connect another saved computer to change shared settings.")
+                })
                 .changed()
                 {
                     send(Action::Quick(Command::Toggle(device, value)));
@@ -699,6 +737,9 @@ fn body(ui: &mut egui::Ui, snapshot: &Snapshot, send: &mut impl FnMut(Action)) {
         let mut level = row.value;
         let changed = ui
             .horizontal(|ui| {
+                if !snapshot.can_edit {
+                    ui.disable();
+                }
                 let slider = ui
                     .scope(|ui| {
                         let font = egui::TextStyle::Body.resolve(ui.style());
@@ -737,6 +778,7 @@ fn body(ui: &mut egui::Ui, snapshot: &Snapshot, send: &mut impl FnMut(Action)) {
         )
         .on_hover_text(tr(&snapshot.notice));
     }
+    (switch, edge_pause)
 }
 
 fn footer(ui: &mut egui::Ui, send: &mut impl FnMut(Action)) -> [egui::Rect; 2] {
@@ -757,6 +799,53 @@ fn footer(ui: &mut egui::Ui, send: &mut impl FnMut(Action)) -> [egui::Rect; 2] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn popup_pause_can_be_resumed_and_does_not_disable_manual_switching() {
+        for (paused, control, expected) in [
+            (false, 1, Action::Quick(Command::EdgePause(true))),
+            (true, 1, Action::Quick(Command::EdgePause(false))),
+            (true, 0, Action::Switch),
+        ] {
+            let ctx = egui::Context::default();
+            let snapshot = Snapshot {
+                can_switch: true,
+                can_edit: true,
+                edge_available: true,
+                edge_paused: paused,
+                targets: vec![([1; 32], "Another computer".into(), true)],
+                ..Default::default()
+            };
+            let raw = || egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(Pos2::ZERO, preferred_size())),
+                ..Default::default()
+            };
+            let mut rects = [egui::Rect::NOTHING; 2];
+            for _ in 0..3 {
+                let _ = ctx.run_ui(raw(), |ui| {
+                    let (switch, pause) = body(ui, &snapshot, &mut |_| {});
+                    rects = [switch.rect, pause.unwrap().rect];
+                });
+            }
+            let mut actions = Vec::new();
+            for pressed in [true, false] {
+                let mut input = raw();
+                input.events = vec![
+                    egui::Event::PointerMoved(rects[control].center()),
+                    egui::Event::PointerButton {
+                        pos: rects[control].center(),
+                        button: egui::PointerButton::Primary,
+                        pressed,
+                        modifiers: egui::Modifiers::NONE,
+                    },
+                ];
+                let _ = ctx.run_ui(input, |ui| {
+                    body(ui, &snapshot, &mut |action| actions.push(action));
+                });
+            }
+            assert!(actions == [expected]);
+        }
+    }
 
     #[test]
     fn child_popup_open_close_and_quit_wake_the_hidden_main_dispatcher() {

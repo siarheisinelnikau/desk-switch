@@ -120,11 +120,21 @@ fn monitor_epoch_connection(new_invite: bool) {
         );
         computers.iter().all(|computer| {
             computer.state.as_ref().is_some_and(|state| {
-                state.hub == keys[0]
+                state.workspace_id() == keys[0]
+                    && state.authority.is_some()
                     && state.activation == 16
                     && state.members.len() == 2
                     && state.members.values().all(|member| member.online)
             })
+        }) && (0..computers.len()).all(|index| {
+            events
+                .iter()
+                .rev()
+                .find_map(|(source, event)| match event {
+                    Event::Coordination { writable, .. } if *source == index => Some(*writable),
+                    _ => None,
+                })
+                .unwrap_or(false)
         })
     });
 

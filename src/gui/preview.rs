@@ -820,6 +820,7 @@ impl Desktop {
             }
             let mut state = crate::group::model::Workspace {
                 hub: self.public_key.clone(),
+                authority: None,
                 revision: 8,
                 settings: crate::group::model::Settings {
                     clipboard_enabled: true,
@@ -827,6 +828,8 @@ impl Desktop {
                     monitor_enabled: true,
                     ..Default::default()
                 },
+                edge_paused: false,
+                edge_policy_revision: 0,
                 members,
                 active_input: Some("11".repeat(32)),
                 input_intent: None,
@@ -889,6 +892,7 @@ impl Desktop {
                 "shared-four-settings"
                     | "shared-four-settings-error"
                     | "shared-four-update-download-error"
+                    | "shared-four-edge-settings"
             ) {
                 self.page = Page::Application;
             }
@@ -917,6 +921,42 @@ impl Desktop {
             }
             if case == "shared-four-settings-error" {
                 self.notice = Some(("The selected monitor is unavailable".into(), true));
+            }
+            if case == "shared-four-edge-settings"
+                || case == "shared-four-edge-paused-quick-controls"
+            {
+                let workspace = self.group.workspace.as_mut().unwrap();
+                workspace.settings.edge = true;
+                workspace.edge_paused = case.ends_with("quick-controls");
+            }
+            if case == "shared-four-reconnecting" || case == "shared-four-waiting" {
+                let waiting = case == "shared-four-waiting";
+                self.group.coordination = Some(super::group::Coordination {
+                    writable: false,
+                    online: if waiting { 2 } else { 3 },
+                    quorum: 3,
+                });
+                self.group
+                    .workspace
+                    .as_mut()
+                    .unwrap()
+                    .members
+                    .get_mut(&"44".repeat(32))
+                    .unwrap()
+                    .online = false;
+                if waiting {
+                    self.group
+                        .workspace
+                        .as_mut()
+                        .unwrap()
+                        .members
+                        .get_mut(&"33".repeat(32))
+                        .unwrap()
+                        .online = false;
+                }
+            }
+            if case.starts_with("shared-four-transfers") {
+                self.preview_transfers(case);
             }
             if case == "shared-four-diagnostics" {
                 self.page = Page::Diagnostics;

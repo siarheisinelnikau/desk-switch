@@ -138,9 +138,12 @@ pub struct Routes {
     pub revision: u64,
     pub activation: u64,
     pub boundaries: Vec<Boundary>,
+    #[serde(default)]
+    pub policy: Policy,
 }
 impl Routes {
     pub fn validate(&self) -> Result<()> {
+        self.policy.validate()?;
         ensure!(self.boundaries.len() <= 4096, "Too many edge boundaries");
         ensure!(
             self.boundaries.is_empty() || self.revision != 0,
@@ -172,6 +175,46 @@ impl Routes {
     }
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Policy {
+    pub dwell_ms: u16,
+    pub protect_corners: bool,
+    pub paused: bool,
+}
+impl Default for Policy {
+    fn default() -> Self {
+        Self {
+            dwell_ms: 150,
+            protect_corners: true,
+            paused: false,
+        }
+    }
+}
+impl Policy {
+    pub fn validate(self) -> Result<()> {
+        ensure!(self.dwell_ms <= 1000, "Invalid screen edge delay");
+        Ok(())
+    }
+    fn protects(self, boundary: Boundary, position: u16) -> bool {
+        if !self.protect_corners {
+            return false;
+        }
+        let rect = boundary.screen.rect();
+        let span = if boundary.side.vertical() {
+            rect.height - 1.0
+        } else {
+            rect.width - 1.0
+        };
+        // Both the edge offset and this square are in the screen's native
+        // coordinate space. No physical-pixel assumption is made on a scaled
+        // Windows display or a compositor using logical coordinates.
+        let corner = rect.width.min(rect.height) * 0.025;
+        let offset = f64::from(position) / f64::from(u16::MAX) * span;
+        offset < corner || span - offset < corner
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Hit {
     Cross(Crossing),
@@ -184,6 +227,12 @@ pub struct Router {
     screens: BTreeMap<ScreenRect, Vec<Boundary>>,
     latch: Option<(ScreenRect, Side)>,
     cooldown: Option<Instant>,
+    dwell: Option<Dwell>,
+}
+struct Dwell {
+    boundary: Boundary,
+    since: Instant,
+    last: Instant,
 }
 impl Router {
     pub fn configure(&mut self, routes: Routes, screens: &[NativeScreen]) -> Result<()> {
@@ -200,8 +249,9 @@ impl Router {
                 indexed.entry(boundary.screen).or_default().push(*boundary);
             }
         }
-        if self.routes.activation != routes.activation {
+        if self.routes != routes || self.screens != indexed {
             self.latch = None;
+            self.cancel_dwell();
         }
         self.screens = indexed;
         self.routes = routes;
@@ -216,17 +266,52 @@ impl Router {
     }
     pub fn reset_entry(&mut self) {
         self.latch = None;
+        self.cancel_dwell();
         self.cooldown = Some(Instant::now() + Duration::from_millis(120));
+    }
+    pub fn cancel_dwell(&mut self) {
+        self.dwell = None;
+    }
+    /// A cheap, non-mutating probe for adapters that observe held OS inputs
+    /// only when the pointer reaches a configured edge.
+    #[cfg(any(windows, test))]
+    pub fn would_cross(&self, x: f64, y: f64, dx: f64, dy: f64) -> bool {
+        self.screens
+            .iter()
+            .find(|(screen, _)| screen.rect().contains(x, y))
+            .is_some_and(|(_, boundaries)| {
+                boundaries.iter().any(|boundary| {
+                    boundary
+                        .side
+                        .crossing(boundary.screen.rect(), x, y, dx, dy)
+                        .is_some_and(|position| boundary.contains(position))
+                })
+            })
     }
     #[cfg(test)]
     pub fn crossing(&mut self, x: f64, y: f64, dx: f64, dy: f64) -> Option<Hit> {
         self.crossing_if(x, y, dx, dy, true)
     }
     pub fn crossing_if(&mut self, x: f64, y: f64, dx: f64, dy: f64, allow: bool) -> Option<Hit> {
-        let (screen, candidates) = self
+        self.crossing_at(x, y, dx, dy, allow, Instant::now())
+    }
+    fn crossing_at(
+        &mut self,
+        x: f64,
+        y: f64,
+        dx: f64,
+        dy: f64,
+        allow: bool,
+        now: Instant,
+    ) -> Option<Hit> {
+        let Some((screen, candidates)) = self
             .screens
             .iter()
-            .find(|(screen, _)| screen.rect().contains(x, y))?;
+            .find(|(screen, _)| screen.rect().contains(x, y))
+        else {
+            self.cancel_dwell();
+            return None;
+        };
         if let Some((previous, side)) = self.latch {
             let rect = previous.rect();
             let distance = match side {
@@ -256,11 +341,38 @@ impl Router {
             }
             if boundary.id == 0
                 || !allow
+                || self.routes.policy.paused
+                || self.routes.policy.protects(*boundary, position)
                 || self.latch.is_some()
-                || self.cooldown.is_some_and(|until| Instant::now() < until)
+                || self.cooldown.is_some_and(|until| now < until)
             {
+                self.dwell = None;
                 return Some(Hit::Block);
             }
+            if self.routes.policy.dwell_ms > 0 {
+                // Dwell requires continued outward motion. Parking at an edge
+                // does not arm a timer or count idle time toward a later push.
+                let gap = Duration::from_millis(100);
+                let dwell = self.dwell.get_or_insert(Dwell {
+                    boundary: *boundary,
+                    since: now,
+                    last: now,
+                });
+                if dwell.boundary != *boundary || now.saturating_duration_since(dwell.last) > gap {
+                    *dwell = Dwell {
+                        boundary: *boundary,
+                        since: now,
+                        last: now,
+                    };
+                }
+                dwell.last = now;
+                if now.saturating_duration_since(dwell.since)
+                    < Duration::from_millis(u64::from(self.routes.policy.dwell_ms))
+                {
+                    return Some(Hit::Block);
+                }
+            }
+            self.dwell = None;
             self.latch = Some((*screen, boundary.side));
             return Some(Hit::Cross(Crossing {
                 revision: self.routes.revision,
@@ -269,6 +381,7 @@ impl Router {
                 position,
             }));
         }
+        self.cancel_dwell();
         None
     }
 }
@@ -387,6 +500,16 @@ mod tests {
         }
     }
     fn routed(boundaries: Vec<Boundary>) -> Router {
+        routed_policy(
+            boundaries,
+            Policy {
+                dwell_ms: 0,
+                protect_corners: false,
+                ..Default::default()
+            },
+        )
+    }
+    fn routed_policy(boundaries: Vec<Boundary>, policy: Policy) -> Router {
         let mut router = Router::default();
         router
             .configure(
@@ -394,6 +517,7 @@ mod tests {
                     revision: 3,
                     activation: 5,
                     boundaries,
+                    policy,
                 },
                 &[native()],
             )
@@ -408,6 +532,8 @@ mod tests {
             boundary(2, Side::Right, 32768, u16::MAX),
             boundary(3, Side::Top, 0, u16::MAX),
         ]);
+        assert!(router.would_cross(-2.0, 100.0, 5.0, 0.0));
+        assert!(!router.would_cross(-2.0, 30.0, 5.0, 0.0));
         assert_eq!(router.crossing(-2.0, 30.0, 5.0, 0.0), None);
         assert!(matches!(
             router.crossing(-50.0, 21.0, 0.0, -5.0),
@@ -453,6 +579,7 @@ mod tests {
             revision: 1,
             activation: 1,
             boundaries: vec![boundary(0, Side::Right, 0, u16::MAX)],
+            ..Default::default()
         };
         let mut router = Router::default();
         router.configure(routes.clone(), &[native()]).unwrap();
@@ -499,5 +626,192 @@ mod tests {
         assert_eq!(x, 2576.0);
         assert!((y - 359.8).abs() < 0.1);
         assert_eq!(Side::Left.crossing(linux, x, y, -20.0, 0.0), Some(position));
+    }
+
+    #[test]
+    fn dwell_requires_continued_pressure_and_pullback_or_idle_time_cancels_it() {
+        let mut router = routed_policy(
+            vec![boundary(1, Side::Right, 0, u16::MAX)],
+            Policy::default(),
+        );
+        let now = Instant::now();
+        let push = |router: &mut Router, millis| {
+            router.crossing_at(
+                -2.0,
+                60.0,
+                5.0,
+                0.0,
+                true,
+                now + Duration::from_millis(millis),
+            )
+        };
+        assert_eq!(push(&mut router, 0), Some(Hit::Block));
+        assert_eq!(push(&mut router, 80), Some(Hit::Block));
+        assert_eq!(
+            router.crossing_at(-2.0, 60.0, -5.0, 0.0, true, now + Duration::from_millis(90)),
+            None
+        );
+        assert_eq!(push(&mut router, 150), Some(Hit::Block));
+        assert_eq!(push(&mut router, 230), Some(Hit::Block));
+        assert!(matches!(push(&mut router, 300), Some(Hit::Cross(_))));
+
+        let mut router = routed_policy(
+            vec![boundary(1, Side::Right, 0, u16::MAX)],
+            Policy::default(),
+        );
+        assert_eq!(push(&mut router, 0), Some(Hit::Block));
+        assert_eq!(push(&mut router, 2000), Some(Hit::Block));
+        assert_eq!(push(&mut router, 2080), Some(Hit::Block));
+        assert!(matches!(push(&mut router, 2150), Some(Hit::Cross(_))));
+    }
+
+    #[test]
+    fn held_inputs_and_pausing_require_a_fresh_dwell_after_release_or_unlock() {
+        let mut router = routed_policy(
+            vec![boundary(1, Side::Right, 0, u16::MAX)],
+            Policy::default(),
+        );
+        let now = Instant::now();
+        let push = |router: &mut Router, millis, allow| {
+            router.crossing_at(
+                -2.0,
+                60.0,
+                5.0,
+                0.0,
+                allow,
+                now + Duration::from_millis(millis),
+            )
+        };
+        assert_eq!(push(&mut router, 0, true), Some(Hit::Block));
+        assert_eq!(push(&mut router, 80, false), Some(Hit::Block));
+        assert_eq!(push(&mut router, 150, true), Some(Hit::Block));
+        router.cancel_dwell(); // A complete key press between pointer events.
+        assert_eq!(push(&mut router, 230, true), Some(Hit::Block));
+        let mut locked = router.routes().clone();
+        locked.revision += 1;
+        locked.policy.paused = true;
+        router.configure(locked.clone(), &[native()]).unwrap();
+        assert_eq!(push(&mut router, 300, true), Some(Hit::Block));
+        locked.revision += 1;
+        locked.policy.paused = false;
+        router.configure(locked, &[native()]).unwrap();
+        assert_eq!(push(&mut router, 380, true), Some(Hit::Block));
+        assert_eq!(push(&mut router, 460, true), Some(Hit::Block));
+        assert!(matches!(push(&mut router, 530, true), Some(Hit::Cross(_))));
+    }
+
+    #[test]
+    fn moving_to_a_different_contact_or_generation_does_not_reuse_dwell() {
+        let mut router = routed_policy(
+            vec![
+                boundary(1, Side::Right, 0, 32768),
+                boundary(2, Side::Right, 32768, u16::MAX),
+                boundary(3, Side::Top, 0, u16::MAX),
+            ],
+            Policy::default(),
+        );
+        let now = Instant::now();
+        assert_eq!(
+            router.crossing_at(-2., 40., 5., 0., true, now),
+            Some(Hit::Block)
+        );
+        assert_eq!(
+            router.crossing_at(-2., 100., 5., 0., true, now + Duration::from_millis(80)),
+            Some(Hit::Block)
+        );
+        assert_eq!(
+            router.crossing_at(-50., 21., 0., -5., true, now + Duration::from_millis(150)),
+            Some(Hit::Block)
+        );
+        let mut changed = router.routes().clone();
+        changed.activation += 1;
+        router.configure(changed, &[native()]).unwrap();
+        assert_eq!(
+            router.crossing_at(-50., 21., 0., -5., true, now + Duration::from_millis(230)),
+            Some(Hit::Block)
+        );
+        assert_eq!(
+            router.crossing_at(-50., 21., 0., -5., true, now + Duration::from_millis(310)),
+            Some(Hit::Block)
+        );
+        assert!(matches!(
+            router.crossing_at(-50., 21., 0., -5., true, now + Duration::from_millis(380)),
+            Some(Hit::Cross(Crossing {
+                boundary: 3,
+                activation: 6,
+                ..
+            }))
+        ));
+    }
+
+    #[test]
+    fn protected_corners_scale_with_the_screen_and_not_with_contact_endpoints() {
+        let policy = Policy {
+            dwell_ms: 0,
+            ..Default::default()
+        };
+        for scale in [1, 2] {
+            let screen = NativeScreen {
+                native_id: "scaled".into(),
+                rect: ScreenRect {
+                    x: -1000 * scale,
+                    y: 20 * scale,
+                    width: 1000 * scale as u32,
+                    height: 800 * scale as u32,
+                },
+                epoch: 7,
+            };
+            for side in [Side::Left, Side::Right, Side::Top, Side::Bottom] {
+                let rect = screen.rect.rect();
+                let edge = Boundary {
+                    id: 1,
+                    screen: screen.rect,
+                    geometry: 7,
+                    side,
+                    start: 0,
+                    end: u16::MAX,
+                };
+                let mut router = Router::default();
+                router
+                    .configure(
+                        Routes {
+                            revision: 1,
+                            activation: 1,
+                            boundaries: vec![edge],
+                            policy,
+                        },
+                        std::slice::from_ref(&screen),
+                    )
+                    .unwrap();
+                let (x, y, dx, dy) = match side {
+                    Side::Left => (rect.x, rect.y + 10. * f64::from(scale), -5., 0.),
+                    Side::Right => (rect.right() - 1., rect.y + 10. * f64::from(scale), 5., 0.),
+                    Side::Top => (rect.x + 10. * f64::from(scale), rect.y, 0., -5.),
+                    Side::Bottom => (rect.x + 10. * f64::from(scale), rect.bottom() - 1., 0., 5.),
+                };
+                assert_eq!(router.crossing(x, y, dx, dy), Some(Hit::Block));
+                let (x, y) = if side.vertical() {
+                    (x, rect.y + 40. * f64::from(scale))
+                } else {
+                    (rect.x + 40. * f64::from(scale), y)
+                };
+                assert!(matches!(router.crossing(x, y, dx, dy), Some(Hit::Cross(_))));
+            }
+        }
+        let mut router = routed_policy(vec![boundary(1, Side::Right, 32768, u16::MAX)], policy);
+        assert!(matches!(
+            router.crossing(-2., 70., 5., 0.),
+            Some(Hit::Cross(_))
+        ));
+    }
+
+    #[test]
+    fn policy_defaults_are_protective_and_invalid_delays_are_rejected() {
+        let routes: Routes =
+            serde_json::from_str(r#"{"revision":1,"activation":1,"boundaries":[]}"#).unwrap();
+        assert_eq!(routes.policy, Policy::default());
+        let mut invalid = routes;
+        invalid.policy.dwell_ms = 1001;
+        assert!(invalid.validate().is_err());
     }
 }
