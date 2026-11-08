@@ -219,6 +219,14 @@ impl FailoverWorkspace {
                             && state.active_input.as_ref().is_none_or(|target| {
                                 state.members[target].compatible()
                             })
+                            // A reachable remembered target may have just
+                            // returned in raw telemetry. Its automatic restore
+                            // must commit before this snapshot is a CAS base.
+                            && state.input_intent.as_ref().is_none_or(|target| {
+                                !state.members[target].compatible()
+                                    || state.members[target].node.monitor_error.is_some()
+                                    || state.active_input.as_ref() == Some(target)
+                            })
                             && (state.plan().input.is_none()
                                 || (state.active_input.is_some() && state.input_intent.is_some()))
                     })
@@ -901,6 +909,10 @@ fn commit_storage_failure_stops_only_that_voter_without_publishing_partial_state
         .filter(|index| *index != follower)
         .collect::<Vec<_>>();
     let intent = group.state(follower).input_intent.clone();
+    assert_eq!(intent, Some(group.keys[2].clone()));
+    for index in 0..3 {
+        assert_eq!(group.state(index).active_input, intent);
+    }
     let (arm, armed) = std::sync::mpsc::channel();
     group.computers[follower]
         .service
@@ -1178,6 +1190,9 @@ fn five_member_majority_serializes_competing_edits_and_preserves_only_committed_
     group.stop(0);
     group.stop(3);
     group.wait_ready(&alive);
+    for index in alive {
+        assert_eq!(group.state(index).active_input, intent);
+    }
     let keys = group.keys.clone();
     group.wait(|computers, _| {
         let revision = computers[alive[0]].state.as_ref().unwrap().revision;
