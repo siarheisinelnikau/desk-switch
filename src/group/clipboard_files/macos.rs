@@ -253,6 +253,9 @@ mod tests {
         use std::sync::Arc;
         struct UnexpectedDemand;
         impl DemandProvider for UnexpectedDemand {
+            fn lease(&self) -> Result<Arc<dyn DemandProvider>> {
+                panic!("An unsupported native paste must not acquire a lease")
+            }
             fn begin(&self, _intent: PasteIntent) -> Result<Arc<dyn PasteSession>> {
                 panic!("An unsupported native paste must not start a transfer")
             }

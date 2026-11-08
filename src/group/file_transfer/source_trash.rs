@@ -65,6 +65,9 @@ pub struct TrashReceipt {
 // Receipts are short-lived status values. Boxing would add an allocation to
 // every inspection while the largest variant is only a few hundred bytes.
 #[allow(clippy::large_enum_variant)]
+// Recycling a native Move source is only driven by the Windows and Linux paste
+// backends; on macOS the receipt variants are never constructed.
+#[cfg_attr(target_os = "macos", allow(dead_code))]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum TrashStatus {
     Pending,

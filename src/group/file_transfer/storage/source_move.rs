@@ -1416,6 +1416,7 @@ pub(crate) fn rename_for_trash(
     )
 }
 
+#[cfg_attr(target_os = "macos", allow(dead_code))]
 fn single_component(name: &OsStr) -> Result<()> {
     let mut components = Path::new(name).components();
     ensure!(
