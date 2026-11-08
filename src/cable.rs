@@ -294,19 +294,17 @@ fn launch_installer(installer: &Path, directory: &Path) -> Result<()> {
             WindowsAndMessaging::SW_SHOWNORMAL,
         },
     };
-    unsafe {
-        // SAFETY: the apartment is initialized for this thread and the
-        // matching CoUninitialize runs in the guard below, on the same thread.
-        CoInitializeEx(None, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE)
-    }
-    .ok()
-    .context("Could not initialize the Windows installer launcher")?;
+    // SAFETY: the apartment is initialized for this thread and the
+    // matching CoUninitialize runs in the guard below, on the same thread.
+    unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE) }
+        .ok()
+        .context("Could not initialize the Windows installer launcher")?;
     struct Apartment;
     impl Drop for Apartment {
         fn drop(&mut self) {
+            // SAFETY: this matches the successful CoInitializeEx above on
+            // the same thread, and it runs exactly once.
             unsafe {
-                // SAFETY: this matches the successful CoInitializeEx above on
-                // the same thread, and it runs exactly once.
                 CoUninitialize();
             }
         }
@@ -341,9 +339,9 @@ fn launch_installer(installer: &Path, directory: &Path) -> Result<()> {
             .context("Could not open the official VB-CABLE installer");
     }
     if !info.hProcess.is_null() {
+        // SAFETY: SEE_MASK_NOCLOSEPROCESS asked the shell to return the
+        // process handle, and it is closed exactly once here.
         unsafe {
-            // SAFETY: SEE_MASK_NOCLOSEPROCESS asked the shell to return the
-            // process handle, and it is closed exactly once here.
             CloseHandle(info.hProcess);
         }
     }

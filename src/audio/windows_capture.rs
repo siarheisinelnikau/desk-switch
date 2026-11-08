@@ -137,9 +137,9 @@ fn record(
             let mut pointer = std::ptr::null_mut();
             let mut frames = 0;
             let mut flags = 0;
+            // SAFETY: the three out-parameters are live locals and the
+            // null event arguments are allowed by the API.
             unsafe {
-                // SAFETY: the three out-parameters are live locals and the
-                // null event arguments are allowed by the API.
                 capture.GetBuffer(&mut pointer, &mut frames, &mut flags, None, None)?;
             }
             let bytes = frames as usize * BLOCK_ALIGN;
@@ -159,20 +159,19 @@ fn record(
                         "WASAPI returned a null audio buffer"
                     );
                     if bytes != 0 {
-                        buffer.pending.extend(unsafe {
-                            // SAFETY: the pointer is the capture buffer that
-                            // WASAPI just handed out and it holds exactly
-                            // `frames` frames of `BLOCK_ALIGN` bytes. The
-                            // slice is copied before the buffer is released.
-                            std::slice::from_raw_parts(pointer, bytes)
-                        });
+                        // SAFETY: the pointer is the capture buffer that WASAPI
+                        // just handed out and it holds exactly `frames` frames
+                        // of `BLOCK_ALIGN` bytes. The slice is copied before
+                        // the buffer is released.
+                        let capture = unsafe { std::slice::from_raw_parts(pointer, bytes) };
+                        buffer.pending.extend(capture);
                     }
                 }
                 Ok::<_, anyhow::Error>(())
             })();
+            // SAFETY: the same frame count that GetBuffer reported is
+            // handed back, which is what the API requires.
             unsafe {
-                // SAFETY: the same frame count that GetBuffer reported is
-                // handed back, which is what the API requires.
                 capture.ReleaseBuffer(frames)?;
             }
             read?;

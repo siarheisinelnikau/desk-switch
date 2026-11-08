@@ -141,10 +141,14 @@ struct Native {
 }
 #[cfg(windows)]
 fn native_sequence() -> Option<u64> {
+    // SAFETY: the function takes no arguments, returns a plain counter and
+    // transfers no ownership.
     #[link(name = "user32")]
     unsafe extern "system" {
         fn GetClipboardSequenceNumber() -> u32;
     }
+    // SAFETY: the call has no pointer arguments and only reads the clipboard
+    // sequence counter.
     let sequence = unsafe { GetClipboardSequenceNumber() };
     (sequence != 0).then_some(u64::from(sequence))
 }
@@ -158,8 +162,11 @@ fn native_sequence() -> Option<u64> {
     autoreleasepool(|_| {
         // NSPasteboard can be used on the clipboard worker, just as arboard
         // does. Match its nullable lookup for non-GUI/launchd environments.
-        let pasteboard: Option<Retained<NSPasteboard>> =
-            unsafe { msg_send![NSPasteboard::class(), generalPasteboard] };
+        let pasteboard: Option<Retained<NSPasteboard>> = unsafe {
+            // SAFETY: the message takes no arguments and returns a retained
+            // pasteboard, which the optional keeps owned.
+            msg_send![NSPasteboard::class(), generalPasteboard]
+        };
         pasteboard.and_then(|pasteboard| u64::try_from(pasteboard.changeCount()).ok())
     })
 }

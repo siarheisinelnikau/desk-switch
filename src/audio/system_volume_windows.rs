@@ -36,9 +36,11 @@ impl Backend for Native {
     }
 
     fn set_volume(&mut self, volume: u8) -> Result<()> {
+        // SAFETY: the endpoint volume interface is owned by this backend and
+        // the null event pointer is allowed by the API.
+        // SAFETY: the endpoint volume interface is owned by this backend and the
+        // null event pointer is allowed by the API.
         unsafe {
-            // SAFETY: the endpoint volume interface is owned by this backend
-            // and the null event pointer is allowed by the API.
             self.volume
                 .SetMasterVolumeLevelScalar(f32::from(volume) / 100.0, std::ptr::null())?;
         }
@@ -46,9 +48,11 @@ impl Backend for Native {
     }
 
     fn set_muted(&mut self, muted: bool) -> Result<()> {
+        // SAFETY: the endpoint volume interface is owned by this backend and
+        // the null event pointer is allowed by the API.
+        // SAFETY: the endpoint volume interface is owned by this backend and the
+        // null event pointer is allowed by the API.
         unsafe {
-            // SAFETY: the endpoint volume interface is owned by this backend
-            // and the null event pointer is allowed by the API.
             self.volume.SetMute(muted, std::ptr::null())?;
         }
         Ok(())

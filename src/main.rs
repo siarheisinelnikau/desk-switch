@@ -76,6 +76,8 @@ fn main() {
         && !lifecycle::managed()
     {
         // Keep explicit CLI commands usable from a terminal without a console on GUI launch.
+        // SAFETY: the call attaches the parent console to this process and
+        // touches no memory.
         unsafe {
             windows_sys::Win32::System::Console::AttachConsole(u32::MAX);
         }

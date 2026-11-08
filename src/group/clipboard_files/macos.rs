@@ -35,6 +35,8 @@ thread_local! {
 
 fn pasteboard() -> Result<Retained<NSPasteboard>> {
     // Match arboard's nullable lookup when no Aqua pasteboard is available.
+    // SAFETY: the message takes no arguments and returns a retained
+    // pasteboard, which the optional keeps owned.
     let board: Option<Retained<NSPasteboard>> =
         unsafe { msg_send![NSPasteboard::class(), generalPasteboard] };
     board.context("The macOS system pasteboard is unavailable")
@@ -124,6 +126,8 @@ pub(super) fn read() -> Result<Option<Selection>> {
                 items.len() <= MAX_ROOTS,
                 "The clipboard has more than 10000 items"
             );
+            // SAFETY: the constant is a static pasteboard type identifier and no
+            // memory is transferred.
             let file_type = unsafe { NSPasteboardTypeFileURL };
             let file_types = NSArray::from_slice(&[file_type]);
             let mut metadata = 0usize;

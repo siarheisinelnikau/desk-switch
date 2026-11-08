@@ -46,6 +46,8 @@ impl Process {
         // A suspended helper must never block the Rust lease or shutdown
         // path on a full pipe. Every control message fits in PIPE_BUF.
         let descriptor = writer.lock().unwrap().as_raw_fd();
+        // SAFETY: the descriptor is open and the calls only read and update its
+        // status flags.
         let nonblocking = unsafe {
             let flags = libc::fcntl(descriptor, libc::F_GETFL);
             flags >= 0 && libc::fcntl(descriptor, libc::F_SETFL, flags | libc::O_NONBLOCK) >= 0
