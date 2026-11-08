@@ -68,7 +68,6 @@ pub enum PasteStage {
     Paused,
     Verifying,
     Delivered,
-    NativeCompleted,
     RemovingOriginals,
     OriginalsRetained,
     Moved,

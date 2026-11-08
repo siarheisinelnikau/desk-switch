@@ -242,7 +242,6 @@ impl PasteSession for TestSession {
                 state.committed = true;
                 self.fixture.commits.fetch_add(1, Ordering::AcqRel);
             }
-            NativeResult::Succeeded => {}
         }
         self.changed.notify_all();
         Ok(())
