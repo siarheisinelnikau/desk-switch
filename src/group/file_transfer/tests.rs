@@ -336,7 +336,10 @@ async fn crash_receiver(root: &Path, port: u16, peer: &str, workspace: &str) -> 
         peer_paused: false,
         offer: None,
         operation: Operation::Copy,
-        native_move: None, move_binding: None, move_outcome: None, move_grant: None,
+        native_move: None,
+        move_binding: None,
+        move_outcome: None,
+        move_grant: None,
         view: Transfer {
             id: job_id(&manifest.id, &source),
             peer: source.clone(),
@@ -513,7 +516,10 @@ fn cancellation_between_the_first_marker_read_and_registration_rejects_the_new_j
                 peer_paused: false,
                 offer: None,
                 operation: Operation::Copy,
-                native_move: None, move_binding: None, move_outcome: None, move_grant: None,
+                native_move: None,
+                move_binding: None,
+                move_outcome: None,
+                move_grant: None,
                 view: Transfer {
                     id: job_id(&id, &peer),
                     peer: peer.clone(),
