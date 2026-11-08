@@ -34,11 +34,29 @@ impl Probe {
                     if cancel.try_recv().is_ok() {
                         break;
                     }
+                    let displays = crate::platform::list_displays().unwrap_or_default();
+                    let speakers = crate::audio::devices()
+                        .unwrap_or_default()
+                        .into_iter()
+                        .take(32)
+                        .collect();
+                    let microphones = crate::audio::microphones()
+                        .unwrap_or_default()
+                        .into_iter()
+                        .take(32)
+                        .collect();
+                    let microphone_bridges = crate::audio::microphone_bridges()
+                        .unwrap_or_default()
+                        .into_iter()
+                        .take(32)
+                        .collect();
+                    // Audio and display queries can wait on their services.
+                    // Publish input presence sampled after those waits, so an
+                    // unplug during enumeration cannot publish the old owner.
                     let (inputs, error) = match input_devices() {
                         Ok(inputs) => (inputs, None),
                         Err(error) => (Vec::new(), Some(error.to_string())),
                     };
-                    let displays = crate::platform::list_displays().unwrap_or_default();
                     let mut inventory = super::devices::Inventory {
                         displays: display_inventory(&displays),
                         keyboards: inputs
@@ -53,21 +71,9 @@ impl Probe {
                             .map(|d| d.info.clone())
                             .take(32)
                             .collect(),
-                        speakers: crate::audio::devices()
-                            .unwrap_or_default()
-                            .into_iter()
-                            .take(32)
-                            .collect(),
-                        microphones: crate::audio::microphones()
-                            .unwrap_or_default()
-                            .into_iter()
-                            .take(32)
-                            .collect(),
-                        microphone_bridges: crate::audio::microphone_bridges()
-                            .unwrap_or_default()
-                            .into_iter()
-                            .take(32)
-                            .collect(),
+                        speakers,
+                        microphones,
+                        microphone_bridges,
                         individual_input: cfg!(target_os = "linux"),
                     };
                     for list in [
@@ -242,8 +248,17 @@ fn input_capabilities(key: &str, rel: &str, abs: &str) -> (bool, bool) {
 }
 
 #[cfg(target_os = "linux")]
+fn input_node_generation(path: &std::path::Path) -> Option<(u64, u64)> {
+    use std::os::unix::fs::{FileTypeExt, MetadataExt};
+    let metadata = std::fs::metadata(path).ok()?;
+    if !metadata.file_type().is_char_device() {
+        return None;
+    }
+    Some((metadata.dev(), metadata.ino()))
+}
+
+#[cfg(target_os = "linux")]
 pub fn input_devices() -> Result<Vec<InputEndpoint>> {
-    use std::os::unix::fs::MetadataExt;
     let mut result = Vec::new();
     let mut aliases = std::collections::BTreeMap::new();
     for directory in ["/dev/input/by-path", "/dev/input/by-id"] {
@@ -280,6 +295,11 @@ pub fn input_devices() -> Result<Vec<InputEndpoint>> {
         let (k, m) = input_capabilities(&key, &rel, &abs);
         if (k || m) && result.len() < 32 {
             let path = PathBuf::from("/dev/input").join(name.as_ref());
+            let Some(generation) = input_node_generation(&path) else {
+                // sysfs removal and udev node removal are separate operations.
+                // A lingering capability entry is not an attached input device.
+                continue;
+            };
             let id = aliases
                 .get(&path)
                 .map(|p| p.to_string_lossy().into_owned())
@@ -299,7 +319,7 @@ pub fn input_devices() -> Result<Vec<InputEndpoint>> {
                     name: label.trim().chars().take(256).collect(),
                     default: false,
                 },
-                generation: std::fs::metadata(&path).ok().map(|m| (m.dev(), m.ino())),
+                generation: Some(generation),
                 path,
                 keyboard: k,
                 mouse: m,
@@ -591,6 +611,30 @@ pub fn hardware(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn lingering_sysfs_candidate_requires_a_current_character_device() {
+        let directory = std::env::temp_dir().join(format!(
+            "desk-switch-missing-input-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir(&directory).unwrap();
+        let node = directory.join("event7");
+        assert!(input_node_generation(&node).is_none());
+        std::fs::write(
+            &node,
+            "A reused path is a regular file, not an input device",
+        )
+        .unwrap();
+        assert!(input_node_generation(&node).is_none());
+        std::fs::remove_file(&node).unwrap();
+        assert!(input_node_generation(&node).is_none());
+        std::fs::remove_dir(directory).unwrap();
+    }
     #[test]
     fn windows_consumer_controls_and_software_buses_do_not_supply_a_keyboard() {
         assert!(!full_windows_keyboard(8, 0));

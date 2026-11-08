@@ -56,6 +56,9 @@ def main():
             run(str(binary), "macos-export-helper", name, str(helper))
             helper.chmod(0o755)
             run(str(helper), "--version", stdout=subprocess.DEVNULL)
+            if name == "desk-switch-native":
+                # Pure layout fixtures: no GUI, display queries or permissions.
+                run(str(helper), "layout-self-test")
             # build.rs signs helpers before embedding them. Re-signing here
             # would change the bytes checked by the running application.
             run("/usr/bin/codesign", "--verify", "--strict", str(helper))

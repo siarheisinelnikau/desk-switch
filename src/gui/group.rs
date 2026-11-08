@@ -18,6 +18,19 @@ fn tr(text: &str) -> String {
     crate::i18n::tr(text)
 }
 
+fn clear_recovered_input_notice(
+    notice: &mut Option<(String, bool)>,
+    input_notice: &mut Option<String>,
+) {
+    if let Some(previous) = input_notice.take()
+        && notice
+            .as_ref()
+            .is_some_and(|(message, error)| *error && *message == previous)
+    {
+        *notice = None;
+    }
+}
+
 #[derive(Default)]
 pub(super) struct Group {
     pub compat: super::group_compat::Compat,
@@ -30,6 +43,9 @@ pub(super) struct Group {
     network_log: std::collections::VecDeque<String>,
     network_reconnecting: std::collections::BTreeSet<String>,
     pub return_pending: bool,
+    return_request: Option<u64>,
+    return_retry_at: Option<std::time::Instant>,
+    input_notice: Option<String>,
     pub(super) probe: Option<workspace::hardware::Probe>,
     last_node: Option<Node>,
     last_volume: Option<workspace::AudioLevel>,
@@ -552,13 +568,49 @@ impl Desktop {
             }
             if self.group.data.returned {
                 self.group.data.returned = false;
+                if !self.group.return_pending {
+                    self.group.return_request = Some(state.input_request);
+                    self.group.return_retry_at = None;
+                }
                 self.group.return_pending = true;
             }
-            if self.group.return_pending && !state.switch_pending() {
-                self.group.return_pending = false;
-                self.group_action(Action::ReturnInput);
+            if self.group.return_pending {
+                let source = state.plan().input;
+                let acknowledged = state.active_input == source && state.input_intent == source;
+                let superseded = self
+                    .group
+                    .return_request
+                    .is_some_and(|request| state.input_request > request);
+                if acknowledged || superseded {
+                    self.group.return_pending = false;
+                    self.group.return_request = None;
+                    self.group.return_retry_at = None;
+                } else if !state.switch_pending()
+                    && state
+                        .members
+                        .get(&state.hub)
+                        .is_some_and(|member| member.online)
+                {
+                    let now = std::time::Instant::now();
+                    if self.group.return_retry_at.is_none_or(|until| now >= until) {
+                        self.group.return_retry_at = Some(now + std::time::Duration::from_secs(1));
+                        self.group_action(Action::ReturnInput);
+                    }
+                    if let Some(until) = self.group.return_retry_at {
+                        ctx.request_repaint_after_for(
+                            until.saturating_duration_since(now),
+                            egui::ViewportId::ROOT,
+                        );
+                    }
+                }
+            }
+            if std::mem::take(&mut self.group.data.input_recovered) {
+                clear_recovered_input_notice(&mut self.notice, &mut self.group.input_notice);
             }
             if let Some(error) = self.group.data.error.take() {
+                if self.group.data.input_notice.take().as_deref() == Some(error.as_str()) {
+                    self.group.input_notice = Some(error.clone());
+                }
                 self.notice = Some((error, true));
             }
             self.tick_group_monitor(&state, ctx);
@@ -1732,6 +1784,18 @@ fn manual_address(value: &str) -> Result<SocketAddr> {
 #[cfg(test)]
 mod manual_tests {
     use super::*;
+    #[test]
+    fn input_recovery_clears_only_its_owned_notice_and_never_an_update_or_monitor_error() {
+        let old = "peer heartbeat timed out (last reply 1761 ms ago)".to_owned();
+        let mut notice = Some((old.clone(), true));
+        clear_recovered_input_notice(&mut notice, &mut Some(old.clone()));
+        assert!(notice.is_none());
+        for message in ["Monitor switch failed", "Could not download the update"] {
+            let mut notice = Some((message.to_owned(), true));
+            clear_recovered_input_notice(&mut notice, &mut Some(old.clone()));
+            assert_eq!(notice, Some((message.to_owned(), true)));
+        }
+    }
     #[test]
     fn manual_connection_addresses_keep_ports_and_normalize_mapped_ipv4() {
         assert_eq!(

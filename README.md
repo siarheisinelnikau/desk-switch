@@ -6,9 +6,9 @@
 
 ## Get started
 
-Download the same version for every computer from [Releases](https://github.com/siarheisinelnikau/desk-switch/releases/latest). Current releases provide **Windows x86-64** and **Ubuntu 24.04/26.04 x86-64** installers.
+Download the same version for every computer from [Releases](https://github.com/siarheisinelnikau/desk-switch/releases/latest). From **0.6.2**, downloads include **Windows x86-64**, **Ubuntu 24.04/26.04 x86-64**, and experimental **macOS 13+** app bundles for **Apple Silicon** and **Intel**.
 
-Run the Windows executable or install the Ubuntu `.deb` with APT. Open **+ Add a computer**, find a nearby computer or enter its **Manual IP**, and approve the connection on that computer. Repeat for the rest of your workspace.
+Run the Windows executable, install the Ubuntu `.deb` with APT, or unzip the matching Mac archive and move **Desk Switch.app** to **Applications** or **~/Applications**. Open **+ Add a computer**, find a nearby computer or enter its **Manual IP**, and approve the connection on that computer. Repeat for the rest of your workspace.
 
 Choose where your keyboard, mouse and sound come from. Click **Switch here** to control a computer, press **F12** to cycle, or **F11** to return input to its source. Keep the coordinating computer running; update it last.
 
@@ -45,4 +45,4 @@ See the [guide](docs/guide.md) for setup, permissions, virtual microphones, moni
 
 A good friend shared this idea and showed me [Hotseat](https://github.com/muspelheim/hotseat), his project for switching monitor inputs on macOS. I built Desk Switch for my Ubuntu and Windows computers, extending the idea to keyboards, mice, speakers, headphones and microphones. Thank you, my friend, for the idea and inspiration.
 
-macOS support remains experimental, has not been tested on physical hardware and is excluded from current releases. **macOS testing and pull requests are warmly appreciated.**
+macOS support remains experimental and **has not been tested on physical hardware**. Mac bundles are ad-hoc signed and are not notarized; see the guide for permissions and limitations. **macOS testing and pull requests are warmly appreciated.**

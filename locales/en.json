@@ -202,6 +202,8 @@
   "Не удалось включить доступность в сети. Возможно, Desk Switch уже запущен.": "Could not enable network availability. Desk Switch may already be running.",
   "Не удалось найти второй ПК": "Could not reach the other PC",
   "Не удалось проверить обновления: {error:#}": "Could not check for updates: {error:#}",
+  "Could not check for updates: {error:#}": "Could not check for updates: {error:#}",
+  "Could not download or verify the update: {error:#}": "Could not download or verify the update: {error:#}",
   "Не удалось проверить устройства ввода": "Could not check input devices",
   "Не удалось прочитать текущее подключение. Включите DDC/CI в меню монитора.": "Could not read the current connection. Enable DDC/CI in the monitor's menu.",
   "Не удалось разорвать пару": "Could not unlink computers",
