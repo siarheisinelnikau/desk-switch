@@ -69,6 +69,10 @@ struct Worker {
 struct Apartment;
 impl Apartment {
     fn enter() -> Option<Self> {
+        // SAFETY: This worker thread is created only for Shell queries and has
+        // not initialized COM before, so this call starts its apartment in
+        // multi-threaded mode; the returned guard is dropped on this same
+        // thread and calls CoUninitialize exactly once to balance it.
         unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) }
             .ok()
             .ok()?;
@@ -77,24 +81,36 @@ impl Apartment {
 }
 impl Drop for Apartment {
     fn drop(&mut self) {
+        // SAFETY: CoUninitialize must run on the thread that initialized COM;
+        // this guard was created by CoInitializeEx on the same worker thread and
+        // is dropped exactly once there.
         unsafe { CoUninitialize() };
     }
 }
 struct Cancellation;
 impl Cancellation {
     fn enter() -> Option<Self> {
+        // SAFETY: Call cancellation is enabled only for the calling thread's
+        // apartment; the guard disables it again on this same thread, so the
+        // Shell query that follows can be cancelled by CoCancelCall.
         unsafe { CoEnableCallCancellation(None) }.ok()?;
         Some(Self)
     }
 }
 impl Drop for Cancellation {
     fn drop(&mut self) {
+        // SAFETY: The guard enabled call cancellation on this thread and the
+        // drop runs on that same thread, so this restores the apartment state
+        // that existed before the guard was created.
         let _ = unsafe { CoDisableCallCancellation(None) };
     }
 }
 struct Pidl(*mut ITEMIDLIST);
 impl Drop for Pidl {
     fn drop(&mut self) {
+        // SAFETY: The pointer is the ITEMIDLIST that GetCurFolder allocated with
+        // CoTaskMemAlloc and transferred to this guard, so it is freed exactly
+        // once here with the matching allocator.
         unsafe { CoTaskMemFree(Some(self.0.cast())) };
     }
 }
@@ -112,6 +128,9 @@ impl Worker {
                 let Some(_apartment) = Apartment::enter() else {
                     return;
                 };
+                // SAFETY: The call takes no pointer arguments and returns the
+                // id of the calling thread, which is this worker thread; the
+                // value is used only to target CoCancelCall at this apartment.
                 let thread_id = unsafe { GetCurrentThreadId() };
                 while let Ok(job) = receive.recv() {
                     if !job.live() {
@@ -149,11 +168,16 @@ fn foreground_for(process: u32) -> Option<usize> {
     if process == 0 {
         return None;
     }
+    // SAFETY: The call takes no arguments and returns a borrowed window handle
+    // that this code neither owns nor closes; it is only compared with the
+    // recorded foreground window and passed to GetWindowThreadProcessId.
     let window = unsafe { GetForegroundWindow() };
     if window.is_null() {
         return None;
     }
     let mut actual = 0;
+    // SAFETY: `actual` is a live u32 local that outlives the call and receives
+    // the owning process id; `window` is a borrowed handle that is not closed.
     if unsafe { GetWindowThreadProcessId(window, &mut actual) } == 0 || actual != process {
         return None;
     }
@@ -192,6 +216,9 @@ pub(super) fn capture(process_id: u32) -> Option<PathBuf> {
             {
                 // Zero means no server wait. Cancellation is best effort;
                 // a noncooperating server can occupy only this one worker.
+                // SAFETY: `thread_id` is the id of this worker thread's own COM
+                // apartment, taken from GetCurrentThreadId on that thread, and a
+                // zero timeout only requests cancellation without waiting.
                 let _ = unsafe { CoCancelCall(thread_id, 0) };
             }
             None
@@ -204,7 +231,14 @@ fn discover(job: &Job) -> Option<PathBuf> {
         return None;
     }
     let windows: IShellWindows =
+        // SAFETY: The ShellWindows automation object is created in this
+        // worker's multi-threaded apartment; the returned interface pointer is
+        // owned by the `windows` binding and released when it goes out of scope,
+        // still inside that apartment.
         unsafe { CoCreateInstance(&ShellWindows, None, CLSCTX_LOCAL_SERVER) }.ok()?;
+    // SAFETY: `windows` is a live COM interface pointer owned by this scope, so
+    // the method call targets a valid object and the reference count stays
+    // balanced; the count is only used as a bounded loop limit.
     let count = unsafe { windows.Count() }.ok()?;
     if !(1..=MAX_WINDOWS).contains(&count) {
         return None;
@@ -214,10 +248,16 @@ fn discover(job: &Job) -> Option<PathBuf> {
         if !job.foreground_matches() {
             return None;
         }
+        // SAFETY: `windows` is a live interface pointer for the duration of
+        // this call, and the referenced VARIANT temporary is alive until the
+        // end of the enclosing statement, which includes the call.
         let dispatch = unsafe { windows.Item(&VARIANT::from(index)) }.ok()?;
         let Ok(browser) = dispatch.cast::<IWebBrowserApp>() else {
             continue;
         };
+        // SAFETY: `browser` is a live IWebBrowserApp interface pointer owned by
+        // this iteration, and the call only reads the Explorer window handle;
+        // no ownership of the window is transferred to this code.
         let Ok(window) = (unsafe { browser.HWND() }) else {
             continue;
         };
@@ -225,29 +265,56 @@ fn discover(job: &Job) -> Option<PathBuf> {
             continue;
         }
         let service: IServiceProvider = dispatch.cast().ok()?;
-        let browser: IShellBrowser = unsafe { service.QueryService(&SID_STopLevelBrowser) }.ok()?;
+        let browser: IShellBrowser =
+            // SAFETY: `service` is a live IServiceProvider interface pointer
+            // owned by this iteration, so the query is valid; the returned
+            // IShellBrowser pointer is owned by the `browser` binding and
+            // released at the end of the iteration.
+            unsafe { service.QueryService(&SID_STopLevelBrowser) }.ok()?;
+        // SAFETY: `browser` is a live IShellBrowser pointer owned by this
+        // iteration; the returned IShellView pointer is owned by the `view`
+        // binding and released before the next iteration.
         let view = unsafe { browser.QueryActiveShellView() }.ok()?;
+        // SAFETY: `view` is a live IShellView pointer owned by this iteration,
+        // and the call only reads the Explorer window handle; the window itself
+        // stays owned by Explorer.
         let view_window = unsafe { view.GetWindow() }.ok()?.0;
         let frame = job.foreground as HWND;
         if view_window.is_null()
+            // SAFETY: `view_window` is the window of the live Explorer view, so
+            // the call only reads its visibility and owns nothing.
             || unsafe { IsWindowVisible(view_window) } == 0
+            // SAFETY: `frame` is the recorded foreground window and
+            // `view_window` belongs to the live Explorer view, so the call only
+            // tests their parent/child relationship and owns nothing.
             || (view_window != frame && unsafe { IsChild(frame, view_window) } == 0)
         {
             continue;
         }
         let mut view_process = 0;
+        // SAFETY: `view_process` is a live u32 local that outlives the call and
+        // receives the owning process id; the view window handle is borrowed.
         if unsafe { GetWindowThreadProcessId(view_window, &mut view_process) } == 0
             || view_process != job.process
         {
             return None;
         }
         let folder_view: IFolderView = view.cast().ok()?;
+        // SAFETY: `folder_view` is a live interface pointer owned by this
+        // iteration; the returned IPersistFolder2 pointer is owned by the
+        // `folder` binding and released at the end of the iteration.
         let folder: IPersistFolder2 = unsafe { folder_view.GetFolder() }.ok()?;
+        // SAFETY: `folder` is a live IPersistFolder2 pointer owned by this
+        // iteration; GetCurFolder transfers an ITEMIDLIST allocated with
+        // CoTaskMemAlloc to this code, and the Pidl guard frees it exactly once.
         let item = Pidl(unsafe { folder.GetCurFolder() }.ok()?);
         if item.0.is_null() {
             return None;
         }
         let mut buffer = vec![0u16; MAX_PATH];
+        // SAFETY: `buffer` holds MAX_PATH u16 units and `item.0` is the
+        // ITEMIDLIST owned by the `item` guard; the call writes at most
+        // buffer.len() units and only reads the PIDL during the call.
         if !unsafe { SHGetPathFromIDListEx(item.0, &mut buffer, GPFIDL_DEFAULT) }.as_bool() {
             return None;
         }
@@ -262,6 +329,9 @@ fn discover(job: &Job) -> Option<PathBuf> {
             return None;
         }
     }
+    // SAFETY: `windows` is still the live COM interface pointer owned by this
+    // scope, so the repeated count call targets a valid object and keeps the
+    // reference count balanced.
     if !job.foreground_matches() || unsafe { windows.Count() }.ok()? != count {
         return None;
     }
