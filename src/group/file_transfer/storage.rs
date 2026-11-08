@@ -292,7 +292,20 @@ fn open_file(parent: &Dir, name: impl AsRef<Path>, write: bool, create: bool) ->
 
 fn sync_dir(dir: &Dir) -> Result<()> {
     #[cfg(unix)]
-    dir.try_clone()?.into_std_file().sync_all()?;
+    {
+        use cap_std::fs::OpenOptionsExt;
+        // Linux capability directories use O_PATH, which cannot be fsynced.
+        // Reopen the same pinned directory read-only, relative to its handle;
+        // setting O_DIRECTORY as a custom flag avoids cap-std's O_PATH-only
+        // dir_required mode without introducing an ambient path or following
+        // a symlink. Keep the real fsync failure observable to the caller.
+        let mut options = OpenOptions::new();
+        options
+            .read(true)
+            .follow(FollowSymlinks::No)
+            .custom_flags(libc::O_DIRECTORY);
+        dir.open_with(".", &options)?.sync_all()?;
+    }
     #[cfg(not(unix))]
     let _ = dir;
     Ok(())
@@ -1435,6 +1448,32 @@ mod tests {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.0);
         }
+    }
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn directory_durability_reopens_a_capability_only_descriptor_for_real_fsync() {
+        use std::os::fd::AsRawFd;
+        let fixture = Fixture::new();
+        let parent = absolute_directory(&fixture.0, false).unwrap();
+        let child = directory(&parent, OsStr::new("durable"), true).unwrap();
+        let flags = unsafe { libc::fcntl(child.as_raw_fd(), libc::F_GETFL) };
+        assert!(
+            flags >= 0 && flags & libc::O_PATH != 0,
+            "The regression must exercise an actual O_PATH capability descriptor"
+        );
+        write_new(&child, "receipt.json", b"durably written").unwrap();
+        sync_dir(&child).unwrap();
+        drop(child);
+        let reopened = directory(&parent, OsStr::new("durable"), false).unwrap();
+        assert_eq!(
+            open_file(&reopened, "receipt.json", false, false)
+                .unwrap()
+                .metadata()
+                .unwrap()
+                .len(),
+            15
+        );
+        sync_dir(&reopened).unwrap();
     }
     fn copy(export: &Export, receive: &mut Receive) {
         for (index, entry) in export.manifest.entries.iter().enumerate() {
