@@ -360,7 +360,11 @@ impl State {
     fn new(offer: RemoteOffer) -> Result<Arc<Self>> {
         valid_id(&offer.id)?;
         offer.description.validate()?;
+        // SAFETY: the call takes no arguments and only reads the calling
+        // process credentials.
         let uid = unsafe { libc::geteuid() };
+        // SAFETY: the call takes no arguments and only reads the calling
+        // process credentials.
         let gid = unsafe { libc::getegid() };
         // This pins metadata only. It keeps a URI obtained by a native folder
         // scan usable when the clipboard changes before the first file opens.

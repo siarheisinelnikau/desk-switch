@@ -447,6 +447,9 @@ pub fn input_devices() -> Result<Vec<InputEndpoint>> {
             ..Default::default()
         };
         let mut length = info.cbSize;
+        // SAFETY: `info` is a live structure whose size field matches the
+        // structure, and `length` states the buffer size, so the call writes
+        // at most that many bytes into it.
         if unsafe {
             GetRawInputDeviceInfoW(
                 device.hDevice,
@@ -459,6 +462,8 @@ pub fn input_devices() -> Result<Vec<InputEndpoint>> {
         {
             continue;
         }
+        // SAFETY: the union fields are read according to `dwType`, which the
+        // call above has just confirmed against the enumerated device.
         let supported = unsafe {
             match info.dwType {
                 RIM_TYPEKEYBOARD => full_windows_keyboard(
@@ -473,6 +478,8 @@ pub fn input_devices() -> Result<Vec<InputEndpoint>> {
             continue;
         }
         let mut length = 0;
+        // SAFETY: a null buffer with a zero size only asks for the required
+        // buffer size, which is written to `length`.
         if unsafe {
             GetRawInputDeviceInfoW(
                 device.hDevice,
@@ -486,6 +493,8 @@ pub fn input_devices() -> Result<Vec<InputEndpoint>> {
             continue;
         }
         let mut name = vec![0u16; length as usize];
+        // SAFETY: the buffer holds exactly `length` UTF-16 units and the call
+        // is told that size, so it cannot write past the buffer.
         if unsafe {
             GetRawInputDeviceInfoW(
                 device.hDevice,

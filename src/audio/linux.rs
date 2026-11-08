@@ -10,6 +10,9 @@ fn command(program: &str) -> Command {
     // These helpers must disappear even if the managed service is force-killed.
     // The post-prctl parent check closes the fork/parent-exit race. Only raw
     // syscalls and errno conversion run between fork and exec.
+    // SAFETY: pre_exec runs between fork and exec in the child, where only
+    // async-signal-safe operations are allowed. The closure sets the parent
+    // death signal and reports failures through the exec pipe.
     unsafe {
         command.pre_exec(move || {
             rustix::process::set_parent_process_death_signal(Some(rustix::process::Signal::KILL))?;
