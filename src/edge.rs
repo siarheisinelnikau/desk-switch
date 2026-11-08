@@ -207,7 +207,7 @@ impl Router {
         self.routes = routes;
         Ok(())
     }
-    #[cfg(any(target_os = "linux", test))]
+    #[cfg(test)]
     pub fn enabled(&self) -> bool {
         !self.screens.is_empty()
     }
