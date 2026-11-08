@@ -28,7 +28,9 @@ pub(super) struct Spec {
     sharing: config::InputSharing,
     cursor: bool,
     edge: bool,
+    routes: crate::edge::Routes,
     entry: Option<u16>,
+    display_entry: Option<crate::edge::Entry>,
     generation: u64,
     desired_remote: bool,
     activate: bool,
@@ -61,6 +63,8 @@ struct Task {
     switched: bool,
     was_remote: bool,
     cycling: bool,
+    cycle_since: Option<std::time::Instant>,
+    coordinated_return: Option<u64>,
     switch_failed: bool,
     restart_requested: bool,
     local_entry: Option<u64>,
@@ -72,7 +76,10 @@ fn equivalent(a: &Spec, b: &Spec) -> bool {
         spec.activate = false;
         spec.native = None;
         spec.cursor = false;
+        spec.edge = false;
+        spec.routes = crate::edge::Routes::default();
         spec.entry = None;
+        spec.display_entry = None;
         spec.generation = 0;
         spec.desired_remote = false;
         if matches!(spec.kind, Kind::AudioReceive | Kind::MicrophoneReceive) {
@@ -100,9 +107,11 @@ fn mix_volume(spec: &Spec) -> Option<&str> {
 #[derive(Default)]
 pub(super) struct Data {
     tasks: BTreeMap<String, Task>,
+    routing_cache: crate::group::layout::RoutingCache,
     pub error: Option<String>,
     pub cycle: bool,
     pub cycle_position: Option<u16>,
+    pub crossing: Option<crate::edge::Crossing>,
     pub returned: bool,
     pub volume: Option<AudioLevel>,
     pub input: Option<crate::lifecycle::InputStatus>,
@@ -129,11 +138,28 @@ fn device_arg(args: &mut Vec<String>, flag: &str, device: &Option<String>) {
     }
 }
 
-pub(super) fn desired(
+#[cfg(test)]
+fn desired(
     state: &Workspace,
     own: &str,
     inputs: &[InputEndpoint],
     cursor: bool,
+) -> Result<BTreeMap<String, Spec>> {
+    desired_with_routes(
+        state,
+        own,
+        inputs,
+        cursor,
+        crate::group::layout::routes_for(state, own),
+    )
+}
+
+fn desired_with_routes(
+    state: &Workspace,
+    own: &str,
+    inputs: &[InputEndpoint],
+    cursor: bool,
+    edge_routes: crate::edge::Routes,
 ) -> Result<BTreeMap<String, Spec>> {
     let mut result = BTreeMap::new();
     let Some(local) = state.members.get(own).filter(|member| member.compatible()) else {
@@ -160,7 +186,13 @@ pub(super) fn desired(
         },
         cursor: kind == Kind::Input && cursor,
         edge: kind == Kind::Input && state.settings.edge && state.settings.mouse_enabled,
+        routes: if kind == Kind::Input {
+            edge_routes.clone()
+        } else {
+            Default::default()
+        },
         entry: None,
+        display_entry: None,
         generation: state.activation,
         desired_remote: false,
         activate: false,
@@ -206,6 +238,7 @@ pub(super) fn desired(
                 && peer.input_ready == state.activation
                 && peer.node.monitor_error.is_none();
             spec.entry = host.then_some(state.active_input_entry).flatten();
+            spec.display_entry = host.then_some(state.display_entry).flatten();
             for input in inputs {
                 let keyboard = input.keyboard
                     && choices
@@ -338,11 +371,8 @@ fn configure(root: &Path, spec: &Spec) -> Result<PathBuf> {
         &dir,
         &config::FileSettings {
             monitor: None,
-            edge: spec.edge.then(|| config::EdgeSettings {
-                mode: "input".into(),
-                screen: Some("auto".into()),
-                side: Some("right".into()),
-            }),
+            edge: None,
+            routes: (spec.kind == Kind::Input).then(|| spec.routes.clone()),
             capture: Some(config::CaptureSettings {
                 devices: spec.capture.clone(),
                 keyboard: spec.keyboard.clone(),
@@ -381,6 +411,17 @@ fn migrate_portal_token(root: &Path, dir: &Path) -> Result<()> {
     Ok(())
 }
 impl Data {
+    pub fn desired(
+        &mut self,
+        state: &Workspace,
+        own: &str,
+        inputs: &[InputEndpoint],
+        cursor: bool,
+    ) -> Result<BTreeMap<String, Spec>> {
+        let routes = self.routing_cache.routes_for(state, own);
+        desired_with_routes(state, own, inputs, cursor, routes)
+    }
+
     pub fn emergency(&mut self) -> Result<()> {
         let mut result = Ok(());
         for task in self.tasks.values_mut().filter(|task| {
@@ -505,6 +546,16 @@ impl Data {
                     self.returned = true;
                 }
             }
+            while let Some((activation, completed)) = task.worker.return_results.pop_front() {
+                if task.coordinated_return == Some(activation) {
+                    task.coordinated_return = None;
+                    if completed {
+                        task.was_remote = false;
+                        task.switched = false;
+                        task.local_entry = None;
+                    }
+                }
+            }
             if desired
                 .get(name)
                 .is_some_and(|spec| spec.generation != task.spec.generation)
@@ -517,9 +568,35 @@ impl Data {
                 let position = task.worker.cycle_input_position.take();
                 if task.spec.input_host() {
                     task.cycling = true;
+                    task.cycle_since = Some(std::time::Instant::now());
                     self.cycle = true;
                     self.cycle_position = position;
                 }
+            }
+            if let Some(crossing) = task.worker.crossing.take()
+                && task.spec.input_host()
+                && crossing.activation == task.spec.generation
+            {
+                task.cycling = true;
+                task.cycle_since = Some(std::time::Instant::now());
+                self.crossing = Some(crossing);
+            }
+            if let Some((activation, error)) = task.worker.display_error.take()
+                && activation == task.spec.generation
+            {
+                // A failed optional placement leaves the current input session
+                // usable. It must not become an emergency return or disconnect.
+                self.error = Some(error);
+            }
+            if task.cycling
+                && task
+                    .cycle_since
+                    .is_some_and(|started| started.elapsed() >= std::time::Duration::from_secs(2))
+            {
+                // An unavailable coordinator or rejected edge must not suppress
+                // a real local recovery indefinitely.
+                task.cycling = false;
+                task.cycle_since = None;
             }
             if task.spec.kind == Kind::Input {
                 self.input = task.worker.input_status;
@@ -529,6 +606,7 @@ impl Data {
                     }
                     if task.was_remote
                         && task.worker.input_status == Some(crate::lifecycle::InputStatus::Here)
+                        && task.coordinated_return.is_none()
                         && !task.cycling
                         && !task.worker.stopping
                     {
@@ -588,6 +666,8 @@ impl Data {
                                 switched: false,
                                 was_remote: false,
                                 cycling: false,
+                                cycle_since: None,
+                                coordinated_return: None,
                                 switch_failed: false,
                                 restart_requested: false,
                                 local_entry: None,
@@ -608,12 +688,20 @@ impl Data {
             if task.spec.generation != spec.generation {
                 task.spec.generation = spec.generation;
                 task.cycling = false;
+                task.cycle_since = None;
                 task.switch_failed = false;
                 // A new activation may retry a rejected switch, but must not
                 // toggle an already active destination back to the source.
                 task.switched =
                     spec.switched_after_generation(task.worker.input_status, task.switched);
             }
+            if task.spec.kind == Kind::Input && task.spec.routes != spec.routes {
+                match task.worker.set_routes(&spec.routes) {
+                    Ok(()) => task.spec.routes = spec.routes.clone(),
+                    Err(error) => self.error = Some(error.to_string()),
+                }
+            }
+            task.spec.edge = spec.edge;
             if matches!(spec.kind, Kind::AudioReceive | Kind::MicrophoneReceive)
                 && task.spec.args != spec.args
             {
@@ -641,8 +729,24 @@ impl Data {
             }
             task.spec.activate = spec.activate;
             task.spec.desired_remote = spec.desired_remote;
+            if task.local_entry != Some(spec.generation)
+                && task.coordinated_return.is_none()
+                && spec.input_host()
+                && let Some(entry) = spec.display_entry
+                && (!spec.desired_remote || task.switched)
+                && task.worker.input_status
+                    == Some(if spec.desired_remote {
+                        crate::lifecycle::InputStatus::Peer
+                    } else {
+                        crate::lifecycle::InputStatus::Here
+                    })
+                && task.worker.enter_display(spec.generation, entry).is_ok()
+            {
+                task.local_entry = Some(spec.generation);
+            }
             if !spec.desired_remote
                 && spec.edge
+                && spec.display_entry.is_none()
                 && task.local_entry != Some(spec.generation)
                 && task.worker.input_status == Some(crate::lifecycle::InputStatus::Here)
                 && spec.input_host()
@@ -655,26 +759,30 @@ impl Data {
                 task.local_entry = Some(spec.generation);
             }
             task.spec.entry = spec.entry;
+            task.spec.display_entry = spec.display_entry;
             if spec.input_host()
                 && spec.activate
+                && task.coordinated_return.is_none()
                 && !task.switched
                 && !task.switch_failed
                 && task.worker.input_status == Some(crate::lifecycle::InputStatus::Here)
             {
-                let command = spec
-                    .entry
-                    .filter(|_| spec.edge)
-                    .map(|position| format!("switch-edge {position}"))
-                    .unwrap_or_else(|| "switch".into());
-                if let Err(error) = task.worker.command(&command) {
+                if let Err(error) = task
+                    .worker
+                    .switch_display(spec.generation, spec.display_entry)
+                {
                     self.error = Some(error.to_string());
                     task.switch_failed = true;
                 } else {
                     task.switched = true;
+                    task.local_entry = Some(spec.generation);
                 }
             }
-            if spec.return_host_input(task.switched) {
-                let _ = task.worker.command("emergency");
+            if spec.return_host_input(task.switched) && task.coordinated_return.is_none() {
+                match task.worker.return_input(spec.generation) {
+                    Ok(()) => task.coordinated_return = Some(spec.generation),
+                    Err(error) => self.error = Some(error.to_string()),
+                }
                 task.switched = false;
                 task.was_remote = false;
             }
@@ -694,6 +802,98 @@ impl Data {
 mod tests {
     use super::*;
     use std::net::{Ipv6Addr, SocketAddr, SocketAddrV6};
+
+    #[test]
+    fn arranging_a_third_display_updates_routes_without_restarting_input_and_carries_exact_entry() {
+        use crate::{
+            edge::{Crossing, NativeScreen, ScreenRect, Side},
+            group::layout::{self, Point},
+        };
+        let mut state = crate::group::model::tests::fixture(3);
+        let source = state.plan().input.unwrap();
+        let keys = state.members.keys().cloned().collect::<Vec<_>>();
+        for (index, member) in state.members.values_mut().enumerate() {
+            member.node.monitor.enabled = false;
+            member.node.devices.displays = vec![workspace::devices::Display {
+                id: format!("ordinary-{index}"),
+                name: format!("Display {index}"),
+                fingerprint: String::new(),
+                native: Some(NativeScreen {
+                    native_id: format!("native-{index}"),
+                    rect: ScreenRect {
+                        x: 0,
+                        y: 0,
+                        width: 1920,
+                        height: 1080,
+                    },
+                    epoch: index as u64 + 1,
+                }),
+            }];
+        }
+        state.active_input = Some(source.clone());
+        state.settings.edge = true;
+        let mut arrangement = layout::draft(&state);
+        for (index, key) in keys.iter().enumerate() {
+            arrangement.positions.insert(
+                key.clone(),
+                Point {
+                    x: index as i32 * 1920,
+                    y: 0,
+                },
+            );
+        }
+        state.set_layout(0, arrangement).unwrap();
+        let original = desired(&state, &source, &[], true).unwrap()["input"].clone();
+        assert_eq!(original.routes.boundaries.len(), 1);
+        assert_eq!(original.routes.boundaries[0].side, Side::Right);
+
+        let mut arrangement = state.layout.clone();
+        arrangement
+            .positions
+            .insert(keys[2].clone(), Point { x: 0, y: 1080 });
+        state
+            .set_layout(state.layout.revision, arrangement)
+            .unwrap();
+        let changed = desired(&state, &source, &[], true).unwrap()["input"].clone();
+        assert!(
+            equivalent(&original, &changed),
+            "Applying positions must keep the authenticated native input worker"
+        );
+        assert_ne!(original.routes, changed.routes);
+        let bottom = changed
+            .routes
+            .boundaries
+            .iter()
+            .find(|boundary| boundary.side == Side::Bottom)
+            .unwrap();
+        let activation = layout::resolve_crossing(
+            &state,
+            &source,
+            Crossing {
+                revision: changed.routes.revision,
+                activation: state.activation,
+                boundary: bottom.id,
+                position: 20_000,
+            },
+        )
+        .unwrap()
+        .unwrap();
+        let entry = activation.entry;
+        assert_eq!(entry.side, Side::Top);
+        assert_eq!(entry.geometry, 3);
+        state
+            .activate_display(&source, activation.target, Some(entry))
+            .unwrap();
+        let routed = desired(&state, &source, &[], true).unwrap()["input"].clone();
+        assert_eq!(routed.peer, keys[2]);
+        assert!(routed.activate);
+        assert_eq!(routed.display_entry, Some(entry));
+        assert!(routed.entry.is_none());
+        assert!(
+            state.monitor_command.is_none(),
+            "An ordinary display must not select a monitor port"
+        );
+    }
 
     #[test]
     fn receiver_authentication_and_monitor_generations_never_request_emergency_return() {
@@ -985,7 +1185,11 @@ mod tests {
                 settings.monitor.is_none(),
                 "native workers must not send another DDC command"
             );
-            assert_eq!(settings.edge.unwrap().side.as_deref(), Some("right"));
+            assert!(
+                settings.edge.is_none(),
+                "groups must not enable the legacy right-edge cycle"
+            );
+            assert_eq!(settings.routes, Some(wanted["input"].routes.clone()));
             assert_eq!(
                 std::fs::read_to_string(profile.join("wayland-restore-token")).unwrap(),
                 "existing-portal-grant"

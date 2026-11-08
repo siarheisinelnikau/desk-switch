@@ -22,6 +22,7 @@ const CLIPBOARD_INTERFACE = `<node><interface name="${CLIPBOARD_NAME}">
         <arg type="u" direction="out"/>
     </method>
     <method name="ActivateWindow"><arg type="s" direction="in"/></method>
+    <method name="PointerState"><arg type="i" direction="out"/><arg type="i" direction="out"/></method>
 </interface></node>`;
 
 export default class DeskSwitchTray extends Extension {
@@ -135,9 +136,17 @@ export default class DeskSwitchTray extends Extension {
     }
 
     _processId(name) {
+        return this._connectionNumber(name, 'GetConnectionUnixProcessID');
+    }
+
+    _userId(name) {
+        return this._connectionNumber(name, 'GetConnectionUnixUser');
+    }
+
+    _connectionNumber(name, method) {
         return new Promise((resolve, reject) => {
             Gio.DBus.session.call('org.freedesktop.DBus', '/org/freedesktop/DBus',
-                'org.freedesktop.DBus', 'GetConnectionUnixProcessID',
+                'org.freedesktop.DBus', method,
                 new GLib.Variant('(s)', [name]), null, Gio.DBusCallFlags.NONE,
                 1000, this._cancellable, (connection, result) => {
                     try {
@@ -166,6 +175,168 @@ export default class DeskSwitchTray extends Extension {
             this._allowedCallers.clear();
         this._allowedCallers.set(sender, callerPid);
         return callerPid;
+    }
+
+    async _boundedText(path, limit) {
+        const file = Gio.File.new_for_path(path);
+        const stream = await new Promise((resolve, reject) => {
+            file.read_async(GLib.PRIORITY_DEFAULT, this._cancellable, (source, result) => {
+                try { resolve(source.read_finish(result)); } catch (error) { reject(error); }
+            });
+        });
+        const parts = [];
+        let length = 0;
+        try {
+            for (;;) {
+                const bytes = await new Promise((resolve, reject) => {
+                    stream.read_bytes_async(Math.min(4096, limit + 1 - length),
+                        GLib.PRIORITY_DEFAULT, this._cancellable, (source, result) => {
+                            try { resolve(source.read_bytes_finish(result)); } catch (error) { reject(error); }
+                        });
+                });
+                const data = bytes.get_data();
+                if (data.length === 0)
+                    break;
+                length += data.length;
+                if (length > limit)
+                    throw new Error('Process metadata exceeds its limit');
+                parts.push(Uint8Array.from(data));
+            }
+        } finally {
+            stream.close(null);
+        }
+        const data = new Uint8Array(length);
+        let offset = 0;
+        for (const part of parts) {
+            data.set(part, offset);
+            offset += part.length;
+        }
+        return new TextDecoder('utf-8', {fatal: true}).decode(data);
+    }
+
+    _fileInfo(path, attributes) {
+        const file = Gio.File.new_for_path(path);
+        return new Promise((resolve, reject) => {
+            file.query_info_async(attributes, Gio.FileQueryInfoFlags.NOFOLLOW_SYMLINKS,
+                GLib.PRIORITY_DEFAULT, this._cancellable, (source, result) => {
+                    try { resolve(source.query_info_finish(result)); } catch (error) { reject(error); }
+                });
+        });
+    }
+
+    async _processIdentity(pid) {
+        if (!Number.isInteger(pid) || pid <= 0)
+            throw new Error('Invalid process identity');
+        const status = await this._boundedText(`/proc/${pid}/status`, 16384);
+        const stat = await this._boundedText(`/proc/${pid}/stat`, 4096);
+        const recordedPid = status.match(/^Pid:\s*(\d+)$/m)?.[1];
+        const parent = status.match(/^PPid:\s*(\d+)$/m)?.[1];
+        const users = status.match(/^Uid:\s*(\d+)\s+(\d+)\s+(\d+)\s+(\d+)$/m)?.slice(1);
+        const end = stat.lastIndexOf(')');
+        const fields = stat.slice(end + 1).trim().split(/\s+/);
+        if (Number(recordedPid) !== pid || !parent || !users ||
+            !stat.startsWith(`${pid} (`) || end < 0 || fields.length < 20 ||
+            !/^[A-Za-z]$/.test(fields[0]) || ['Z', 'X', 'x'].includes(fields[0]) ||
+            fields[1] !== parent || !/^\d+$/.test(fields[19]))
+            throw new Error('Process metadata is incomplete');
+        return {pid, parent: Number(parent), users: users.map(Number), started: fields[19]};
+    }
+
+    async _executable(pid) {
+        const info = await this._fileInfo(`/proc/${pid}/exe`, 'standard::symlink-target');
+        const target = info.get_symlink_target();
+        if (!target || target.length > 4096 || !GLib.path_is_absolute(target))
+            throw new Error('Process executable is unavailable');
+        return target;
+    }
+
+    async _authorizePointer(invocation) {
+        try {
+            return await this._authorizeCaller(invocation);
+        } catch {
+            // Clipboard and window activation keep their original exact GUI PID
+            // policy. Pointer observation alone also accepts a verified direct
+            // managed input child; no child authorization is cached.
+        }
+        if (!this._alive)
+            throw new Error('The Desk Switch companion is disabled');
+        const sender = invocation.get_sender();
+        const pid = await this._processId(sender);
+        const child = await this._processIdentity(pid);
+        const names = new Set([...this._icons.keys()].filter(icon =>
+            icon._indicator.id === INDICATOR_ID && icon._indicator.busName)
+            .map(icon => icon._indicator.busName));
+        let parentName = null;
+        for (const name of names) {
+            if (await this._processId(name) === child.parent) {
+                parentName = name;
+                break;
+            }
+        }
+        if (!parentName)
+            throw new Error('Only a direct Desk Switch input child may observe the pointer');
+        const parent = await this._processIdentity(child.parent);
+        const uid = await this._userId(sender);
+        if (await this._userId(parentName) !== uid ||
+            !child.users.every(user => user === uid) || !parent.users.every(user => user === uid) ||
+            await this._executable(pid) !== await this._executable(parent.pid))
+            throw new Error('Input child executable or user does not match Desk Switch');
+        const args = (await this._boundedText(`/proc/${pid}/cmdline`, 8192)).split('\0');
+        if (args.at(-1) === '')
+            args.pop();
+        if (args.length !== 5 || !args[0] || args[1] !== 'run' || args[2] !== '--role' ||
+            !['host', 'receiver'].includes(args[3]) || !args[4] || args[4].length > 128)
+            throw new Error('The process is not a managed input worker');
+        const environment = new Map();
+        for (const entry of (await this._boundedText(`/proc/${pid}/environ`, 65536)).split('\0')) {
+            const separator = entry.indexOf('=');
+            if (separator < 0)
+                continue;
+            const key = entry.slice(0, separator);
+            if (!['DESK_SWITCH_STATE', 'DESK_SWITCH_GROUP_INPUT', 'DESK_SWITCH_MANAGED'].includes(key))
+                continue;
+            if (environment.has(key))
+                throw new Error('Input worker environment is ambiguous');
+            environment.set(key, entry.slice(separator + 1));
+        }
+        const profile = environment.get('DESK_SWITCH_STATE');
+        if (environment.get('DESK_SWITCH_GROUP_INPUT') !== '1' ||
+            environment.get('DESK_SWITCH_MANAGED') !== '1' || !profile || profile.length > 4096 ||
+            !GLib.path_is_absolute(profile))
+            throw new Error('The input worker has no group profile');
+        const marker = `${profile}/group-input`;
+        const info = await this._fileInfo(marker, 'standard::type,unix::uid');
+        if (info.get_file_type() !== Gio.FileType.REGULAR || info.get_attribute_uint32('unix::uid') !== uid ||
+            (await this._boundedText(marker, 2)).trim() !== '1')
+            throw new Error('The input worker group profile is unavailable');
+        const finalChild = await this._processIdentity(pid);
+        const finalParent = await this._processIdentity(parent.pid);
+        if (!this._alive || await this._processId(sender) !== pid ||
+            await this._processId(parentName) !== parent.pid ||
+            finalChild.started !== child.started || finalChild.parent !== parent.pid ||
+            finalParent.started !== parent.started ||
+            !finalChild.users.every(user => user === uid) || !finalParent.users.every(user => user === uid))
+            throw new Error('The input worker exited or changed identity');
+        return pid;
+    }
+
+    async PointerStateAsync(_parameters, invocation) {
+        try {
+            await this._authorizePointer(invocation);
+            if (!this._alive)
+                throw new Error('The Desk Switch companion is disabled');
+        } catch (error) {
+            invocation.return_dbus_error(CLIPBOARD_NAME + '.PointerAccessDenied', error.message);
+            return;
+        }
+        try {
+            const [x, y] = global.get_pointer();
+            if (![x, y].every(value => Number.isInteger(value) && value >= -2147483648 && value <= 2147483647))
+                throw new Error('Pointer coordinates are unavailable');
+            invocation.return_value(new GLib.Variant('(ii)', [x, y]));
+        } catch (error) {
+            this._clipboardError(invocation, error);
+        }
     }
 
     _clipboardError(invocation, error) {

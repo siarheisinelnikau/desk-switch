@@ -89,6 +89,7 @@ pub fn list_displays() -> Result<Vec<super::MonitorInfo>> {
                 .builtin
                 .then(|| "The built-in display has no switchable input".into()),
             fingerprint: crate::config::hex(&Sha256::digest(display.fingerprint.as_bytes())),
+            native: None,
         })
         .collect())
 }

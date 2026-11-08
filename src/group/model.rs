@@ -1,5 +1,6 @@
 //! A workspace contains independently managed PCs, with one active input target.
 //! Audio fans in to the chosen listening PC; the microphone fans out to receivers.
+use super::layout::{self, DisplayTarget, Layout};
 use crate::{
     compatibility::Version,
     config,
@@ -243,6 +244,12 @@ pub struct Workspace {
     pub confirmed_monitor: Option<Key>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub monitor_command: Option<MonitorCommand>,
+    #[serde(default)]
+    pub layout: Layout,
+    #[serde(default)]
+    pub active_display: Option<DisplayTarget>,
+    #[serde(default)]
+    pub display_entry: Option<crate::edge::Entry>,
 }
 impl Workspace {
     fn next_revision(&self) -> Result<u64> {
@@ -252,6 +259,17 @@ impl Workspace {
             .context("Workspace revision exhausted")
     }
     pub fn validate(&self) -> Result<()> {
+        self.layout.validate_shape()?;
+        if let Some(target) = &self.active_display {
+            ensure!(
+                self.members.contains_key(target.computer())
+                    && self.active_input.as_deref() == Some(target.computer()),
+                "Invalid active display target"
+            );
+        }
+        if let Some(entry) = self.display_entry {
+            entry.validate()?;
+        }
         valid_key(&self.hub)?;
         ensure!(
             self.members.contains_key(&self.hub),
@@ -352,6 +370,66 @@ impl Workspace {
         self.revision = revision;
         Ok(())
     }
+    pub fn set_layout(&mut self, expected: u64, mut value: Layout) -> Result<()> {
+        ensure!(
+            self.layout.revision == expected,
+            "The display arrangement changed. Review it and try again."
+        );
+        ensure!(
+            !self.switch_pending(),
+            "Wait for the previous switch before saving the display arrangement"
+        );
+        layout::validate(self, &value)?;
+        value.revision = expected
+            .checked_add(1)
+            .filter(|revision| *revision < u64::MAX)
+            .context("Display arrangement revision exhausted")?;
+        self.revision = self.next_revision()?;
+        self.layout = value;
+        Ok(())
+    }
+    pub fn reconcile_input(&mut self) {
+        if !self.switch_pending()
+            && self
+                .active_input
+                .as_ref()
+                .is_none_or(|key| !self.members.get(key).is_some_and(Member::compatible))
+        {
+            self.active_input = self.plan().input;
+            self.active_input_entry = None;
+            self.active_display = None;
+            self.display_entry = None;
+        }
+    }
+    pub fn activate_display(
+        &mut self,
+        requester: &str,
+        target: DisplayTarget,
+        entry: Option<crate::edge::Entry>,
+    ) -> Result<()> {
+        let native = layout::native_target(self, &target)?;
+        let entry = entry.unwrap_or(crate::edge::Entry {
+            screen: native.rect,
+            geometry: native.epoch,
+            side: crate::edge::Side::Left,
+            position: u16::MAX / 2,
+        });
+        entry.validate()?;
+        ensure!(
+            entry.screen == native.rect && entry.geometry == native.epoch,
+            "The destination display geometry changed"
+        );
+        let computer = target.computer().to_owned();
+        let shared = matches!(&target, DisplayTarget::Shared { .. });
+        self.activate_target(
+            requester,
+            &computer,
+            None,
+            shared,
+            Some(target),
+            Some(entry),
+        )
+    }
     pub fn set_member(
         &mut self,
         key: &str,
@@ -420,6 +498,17 @@ impl Workspace {
         destination: &str,
         position: Option<u16>,
     ) -> Result<()> {
+        self.activate_target(requester, destination, position, true, None, None)
+    }
+    fn activate_target(
+        &mut self,
+        requester: &str,
+        destination: &str,
+        position: Option<u16>,
+        shared: bool,
+        target: Option<DisplayTarget>,
+        entry: Option<crate::edge::Entry>,
+    ) -> Result<()> {
         ensure!(
             !self.switch_pending(),
             "The previous switch is still finishing. Wait for the monitor before switching again."
@@ -429,12 +518,15 @@ impl Workspace {
             .get(destination)
             .filter(|member| member.compatible())
             .context("The destination is offline or needs an update")?;
-        let monitor = self.settings.monitor_enabled && member.node.monitor.enabled;
+        let monitor = shared && self.settings.monitor_enabled && member.node.monitor.enabled;
         if monitor {
             self.monitor_input(destination)?;
         }
-        if self.active_input.as_deref() == Some(destination)
+        if target.is_none()
+            && self.active_input.as_deref() == Some(destination)
             && self.active_input_entry == position
+            && self.active_display == target
+            && self.display_entry == entry
             && (!monitor || self.confirmed_monitor.as_deref() == Some(destination))
             && member.node.monitor_error.is_none()
         {
@@ -477,6 +569,8 @@ impl Workspace {
         };
         self.active_input = Some(destination.into());
         self.active_input_entry = position;
+        self.active_display = target;
+        self.display_entry = entry;
         if monitor {
             self.active_monitor = Some(destination.into());
         }
@@ -561,7 +655,11 @@ impl Workspace {
             .plan()
             .input
             .context("The input owner is unavailable")?;
-        if self.active_input.as_ref() == Some(&source) && self.active_input_entry.is_none() {
+        if self.active_input.as_ref() == Some(&source)
+            && self.active_input_entry.is_none()
+            && self.active_display.is_none()
+            && self.display_entry.is_none()
+        {
             return Ok(());
         }
         let revision = self.next_revision()?;
@@ -571,6 +669,8 @@ impl Workspace {
             .context("Too many input switches")?;
         self.active_input = Some(source.clone());
         self.active_input_entry = None;
+        self.active_display = None;
+        self.display_entry = None;
         self.revision = revision;
         self.activation = activation;
         self.members.get_mut(&source).unwrap().input_ready = activation;
@@ -897,6 +997,9 @@ pub(crate) mod tests {
             active_monitor: None,
             confirmed_monitor: None,
             monitor_command: None,
+            layout: Default::default(),
+            active_display: None,
+            display_entry: None,
         }
     }
 

@@ -4,6 +4,7 @@ use super::{
 };
 use crate::{
     config::{Edge, Identity, Key},
+    edge::Entry,
     gate::{Gate, Route},
     video::{Inputs, VideoWorker},
     wire::Input,
@@ -13,7 +14,7 @@ use evdev::{
     AbsoluteAxisCode, Device, EventSummary, InputEvent, KeyCode, RelativeAxisCode,
     SynchronizationCode,
 };
-use futures_util::{StreamExt, future::poll_fn};
+use futures_util::future::poll_fn;
 use std::{
     collections::{BTreeMap, BTreeSet},
     net::SocketAddr,
@@ -25,15 +26,39 @@ use std::{
 };
 use tokio::sync::{mpsc, oneshot};
 
+#[derive(Clone, Copy)]
 enum CursorAction {
     Toggle,
     Suspend,
     Resume(Option<u16>),
+    EnterDisplay { activation: u64, entry: Entry },
 }
 
 struct CursorCommand {
     action: CursorAction,
     reply: oneshot::Sender<Result<()>>,
+}
+
+impl CursorCommand {
+    fn check_entry(&self, current: u64) -> Result<()> {
+        if let CursorAction::EnterDisplay { activation, .. } = self.action {
+            ensure!(!self.reply.is_closed(), "The display entry was canceled");
+            ensure!(
+                activation == current,
+                "The display entry generation changed"
+            );
+        }
+        Ok(())
+    }
+
+    fn enter_display(&self, portal: &mut Portal, entry: Entry) -> Result<()> {
+        let routes = crate::lifecycle::routes();
+        let current = routes.borrow();
+        self.check_entry(current.activation)?;
+        let result = portal.enter_display(entry);
+        drop(current);
+        result
+    }
 }
 
 struct PortalCursor(mpsc::Sender<CursorCommand>);
@@ -61,6 +86,10 @@ impl host::Cursor for PortalCursor {
     }
     async fn enter(&self, _: &Edge, position: u16) -> Result<()> {
         self.command(CursorAction::Resume(Some(position))).await
+    }
+    async fn enter_display(&self, activation: u64, entry: Entry) -> Result<()> {
+        self.command(CursorAction::EnterDisplay { activation, entry })
+            .await
     }
 }
 
@@ -306,6 +335,9 @@ pub async fn run(
     let mut devices = open_devices(&paths)?;
     let mut portal = Portal::open(edge.clone()).await?;
     let result = async {
+        let initial_routes = crate::lifecycle::routes().borrow().clone();
+        portal.set_generation(initial_routes.activation);
+        portal.set_routes(initial_routes)?;
         portal.start_local()?;
         let mut high_resolution = Vec::new();
         for device in &mut devices {
@@ -370,24 +402,34 @@ async fn capture(
         .collect::<Vec<_>>();
     let mut local_active = true;
     let mut resume: Option<(CursorCommand, Instant)> = None;
+    let mut routes = crate::lifecycle::routes();
+    let initial_routes = routes.borrow_and_update().clone();
+    portal.set_generation(initial_routes.activation);
+    portal.set_routes(initial_routes)?;
     let mut tick = tokio::time::interval(Duration::from_millis(20));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
         tokio::select! {
             _ = tick.tick() => {
-                if let Some((command, deadline)) = resume.take() {
-                    let result = portal.start_local().and_then(|()| {
-                        if let CursorAction::Resume(Some(position)) = command.action {
-                            portal.enter_local(position)?;
-                        }
+                if let Some((command, deadline)) = resume.take().filter(|(command, _)| !command.reply.is_closed()) {
+                    let current = command.check_entry(crate::lifecycle::routes().borrow().activation);
+                    let obsolete = current.is_err();
+                    let result = current
+                    .and_then(|()| if local_active {
                         Ok(())
+                    } else {
+                        portal.start_local().inspect(|()| local_active = true)
+                    }).and_then(|()| match command.action {
+                        CursorAction::Resume(Some(position)) => portal.enter_local(position),
+                        CursorAction::EnterDisplay { entry, .. } => command.enter_display(portal, entry),
+                        _ => Ok(()),
                     });
                     match result {
                         Ok(()) => {
                             local_active = true;
                             let _ = command.reply.send(Ok(()));
                         }
-                        Err(error) if Instant::now() >= deadline => {
+                        Err(error) if obsolete || Instant::now() >= deadline => {
                             let _ = command.reply.send(Err(error));
                         }
                         Err(_) => resume = Some((command, deadline)),
@@ -400,9 +442,19 @@ async fn capture(
                     local_active = true;
                 }
             }
-            event = portal.stream.next() => portal.handle(event.context("local Wayland EIS closed")??)?,
+            event = portal.poll() => event?,
+            changed = routes.changed() => {
+                changed.context("native edge routing stopped")?;
+                let next = routes.borrow_and_update().clone();
+                portal.set_generation(next.activation);
+                portal.set_routes(next)?;
+            }
             command = cursor.recv() => {
                 let command = command.context("host coordinator stopped")?;
+                if let Err(error) = command.check_entry(crate::lifecycle::routes().borrow().activation) {
+                    let _ = command.reply.send(Err(error));
+                    continue;
+                }
                 match command.action {
                     CursorAction::Toggle => {
                         if let Some(control) = routing.toggle()
@@ -426,11 +478,18 @@ async fn capture(
                     CursorAction::Resume(position) if local_active => {
                         let result = match position {
                             Some(position) => portal.enter_local(position),
-                            None => Ok(()),
+                            None => {
+                                portal.refresh_pointer();
+                                Ok(())
+                            }
                         };
                         let _ = command.reply.send(result);
                     }
-                    CursorAction::Resume(_) => {
+                    CursorAction::EnterDisplay { entry, .. } if local_active => {
+                        let result = command.enter_display(portal, entry);
+                        let _ = command.reply.send(result);
+                    }
+                    CursorAction::Resume(_) | CursorAction::EnterDisplay { .. } => {
                         ensure!(resume.is_none(), "a local cursor resume is already pending");
                         resume = Some((command, Instant::now() + Duration::from_secs(2)));
                     }
@@ -506,6 +565,13 @@ fn route(
             {
                 routing.gate.control_overflow(token);
             }
+            if let Some(crossing) = portal.take_crossing()
+                && controls
+                    .try_send(Control::Boundary { token, crossing })
+                    .is_err()
+            {
+                routing.gate.control_overflow(token);
+            }
         }
         Owner::Remote(owned)
             if owned == token
@@ -522,6 +588,33 @@ fn route(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn queued_display_entry_requires_live_reply_and_same_activation() {
+        let entry = Entry {
+            screen: crate::edge::ScreenRect {
+                x: 0,
+                y: 0,
+                width: 1920,
+                height: 1080,
+            },
+            geometry: 9,
+            side: crate::edge::Side::Left,
+            position: u16::MAX / 2,
+        };
+        let (reply, receive) = oneshot::channel();
+        let command = CursorCommand {
+            action: CursorAction::EnterDisplay {
+                activation: 7,
+                entry,
+            },
+            reply,
+        };
+        assert!(command.check_entry(7).is_ok());
+        assert!(command.check_entry(8).is_err());
+        drop(receive);
+        assert!(command.check_entry(7).is_err());
+    }
 
     #[test]
     fn composite_interfaces_share_only_the_selected_device_kind() {

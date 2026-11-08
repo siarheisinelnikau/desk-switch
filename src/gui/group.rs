@@ -26,6 +26,7 @@ pub(super) struct Group {
     pub selected: String,
     pub request: Option<Request>,
     pub data: Data,
+    pub layout_editor: super::group_layout::Editor,
     network_log: std::collections::VecDeque<String>,
     network_reconnecting: std::collections::BTreeSet<String>,
     pub return_pending: bool,
@@ -162,6 +163,32 @@ impl Desktop {
                             && let Some(command) = state.monitor_command.clone()
                         {
                             let _ = state.monitor_result(&command.writer, command.id, None);
+                        }
+                    }
+                    Action::SetLayout { expected, layout } => {
+                        let _ = state.set_layout(expected, layout);
+                    }
+                    Action::ActivateDisplay { target, entry } => {
+                        if state
+                            .activate_display(&self.public_key, target, entry)
+                            .is_ok()
+                            && let Some(command) = state.monitor_command.clone()
+                            && command.result.is_none()
+                        {
+                            let _ = state.monitor_result(&command.writer, command.id, None);
+                        }
+                    }
+                    Action::CrossEdge { crossing } => {
+                        if let Ok(Some(activation)) = crate::group::layout::resolve_crossing(
+                            state,
+                            &self.public_key,
+                            crossing,
+                        ) {
+                            let _ = state.activate_display(
+                                &self.public_key,
+                                activation.target,
+                                Some(activation.entry),
+                            );
                         }
                     }
                     Action::ReturnInput => {
@@ -500,7 +527,7 @@ impl Desktop {
             let specs = if self.quitting || self.install_pending {
                 BTreeMap::new()
             } else {
-                match super::group_data::desired(
+                match self.group.data.desired(
                     &state,
                     &self.public_key,
                     &self.pair.inputs,
@@ -519,6 +546,9 @@ impl Desktop {
             if self.group.data.cycle {
                 self.group.data.cycle = false;
                 self.group_cycle();
+            }
+            if let Some(crossing) = self.group.data.crossing.take() {
+                self.group_action(Action::CrossEdge { crossing });
             }
             if self.group.data.returned {
                 self.group.data.returned = false;
@@ -782,14 +812,36 @@ impl Desktop {
                     .clipboard
                     .as_ref()
                     .and_then(|clipboard| clipboard.status());
+                let mut arrange = false;
+                let layout_supported = state
+                    .members
+                    .get(&state.hub)
+                    .is_some_and(Member::compatible);
                 if ui.available_width() >= 700.0 {
                     ui.columns(2, |columns| {
-                        sharing_toggles(&mut columns[0], &mut settings, status.as_deref(), &visual);
+                        arrange = sharing_toggles(
+                            &mut columns[0],
+                            &mut settings,
+                            status.as_deref(),
+                            &visual,
+                            layout_supported,
+                        );
                         sharing_sources(&mut columns[1], &mut settings, &state);
                     });
                 } else {
-                    sharing_toggles(ui, &mut settings, status.as_deref(), &visual);
+                    arrange = sharing_toggles(
+                        ui,
+                        &mut settings,
+                        status.as_deref(),
+                        &visual,
+                        layout_supported,
+                    );
                     sharing_sources(ui, &mut settings, &state);
+                }
+                if arrange {
+                    self.group.add_open = false;
+                    self.page = Page::Application;
+                    self.group.layout_editor.open(&state);
                 }
                 if settings.microphone != previous {
                     settings.microphone_binding = None;
@@ -954,6 +1006,30 @@ impl Desktop {
         let Some(state) = self.group.workspace.clone() else {
             return;
         };
+        ui.horizontal_wrapped(|ui| {
+            ui.strong(tr("Workspace displays"));
+            if ui
+                .add_enabled(
+                    state
+                        .members
+                        .get(&state.hub)
+                        .is_some_and(Member::compatible),
+                    egui::Button::new(tr("Arrange displays…")),
+                )
+                .on_disabled_hover_text(tr(
+                    "Connect and update the workspace coordinator to arrange displays.",
+                ))
+                .clicked()
+            {
+                self.group.layout_editor.open(&state);
+            }
+        });
+        ui.weak(tr(
+            "Choose where the pointer goes when it reaches a screen edge.",
+        ));
+        ui.add_space(12.0);
+        ui.separator();
+        ui.add_space(12.0);
         egui::ComboBox::from_id_salt("settings-computer")
             .width(320.0)
             .selected_text(
@@ -1000,6 +1076,22 @@ impl Desktop {
             self.group_device_settings(ui, &member);
             ui.add_space(12.0);
             self.group_monitor_settings(ui, &member, local, &ctx);
+        }
+    }
+    pub(super) fn group_layout_dialog(&mut self, ctx: &egui::Context) {
+        let Some(state) = self.group.workspace.as_ref() else {
+            self.group.layout_editor.close();
+            return;
+        };
+        let apply = self.group.layout_editor.show(ctx, state);
+        if self.group.layout_editor.take_workspace_request() {
+            self.page = Page::Overview;
+        }
+        if let Some(apply) = apply {
+            self.group_action(Action::SetLayout {
+                expected: apply.expected,
+                layout: apply.layout,
+            });
         }
     }
     fn group_application_settings(
@@ -1359,7 +1451,8 @@ fn sharing_toggles(
     settings: &mut model::Settings,
     status: Option<&str>,
     visual: &super::view::WorkspaceVisual,
-) {
+    layout_supported: bool,
+) -> bool {
     use super::view::{DeviceIcon, device_checkbox};
     ui.horizontal_wrapped(|ui| {
         for (icon, value, label) in [
@@ -1391,10 +1484,19 @@ fn sharing_toggles(
     if let Some(status) = status {
         ui.weak(tr(status));
     }
-    ui.checkbox(
-        &mut settings.edge,
-        tr("Move between computers at the screen edge"),
-    );
+    let mut arrange = false;
+    ui.horizontal_wrapped(|ui| {
+        let edge = ui.checkbox(
+            &mut settings.edge,
+            tr("Move between computers at the screen edge"),
+        );
+        let button = ui
+            .add_enabled(layout_supported, egui::Button::new(tr("Arrange displays…")))
+            .on_disabled_hover_text(tr(
+                "Connect and update the workspace coordinator to arrange displays.",
+            ));
+        arrange = (edge.changed() && settings.edge && layout_supported) || button.clicked();
+    });
     ui.checkbox(
         &mut settings.monitor_enabled,
         tr("Switch the shared monitor"),
@@ -1405,6 +1507,7 @@ fn sharing_toggles(
             ui.checkbox(&mut settings.microphone_level.muted, tr("Mute microphone"));
         });
     }
+    arrange
 }
 
 fn sharing_sources(ui: &mut egui::Ui, settings: &mut model::Settings, state: &Workspace) {

@@ -854,8 +854,11 @@ impl Desktop {
                 });
             });
         if !self.quitting {
-            self.settings_windows(&ctx);
+            if !self.group.layout_editor.is_open() {
+                self.settings_windows(&ctx);
+            }
             self.group_add_dialog(&ctx);
+            self.group_layout_dialog(&ctx);
         }
     }
 

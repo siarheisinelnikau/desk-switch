@@ -1,6 +1,6 @@
 use crate::{
     config::Edge,
-    edge::Rect,
+    edge::{Crossing, Entry, Hit, NativeScreen, Router, Routes, ScreenRect},
     wire::{Input, Mode},
 };
 use anyhow::{Context, Result, bail, ensure};
@@ -19,11 +19,47 @@ use reis::{
 use std::{collections::BTreeSet, os::unix::net::UnixStream, path::Path, time::Duration};
 use tokio::time::timeout;
 
+#[derive(Clone)]
 struct Screen {
     id: String,
-    rect: Rect,
+    rect: ScreenRect,
     scale: f64,
     device: Device,
+}
+
+struct Refresh {
+    geometry: bool,
+    pointer: bool,
+    geometry_stamp: u64,
+    pointer_stamp: u64,
+    task: tokio::task::JoinHandle<(Option<Vec<NativeScreen>>, Option<(i32, i32)>)>,
+}
+
+/// Both sources must identify exactly one region. Mirrored outputs and stale
+/// compositor geometry cannot authorize an absolute entry or an edge crossing.
+fn match_regions(regions: &[ScreenRect], native: &[NativeScreen]) -> Vec<NativeScreen> {
+    native
+        .iter()
+        .filter(|screen| {
+            screen.validate().is_ok()
+                && regions.iter().filter(|rect| **rect == screen.rect).count() == 1
+                && native
+                    .iter()
+                    .filter(|other| other.rect == screen.rect)
+                    .count()
+                    == 1
+        })
+        .cloned()
+        .collect()
+}
+
+fn unique_region(screens: &[Screen], x: f64, y: f64) -> Option<usize> {
+    let mut found = screens
+        .iter()
+        .enumerate()
+        .filter(|(_, screen)| screen.rect.rect().contains(x, y));
+    let (index, _) = found.next()?;
+    found.next().is_none().then_some(index)
 }
 
 pub async fn check() -> Result<RemoteDesktop> {
@@ -64,6 +100,17 @@ pub struct Portal {
     buttons: BTreeSet<u16>,
     edge: Option<Edge>,
     cursor: Option<(f64, f64)>,
+    screens: Vec<Screen>,
+    native: Vec<NativeScreen>,
+    router: Router,
+    group: bool,
+    generation: u64,
+    crossing: Option<Crossing>,
+    geometry_stamp: u64,
+    pointer_stamp: u64,
+    geometry_dirty: bool,
+    pointer_dirty: bool,
+    refresh: Option<Refresh>,
 }
 
 impl Portal {
@@ -154,6 +201,17 @@ impl Portal {
             buttons: BTreeSet::new(),
             edge,
             cursor: None,
+            screens: Vec::new(),
+            native: Vec::new(),
+            router: Router::default(),
+            group: crate::lifecycle::group_input(),
+            generation: 0,
+            crossing: None,
+            geometry_stamp: 0,
+            pointer_stamp: 0,
+            geometry_dirty: false,
+            pointer_dirty: false,
+            refresh: None,
         };
         let ready = timeout(Duration::from_secs(5), async {
             while !result.ready() {
@@ -193,9 +251,21 @@ impl Portal {
             return Err(error);
         }
         println!("Wayland EIS session ready. No screen capture was requested.");
-        let screens = result.screens();
-        for screen in &screens {
+        for screen in &result.screens {
             println!("  EIS screen '{}' (scale {})", screen.id, screen.scale);
+        }
+        if result.group {
+            // The public compositor query runs off the latency-sensitive input
+            // executor. Failure leaves the relative EIS devices usable.
+            let native = tokio::task::spawn_blocking(super::linux_geometry::snapshot)
+                .await
+                .ok()
+                .flatten()
+                .unwrap_or_default();
+            result.replace_native(native)?;
+            result.geometry_dirty = false;
+            let routes = crate::lifecycle::routes().borrow().clone();
+            result.set_routes(routes)?;
         }
         if let Some(edge) = &result.edge
             && result.find_screen(&edge.screen).is_err()
@@ -230,6 +300,7 @@ impl Portal {
                 self.devices
                     .retain(|device| device.device() != event.device.device());
                 self.devices.push(event.device);
+                self.regions_changed()?;
             }
             EiEvent::DevicePaused(_) | EiEvent::DeviceRemoved(_) => {
                 let event = event
@@ -237,13 +308,22 @@ impl Portal {
                     .context("EIS device event without a device")?;
                 self.devices
                     .retain(|device| device.device() != event.device());
+                let optional_absolute = self.group
+                    && event.has_capability(Cap::PointerAbsolute)
+                    && ![Cap::Keyboard, Cap::Pointer, Cap::Button, Cap::Scroll]
+                        .into_iter()
+                        .any(|cap| event.has_capability(cap));
                 ensure!(
-                    !self
-                        .started
-                        .iter()
-                        .any(|device| device.device() == event.device()),
+                    optional_absolute
+                        || !self
+                            .started
+                            .iter()
+                            .any(|device| device.device() == event.device()),
                     "the compositor paused or removed an active EIS input device"
                 );
+                self.started
+                    .retain(|device| device.device() != event.device());
+                self.regions_changed()?;
             }
             EiEvent::Disconnected(_) => bail!("Wayland EIS session disconnected"),
             _ => {}
@@ -251,8 +331,9 @@ impl Portal {
         Ok(())
     }
 
-    fn screens(&self) -> Vec<Screen> {
-        self.devices
+    fn regions_changed(&mut self) -> Result<()> {
+        self.screens = self
+            .devices
             .iter()
             .filter(|device| device.has_capability(Cap::PointerAbsolute))
             .flat_map(|device| {
@@ -264,39 +345,52 @@ impl Portal {
                     {
                         return None;
                     }
+                    let rect = ScreenRect {
+                        x: i32::try_from(region.x).ok()?,
+                        y: i32::try_from(region.y).ok()?,
+                        width: region.width,
+                        height: region.height,
+                    };
+                    rect.validate().ok()?;
                     Some(Screen {
                         id: format!(
                             "{},{},{},{}",
                             region.x, region.y, region.width, region.height
                         ),
-                        rect: Rect {
-                            x: region.x.into(),
-                            y: region.y.into(),
-                            width: region.width.into(),
-                            height: region.height.into(),
-                        },
+                        rect,
                         scale: region.scale.into(),
                         device: device.clone(),
                     })
                 })
             })
-            .collect()
+            .collect();
+        if self.group {
+            self.geometry_stamp = self.geometry_stamp.wrapping_add(1);
+            self.geometry_dirty = true;
+            self.native.clear();
+            self.router.configure(self.router.routes().clone(), &[])?;
+            self.cursor = None;
+            // Region changes invalidate the old pointer basis. This is a
+            // resume query, never a motion-time query or an unsolicited warp.
+            if !self.started.is_empty() {
+                self.refresh_pointer();
+                self.start_absolute_devices();
+                self.connection.flush()?;
+            }
+        }
+        Ok(())
     }
 
     fn find_screen(&self, id: &str) -> Result<Screen> {
         if id == "auto" {
             return self
-                .screens()
-                .into_iter()
-                .min_by(|a, b| {
-                    a.rect
-                        .x
-                        .total_cmp(&b.rect.x)
-                        .then(a.rect.y.total_cmp(&b.rect.y))
-                })
+                .screens
+                .iter()
+                .min_by(|a, b| a.rect.x.cmp(&b.rect.x).then(a.rect.y.cmp(&b.rect.y)))
+                .cloned()
                 .context("Wayland не предоставил область экрана");
         }
-        let mut screens = self.screens().into_iter().filter(|screen| screen.id == id);
+        let mut screens = self.screens.iter().filter(|screen| screen.id == id);
         let screen = screens
             .next()
             .context("the selected Wayland EIS edge screen is unavailable")?;
@@ -304,7 +398,157 @@ impl Portal {
             screens.next().is_none(),
             "the selected EIS region is ambiguous"
         );
-        Ok(screen)
+        Ok(screen.clone())
+    }
+
+    fn replace_native(&mut self, native: Vec<NativeScreen>) -> Result<()> {
+        let regions: Vec<_> = self.screens.iter().map(|screen| screen.rect).collect();
+        self.native = match_regions(&regions, &native);
+        self.router
+            .configure(self.router.routes().clone(), &self.native)
+    }
+
+    pub fn set_routes(&mut self, routes: Routes) -> Result<()> {
+        routes.validate()?;
+        if self.router.routes() == &routes {
+            return Ok(());
+        }
+        let needs_geometry = routes.boundaries.iter().any(|boundary| {
+            Entry {
+                screen: boundary.screen,
+                geometry: boundary.geometry,
+                side: boundary.side,
+                position: 0,
+            }
+            .resolve(&self.native)
+            .is_err()
+        });
+        self.router.configure(routes, &self.native)?;
+        self.crossing = None;
+        if self.group && needs_geometry {
+            self.geometry_stamp = self.geometry_stamp.wrapping_add(1);
+            self.geometry_dirty = true;
+            self.native.clear();
+            self.router.configure(self.router.routes().clone(), &[])?;
+            if !self.started.is_empty() {
+                self.refresh_pointer();
+            }
+        }
+        self.start_refresh();
+        Ok(())
+    }
+
+    pub fn set_generation(&mut self, generation: u64) {
+        if self.generation != generation {
+            self.generation = generation;
+            self.crossing = None;
+            self.router.reset_entry();
+        }
+    }
+
+    pub fn take_crossing(&mut self) -> Option<Crossing> {
+        self.crossing.take()
+    }
+
+    pub fn display_pending(&self) -> bool {
+        self.group
+            && (self.geometry_dirty
+                || self
+                    .refresh
+                    .as_ref()
+                    .is_some_and(|refresh| refresh.geometry))
+    }
+
+    pub fn refresh_pointer(&mut self) {
+        if self.group {
+            self.pointer_stamp = self.pointer_stamp.wrapping_add(1);
+            self.cursor = None;
+            self.pointer_dirty = true;
+            self.start_refresh();
+        }
+    }
+
+    fn start_refresh(&mut self) {
+        if !self.group || self.refresh.is_some() || !(self.geometry_dirty || self.pointer_dirty) {
+            return;
+        }
+        let geometry = std::mem::take(&mut self.geometry_dirty);
+        let pointer = std::mem::take(&mut self.pointer_dirty);
+        self.refresh = Some(Refresh {
+            geometry,
+            pointer,
+            geometry_stamp: self.geometry_stamp,
+            pointer_stamp: self.pointer_stamp,
+            task: tokio::task::spawn_blocking(move || {
+                let native = geometry.then(super::linux_geometry::snapshot).flatten();
+                let point = if pointer {
+                    match super::linux_geometry::pointer() {
+                        Ok(point) => Some(point),
+                        Err(error) => {
+                            eprintln!("{error}");
+                            None
+                        }
+                    }
+                } else {
+                    None
+                };
+                (native, point)
+            }),
+        });
+    }
+
+    /// Keep the refresh task in the adapter: callers may cancel this poll in a
+    /// select without discarding a query or spawning another blocking worker.
+    pub async fn poll(&mut self) -> Result<()> {
+        self.start_refresh();
+        if let Some(refresh) = self.refresh.as_mut() {
+            tokio::select! {
+                event = self.stream.next() => {
+                    self.handle(event.context("EIS device stream closed")??)
+                }
+                result = &mut refresh.task => {
+                    let refresh = self.refresh.take().unwrap();
+                    let (native, point) = result.unwrap_or_default();
+                    if refresh.geometry && refresh.geometry_stamp == self.geometry_stamp {
+                        self.replace_native(native.unwrap_or_default())?;
+                    }
+                    if refresh.pointer && refresh.pointer_stamp == self.pointer_stamp && !self.started.is_empty() {
+                        self.cursor = point.and_then(|(x,y)| {
+                            let (x,y) = (f64::from(x),f64::from(y));
+                            let index = unique_region(&self.screens,x,y)?;
+                            self.native.iter().any(|native| native.rect == self.screens[index].rect)
+                                .then_some((x,y))
+                        });
+                        self.router.reset_entry();
+                    }
+                    self.start_refresh();
+                    Ok(())
+                }
+            }
+        } else {
+            let event = self
+                .stream
+                .next()
+                .await
+                .context("EIS device stream closed")??;
+            self.handle(event)
+        }
+    }
+
+    fn entry_screen(&self, entry: Entry) -> Result<Screen> {
+        entry.resolve(&self.native)?;
+        let mut screens = self
+            .screens
+            .iter()
+            .filter(|screen| screen.rect == entry.screen);
+        let screen = screens
+            .next()
+            .context("The destination EIS region is unavailable")?;
+        ensure!(
+            screens.next().is_none(),
+            "The destination EIS region is ambiguous"
+        );
+        Ok(screen.clone())
     }
 
     pub fn can_start(&self, edge: Option<u16>, mode: Mode, require_region: bool) -> Result<()> {
@@ -329,7 +573,32 @@ impl Portal {
     }
 
     pub fn start(&mut self, edge: Option<u16>, mode: Mode) -> Result<()> {
+        self.start_display(edge, None, mode)
+    }
+
+    pub fn can_start_display(
+        &self,
+        edge: Option<u16>,
+        entry: Option<Entry>,
+        mode: Mode,
+    ) -> Result<()> {
+        self.can_start(edge, mode, mode == Mode::Input)?;
+        if let Some(entry) = entry {
+            ensure!(self.group, "Explicit display entry requires group input");
+            self.entry_screen(entry)?;
+        }
+        Ok(())
+    }
+
+    pub fn start_display(
+        &mut self,
+        edge: Option<u16>,
+        entry: Option<Entry>,
+        mode: Mode,
+    ) -> Result<()> {
+        self.can_start_display(edge, entry, mode)?;
         self.can_start(edge, mode, true)?;
+        let destination = entry.map(|entry| self.entry_screen(entry)).transpose()?;
         // Start all eligible devices. Relative and absolute pointer devices can be separate.
         self.sequence = self.sequence.wrapping_add(1);
         for cap in [Cap::Keyboard, Cap::Pointer, Cap::Button, Cap::Scroll] {
@@ -346,7 +615,7 @@ impl Portal {
                 self.started.push(device.clone());
             }
         }
-        if edge.is_some() {
+        if edge.is_some() || self.group {
             for device in &self.devices {
                 if device.has_capability(Cap::PointerAbsolute)
                     && !self
@@ -366,10 +635,53 @@ impl Portal {
         if let Some(fraction) = edge {
             let config = self.edge.as_ref().unwrap();
             let screen = self.find_screen(&config.screen)?;
-            let (x, y) = config.entry(screen.rect, fraction);
+            let (x, y) = config.entry(screen.rect.rect(), fraction);
             self.absolute(&screen, x, y)?;
             self.cursor = Some((x, y));
+        } else if let (Some(entry), Some(screen)) = (entry, destination) {
+            self.position_display(entry, &screen)?;
+        } else if self.group {
+            self.refresh_pointer();
         }
+        self.connection.flush()?;
+        Ok(())
+    }
+
+    fn start_absolute_devices(&mut self) {
+        for device in &self.devices {
+            if device.has_capability(Cap::PointerAbsolute)
+                && !self
+                    .started
+                    .iter()
+                    .any(|started| started.device() == device.device())
+            {
+                device
+                    .device()
+                    .start_emulating(self.connection.serial(), self.sequence);
+                self.started.push(device.clone());
+            }
+        }
+    }
+
+    fn position_display(&mut self, entry: Entry, screen: &Screen) -> Result<()> {
+        let (x, y) = entry.point();
+        self.start_absolute_devices();
+        self.absolute(screen, x, y)?;
+        self.pointer_stamp = self.pointer_stamp.wrapping_add(1);
+        self.pointer_dirty = false;
+        self.cursor = Some((x, y));
+        self.crossing = None;
+        self.router.reset_entry();
+        Ok(())
+    }
+
+    pub fn enter_display(&mut self, entry: Entry) -> Result<()> {
+        ensure!(
+            !self.started.is_empty(),
+            "Wayland input devices are inactive"
+        );
+        let screen = self.entry_screen(entry)?;
+        self.position_display(entry, &screen)?;
         self.connection.flush()?;
         Ok(())
     }
@@ -462,33 +774,51 @@ impl Portal {
                 self.send(|scroll: ei::Scroll| scroll.scroll_discrete(dx.into(), dy.into()))?;
             }
             Input::Move { dx, dy } => {
-                if let Some((x, y)) = self.cursor {
-                    let screens = self.screens();
-                    let current = screens
-                        .iter()
-                        .find(|screen| screen.rect.contains(x, y))
-                        .context("Wayland edge layout changed during the transfer")?;
+                let current = self.cursor.and_then(|(x, y)| {
+                    unique_region(&self.screens, x, y).map(|index| (x, y, index))
+                });
+                if let Some((x, y, index)) = current {
+                    let current = &self.screens[index];
                     let (dx, dy) = (f64::from(dx) / current.scale, f64::from(dy) / current.scale);
-                    let edge = self.edge.as_ref().unwrap();
-                    if detect_edge
-                        && (current.id == edge.screen
-                            || (edge.screen == "auto"
-                                && current.id == self.find_screen("auto")?.id))
-                        && self.keys.is_empty()
-                        && self.buttons.is_empty()
-                        && let Some(position) = edge.side.crossing(current.rect, x, y, dx, dy)
-                    {
-                        return Ok(Some(position));
-                    }
-                    let (x, y) = (x + dx, y + dy);
-                    let target = screens
-                        .iter()
-                        .find(|screen| screen.rect.contains(x, y))
-                        .unwrap_or(current);
-                    let (x, y) = target.rect.clamp(x, y);
+                    let unheld = detect_edge && self.keys.is_empty() && self.buttons.is_empty();
+                    let blocked = if self.group {
+                        let allow = unheld && self.generation == self.router.routes().activation;
+                        match self.router.crossing_if(x, y, dx, dy, allow) {
+                            Some(Hit::Cross(crossing)) => {
+                                self.crossing = Some(crossing);
+                                true
+                            }
+                            Some(Hit::Block) => true,
+                            None => false,
+                        }
+                    } else {
+                        if let Some(edge) = self.edge.as_ref()
+                            && unheld
+                            && (current.id == edge.screen
+                                || edge.screen == "auto"
+                                    && current.id == self.find_screen("auto")?.id)
+                            && let Some(position) =
+                                edge.side.crossing(current.rect.rect(), x, y, dx, dy)
+                        {
+                            return Ok(Some(position));
+                        }
+                        false
+                    };
+                    let next = (x + dx, y + dy);
+                    let target = if blocked {
+                        current
+                    } else {
+                        unique_region(&self.screens, next.0, next.1)
+                            .map(|index| &self.screens[index])
+                            .unwrap_or(current)
+                    };
+                    let (x, y) = target.rect.rect().clamp(next.0, next.1);
                     self.absolute(target, x, y)?;
                     self.cursor = Some((x, y));
                 } else {
+                    // Unknown pointer position/geometry must not stop manual
+                    // input or select an arbitrary first absolute screen.
+                    self.cursor = None;
                     self.send(|pointer: ei::Pointer| {
                         pointer.motion_relative(dx as f32, dy as f32)
                     })?;
@@ -500,7 +830,10 @@ impl Portal {
     }
 
     pub fn screen_ids(&self) -> Vec<String> {
-        self.screens().into_iter().map(|screen| screen.id).collect()
+        self.screens
+            .iter()
+            .map(|screen| screen.id.clone())
+            .collect()
     }
 
     pub fn start_local(&mut self) -> Result<()> {
@@ -508,8 +841,9 @@ impl Portal {
             let mode = edge.mode;
             self.start(Some(u16::MAX / 2), mode)?;
             let screen = self.find_screen(&self.edge.as_ref().unwrap().screen)?;
-            let x = screen.rect.x + screen.rect.width / 2.0;
-            let y = screen.rect.y + screen.rect.height / 2.0;
+            let rect = screen.rect.rect();
+            let x = rect.x + rect.width / 2.0;
+            let y = rect.y + rect.height / 2.0;
             self.absolute(&screen, x, y)?;
             self.cursor = Some((x, y));
             self.connection.flush()?;
@@ -525,7 +859,7 @@ impl Portal {
             .as_ref()
             .context("the local return edge is disabled")?;
         let screen = self.find_screen(&edge.screen)?;
-        let (x, y) = edge.entry(screen.rect, position);
+        let (x, y) = edge.entry(screen.rect.rect(), position);
         self.absolute(&screen, x, y)?;
         self.cursor = Some((x, y));
         self.connection.flush()?;
@@ -555,10 +889,16 @@ impl Portal {
             }
         }
         self.cursor = None;
+        self.pointer_stamp = self.pointer_stamp.wrapping_add(1);
+        self.pointer_dirty = false;
+        self.crossing = None;
         result.and(self.connection.flush().map_err(Into::into))
     }
 
     pub async fn close(self) {
+        if let Some(refresh) = &self.refresh {
+            refresh.task.abort();
+        }
         let _ = timeout(Duration::from_secs(1), self.session.close()).await;
     }
 }
@@ -588,12 +928,7 @@ fn save_restore_token(dir: &Path, token: Option<&str>) -> Result<()> {
 
 impl super::receiver::Sink for Portal {
     async fn poll(&mut self) -> Result<()> {
-        let event = self
-            .stream
-            .next()
-            .await
-            .context("EIS device stream closed")??;
-        self.handle(event)
+        Portal::poll(self).await
     }
 
     fn prepare(&self, edge: Option<u16>, mode: Mode) -> Result<()> {
@@ -602,6 +937,39 @@ impl super::receiver::Sink for Portal {
 
     fn activate(&mut self, edge: Option<u16>, mode: Mode) -> Result<()> {
         self.start(edge, mode)
+    }
+
+    fn prepare_display(&self, edge: Option<u16>, entry: Option<Entry>, mode: Mode) -> Result<()> {
+        self.can_start_display(edge, entry, mode)
+    }
+
+    fn activate_display(
+        &mut self,
+        edge: Option<u16>,
+        entry: Option<Entry>,
+        mode: Mode,
+    ) -> Result<()> {
+        self.start_display(edge, entry, mode)
+    }
+
+    fn reposition(&mut self, entry: Entry) -> Result<()> {
+        self.enter_display(entry)
+    }
+
+    fn set_routes(&mut self, routes: Routes) -> Result<()> {
+        Portal::set_routes(self, routes)
+    }
+
+    fn set_generation(&mut self, generation: u64) {
+        Portal::set_generation(self, generation);
+    }
+
+    fn take_crossing(&mut self) -> Option<Crossing> {
+        Portal::take_crossing(self)
+    }
+
+    fn display_pending(&self) -> bool {
+        Portal::display_pending(self)
     }
 
     fn event(&mut self, event: Input) -> Result<Option<u16>> {
@@ -644,5 +1012,75 @@ mod permission_tests {
         save_restore_token(&dir, Some("invalid\ntoken")).unwrap();
         assert!(take_restore_token(&dir).is_none());
         std::fs::remove_dir_all(dir).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod geometry_tests {
+    use super::*;
+    use crate::edge::Side;
+
+    fn screen(id: &str, x: i32, y: i32, epoch: u64) -> NativeScreen {
+        NativeScreen {
+            native_id: id.into(),
+            rect: ScreenRect {
+                x,
+                y,
+                width: 1920,
+                height: 1080,
+            },
+            epoch,
+        }
+    }
+
+    #[test]
+    fn eis_binding_requires_exact_unique_region_and_native_output() {
+        let left = screen("DP-1", 0, 0, 7);
+        let right = screen("HDMI-1", 1920, 0, 7);
+        let mirrored = screen("HDMI-2", 1920, 0, 7);
+
+        // An ambiguous secondary screen does not disable a uniquely bound one.
+        assert_eq!(
+            match_regions(
+                &[left.rect, right.rect],
+                &[left.clone(), right.clone(), mirrored]
+            ),
+            vec![left.clone()]
+        );
+        assert_eq!(
+            match_regions(
+                &[left.rect, right.rect, right.rect],
+                &[left.clone(), right.clone()]
+            ),
+            vec![left.clone()]
+        );
+        let mut offset_region = right.rect;
+        offset_region.y = 1;
+        assert_eq!(
+            match_regions(&[left.rect, offset_region], &[left.clone(), right]),
+            vec![left]
+        );
+    }
+
+    #[test]
+    fn saved_entry_is_rejected_after_same_rectangle_has_new_geometry_epoch() {
+        let old = screen("DP-1", 0, 0, 7);
+        let current = screen("DP-1", 0, 0, 8);
+        let entry = Entry {
+            screen: old.rect,
+            geometry: old.epoch,
+            side: Side::Bottom,
+            position: u16::MAX / 4,
+        };
+        let mapped = match_regions(&[current.rect], &[current]);
+        assert!(entry.resolve(&mapped).is_err());
+        let fresh = Entry {
+            geometry: 8,
+            ..entry
+        };
+        let resolved = fresh.resolve(&mapped).unwrap();
+        let (x, y) = fresh.point();
+        assert!(resolved.rect.rect().contains(x, y));
+        assert_eq!(y, 1080.0 - 1.0 - 16.0);
     }
 }
