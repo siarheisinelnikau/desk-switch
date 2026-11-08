@@ -66,6 +66,7 @@ pub(crate) trait PasteSession: Send + Sync {
     /// accepted. A committed/recovery journal requires a new explicit Cut.
     fn can_retry_move(&self) -> bool;
     fn native_complete(&self, result: NativeResult) -> Result<()>;
+    #[cfg_attr(not(windows), allow(dead_code))]
     fn open_verified_cancellable(&self, index: usize, cancel: &AtomicBool) -> Result<File> {
         anyhow::ensure!(
             !cancel.load(Ordering::Acquire),
@@ -78,6 +79,7 @@ pub(crate) trait PasteSession: Send + Sync {
         );
         Ok(file)
     }
+    #[cfg_attr(not(windows), allow(dead_code))]
     fn wait_verified_cancellable(&self, cancel: &AtomicBool) -> Result<()> {
         anyhow::ensure!(
             !cancel.load(Ordering::Acquire),
@@ -90,6 +92,7 @@ pub(crate) trait PasteSession: Send + Sync {
         );
         Ok(())
     }
+    #[cfg_attr(not(windows), allow(dead_code))]
     fn wait_unpaused_cancellable(&self, cancel: &AtomicBool) -> Result<()> {
         anyhow::ensure!(
             !cancel.load(Ordering::Acquire),
