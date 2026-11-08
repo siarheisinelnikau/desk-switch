@@ -19,6 +19,19 @@ jobs:
       - run: cargo clippy --locked --all-targets -- -D warnings
       - run: cargo test --locked
       - run: cargo test --locked -p rust-auto-updator --lib
+      - name: Check Ubuntu tray window lifecycle on an isolated desktop
+        if: runner.os == 'Linux'
+        timeout-minutes: 15
+        run: |
+          sudo apt-get install -y xvfb openbox wmctrl x11-utils libgl1-mesa-dri
+          cargo build --locked --profile diagnostic
+          timeout 90s xvfb-run -a -s '-screen 0 1920x1080x24' /usr/bin/python3 tools/test_linux_tray.py --binary target/diagnostic/desk-switch --out target/linux-tray-proof
+      - uses: actions/upload-artifact@v7.0.2
+        if: runner.os == 'Linux' && always()
+        with:
+          name: ubuntu-tray-lifecycle-proof
+          path: target/linux-tray-proof
+          if-no-files-found: ignore
       - if: runner.os == 'Linux'
         run: |
           node tools/test_gnome_companion.mjs

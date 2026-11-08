@@ -112,23 +112,29 @@ export default class DeskSwitchTray extends Extension {
             if (!pressed)
                 return Clutter.EVENT_PROPAGATE;
             if (pressed === icon)
-                this._activate(icon._indicator, x, y, event.get_time());
+                this._activate(icon._indicator, x, y);
         }
         return Clutter.EVENT_STOP;
     }
 
-    async _activate(indicator, x, y, timestamp) {
-        try {
-            // The host supplies an activation token before the standard SNI call.
-            // Its existing native menu remains responsible for secondary clicks.
-            if (typeof indicator.open === 'function')
-                await indicator.open(Math.round(x), Math.round(y), timestamp);
-            else
-                await indicator._proxy.ActivateAsync(Math.round(x), Math.round(y), this._cancellable);
-        } catch (error) {
-            if (!error.matches?.(Gio.IOErrorEnum, Gio.IOErrorEnum.CANCELLED))
-                console.error(`Desk Switch tray activation failed: ${error.message}`);
-        }
+    _activate(indicator, x, y) {
+        // Call our exported action directly, as DownloadManager's companion
+        // does. AppIndicator.open() may open the host menu instead of Activate.
+        // Our ksni Activate handler opens quick controls; right clicks continue
+        // through the unchanged Shell/AppIndicator context-menu handler.
+        Gio.DBus.session.call(
+            indicator.busName, indicator._proxy.g_object_path ?? '/StatusNotifierItem',
+            'org.kde.StatusNotifierItem', 'Activate',
+            new GLib.Variant('(ii)', [Math.round(x), Math.round(y)]),
+            null, Gio.DBusCallFlags.NONE, 1500, this._cancellable,
+            (connection, result) => {
+                try {
+                    connection.call_finish(result);
+                } catch (error) {
+                    if (!error.matches?.(Gio.IOErrorEnum, Gio.IOErrorEnum.CANCELLED))
+                        console.error(`Desk Switch tray activation failed: ${error.message}`);
+                }
+            });
     }
 
     VersionAsync(_parameters, invocation) {

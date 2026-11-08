@@ -141,6 +141,8 @@ Use **Quit application** from quick controls or the native tray menu to release 
 
 On **Ubuntu GNOME**, enable **Desk Switch Tray** once in GNOME **Extensions** for left-click popup and right-click native-menu behavior. Log out and back in if the newly installed extension is not listed yet. Other desktops need an AppIndicator/StatusNotifier host and may apply their own click policy.
 
+After a companion update, toggle **Desk Switch Tray** off and on in **Extensions**, or sign out and back in, to load the new code. The application window uses X11/XWayland when available so closing it can hide it in the tray and quick controls can be positioned beside the indicator. This does not change native Wayland keyboard/mouse capture. A desktop without XWayland cannot provide these window-hiding and placement operations through the current native Wayland window backend.
+
 Login startup is enabled after the first launch and can be disabled in Settings for any selected computer. Startup uses that computer's saved profile and auto-connect choice.
 
 ## Updates

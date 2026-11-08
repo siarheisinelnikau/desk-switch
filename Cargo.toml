@@ -32,6 +32,7 @@ tokio = { version = "1.48", features = ["rt", "macros", "net", "sync", "time", "
 [target.'cfg(target_os = "linux")'.dependencies]
 zbus = { version = "5.19", default-features = false, features = ["tokio", "blocking-api"] }
 eframe = { version = "0.35", default-features = false, features = ["glow", "x11", "wayland"] }
+winit = { version = "=0.30.13", default-features = false, features = ["rwh_06", "x11"] }
 libc = "0.2"
 ashpd = { version = "0.13", default-features = false, features = ["tokio", "remote_desktop", "screencast"] }
 futures-util = "0.3"
