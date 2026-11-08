@@ -545,15 +545,29 @@ impl PasteSession for Session {
             state.cleanup_started = true;
             state.cleanup_consumer = self.intent.consumer.clone();
         }
-        if let Err(error) = core
+        match core
             .commands
             .try_send(Command::NativeResult(session, result))
         {
-            if moving && !already_cleaning {
-                state.cleanup_started = false;
-                state.cleanup_consumer = None;
+            Ok(()) => {}
+            Err(mpsc::error::TrySendError::Full(Command::NativeResult(session, result))) => {
+                // The bounded service queue is momentarily full. Keep the
+                // terminal result for the maintenance tick rather than losing
+                // a committed Move or a cancellation.
+                core.pending_results
+                    .lock()
+                    .unwrap()
+                    .push_back((session, result));
             }
-            return Err(error).context("The file transfer queue is full");
+            Err(error) => {
+                if moving && !already_cleaning {
+                    state.cleanup_started = false;
+                    state.cleanup_consumer = None;
+                }
+                return Err(anyhow::anyhow!(
+                    "The file transfer queue is closed: {error}"
+                ));
+            }
         }
         self.reported.store(true, Ordering::Release);
         Ok(())
@@ -663,6 +677,7 @@ pub(super) fn protected_jobs(core: &Core) -> BTreeSet<String> {
 /// Leases are bounded metadata capabilities. A lost release message expires;
 /// an actual started transfer is retained independently by its persisted job.
 pub(super) fn maintain(core: &Arc<Core>) {
+    core.flush_pending_results();
     let (refresh, locals) = {
         let mut state = core.lazy.lock().unwrap();
         state.fetches.retain(|_, fetch| fetch.strong_count() > 0);
