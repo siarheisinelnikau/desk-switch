@@ -51,6 +51,7 @@ struct Snapshot {
     can_disable_mouse: bool,
     levels: Vec<Level>,
     notice: String,
+    transfers: usize,
 }
 #[derive(Clone, PartialEq)]
 struct Level {
@@ -371,6 +372,11 @@ impl Desktop {
         if let Some(workspace) = &self.group.workspace {
             let plan = workspace.plan();
             snapshot.visual = super::view::WorkspaceVisual::from_workspace(workspace);
+            snapshot.transfers = self
+                .transfer_snapshot()
+                .iter()
+                .filter(|transfer| super::transfer::active(transfer))
+                .count();
             snapshot.connected = workspace
                 .members
                 .values()
@@ -502,7 +508,10 @@ impl Desktop {
                 }
                 let popup_ctx = ui.ctx().clone();
                 content(ui, &snapshot, |action| {
-                    if matches!(action, Action::QuickClose | Action::Show | Action::Quit) {
+                    if matches!(
+                        action,
+                        Action::QuickClose | Action::Show | Action::Quit | Action::FileTransfers
+                    ) {
                         state.lock().unwrap().open = false;
                         popup_ctx.send_viewport_cmd_to(id(), egui::ViewportCommand::Close);
                     }
@@ -548,7 +557,7 @@ fn content(
                 });
             });
             ui.with_layout(egui::Layout::bottom_up(egui::Align::Min), |ui| {
-                let actions = footer(ui, &mut send);
+                let actions = footer(ui, snapshot.transfers, &mut send);
                 ui.separator();
                 ui.with_layout(egui::Layout::top_down(egui::Align::Min), |ui| {
                     egui::ScrollArea::vertical()
@@ -781,7 +790,14 @@ fn body(
     (switch, edge_pause)
 }
 
-fn footer(ui: &mut egui::Ui, send: &mut impl FnMut(Action)) -> [egui::Rect; 2] {
+fn footer(ui: &mut egui::Ui, transfers: usize, send: &mut impl FnMut(Action)) -> [egui::Rect; 2] {
+    if transfers > 0
+        && ui
+            .button(crate::i18n::tr(format!("Transfers · {transfers}")))
+            .clicked()
+    {
+        send(Action::FileTransfers);
+    }
     ui.horizontal_wrapped(|ui| {
         let open = ui.button(crate::i18n::tr("Open Desk Switch"));
         if open.clicked() {
@@ -849,7 +865,12 @@ mod tests {
 
     #[test]
     fn child_popup_open_close_and_quit_wake_the_hidden_main_dispatcher() {
-        for action in [Action::Show, Action::QuickClose, Action::Quit] {
+        for action in [
+            Action::Show,
+            Action::QuickClose,
+            Action::Quit,
+            Action::FileTransfers,
+        ] {
             let ctx = egui::Context::default();
             ctx.set_embed_viewports(false);
             // Drain the root's initial repaint requests before entering a child.

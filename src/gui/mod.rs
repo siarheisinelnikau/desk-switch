@@ -1,3 +1,4 @@
+mod file_progress;
 mod group;
 mod group_compat;
 mod group_data;
@@ -48,6 +49,7 @@ pub enum Action {
     Hide,
     QuickOpen { x: i32, y: i32 },
     QuickClose,
+    FileTransfers,
     Quick(popup::Command),
 }
 
@@ -95,6 +97,7 @@ pub struct Desktop {
     tray_snapshot: tray::State,
     quick: popup::Popup,
     transfers: transfer::Transfers,
+    file_progress: file_progress::Progress,
     monitor_setup_open: bool,
     actions: Receiver<Action>,
     hidden: bool,
@@ -143,6 +146,8 @@ pub struct Desktop {
     preview_scroll: f32,
     #[cfg(debug_assertions)]
     preview_popup: bool,
+    #[cfg(debug_assertions)]
+    preview_file_progress: bool,
 }
 
 pub fn run(start_hidden: bool) -> Result<()> {
@@ -248,6 +253,7 @@ impl Desktop {
             tray_snapshot: tray::State::default(),
             quick,
             transfers: Default::default(),
+            file_progress: Default::default(),
             monitor_setup_open: false,
             actions,
             hidden: false,
@@ -296,6 +302,8 @@ impl Desktop {
             preview_scroll: 0.0,
             #[cfg(debug_assertions)]
             preview_popup: false,
+            #[cfg(debug_assertions)]
+            preview_file_progress: false,
         }
     }
 
@@ -575,6 +583,10 @@ impl Desktop {
             Action::Sound => self.toggle_audio(),
             Action::QuickOpen { x, y } => self.quick.open(ctx, x, y),
             Action::QuickClose => self.quick.close(ctx),
+            Action::FileTransfers => {
+                self.quick.close(ctx);
+                self.reopen_transfer_progress(ctx);
+            }
             Action::Quick(command) => self.quick_action(command),
             Action::Hide => {
                 if self.tray.as_ref().is_some_and(tray::Tray::available) {
@@ -1257,6 +1269,7 @@ impl eframe::App for Desktop {
     fn logic(&mut self, ctx: &egui::Context, _: &mut eframe::Frame) {
         self.tick(ctx);
         self.quick_popup(ctx);
+        self.transfer_progress(ctx);
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _: &mut eframe::Frame) {
@@ -1272,6 +1285,7 @@ impl software::App for Desktop {
     fn logic(&mut self, ctx: &egui::Context) {
         self.tick(ctx);
         self.quick_popup(ctx);
+        self.transfer_progress(ctx);
     }
     fn ui(&mut self, ui: &mut egui::Ui) {
         self.render(ui);

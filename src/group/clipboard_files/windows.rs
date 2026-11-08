@@ -1,6 +1,11 @@
 //! Windows file selections use CF_HDROP, never text that happens to name a file.
-//! All data is eagerly rendered; writing a selection does not implement an OLE
-//! stream or block Explorer while a transfer is still downloading.
+//! Remote selections reference genuine Cloud Files placeholders. Publishing
+//! metadata keeps the native clipboard lock short; filesystem reads hydrate it.
+mod cloud;
+mod cloud_api;
+mod destination;
+
+use crate::group::file_transfer::protocol::Operation;
 use anyhow::{Context, Result, ensure};
 use std::{
     cell::RefCell,
@@ -18,6 +23,7 @@ const DROP_HEADER: usize = 20;
 const GMEM_MOVEABLE: u32 = 0x0002;
 const GMEM_ZEROINIT: u32 = 0x0040;
 const DROPEFFECT_COPY: u32 = 1;
+const DROPEFFECT_MOVE: u32 = 2;
 type Handle = *mut c_void;
 
 #[repr(C)]
@@ -422,25 +428,27 @@ fn preferred_format() -> Result<u32> {
     Ok(format)
 }
 
-fn copy_effect(bytes: Option<&[u8]>) -> Result<bool> {
+fn drop_operation(bytes: Option<&[u8]>) -> Result<Option<Operation>> {
     let Some(bytes) = bytes else {
         // The standard CF_HDROP format does not require a preferred effect.
-        return Ok(true);
+        return Ok(Some(Operation::Copy));
     };
     ensure!(
         (4..=MAX_METADATA).contains(&bytes.len()),
         "Windows file clipboard drop effect is malformed"
     );
     let effect = u32::from_le_bytes(bytes[..4].try_into().unwrap());
-    // Cross-computer clipboard transfer only implements copy. In particular,
-    // exporting Explorer Cut as Copy would contradict its pending move state.
-    Ok(effect == DROPEFFECT_COPY)
+    Ok(match effect {
+        DROPEFFECT_COPY => Some(Operation::Copy),
+        DROPEFFECT_MOVE => Some(Operation::Move),
+        _ => None,
+    })
 }
 
-fn preferred_copy(_clipboard: &Clipboard) -> Result<bool> {
+fn preferred_operation(_clipboard: &Clipboard) -> Result<Option<Operation>> {
     let format = preferred_format()?;
     if unsafe { IsClipboardFormatAvailable(format) } == 0 {
-        return copy_effect(None);
+        return drop_operation(None);
     }
     let memory = unsafe { GetClipboardData(format) };
     if memory.is_null() {
@@ -454,7 +462,12 @@ fn preferred_copy(_clipboard: &Clipboard) -> Result<bool> {
         "Windows file clipboard drop effect is malformed"
     );
     let (_lock, bytes) = Locked::new(memory)?;
-    copy_effect(Some(unsafe { std::slice::from_raw_parts(bytes, length) }))
+    drop_operation(Some(unsafe { std::slice::from_raw_parts(bytes, length) }))
+}
+
+#[cfg(test)]
+fn preferred_copy(clipboard: &Clipboard) -> Result<bool> {
+    Ok(preferred_operation(clipboard)? == Some(Operation::Copy))
 }
 
 fn sequence_matches(expected: Option<u64>, actual: u32) -> bool {
@@ -466,24 +479,28 @@ pub(super) fn read() -> Result<Option<super::Selection>> {
         return Ok(None);
     }
     let clipboard = Clipboard::open(ptr::null_mut())?;
+    read_locked(&clipboard, true)
+}
+fn read_locked(clipboard: &Clipboard, suppress_provider: bool) -> Result<Option<super::Selection>> {
     // Formats may change between IsClipboardFormatAvailable and OpenClipboard.
     // Both Preferred DropEffect and CF_HDROP must be read under this same lock.
     if unsafe { IsClipboardFormatAvailable(CF_HDROP) } == 0 {
         return Ok(None);
     }
-    if !preferred_copy(&clipboard)? {
+    let Some(operation) = preferred_operation(clipboard)? else {
         let sequence = u64::from(unsafe { GetClipboardSequenceNumber() });
         ensure!(
             sequence != 0,
             "Windows file clipboard sequence is unavailable"
         );
-        // A file format is present, but Cut/Link must stay local. The empty
+        // A file format is present, but Link/unknown effects stay local. The empty
         // selection prevents ancillary filenames from leaking as plain text.
         return Ok(Some(super::Selection {
             sequence,
             paths: Vec::new(),
+            operation: Operation::Copy,
         }));
-    }
+    };
     let memory = unsafe { GetClipboardData(CF_HDROP) };
     if memory.is_null() {
         return Err(os_error("Could not read Windows clipboard files"));
@@ -494,13 +511,60 @@ pub(super) fn read() -> Result<Option<super::Selection>> {
         "File clipboard data exceeds the 1 MiB limit or is malformed"
     );
     let (_lock, bytes) = Locked::new(memory)?;
-    let paths = decode_drop(unsafe { std::slice::from_raw_parts(bytes, length) })?;
+    let mut paths = decode_drop(unsafe { std::slice::from_raw_parts(bytes, length) })?;
+    if suppress_provider && cloud::owns_paths(&paths) {
+        paths.clear();
+    }
     let sequence = u64::from(unsafe { GetClipboardSequenceNumber() });
     ensure!(
         sequence != 0,
         "Windows file clipboard sequence is unavailable"
     );
-    Ok(Some(super::Selection { sequence, paths }))
+    Ok(Some(super::Selection {
+        sequence,
+        paths,
+        operation,
+    }))
+}
+
+pub(super) fn publish_offer_if_current(
+    offer: super::provider::RemoteOffer,
+    expected: u64,
+) -> Result<Option<Box<dyn super::provider::PublishedOffer>>> {
+    cloud::publish(offer, expected)
+}
+pub(super) fn is_provider_path(path: &Path) -> bool {
+    cloud::owns_path(path)
+}
+pub(super) fn clear_cut_if_current(paths: &[PathBuf], expected: u64) -> Result<bool> {
+    ensure!(
+        expected != 0,
+        "The original Cut clipboard generation is unavailable"
+    );
+    OWNER.with(|slot| {
+        let mut owner = slot.borrow_mut();
+        if owner.is_none() {
+            *owner = Some(Owner::create()?);
+        }
+        let clipboard = Clipboard::open(owner.as_ref().unwrap().0)?;
+        if !sequence_matches(Some(expected), unsafe { GetClipboardSequenceNumber() }) {
+            return Ok(false);
+        }
+        let Some(selection) = read_locked(&clipboard, false)? else {
+            return Ok(false);
+        };
+        if selection.sequence != expected
+            || selection.operation != Operation::Move
+            || selection.paths != paths
+        {
+            return Ok(false);
+        }
+        ensure!(
+            unsafe { EmptyClipboard() } != 0,
+            "Could not clear the completed Cut selection"
+        );
+        Ok(true)
+    })
 }
 
 #[cfg(test)]
@@ -513,28 +577,54 @@ pub(super) fn write_if_current(paths: &[PathBuf], expected: u64) -> Result<bool>
 }
 
 fn write_inner(paths: &[PathBuf], expected: Option<u64>) -> Result<bool> {
+    publish_paths(paths, expected, Operation::Copy).map(|receipt| receipt.is_some())
+}
+
+#[derive(Clone, Copy)]
+struct Receipt {
+    sequence: u64,
+}
+
+fn publish_paths(
+    paths: &[PathBuf],
+    expected: Option<u64>,
+    operation: Operation,
+) -> Result<Option<Receipt>> {
     // Finish validation and allocation before replacing the current clipboard.
     let files = Allocation::new(&encode_drop(paths)?)?;
-    let effect = Allocation::new(&DROPEFFECT_COPY.to_le_bytes())?;
+    let value = match operation {
+        Operation::Copy => DROPEFFECT_COPY,
+        Operation::Move => DROPEFFECT_MOVE,
+    };
+    let effect = Allocation::new(&value.to_le_bytes())?;
     let format = preferred_format()?;
     OWNER.with(|slot| {
         let mut slot = slot.borrow_mut();
         if slot.is_none() {
             *slot = Some(Owner::create()?);
         }
-        let _clipboard = Clipboard::open(slot.as_ref().unwrap().0)?;
+        let owner = slot.as_ref().unwrap().0;
+        let clipboard = Clipboard::open(owner)?;
         // This check is protected by the same native lock as EmptyClipboard.
         // A newer local copy cannot be overwritten between comparison and
         // publication by another application.
         if !sequence_matches(expected, unsafe { GetClipboardSequenceNumber() }) {
-            return Ok(false);
+            return Ok(None);
         }
         if unsafe { EmptyClipboard() } == 0 {
             return Err(os_error("Could not prepare Windows file clipboard"));
         }
         effect.publish(format)?;
         files.publish(CF_HDROP)?;
-        Ok(true)
+        let sequence = u64::from(unsafe { GetClipboardSequenceNumber() });
+        ensure!(
+            sequence != 0,
+            "Windows file clipboard sequence is unavailable"
+        );
+        drop(clipboard);
+        // Record our serial while still protected, not a later local copy's
+        // serial. The binding compares exact file metadata before reusing it.
+        Ok(Some(Receipt { sequence }))
     })
 }
 
@@ -615,13 +705,20 @@ mod tests {
     }
 
     #[test]
-    fn cut_link_and_unknown_effects_stay_local_and_missing_hint_means_copy() {
-        assert!(copy_effect(None).unwrap());
-        assert!(copy_effect(Some(&1u32.to_le_bytes())).unwrap());
-        for effect in [0u32, 2, 3, 4, 7, u32::MAX] {
-            assert!(!copy_effect(Some(&effect.to_le_bytes())).unwrap());
+    fn explicit_copy_and_cut_are_distinct_and_links_stay_local() {
+        assert_eq!(drop_operation(None).unwrap(), Some(Operation::Copy));
+        assert_eq!(
+            drop_operation(Some(&1u32.to_le_bytes())).unwrap(),
+            Some(Operation::Copy)
+        );
+        assert_eq!(
+            drop_operation(Some(&2u32.to_le_bytes())).unwrap(),
+            Some(Operation::Move)
+        );
+        for effect in [0u32, 3, 4, 7, u32::MAX] {
+            assert_eq!(drop_operation(Some(&effect.to_le_bytes())).unwrap(), None);
         }
-        assert!(copy_effect(Some(&[1, 0, 0])).is_err());
+        assert!(drop_operation(Some(&[1, 0, 0])).is_err());
     }
 
     #[test]
@@ -877,13 +974,18 @@ mod tests {
         assert_eq!(selected.paths, paths);
         assert_eq!(selected.sequence, copied);
 
-        // An Explorer-like cut/link advertises files and ancillary text. Its
-        // native file selection must suppress both export and text fallback.
+        // Cut preserves its explicit Move intent; links suppress file and text
+        // fallback. Neither metadata read starts any file-content transfer.
         for effect in [2u32, 4] {
             let sequence =
                 native_retry(|| fixture.publish(Some(&paths), Some(effect), Some("Stay local")));
             let selected = native_retry(read).expect("Cut/link must remain a file selection");
-            assert!(selected.paths.is_empty());
+            if effect == DROPEFFECT_MOVE {
+                assert_eq!(selected.paths, paths);
+                assert_eq!(selected.operation, Operation::Move);
+            } else {
+                assert!(selected.paths.is_empty());
+            }
             assert_eq!(selected.sequence, sequence);
         }
 

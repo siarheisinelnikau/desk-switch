@@ -332,6 +332,11 @@ async fn crash_receiver(root: &Path, port: u16, peer: &str, workspace: &str) -> 
         created: millis(),
         manifest: Some(manifest.clone()),
         cancel_notified: false,
+        user_paused: false,
+        peer_paused: false,
+        offer: None,
+        operation: Operation::Copy,
+        native_move: None, move_binding: None, move_outcome: None, move_grant: None,
         view: Transfer {
             id: job_id(&manifest.id, &source),
             peer: source.clone(),
@@ -347,6 +352,10 @@ async fn crash_receiver(root: &Path, port: u16, peer: &str, workspace: &str) -> 
             clipboard_ready: false,
             clipboard_pending: false,
             clipboard_skipped: false,
+            paste: None,
+            pause_reason: None,
+            current_name: None,
+            recovery_paths: vec![],
         },
     };
     config::write_atomic(
@@ -474,7 +483,7 @@ fn cancellation_between_the_first_marker_read_and_registration_rejects_the_new_j
         // while this already-validated Offer is suspended before insertion.
         storage::remember_cancel(&fixture.path("bob"), &workspace, &peer, &id).unwrap();
         let manifest = Manifest {
-            version: protocol::VERSION,
+            version: protocol::MANIFEST_VERSION,
             id: id.clone(),
             name: "Empty folder".into(),
             roots: vec!["Empty folder".into()],
@@ -500,6 +509,11 @@ fn cancellation_between_the_first_marker_read_and_registration_rejects_the_new_j
                     None
                 },
                 cancel_notified: false,
+                user_paused: false,
+                peer_paused: false,
+                offer: None,
+                operation: Operation::Copy,
+                native_move: None, move_binding: None, move_outcome: None, move_grant: None,
                 view: Transfer {
                     id: job_id(&id, &peer),
                     peer: peer.clone(),
@@ -515,6 +529,10 @@ fn cancellation_between_the_first_marker_read_and_registration_rejects_the_new_j
                     clipboard_ready: false,
                     clipboard_pending: false,
                     clipboard_skipped: false,
+                    paste: None,
+                    pause_reason: None,
+                    current_name: None,
+                    recovery_paths: vec![],
                 },
             })
             .unwrap();
