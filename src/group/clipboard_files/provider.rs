@@ -27,6 +27,10 @@ pub(crate) struct PasteIntent {
     pub consumer: Option<NativeConsumer>,
 }
 
+// Platform consumers use only the outcomes they can actually observe. Linux
+// reports MoveCommitted/Cancelled, Windows reports MoveCommitted/Failed, and
+// tests exercise Succeeded for a native Copy acknowledgement.
+#[allow(dead_code)]
 #[derive(Clone, Debug)]
 pub(crate) enum NativeResult {
     /// A native consumer reported successful Copy, not just a completed cache.
@@ -52,6 +56,10 @@ pub(crate) trait DemandProvider: Send + Sync {
 /// Blocking methods are for a bounded native I/O worker, never the GUI thread.
 /// Returned files are read-only handles opened through verified pinned storage.
 pub(crate) trait PasteSession: Send + Sync {
+    /// Stable identity for diagnostics and platform tests. Production paths do
+    /// not currently branch on it, so the trait keeps it available without
+    /// forcing every consumer to display it.
+    #[allow(dead_code)]
     fn id(&self) -> &str;
     fn open_verified(&self, index: usize) -> Result<File>;
     fn wait_verified(&self) -> Result<()>;
