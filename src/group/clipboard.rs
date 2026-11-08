@@ -5,6 +5,8 @@ use anyhow::{Context, Result, ensure};
 use sha2::{Digest, Sha256};
 use std::{
     borrow::Cow,
+    collections::VecDeque,
+    path::PathBuf,
     sync::{Arc, Condvar, Mutex},
     time::Duration,
 };
@@ -333,6 +335,30 @@ impl Engine {
         self.pending = Some(decode(content)?);
         Ok(())
     }
+    fn discard_file_ack(&mut self, file_present: bool) -> bool {
+        if file_present
+            && self
+                .pending
+                .as_ref()
+                .is_some_and(|value| self.fingerprint.as_ref() == Some(&value.fingerprint()))
+        {
+            self.pending = None;
+            true
+        } else {
+            false
+        }
+    }
+    fn guarded_step(
+        &mut self,
+        backend: &mut dyn Backend,
+        file_present: bool,
+    ) -> Result<Option<Content>> {
+        self.discard_file_ack(file_present);
+        if file_present && self.pending.is_none() {
+            return Ok(None);
+        }
+        self.step(backend)
+    }
     fn step(&mut self, backend: &mut dyn Backend) -> Result<Option<Content>> {
         if let Some(value) = self.pending.as_ref() {
             self.rejected = None;
@@ -379,6 +405,60 @@ struct State {
     incoming: Option<(u64, Content)>,
     outgoing: Option<(u64, Content)>,
     status: Option<String>,
+    files_begin: Option<(u64, String, Option<u64>)>,
+    files_incoming: Option<(u64, String, Vec<PathBuf>)>,
+    files_outgoing: Option<(u64, Vec<PathBuf>)>,
+    files_ready: VecDeque<(String, bool)>,
+    native_revision: Option<u64>,
+    files_cancel: Option<(u64, String)>,
+}
+
+/// Native file-drop metadata never enters the text/image wire protocol. A
+/// reservation protects a newer local copy while the remote files download.
+#[derive(Default)]
+struct FileEngine {
+    observed: Option<super::clipboard_files::Selection>,
+    reservation: Option<String>,
+    pending: Option<(String, Vec<PathBuf>)>,
+    revision: Option<u64>,
+    written: Option<Vec<PathBuf>>,
+}
+impl FileEngine {
+    fn observe(
+        &mut self,
+        selection: Option<super::clipboard_files::Selection>,
+        revision: Option<u64>,
+    ) -> Option<Vec<PathBuf>> {
+        if self.observed == selection && self.revision == revision {
+            return None;
+        }
+        self.revision = revision;
+        let own_write = self
+            .written
+            .take()
+            .is_some_and(|paths| selection.as_ref().is_some_and(|value| value.paths == paths));
+        self.observed = selection.clone();
+        self.reservation = None;
+        self.pending = None;
+        if own_write {
+            return None;
+        }
+        selection
+            .filter(|value| !value.paths.is_empty())
+            .map(|value| value.paths)
+    }
+    fn invalidate(&mut self) {
+        self.reservation = None;
+        self.pending = None;
+    }
+    fn reserve(&mut self, id: String, expected: Option<u64>, local_change: bool) -> bool {
+        if expected.is_some() && expected == self.revision && !local_change {
+            self.reservation = Some(id);
+            true
+        } else {
+            false
+        }
+    }
 }
 #[derive(Default)]
 struct Shared {
@@ -390,11 +470,19 @@ pub struct Clipboard {
 }
 impl Clipboard {
     pub fn start(ctx: eframe::egui::Context) -> Result<Self> {
-        Self::spawn(ctx, backend)
+        Self::spawn_with_files(ctx, backend, true)
     }
+    #[cfg(test)]
     fn spawn(
         ctx: eframe::egui::Context,
+        factory: impl FnMut() -> Result<Box<dyn Backend>> + Send + 'static,
+    ) -> Result<Self> {
+        Self::spawn_with_files(ctx, factory, false)
+    }
+    fn spawn_with_files(
+        ctx: eframe::egui::Context,
         mut factory: impl FnMut() -> Result<Box<dyn Backend>> + Send + 'static,
+        native_files: bool,
     ) -> Result<Self> {
         let shared = Arc::new(Shared::default());
         let worker = shared.clone();
@@ -404,6 +492,7 @@ impl Clipboard {
                 let mut native: Option<Box<dyn Backend>> = None;
                 let mut engine = Engine::default();
                 let mut generation = 0;
+                let mut files = FileEngine::default();
                 loop {
                     let mut state = worker.state.lock().unwrap();
                     while !state.enabled && !state.stop {
@@ -415,6 +504,7 @@ impl Clipboard {
                     let current = state.generation;
                     if current != generation {
                         engine = Engine::default();
+                        files = FileEngine::default();
                         generation = current;
                     }
                     let content = state
@@ -422,14 +512,25 @@ impl Clipboard {
                         .take()
                         .filter(|(epoch, _)| *epoch == current)
                         .map(|(_, content)| content);
+                    let begin = state
+                        .files_begin
+                        .take()
+                        .filter(|(epoch, _, _)| *epoch == current)
+                        .map(|(_, id, expected)| (id, expected));
+                    let incoming_files = state
+                        .files_incoming
+                        .take()
+                        .filter(|(epoch, _, _)| *epoch == current)
+                        .map(|(_, id, paths)| (id, paths));
+                    let cancelled_files = state
+                        .files_cancel
+                        .take()
+                        .filter(|(epoch, _)| *epoch == current)
+                        .map(|(_, id)| id);
                     drop(state);
+                    let mut outgoing_files = None;
+                    let mut ready = Vec::new();
                     let result = (|| {
-                        if let Some(content) = content {
-                            engine.receive(content)?;
-                        }
-                        if native.is_none() {
-                            native = Some(factory()?);
-                        }
                         // Disabling cancels queued operations. An OS call already
                         // in flight finishes on this worker and never holds the UI.
                         {
@@ -438,10 +539,141 @@ impl Clipboard {
                                 return Ok(None);
                             }
                         }
-                        engine.step(native.as_mut().unwrap().as_mut())
+                        let receiving_text = content.is_some();
+                        if let Some(id) = cancelled_files {
+                            if files.reservation.as_ref() == Some(&id)
+                                || files
+                                    .pending
+                                    .as_ref()
+                                    .is_some_and(|(pending, _)| pending == &id)
+                            {
+                                files.invalidate();
+                            }
+                            ready.push((id, false));
+                        }
+                        if let Some(content) = content {
+                            engine.receive(content)?;
+                        }
+                        let file_present = if native_files {
+                            let selection = super::clipboard_files::read()?;
+                            let present = selection.is_some();
+                            let pending = files.pending.as_ref().map(|(id, _)| id.clone());
+                            outgoing_files =
+                                files.observe(selection, super::clipboard_files::sequence());
+                            if files.pending.is_none()
+                                && let Some(id) = pending
+                            {
+                                ready.push((id, false));
+                            }
+                            present
+                        } else {
+                            false
+                        };
+                        let receiving_text =
+                            receiving_text && !engine.discard_file_ack(file_present);
+                        let applying_text = engine.pending.is_some();
+                        if receiving_text || applying_text {
+                            if let Some((id, _)) = files.pending.take() {
+                                ready.push((id, false));
+                            }
+                            files.invalidate();
+                        }
+                        let value = if !file_present || applying_text {
+                            if native.is_none() {
+                                native = Some(factory()?);
+                            }
+                            let value = engine
+                                .guarded_step(native.as_mut().unwrap().as_mut(), file_present)?;
+                            if value.is_some() {
+                                files.invalidate();
+                            }
+                            value
+                        } else {
+                            None
+                        };
+                        if let Some((id, expected)) = begin {
+                            if files.reserve(
+                                id.clone(),
+                                expected,
+                                value.is_some()
+                                    || outgoing_files.is_some()
+                                    || receiving_text
+                                    || applying_text,
+                            ) {
+                                if let Some((old, _)) = files.pending.take()
+                                    && old != id
+                                {
+                                    ready.push((old, false));
+                                }
+                            } else {
+                                ready.push((id, false));
+                            }
+                        }
+                        if let Some((id, paths)) = incoming_files {
+                            if files.reservation.as_ref() == Some(&id) {
+                                ensure!(
+                                    !paths.is_empty()
+                                        && paths.len() <= 10_000
+                                        && paths.iter().all(|p| p.is_absolute()),
+                                    "The received file clipboard is invalid"
+                                );
+                                files.pending = Some((id, paths));
+                            } else {
+                                ready.push((id, false));
+                            }
+                        }
+                        if let Some((id, paths)) = files.pending.as_ref()
+                            && native_files
+                        {
+                            let accepted = files.revision.is_some_and(|expected| {
+                                super::clipboard_files::sequence() == Some(expected)
+                            });
+                            let accepted = if accepted {
+                                super::clipboard_files::write_if_current(
+                                    paths,
+                                    files.revision.unwrap(),
+                                )?
+                            } else {
+                                false
+                            };
+                            // Suppress our next observation even if the OS
+                            // is briefly busy immediately after publication.
+                            if accepted {
+                                files.written = Some(paths.clone());
+                                files.observed = None;
+                                // Capture our new revision now so a rapid
+                                // following announcement reserves it. A
+                                // busy clipboard is observed on the next
+                                // tick without echoing these owned paths.
+                                if let Ok(Some(observed)) = super::clipboard_files::read()
+                                    && observed.paths == *paths
+                                {
+                                    files.revision = super::clipboard_files::sequence();
+                                    files.observed = Some(observed);
+                                    files.written = None;
+                                }
+                            }
+                            ready.push((id.clone(), accepted));
+                            files.pending = None;
+                            files.reservation = None;
+                            engine = Engine::default();
+                        }
+                        Ok(value)
                     })();
                     let mut state = worker.state.lock().unwrap();
                     if state.enabled && state.generation == current {
+                        state.native_revision = files.revision;
+                        if let Some(paths) = outgoing_files {
+                            state.files_outgoing = Some((current, paths));
+                            ctx.request_repaint_of(eframe::egui::ViewportId::ROOT);
+                        }
+                        for ready in ready {
+                            if state.files_ready.len() >= 64 {
+                                state.files_ready.pop_front();
+                            }
+                            state.files_ready.push_back(ready);
+                            ctx.request_repaint_of(eframe::egui::ViewportId::ROOT);
+                        }
                         let status = match result {
                             Ok(content) => {
                                 if let Some(content) = content {
@@ -460,7 +692,13 @@ impl Clipboard {
                     if state.stop {
                         break;
                     }
-                    if state.incoming.is_none() && state.enabled && state.generation == current {
+                    if state.incoming.is_none()
+                        && state.files_begin.is_none()
+                        && state.files_incoming.is_none()
+                        && state.files_cancel.is_none()
+                        && state.enabled
+                        && state.generation == current
+                    {
                         let _ = worker.wake.wait_timeout(state, INTERVAL).unwrap();
                     }
                 }
@@ -475,6 +713,12 @@ impl Clipboard {
             state.incoming = None;
             state.outgoing = None;
             state.status = None;
+            state.files_begin = None;
+            state.files_incoming = None;
+            state.files_outgoing = None;
+            state.files_ready.clear();
+            state.native_revision = None;
+            state.files_cancel = None;
             self.shared.wake.notify_one();
         }
     }
@@ -497,6 +741,58 @@ impl Clipboard {
             .filter(|(epoch, _)| state.enabled && *epoch == generation)
             .map(|(_, content)| vec![content])
             .unwrap_or_default()
+    }
+    pub(crate) fn poll_files(&self) -> Vec<Vec<PathBuf>> {
+        let mut state = self.shared.state.lock().unwrap();
+        let generation = state.generation;
+        state
+            .files_outgoing
+            .take()
+            .filter(|(epoch, _)| state.enabled && *epoch == generation)
+            .map(|(_, paths)| vec![paths])
+            .unwrap_or_default()
+    }
+    pub(crate) fn begin_files(&self, id: String) {
+        let mut state = self.shared.state.lock().unwrap();
+        if state.enabled {
+            state.files_begin = Some((state.generation, id, state.native_revision));
+            self.shared.wake.notify_one();
+        }
+    }
+    pub(crate) fn receive_files(&self, id: String, paths: Vec<PathBuf>) {
+        let mut state = self.shared.state.lock().unwrap();
+        if state.enabled {
+            state.files_incoming = Some((state.generation, id, paths));
+            self.shared.wake.notify_one();
+        }
+    }
+    pub(crate) fn files_ready(&self) -> Vec<(String, bool)> {
+        self.shared
+            .state
+            .lock()
+            .unwrap()
+            .files_ready
+            .drain(..)
+            .collect()
+    }
+    pub(crate) fn cancel_files(&self, id: String) {
+        let mut state = self.shared.state.lock().unwrap();
+        if state
+            .files_begin
+            .as_ref()
+            .is_some_and(|(_, pending, _)| pending == &id)
+        {
+            state.files_begin = None;
+        }
+        if state
+            .files_incoming
+            .as_ref()
+            .is_some_and(|(_, pending, _)| pending == &id)
+        {
+            state.files_incoming = None;
+        }
+        state.files_cancel = Some((state.generation, id));
+        self.shared.wake.notify_one();
     }
     pub fn status(&self) -> Option<String> {
         self.shared
@@ -536,6 +832,131 @@ impl Drop for Clipboard {
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    #[test]
+    fn native_file_formats_block_ancillary_text_ack_reads_and_busy_text_writes_retry() {
+        struct Observed {
+            inner: Fake,
+            reads: usize,
+        }
+        impl Backend for Observed {
+            fn read(&mut self) -> Result<Option<Value>> {
+                self.reads += 1;
+                self.inner.read()
+            }
+            fn write(&mut self, value: &Value) -> Result<()> {
+                self.inner.write(value)
+            }
+        }
+        let mut backend = Observed {
+            inner: Fake {
+                value: Some(Value::Text("Earlier text".into())),
+                ..Default::default()
+            },
+            reads: 0,
+        };
+        let mut engine = Engine::default();
+        let old = engine.step(&mut backend).unwrap().unwrap();
+        backend.reads = 0;
+        backend.inner.value = Some(Value::Text("file:///private/ancillary-file-path".into()));
+        engine.receive(old).unwrap();
+        assert!(engine.guarded_step(&mut backend, true).unwrap().is_none());
+        assert_eq!(
+            backend.reads, 0,
+            "File metadata must never fall through to the plain-text reader"
+        );
+        assert_eq!(backend.inner.writes, 0);
+        engine
+            .receive(
+                Value::Text("A new remote text copy".into())
+                    .encode()
+                    .unwrap(),
+            )
+            .unwrap();
+        backend.inner.fail = true;
+        assert!(engine.guarded_step(&mut backend, true).is_err());
+        assert!(engine.pending.is_some());
+        assert!(engine.guarded_step(&mut backend, true).unwrap().is_none());
+        assert_eq!(backend.inner.writes, 1);
+        assert_eq!(
+            backend.inner.value,
+            Some(Value::Text("A new remote text copy".into()))
+        );
+    }
+    #[test]
+    fn newer_native_revision_cancels_a_file_reservation_even_for_identical_text() {
+        let mut engine = FileEngine::default();
+        assert!(engine.observe(None, Some(7)).is_none());
+        assert!(engine.reserve("download".into(), Some(7), false));
+        // No file MIME and no changed text fingerprint are needed: a native
+        // clipboard ownership change alone makes the old reservation stale.
+        assert!(engine.observe(None, Some(8)).is_none());
+        assert!(engine.reservation.is_none());
+        assert!(!engine.reserve("late".into(), Some(7), false));
+        assert!(!engine.reserve("same-tick-local".into(), Some(8), true));
+        assert!(engine.reserve("next".into(), Some(8), false));
+    }
+    #[test]
+    fn owned_file_publication_does_not_echo_but_a_later_real_copy_does() {
+        let paths = vec![std::env::temp_dir().join("synthetic-file-drop")];
+        let mut engine = FileEngine {
+            written: Some(paths.clone()),
+            ..Default::default()
+        };
+        assert!(
+            engine
+                .observe(
+                    Some(super::super::clipboard_files::Selection {
+                        sequence: 10,
+                        paths: paths.clone()
+                    }),
+                    Some(10)
+                )
+                .is_none()
+        );
+        assert!(engine.reserve("next-download".into(), Some(10), false));
+        assert_eq!(
+            engine.observe(
+                Some(super::super::clipboard_files::Selection {
+                    sequence: 11,
+                    paths: paths.clone()
+                }),
+                Some(11)
+            ),
+            Some(paths)
+        );
+        assert!(engine.reservation.is_none());
+        assert!(
+            engine
+                .observe(
+                    Some(super::super::clipboard_files::Selection {
+                        sequence: 12,
+                        paths: vec![]
+                    }),
+                    Some(12)
+                )
+                .is_none()
+        );
+    }
+    #[test]
+    fn cancelling_a_queued_publication_discards_its_begin_and_ready_together() {
+        let clipboard = Clipboard::spawn(eframe::egui::Context::default(), || {
+            Ok(Box::new(Fake::default()))
+        })
+        .unwrap();
+        // Keep the worker disabled so this is solely a queue-ordering fixture.
+        {
+            let mut state = clipboard.shared.state.lock().unwrap();
+            state.files_begin = Some((0, "pending".into(), Some(2)));
+            state.files_incoming = Some((
+                0,
+                "pending".into(),
+                vec![std::env::temp_dir().join("synthetic")],
+            ));
+        }
+        clipboard.cancel_files("pending".into());
+        let state = clipboard.shared.state.lock().unwrap();
+        assert!(state.files_begin.is_none() && state.files_incoming.is_none());
+    }
     #[derive(Default)]
     struct Fake {
         value: Option<Value>,

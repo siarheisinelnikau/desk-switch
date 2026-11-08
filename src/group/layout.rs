@@ -357,6 +357,8 @@ struct RoutingMember {
 struct RoutingStamp {
     layout: Layout,
     owner: Option<Key>,
+    policy: crate::edge::Policy,
+    policy_revision: u64,
     members: Vec<RoutingMember>,
 }
 impl RoutingStamp {
@@ -364,6 +366,8 @@ impl RoutingStamp {
         Self {
             layout: layout.clone(),
             owner: state.confirmed_monitor.clone(),
+            policy: edge_policy(state),
+            policy_revision: state.edge_policy_revision,
             members: state
                 .members
                 .iter()
@@ -385,6 +389,8 @@ impl RoutingStamp {
     fn matches(&self, state: &Workspace) -> bool {
         self.layout == state.layout
             && self.owner == state.confirmed_monitor
+            && self.policy == edge_policy(state)
+            && self.policy_revision == state.edge_policy_revision
             && self.members.len() == state.members.len()
             && self
                 .members
@@ -421,6 +427,7 @@ impl RoutingCache {
         if !routing_enabled(state) {
             return Routes {
                 activation: state.activation,
+                policy: edge_policy(state),
                 ..Default::default()
             };
         }
@@ -792,11 +799,19 @@ pub fn routes_for(state: &Workspace, computer: &str) -> Routes {
     if !routing_enabled(state) {
         return Routes {
             activation: state.activation,
+            policy: edge_policy(state),
             ..Default::default()
         };
     }
     let scene = scene(state, &state.layout);
     routes_from_scene(state, &scene, computer)
+}
+fn edge_policy(state: &Workspace) -> crate::edge::Policy {
+    crate::edge::Policy {
+        dwell_ms: state.settings.edge_delay_ms,
+        protect_corners: state.settings.edge_protect_corners,
+        paused: state.edge_paused,
+    }
 }
 fn routing_enabled(state: &Workspace) -> bool {
     state.settings.edge
@@ -809,6 +824,7 @@ fn routes_from_scene(state: &Workspace, scene: &Scene, computer: &str) -> Routes
         revision: scene.revision,
         activation: state.activation,
         boundaries: Vec::new(),
+        policy: edge_policy(state),
     };
     for contact in &scene.contacts {
         if let Some((source, target)) = routable(scene, contact)
@@ -958,6 +974,7 @@ pub fn resolve_crossing(
     );
     if state.switch_pending()
         || !state.settings.edge
+        || state.edge_paused
         || !state.settings.mouse_enabled
         || state.layout.revision == 0
         || crossing.activation != state.activation
@@ -1537,6 +1554,58 @@ mod tests {
         state.settings.edge = false;
         assert!(cache.routes_for(&state, &keys[0]).boundaries.is_empty());
         assert_eq!(cache.builds, 2);
+    }
+
+    #[test]
+    fn protection_changes_invalidate_cached_and_queued_edges_without_losing_native_barriers() {
+        let (mut state, keys) = fixture(2);
+        let mut cache = RoutingCache::default();
+        let original = cache.routes_for(&state, &keys[0]);
+        let queued = crossing(&state, &keys[0], Side::Right, 32767);
+        state.settings.edge_delay_ms = 300;
+        state.revision += 1;
+        state.edge_policy_revision = state.revision;
+        let delayed = cache.routes_for(&state, &keys[0]);
+        assert_ne!(delayed.revision, original.revision);
+        assert_eq!(delayed.policy.dwell_ms, 300);
+        assert!(
+            resolve_crossing(&state, &keys[0], queued)
+                .unwrap()
+                .is_none()
+        );
+        state.settings.edge_protect_corners = false;
+        state.revision += 1;
+        state.edge_policy_revision = state.revision;
+        let corners = cache.routes_for(&state, &keys[0]);
+        assert_ne!(corners.revision, delayed.revision);
+        assert!(!corners.policy.protect_corners);
+        let before_pause = crossing(&state, &keys[0], Side::Right, 32767);
+        state.edge_paused = true;
+        state.revision += 1;
+        state.edge_policy_revision = state.revision;
+        let paused = cache.routes_for(&state, &keys[0]);
+        assert_ne!(paused.revision, corners.revision);
+        assert!(paused.policy.paused);
+        assert_eq!(paused.boundaries, corners.boundaries);
+        assert!(
+            resolve_crossing(&state, &keys[0], before_pause)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(cache.builds, 4);
+        state.edge_paused = false;
+        state.revision += 1;
+        state.edge_policy_revision = state.revision;
+        let resumed = cache.routes_for(&state, &keys[0]);
+        assert_eq!(resumed.policy, corners.policy);
+        assert_eq!(resumed.boundaries, corners.boundaries);
+        assert_ne!(resumed.revision, corners.revision);
+        assert!(
+            resolve_crossing(&state, &keys[0], before_pause)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(cache.builds, 5);
     }
 
     #[test]

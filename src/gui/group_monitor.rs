@@ -31,7 +31,7 @@ pub(super) struct Attempt {
 impl Attempt {
     fn new(state: &Workspace, command: &MonitorCommand) -> Self {
         Self {
-            hub: state.hub.clone(),
+            hub: state.workspace_id().to_owned(),
             id: command.id,
             writer: command.writer.clone(),
             destination: command.destination.clone(),
@@ -114,8 +114,8 @@ impl Desktop {
         }
     }
     pub(super) fn tick_group_monitor(&mut self, state: &Workspace, ctx: &egui::Context) {
-        let initial = self.group.monitor_observed.as_deref() != Some(&state.hub);
-        self.group.monitor_observed = Some(state.hub.clone());
+        let initial = self.group.monitor_observed.as_deref() != Some(state.workspace_id());
+        self.group.monitor_observed = Some(state.workspace_id().to_owned());
         let command = state
             .monitor_command
             .as_ref()
@@ -123,7 +123,7 @@ impl Desktop {
         let fresh = state
             .monitor_command
             .as_ref()
-            .map(|command| (state.hub.clone(), command.id));
+            .map(|command| (state.workspace_id().to_owned(), command.id));
         let success = state.monitor_command.as_ref().is_some_and(|command| {
             command
                 .result
@@ -140,7 +140,7 @@ impl Desktop {
         }
         self.group.monitor_notice_id = fresh;
         if initial && let Some(command) = command.filter(|command| command.result.is_none()) {
-            self.group.monitor_loaded = Some((state.hub.clone(), command.id));
+            self.group.monitor_loaded = Some((state.workspace_id().to_owned(), command.id));
         }
         // Readiness is controller-owned. Old snapshots are accepted for staged
         // upgrades, but cannot cause this version to issue an implicit DDC call.
@@ -222,7 +222,9 @@ impl Desktop {
                 );
             }
         }
-        if let Some(command) = command.filter(|command| command.result.is_none()) {
+        if let Some(command) = command.filter(|command| command.result.is_none())
+            && state.authority.is_some()
+        {
             let attempt = Attempt::new(state, command);
             let handled = self.group.monitor_attempt.as_ref() == Some(&attempt);
             if !handled
@@ -274,7 +276,7 @@ impl Desktop {
             }
         }
         if let Some((attempt, error)) = self.group.monitor_result.clone() {
-            let relevant = attempt.hub == state.hub
+            let relevant = attempt.hub == state.workspace_id()
                 && command.is_some_and(|command| {
                     command.id == attempt.id
                         && command.destination == attempt.destination
@@ -310,6 +312,45 @@ impl Desktop {
 mod tests {
     use super::*;
     #[test]
+    fn coordinator_handover_preserves_the_monitor_attempt_identity() {
+        let mut state = crate::group::model::tests::fixture(3);
+        state.settings.monitor_enabled = true;
+        let original = state.hub.clone();
+        let destination = state.members.keys().nth(1).unwrap().clone();
+        state.activate(&original, &destination, None).unwrap();
+        state.authority = Some(crate::group::model::Authority {
+            workspace_id: original,
+            term: 1,
+            index: 1,
+        });
+        let before = Attempt::new(&state, state.monitor_command.as_ref().unwrap());
+        let dir = std::env::temp_dir().join(format!(
+            "desk-switch-monitor-handover-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        assert!(record(&dir, &before).unwrap());
+        state.hub = state.members.keys().nth(2).unwrap().clone();
+        state.authority.as_mut().unwrap().term = 2;
+        state.authority.as_mut().unwrap().index = 2;
+        assert_eq!(
+            Attempt::new(&state, state.monitor_command.as_ref().unwrap()),
+            before
+        );
+        assert!(
+            !record(
+                &dir,
+                &Attempt::new(&state, state.monitor_command.as_ref().unwrap())
+            )
+            .unwrap()
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+    #[test]
     fn issuance_is_persistent_monotonic_and_scoped_to_the_controller() {
         let dir = std::env::temp_dir().join(format!(
             "desk-switch-monitor-ledger-{}-{}",
@@ -343,10 +384,10 @@ mod tests {
     #[test]
     fn full_error_context_is_bounded_unicode_safe_and_has_no_control_characters() {
         let state = crate::group::model::tests::fixture(3);
-        let writer = state.hub.clone();
+        let writer = state.workspace_id().to_owned();
         let destination = state.members.keys().nth(1).unwrap().clone();
         let attempt = Attempt {
-            hub: state.hub.clone(),
+            hub: state.workspace_id().to_owned(),
             id: 1,
             writer,
             destination,

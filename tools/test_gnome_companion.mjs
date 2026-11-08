@@ -108,8 +108,9 @@ function icon(id, busName, x) {
     const actor = new Signals();
     Object.assign(actor, {
         visible: true, _indicator: {id, busName, _proxy: {g_object_path: '/StatusNotifierItem'},
-            open: () => assert.fail('AppIndicator.open would reopen the native menu')},
-        menu: {closes: 0, close() { this.closes++; }},
+            open: () => { actor.menu.opens++; actor.menu.isOpen = true; }},
+        menu: {opens: 0, closes: 0, isOpen: false,
+            close() { this.closes++; this.isOpen = false; }},
         get_transformed_extents: () => ({get_x: () => x, get_y: () => 0, get_width: () => 24, get_height: () => 24}),
         contains: other => other?.parent === actor,
     });
@@ -136,6 +137,8 @@ assert.equal(own.menu.closes, 0);
 assert.equal(extension._handleEvent(event(1)), Clutter.EVENT_STOP);
 assert.equal(extension._handleEvent(event(2)), Clutter.EVENT_STOP);
 await Promise.resolve();
+assert.equal(own.menu.opens, 0, 'primary activation must bypass AppIndicator.open and its host menu');
+assert.equal(own.menu.isOpen, false);
 assert.deepEqual(calls, [[110, 12]]);
 assert.equal(own.menu.closes, 1);
 target = other;
@@ -226,7 +229,7 @@ assert.equal(image.result.data[1], 'image/png'); assert.deepEqual(Array.from(ima
 formats.splice(0, formats.length, 'x-special/gnome-copied-files', 'text/plain');
 selection.emit('owner-changed', 1);
 const files = new Invocation(); await extension.ReadAsync([0], files);
-assert.equal(files.result.data[1], ''); assert.equal(reads, 2, 'files must remain deferred');
+assert.equal(files.result.data[1], ''); assert.equal(reads, 2, 'native files use their separate bounded bridge');
 const invalid = new Invocation(); await extension.WriteAsync(['text/uri-list', []], invalid);
 assert(invalid.error); assert.equal(writes, 1);
 formats.splice(0, formats.length, 'text/plain-unrelated');
@@ -295,3 +298,143 @@ assert.equal(main.handlers.size, 0); assert.equal(unrelated.handlers.size, 0);
 assert(boxes.every(box => box.handlers.size === 0)); assert.equal(own.handlers.size, 0); assert.equal(other.handlers.size, 0);
 assert.equal(exports, 0); assert.equal(owned, 0);
 console.log('PASS: shipped GNOME handlers preserve tray routing, bounded text/image sharing, own-window focus and read-only pointer access for the GUI or verified direct managed input children; unrelated/reused/wrong-role processes are rejected and clipboard/focus authorization stays strict. Mock Shell only; physical Ubuntu behavior remains unverified.');
+
+// File transfer uses only native file MIME data, never a plain-text path. The
+// real selection transfer API is mocked with its explicit allocation bound.
+const filePayloads = new Map();
+let fileReads = 0, beforeFileReply = null;
+Gio.MemoryOutputStream = {
+    new_resizable() {
+        return {data: new Uint8Array(), closed: false,
+            close() { this.closed = true; },
+            steal_as_bytes() { assert(this.closed); return {get_data: () => this.data}; }};
+    },
+};
+selection.transfer_async = function (type, mime, size, stream, cancellable, callback) {
+    assert.equal(type, 1); assert.equal(size, 1024 * 1024 + 1);
+    assert(!cancellable.cancelled); fileReads++;
+    const payload = filePayloads.get(mime);
+    stream.data = payload?.slice(0, size) ?? new Uint8Array();
+    queueMicrotask(() => { beforeFileReply?.(); callback(this, {available: payload !== null}); });
+};
+selection.transfer_finish = result => result.available;
+const fileExtension = new sandbox.Subject(); fileExtension.enable();
+for (const [id, callback] of idle) { idle.delete(id); callback(); }
+const copiedFiles = 'x-special/gnome-copied-files';
+const uriList = 'text/uri-list';
+const setFileData = (mime, value) => {
+    formats.splice(0, formats.length, mime, 'text/plain');
+    filePayloads.set(mime, value === null ? null : new TextEncoder().encode(value));
+    selection.emit('owner-changed', 1);
+};
+setFileData(copiedFiles, 'copy\nfile:///tmp/Shared%20folder\nfile:///tmp/%D0%9F%D1%80%D0%B8%D0%B2%D0%B5%D1%82.txt');
+const nativeFiles = new Invocation(); await fileExtension.ReadFilesAsync([0], nativeFiles);
+assert(nativeFiles.result, nativeFiles.error?.message);
+assert.equal(nativeFiles.result.signature, '(usay)');
+assert.equal(nativeFiles.result.data[1], copiedFiles);
+const repeatedFiles = new Invocation(); await fileExtension.ReadFilesAsync([nativeFiles.result.data[0]], repeatedFiles);
+assert.equal(repeatedFiles.result.data[1], ''); assert.equal(fileReads, 1, 'unchanged file metadata is not fetched again');
+const forbiddenFiles = new Invocation(':1.6'); await fileExtension.ReadFilesAsync([0], forbiddenFiles);
+assert(forbiddenFiles.error); assert.equal(fileReads, 1, 'input-worker pointer permission does not grant file clipboard access');
+const forbiddenFilesWrite = new Invocation(':1.99'); await fileExtension.WriteFilesAsync([[1, 2, 3]], forbiddenFilesWrite);
+assert(forbiddenFilesWrite.error);
+const preFileWrite = writes;
+const writtenFiles = new Invocation();
+await fileExtension.WriteFilesAsync([new TextEncoder().encode('file:///tmp/ready%20folder\r\nfile:///tmp/ready.txt')], writtenFiles);
+assert(writtenFiles.result, writtenFiles.error?.message); assert.equal(writes, preFileWrite + 1);
+assert.equal(formats[0], copiedFiles);
+assert.equal(new TextDecoder().decode(png), 'copy\nfile:///tmp/ready%20folder\nfile:///tmp/ready.txt', 'native paste receives copy semantics and real staged file URLs');
+const invalidFileValues = [
+    'https://example.invalid/a', 'file://server/tmp/a', 'file://localhost.evil/tmp/a',
+    'file:///tmp/%00a', 'file:///tmp/%0Aa', 'file:///tmp/../secret',
+    'file:///tmp/%2E%2E/secret', 'file:///tmp/a?query', 'file:///tmp/a#fragment',
+    'file:///tmp/a%GG', 'file:///tmp/%FF', 'file:///tmp/a\nfile:///tmp/a',
+];
+for (const value of invalidFileValues) {
+    const bad = new Invocation();
+    await fileExtension.WriteFilesAsync([new TextEncoder().encode(value)], bad);
+    assert(bad.error, value);
+}
+assert.equal(writes, preFileWrite + 1, 'invalid or remote paths never modify the native clipboard');
+setFileData(uriList, '# local clipboard files\r\nfile://localhost/tmp/a%20b\r\n');
+const uris = new Invocation(); await fileExtension.ReadFilesAsync([0], uris);
+assert(uris.result, uris.error?.message); assert.equal(uris.result.data[1], uriList);
+const noTextPaths = new Invocation(); const readsBeforeUris = reads;
+await fileExtension.ReadAsync([0], noTextPaths);
+assert.equal(noTextPaths.result.data[1], ''); assert.equal(reads, readsBeforeUris, 'URI-list ancillary text is never shared as text');
+setFileData(uriList, 'file:///tmp/concurrent');
+const concurrentReadA = new Invocation(), concurrentReadB = new Invocation();
+const beforeConcurrent = fileReads;
+await Promise.all([fileExtension.ReadFilesAsync([0], concurrentReadA), fileExtension.ReadFilesAsync([0], concurrentReadB)]);
+assert(concurrentReadA.result); assert(concurrentReadB.result);
+assert.equal(fileReads, beforeConcurrent + 1, 'concurrent authorized reads share one bounded native allocation');
+setFileData(copiedFiles, 'cut\nfile:///tmp/a');
+const cutFiles = new Invocation(); await fileExtension.ReadFilesAsync([0], cutFiles);
+assert(cutFiles.result); assert.equal(cutFiles.result.data[1], copiedFiles, 'cut metadata remains recognizable for suppression without authorizing a move');
+setFileData(uriList, 'file:///tmp/' + 'x'.repeat(1024 * 1024));
+const excessive = new Invocation(); await fileExtension.ReadFilesAsync([0], excessive);
+assert(excessive.error); const excessiveReads = fileReads;
+const excessiveAgain = new Invocation(); await fileExtension.ReadFilesAsync([0], excessiveAgain);
+assert(excessiveAgain.error); assert.equal(fileReads, excessiveReads, 'oversized metadata is rejected before repeated reads');
+setFileData(uriList, 'file:///tmp/' + 'ready');
+beforeFileReply = () => selection.emit('owner-changed', 1);
+const changedFiles = new Invocation(); await fileExtension.ReadFilesAsync([0], changedFiles);
+assert(changedFiles.error, 'metadata from a changed selection is never exported');
+beforeFileReply = null;
+setFileData(uriList, null);
+const absentFiles = new Invocation(); await fileExtension.ReadFilesAsync([0], absentFiles);
+assert(absentFiles.error, 'unavailable native content does not clear another computer clipboard');
+setFileData(uriList, 'file:///tmp/ready');
+const lateFileWrite = new Invocation();
+const lateFileOperation = fileExtension.WriteFilesAsync([new TextEncoder().encode('file:///tmp/ready')], lateFileWrite);
+fileExtension.disable(); await lateFileOperation;
+assert(lateFileWrite.error); assert.equal(writes, preFileWrite + 1, 'disable cancels pending authorized file clipboard writes');
+assert.equal(exports, 0); assert.equal(owned, 0); assert.equal(idle.size, 0);
+console.log('PASS: native file clipboard reads/writes are GUI-authorized, bounded, copy-only, local-URI-only and isolated from text sharing. No physical clipboard was touched.');
+
+// Conditional publication cannot replace an explicit newer local copy, even
+// when that copy contains exactly the same text as its preceding selection.
+const conditionalExtension = new sandbox.Subject(); conditionalExtension.enable();
+for (const [id, callback] of idle) { idle.delete(id); callback(); }
+clipboard.set_text(1, 'The same local text');
+const reservation = new Invocation(); await conditionalExtension.ReadFilesAsync([0], reservation);
+assert.equal(reservation.result.data[1], '');
+const reservedSerial = reservation.result.data[0];
+const stagedUris = new TextEncoder().encode('file:///tmp/verified%20download');
+const incorrectRevision = new Invocation(); const beforeIncorrect = writes;
+await conditionalExtension.WriteFilesIfCurrentAsync([reservedSerial + 1, stagedUris], incorrectRevision);
+assert.deepEqual(Array.from(incorrectRevision.result.data), [false, reservedSerial]);
+assert.equal(writes, beforeIncorrect, 'a mismatching revision never changes clipboard ownership');
+clipboard.set_text(1, 'The same local text');
+const beforeNewer = writes, newerSerial = conditionalExtension._clipboardSerial;
+assert.notEqual(newerSerial, reservedSerial);
+const newerLocalCopy = new Invocation();
+await conditionalExtension.WriteFilesIfCurrentAsync([reservedSerial, stagedUris], newerLocalCopy);
+assert.deepEqual(Array.from(newerLocalCopy.result.data), [false, newerSerial]);
+assert.equal(writes, beforeNewer); assert.equal(text, 'The same local text');
+assert.equal(formats[0], 'text/plain;charset=utf-8');
+const acceptedReservation = new Invocation();
+await conditionalExtension.WriteFilesIfCurrentAsync([newerSerial, stagedUris], acceptedReservation);
+assert.equal(acceptedReservation.result.signature, '(bu)');
+assert.equal(acceptedReservation.result.data[0], true); assert.equal(writes, beforeNewer + 1);
+assert.equal(new TextDecoder().decode(png), 'copy\nfile:///tmp/verified%20download');
+const forbiddenConditional = new Invocation(':1.6'); const beforeConditionalDenial = writes;
+await conditionalExtension.WriteFilesIfCurrentAsync([conditionalExtension._clipboardSerial, stagedUris], forbiddenConditional);
+assert(forbiddenConditional.error); assert.equal(writes, beforeConditionalDenial);
+const duringAuthorization = new Invocation();
+const earlierRevision = conditionalExtension._clipboardSerial;
+const pendingConditional = conditionalExtension.WriteFilesIfCurrentAsync([earlierRevision, stagedUris], duringAuthorization);
+clipboard.set_text(1, 'Copied while authorization was pending');
+const afterDuringCopy = writes;
+await pendingConditional;
+assert.equal(duringAuthorization.result.data[0], false); assert.equal(writes, afterDuringCopy);
+const malformedConditional = new Invocation();
+await conditionalExtension.WriteFilesIfCurrentAsync([conditionalExtension._clipboardSerial,
+    new TextEncoder().encode('file://untrusted.invalid/tmp/a')], malformedConditional);
+assert(malformedConditional.error); assert.equal(writes, afterDuringCopy);
+const afterDisable = new Invocation();
+const cancelledConditional = conditionalExtension.WriteFilesIfCurrentAsync([conditionalExtension._clipboardSerial, stagedUris], afterDisable);
+conditionalExtension.disable(); await cancelledConditional;
+assert(afterDisable.error); assert.equal(writes, afterDuringCopy);
+assert.equal(exports, 0); assert.equal(owned, 0); assert.equal(idle.size, 0);
+console.log('PASS: conditional file clipboard publication rejects changed revisions, including identical text recopies, with no native write; accepted writes and GUI authorization remain covered.');

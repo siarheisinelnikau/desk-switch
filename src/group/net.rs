@@ -50,6 +50,9 @@ const MAX_PACKET: usize = 16 * 1024 * 1024;
 const CHUNK: usize = 60 * 1024;
 const AUTH: Duration = Duration::from_secs(5);
 
+#[path = "net/coordination.rs"]
+mod coordination;
+
 fn canonical_address(address: SocketAddr) -> SocketAddr {
     if let SocketAddr::V6(value) = address
         && let Some(ip) = value.ip().to_ipv4_mapped()
@@ -91,6 +94,7 @@ pub enum Action {
         position: u16,
     },
     ReturnInput,
+    EdgePause(bool),
     MonitorResult {
         id: u64,
         error: Option<String>,
@@ -138,6 +142,12 @@ pub enum Event {
         key: String,
         reason: String,
     },
+    Coordination {
+        leader: Option<String>,
+        writable: bool,
+        online: usize,
+        quorum: usize,
+    },
     Error(String),
 }
 
@@ -145,6 +155,7 @@ pub enum Event {
 enum Intent {
     Invite,
     Join,
+    Mesh,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -155,8 +166,13 @@ enum Packet {
         member: Box<Member>,
         hub: String,
         count: usize,
+        workspace_id: String,
     },
     Decision(bool),
+    Bootstrap(Box<super::consensus::HardState>),
+    Consensus(super::consensus::Rpc),
+    Observation(Box<Member>),
+    Directory(BTreeMap<String, SocketAddr>),
     State(Box<Workspace>),
     Node(Box<Node>, Option<workspace::AudioLevel>, u64),
     Action(Action),
@@ -192,6 +208,8 @@ enum Command {
     Disconnect,
     #[cfg(test)]
     Raw(String, Box<Packet>),
+    #[cfg(test)]
+    FailCommitPersistence(mpsc::Sender<()>),
 }
 enum Incoming {
     Consent {
@@ -202,9 +220,12 @@ enum Incoming {
         candidate: Candidate,
         member: Box<Member>,
         controller: bool,
+        mesh: bool,
+        workspace_id: String,
         dial: Option<DialPermit>,
     },
     Packet(String, [u8; 32], Packet),
+    DialFailed(String, anyhow::Error),
     Closed(String, Option<[u8; 32]>, Option<anyhow::Error>),
 }
 
@@ -461,6 +482,7 @@ fn load(dir: &Path, local: Member) -> Result<Workspace> {
     } else {
         Workspace {
             hub: local.node.key.clone(),
+            authority: None,
             revision: 0,
             settings: Settings::from(&local.node.shared),
             members: BTreeMap::new(),
@@ -475,6 +497,8 @@ fn load(dir: &Path, local: Member) -> Result<Workspace> {
             layout: Default::default(),
             active_display: None,
             display_entry: None,
+            edge_paused: false,
+            edge_policy_revision: 0,
         }
     };
     let mut local = local;
@@ -644,6 +668,7 @@ async fn setup(
             member: Box::new(local.clone()),
             hub: state.hub.clone(),
             count: state.members.len(),
+            workspace_id: state.workspace_id().to_owned(),
         },
     )
     .await?;
@@ -653,6 +678,7 @@ async fn setup(
         mut member,
         hub: remote_hub,
         count,
+        workspace_id,
     } = timeout(AUTH, read_packet(&mut candidate.stream, &noise)).await??
     else {
         bail!("Missing workspace handshake")
@@ -664,24 +690,30 @@ async fn setup(
     member.address = canonical_address(candidate.address);
     member.online = true;
     member.validate(&remote_hub)?;
+    model::valid_key(&workspace_id)?;
     let requested = if outgoing { intent } else { remote_intent };
+    let mesh = trusted && workspace_id == state.workspace_id();
+    ensure!(
+        !matches!(requested, Intent::Mesh) || mesh,
+        "The saved computer belongs to a different workspace; invite it explicitly"
+    );
     let controller = matches!(
         (outgoing, requested),
         (true, Intent::Invite) | (false, Intent::Join)
     );
-    if controller {
+    if !mesh && controller {
         ensure!(
             state.hub == local.node.key,
             "Add computers through the workspace controller"
         );
-    } else {
+    } else if !mesh {
         ensure!(remote_hub == peer, "Connect to the workspace controller");
         ensure!(
             state.members.len() <= 1 || state.hub == peer,
             "Leave the existing workspace before joining another"
         );
     }
-    if controller && matches!(requested, Intent::Invite) {
+    if !mesh && controller && matches!(requested, Intent::Invite) {
         ensure!(
             count <= 1 || remote_hub == local.node.key,
             "The invited computer already belongs to another workspace"
@@ -725,6 +757,8 @@ async fn setup(
             candidate,
             member,
             controller,
+            mesh,
+            workspace_id,
             dial,
         })
         .await?;
@@ -776,9 +810,7 @@ fn dial(
         }
         .await;
         if let Err(error) = result {
-            let _ = internal
-                .send(Incoming::Closed(expected, None, Some(error)))
-                .await;
+            let _ = internal.send(Incoming::DialFailed(expected, error)).await;
         }
     });
 }
@@ -932,7 +964,7 @@ fn close_session(
     links: &mut Links,
     state: &mut Workspace,
     receipts: &mut UpdateReceipts,
-    own: &str,
+    _own: &str,
     key: &str,
     generation: [u8; 32],
 ) -> bool {
@@ -942,11 +974,6 @@ fn close_session(
     receipts.closed(key, &state.hub);
     if let Some(member) = state.members.get_mut(key) {
         member.online = false;
-    }
-    if key == state.hub {
-        for member in state.members.values_mut() {
-            member.online = member.node.key == own;
-        }
     }
     true
 }
@@ -959,6 +986,7 @@ fn send(sessions: &Sessions, key: &str, packet: Packet) -> Result<()> {
         .context("The computer's command queue is busy")?;
     Ok(())
 }
+#[cfg(test)]
 fn broadcast(sessions: &Sessions, state: &Workspace) {
     let snapshot = Arc::new(Packet::State(Box::new(state.clone())));
     for session in sessions.values() {
@@ -1010,12 +1038,8 @@ impl UpdateReceipts {
         self.0.remove(index);
         true
     }
-    fn closed(&mut self, peer: &str, hub: &str) {
-        if peer == hub {
-            self.0.clear();
-        } else {
-            self.0.retain(|(target, _)| target != peer);
-        }
+    fn closed(&mut self, peer: &str, _hub: &str) {
+        self.0.retain(|(target, _)| target != peer);
     }
 }
 
@@ -1056,6 +1080,7 @@ fn apply(
         Action::Activate { key } => state.activate(source, &key, None)?,
         Action::ActivateEdge { key, position } => state.activate(source, &key, Some(position))?,
         Action::ReturnInput => state.return_input()?,
+        Action::EdgePause(paused) => state.pause_edges(paused)?,
         Action::MonitorResult { id, error } => state.monitor_result(source, id, error)?,
         Action::Invite { address, key } => {
             if !key.is_empty() {
@@ -1163,389 +1188,33 @@ fn apply(
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
-fn local_action(
-    action: Action,
-    own: &str,
-    state: &mut Workspace,
-    sessions: &Sessions,
-    notify: &Notify,
-    identity: &config::Identity,
-    internal: &Internal,
-    receipts: &mut UpdateReceipts,
-) -> Result<()> {
-    if matches!(
-        &action,
-        Action::SetLayout { .. } | Action::ActivateDisplay { .. } | Action::CrossEdge { .. }
-    ) {
-        ensure!(
-            state
-                .members
-                .get(&state.hub)
-                .is_some_and(Member::compatible),
-            "Update the workspace controller before changing display arrangements"
-        );
-    }
-    if state.hub != own
-        && !sessions.contains_key(&state.hub)
-        && let Action::Invite { address, key } = &action
-    {
-        ensure!(
-            key.is_empty() || key == &state.hub,
-            "Reconnect the workspace controller before adding another computer."
-        );
-        // A manual address is a new route to the saved controller, never consent
-        // to replace its authenticated identity or discard the current workspace.
-        dial(
-            identity,
-            &state.members[own],
-            state,
-            canonical_address(*address),
-            state.hub.clone(),
-            Intent::Join,
-            internal.clone(),
-        );
-        return Ok(());
-    }
-    let update = if let Action::Update { target, message } = &action {
-        message.validate()?;
-        ensure!(
-            state.members.contains_key(target),
-            "Unknown update destination"
-        );
-        receipts.permit(target, message)?;
-        Some((target.clone(), message.clone()))
-    } else {
-        None
-    };
-    if state.hub == own {
-        apply(
-            action, own, own, state, sessions, notify, identity, internal,
-        )?;
-    } else if matches!(&action, Action::Clipboard { .. }) {
-        sessions
-            .get(&state.hub)
-            .context("The workspace controller is offline")?
-            .clipboard
-            .send_replace(Some(Arc::new(Packet::Action(action))));
-    } else {
-        send(sessions, &state.hub, Packet::Action(action))?;
-    }
-    if let Some((target, message)) = update {
-        if target == own && state.hub == own {
-            notify.event(Event::UpdateSent(message));
-        } else {
-            receipts.remember(target, message);
-        }
-    }
-    Ok(())
-}
-
-#[allow(clippy::too_many_arguments)]
-fn receive_packet(
-    key: &str,
-    packet: Packet,
-    own: &str,
-    state: &mut Workspace,
-    sessions: &Sessions,
-    notify: &Notify,
-    identity: &config::Identity,
-    internal: &Internal,
-    receipts: &mut UpdateReceipts,
-) -> Result<()> {
-    ensure!(state.members.contains_key(key), "Unknown workspace member");
-    match packet {
-        Packet::Ping => {}
-        Packet::State(mut remote) if key == state.hub && state.hub != own => {
-            remote.validate()?;
-            ensure!(
-                remote.hub == key && remote.members.contains_key(own),
-                "Invalid controller state"
-            );
-            ensure!(remote.revision >= state.revision, "Stale controller state");
-            let local = &state.members[own];
-            let observed = remote.members.get_mut(own).unwrap();
-            let monitor_error = observed.node.monitor_error.clone();
-            observed.node = local.node.clone();
-            observed.node.monitor_error = monitor_error;
-            observed.native_output = local.native_output;
-            remote.validate()?;
-            *state = *remote;
-        }
-        Packet::Node(node, native, ready) if state.hub == own => {
-            state.update_node(key, *node, native, ready)?;
-        }
-        Packet::Action(action) if state.hub == own => apply(
-            action, key, own, state, sessions, notify, identity, internal,
-        )?,
-        Packet::Management {
-            source,
-            target,
-            message,
-        } if key == state.hub && target == own => {
-            ensure!(
-                state.members.contains_key(&source),
-                "Unknown management source"
-            );
-            message.validate()?;
-            notify.event(Event::Management { source, message });
-        }
-        Packet::Update {
-            source,
-            target,
-            message,
-        } if key == state.hub && target == own => {
-            ensure!(state.members.contains_key(&source), "Unknown update source");
-            message.validate()?;
-            send(
-                sessions,
-                &state.hub,
-                Packet::UpdateAck {
-                    source: own.into(),
-                    target: source.clone(),
-                    message: message.clone(),
-                },
-            )?;
-            notify.event(Event::Update { source, message });
-        }
-        Packet::UpdateAck {
-            source,
-            target,
-            message,
-        } if (state.hub == own && source == key) || (key == state.hub && target == own) => {
-            ensure!(
-                state.members.contains_key(&source) && state.members.contains_key(&target),
-                "Unknown update acknowledgement"
-            );
-            message.validate()?;
-            if target == own {
-                if receipts.confirm(&source, &message) {
-                    notify.event(Event::UpdateSent(message));
-                }
-            } else {
-                send(
-                    sessions,
-                    &target.clone(),
-                    Packet::UpdateAck {
-                        source,
-                        target,
-                        message,
-                    },
-                )?;
-            }
-        }
-        Packet::Clipboard {
-            source,
-            mime,
-            bytes,
-            digest,
-        } if key == state.hub && state.settings.clipboard_enabled => {
-            ensure!(
-                state.members.get(&source).is_some_and(Member::compatible),
-                "Unknown clipboard source"
-            );
-            clipboard_data(&mime, &bytes, &digest)?;
-            if source != own {
-                notify.event(Event::Clipboard {
-                    source,
-                    mime,
-                    bytes,
-                    digest,
-                });
-            }
-        }
-        Packet::Error(error) => {
-            ensure!(
-                error.len() <= 1024 && !error.chars().any(char::is_control),
-                "Invalid peer error"
-            );
-            notify.event(Event::Error(error));
-        }
-        _ => bail!("Unexpected workspace message"),
-    }
-    Ok(())
-}
-
 async fn run(
     listener: std::net::TcpListener,
     dir: PathBuf,
-    mut state: Workspace,
-    mut commands: queue::Receiver<Command>,
+    state: Workspace,
+    commands: queue::Receiver<Command>,
     status_commands: Arc<StatusCommand>,
     clipboard_commands: Arc<ClipboardCommand>,
     notify: Notify,
 ) -> Result<()> {
-    let listener = TcpListener::from_std(listener)?;
-    let identity = config::load_identity(&dir)?;
-    let own = config::hex(&identity.public);
-    let (sender, mut incoming) = queue::channel(256);
-    let internal = Internal {
-        sender,
-        dialing: Default::default(),
-    };
-    let permits = Arc::new(tokio::sync::Semaphore::new(8));
-    let mut sessions = Links::default();
-    let mut receipts = UpdateReceipts::default();
-    let mut approvals: BTreeMap<String, oneshot::Sender<bool>> = BTreeMap::new();
-    let mut reconnect = tokio::time::interval(Duration::from_secs(3));
-    let mut connected_once = false;
-    reconnect.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    notify.state(&state);
-    loop {
-        let before = state.clone();
-        tokio::select! {
-            accepted = listener.accept() => {
-                let (stream, _) = accepted?;
-                if let Ok(permit) = permits.clone().try_acquire_owned() {
-                    let local = state.members[&own].clone(); let current = state.clone(); let internal = internal.clone();
-                    let identity = config::Identity { private: identity.private, public: identity.public };
-                    tokio::spawn(async move {
-                        let _permit = permit;
-                        let mut peer = String::new();
-                        let result = async {
-                            let candidate = timeout(AUTH, workspace::net::authenticate(stream, &identity, &local.node.name, false, None, local.address.port())).await??;
-                            let key = config::hex(&candidate.key);
-                            if current.members.contains_key(&key) { peer = key; }
-                            setup(candidate, local, current, Intent::Invite, internal.clone(), None).await
-                        }.await;
-                        if let Err(error) = result { let _ = internal.send(Incoming::Closed(peer, None, Some(error))).await; }
-                    });
-                }
-            }
-            command = commands.recv() => match command {
-                Some(Command::Disconnect) | None => break,
-                #[cfg(test)]
-                Some(Command::Raw(target, packet)) => { let _ = send(&sessions, &target, *packet); }
-                Some(Command::Approve(key, accept)) => { if let Some(approved) = approvals.remove(&key) { let _: Result<(), bool> = approved.send(accept); } }
-                Some(Command::Action(action)) => {
-                    if let Err(error) = local_action(*action, &own, &mut state, &sessions, &notify, &identity, &internal, &mut receipts) { notify.event(Event::Error(error.to_string())); }
-                }
-            },
-            _ = status_commands.changed.notified() => {
-                let latest = status_commands.latest.lock().unwrap().take();
-                if let Some((mut node,native,_)) = latest {
-                    // The GUI may have queued this observation before a newer
-                    // State or a different controller arrived. Only the actor's
-                    // current workspace owns readiness and monitor completion.
-                    let local = &state.members[&own];
-                    let ready = local.input_ready;
-                    node.monitor_error = local.node.monitor_error.clone();
-                    match state.update_node(&own, *node.clone(), native, ready) {
-                        Ok(()) => if state.hub != own && let Some(hub) = sessions.get(&state.hub) { hub.snapshot.send_replace(Some(Arc::new(Packet::Node(node,native,ready)))); },
-                        Err(error) => notify.event(Event::Error(error.to_string())),
-                    }
-                }
-            }
-            _ = clipboard_commands.changed.notified() => {
-                let latest = clipboard_commands.latest.lock().unwrap().take();
-                if let Some(action) = latest
-                    && let Err(error) = local_action(action, &own, &mut state, &sessions, &notify, &identity, &internal, &mut receipts)
-                { notify.event(Event::Error(error.to_string())); }
-            }
-            _ = reconnect.tick() => {
-                if state.hub == own {state.expire_monitor();}
-                if connected_once || state.members[&own].node.management.as_ref().is_none_or(|management|management.application.auto_connect) {
-                    if state.hub != own && !sessions.contains_key(&state.hub) {
-                        if let Some(hub) = state.members.get(&state.hub) { dial(&identity, &state.members[&own], &state, hub.address, state.hub.clone(), Intent::Join, internal.clone()); }
-                    } else if state.hub == own {
-                        for (key, member) in &state.members { if key != &own && !sessions.contains_key(key) { dial(&identity, &state.members[&own], &state, member.address, key.clone(), Intent::Invite, internal.clone()); } }
-                    }
-                }
-            }
-            event = incoming.recv() => match event.context("Workspace event loop stopped")? {
-                Incoming::Consent { request, accept } => { if !approvals.contains_key(&request.key) { approvals.insert(request.key.clone(), accept); notify.event(Event::Request(request)); } }
-                Incoming::Ready { candidate, member, controller, dial: _dial } => {
-                    let key = member.node.key.clone();
-                    match sessions.accepts(&key, candidate.connection) {
-                        Ok(true) => {}
-                        Ok(false) => continue,
-                        Err(error) => {notify.event(Event::Error(error.to_string()));continue;}
-                    }
-                    let result = (|| {
-                        let mut next = state.clone();
-                        let mut local_address = canonical_address(candidate.stream.local_addr()?);
-                        local_address.set_port(listener.local_addr()?.port());
-                        next.members.get_mut(&own).unwrap().address = local_address;
-                        if controller {
-                            ensure!(state.hub == own, "Add computers through the workspace controller");
-                            let member = hello_observation(&state, *member);
-                            next.members.insert(key.clone(), member);
-                            next.revision = state.revision.checked_add(1).filter(|revision|*revision<u64::MAX).context("Workspace revision exhausted")?;
-                        } else {
-                            ensure!(state.members.len() <= 1 || state.hub == key, "Leave the existing workspace before joining another");
-                            if state.hub != key {
-                                ensure!(!state.switch_pending(), "Wait for the pending monitor command before joining another workspace");
-                                // Revisions belong to a controller. A singleton's
-                                // larger counter cannot reject its new hub's State.
-                                next.revision = 0;
-                                let local = next.members.get_mut(&own).unwrap();
-                                local.input_ready = 0;
-                                local.node.monitor_error = None;
-                            }
-                            let member = hello_observation(&state, *member);
-                            next.hub = key.clone(); next.members.insert(key.clone(), member);
-                        }
-                        next.validate()?;
-                        let connection = start_session(candidate, internal.clone());
-                        if controller { connection.snapshot.send_replace(Some(Arc::new(Packet::State(Box::new(next.clone()))))); }
-                        else {
-                            let local=&next.members[&own];
-                            // The first authoritative State has not arrived yet.
-                            // Telemetry must not carry another activation epoch.
-                            connection.snapshot.send_replace(Some(Arc::new(Packet::Node(Box::new(local.node.clone()),local.native_output,0))));
-                        }
-                        ensure!(sessions.install(key, connection)?, "Workspace handover was superseded");
-                        state = next;
-                        connected_once = true;
-                        Ok::<(), anyhow::Error>(())
-                    })();
-                    if let Err(error) = result { notify.event(Event::Error(error.to_string())); }
-                }
-                Incoming::Packet(key, generation, packet) => {
-                    if !sessions.packet(&key, generation) { continue; }
-                    if let Err(error) = receive_packet(&key, packet, &own, &mut state, &sessions, &notify, &identity, &internal, &mut receipts) {
-                        let _ = send(&sessions, &key, Packet::Error(workspace::management::status_text(error.to_string(),1024)));
-                    }
-                }
-                Incoming::Closed(key, generation, error) => {
-                    if let Some(generation) = generation && !close_session(&mut sessions, &mut state, &mut receipts, &own, &key, generation) { continue; }
-                    if let Some(error) = error && !key.is_empty() && !sessions.contains_key(&key) {
-                        notify.event(closure_event(key.clone(), state.members.contains_key(&key), error));
-                    }
-                }
-            }
-        }
-        if state != before {
-            if state.hub == own {
-                state.bind_microphone();
-                state.reconcile_input();
-                broadcast(&sessions, &state);
-            }
-            notify.state(&state);
-            if (state.revision != before.revision
-                || state.hub != before.hub
-                || state.monitor_command != before.monitor_command
-                || state.confirmed_monitor != before.confirmed_monitor)
-                && let Err(error) = save(&dir, &state)
-            {
-                notify.event(Event::Error(format!(
-                    "Workspace settings could not be saved: {error}"
-                )));
-            }
-        }
-    }
-    sessions.shutdown();
-    drop(incoming);
-    save(&dir, &state)?;
-    Ok(())
+    coordination::run(
+        listener,
+        dir,
+        state,
+        commands,
+        status_commands,
+        clipboard_commands,
+        notify,
+    )
+    .await
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::time::Instant;
 
     include!("net/reconnect_tests.rs");
+    include!("net/failover_tests.rs");
 
     fn synthetic_session(generation: u8) -> (Session, queue::Receiver<Packet>) {
         let (commands, receive) = queue::channel(1);
@@ -2116,7 +1785,9 @@ mod tests {
             })
             .unwrap();
         until(&mut computers, &mut forwarded, |_, events| {
-            events[before..].iter().any(|(index,event)|*index==1 && matches!(event,Event::Error(error) if error.contains("Reconnect the workspace controller")))
+            events[before..].iter().any(|(index, event)| {
+                *index == 1 && matches!(event,Event::Error(error) if error.contains("majority"))
+            })
         });
         let before = forwarded.len();
         computers[1]
@@ -2152,7 +1823,7 @@ mod tests {
         });
         for (index, computer) in computers[..2].iter().enumerate() {
             let state = computer.state.as_ref().unwrap();
-            assert_eq!(state.hub, keys[0]);
+            assert_eq!(state.workspace_id(), keys[0]);
             assert_eq!(state.settings, settings);
             for key in &keys[..2] {
                 assert_eq!(
