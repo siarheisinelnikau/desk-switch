@@ -1223,7 +1223,7 @@ mod tests {
         loop {
             match std::fs::remove_dir_all(root) {
                 Ok(()) => break,
-                Err(error) if Instant::now() < deadline => {
+                Err(_) if Instant::now() < deadline => {
                     std::thread::sleep(Duration::from_millis(50));
                 }
                 Err(error) => {
