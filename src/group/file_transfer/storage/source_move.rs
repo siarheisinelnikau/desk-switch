@@ -470,7 +470,7 @@ impl SourceSelection {
     /// Publish brief source-cleanup progress from the bounded worker. The
     /// callback must not reenter storage or perform GUI work synchronously.
     pub fn finalize_move_with_progress(
-        mut self,
+        self,
         state_dir: &Path,
         manifest: &Manifest,
         binding: &SourceMoveBinding,
