@@ -1978,7 +1978,7 @@ async fn cancel_job(core: Arc<Core>, job: Arc<Job>, tell_peer: bool) -> Result<(
                 r.view.clipboard_skipped = true;
             }
             core.clipboard_event(ClipboardEvent::Cancel(record.view.id));
-            save(core.clone(), job).await?;
+            save(core.clone(), job.clone()).await?;
         }
         return Ok(());
     }
@@ -2027,7 +2027,7 @@ async fn cancel_job(core: Arc<Core>, job: Arc<Job>, tell_peer: bool) -> Result<(
     }
     job.cleaning.store(false, Ordering::Release);
     if tell_peer {
-        queue_control(core.clone(), job, true);
+        queue_control(core.clone(), job.clone(), true);
     }
     Ok(())
 }
