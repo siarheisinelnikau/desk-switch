@@ -43,17 +43,6 @@ pub(super) fn sequence() -> Option<u64> {
     })
 }
 
-pub(super) fn write(paths: &[PathBuf]) -> Result<()> {
-    let bytes = encode_paths(paths)?;
-    NATIVE.with(|native| {
-        let mut native = native.borrow_mut();
-        if native.is_none() {
-            *native = Some(Native::new()?);
-        }
-        native.as_mut().unwrap().write(paths, bytes)
-    })
-}
-
 pub(super) fn write_if_current(paths: &[PathBuf], expected: u64) -> Result<bool> {
     let bytes = encode_paths(paths)?;
     NATIVE.with(|native| {
@@ -94,12 +83,6 @@ impl Native {
         match self {
             Self::Gnome(native) => native.read(),
             Self::X11(native) => native.read(),
-        }
-    }
-    fn write(&mut self, paths: &[PathBuf], bytes: Vec<u8>) -> Result<()> {
-        match self {
-            Self::Gnome(native) => native.write(paths, bytes),
-            Self::X11(native) => native.write(paths),
         }
     }
 }
@@ -155,21 +138,6 @@ impl Gnome {
             sequence: u64::from(serial),
             paths,
         }))
-    }
-    fn write(&mut self, paths: &[PathBuf], bytes: Vec<u8>) -> Result<()> {
-        let proxy =
-            zbus::blocking::Proxy::new(&self.connection, COMPANION, COMPANION_PATH, COMPANION)?;
-        let serial: u32 = proxy.call("WriteFiles", &(bytes,)).context(
-            "Enable or reload Desk Switch Tray in GNOME Extensions to share files on Wayland",
-        )?;
-        ensure!(
-            serial != 0,
-            "The clipboard companion returned an invalid revision"
-        );
-        self.serial = serial;
-        self.paths = Some(paths.to_vec());
-        self.refresh = false;
-        Ok(())
     }
     fn write_if_current(
         &mut self,
