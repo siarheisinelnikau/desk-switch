@@ -561,6 +561,21 @@ fn save(dir: &Path, state: &Workspace) -> Result<()> {
     )
 }
 
+/// A greeting reports hardware, not authority over the controller's activation
+/// counter, device preferences or monitor completion. Its sender can have a
+/// newer cached workspace, or come from an unrelated singleton workspace.
+fn hello_observation(state: &Workspace, mut member: Member) -> Member {
+    if let Some(saved) = state.members.get(&member.node.key) {
+        member.preferences = saved.preferences.clone();
+        member.input_ready = saved.input_ready;
+        member.node.monitor_error = saved.node.monitor_error.clone();
+    } else {
+        member.input_ready = 0;
+        member.node.monitor_error = None;
+    }
+    member
+}
+
 async fn write_packet(
     writer: &mut (impl tokio::io::AsyncWrite + Unpin),
     noise: &Arc<Mutex<snow::TransportState>>,
@@ -1406,7 +1421,13 @@ async fn run(
             },
             _ = status_commands.changed.notified() => {
                 let latest = status_commands.latest.lock().unwrap().take();
-                if let Some((node,native,ready)) = latest {
+                if let Some((mut node,native,_)) = latest {
+                    // The GUI may have queued this observation before a newer
+                    // State or a different controller arrived. Only the actor's
+                    // current workspace owns readiness and monitor completion.
+                    let local = &state.members[&own];
+                    let ready = local.input_ready;
+                    node.monitor_error = local.node.monitor_error.clone();
                     match state.update_node(&own, *node.clone(), native, ready) {
                         Ok(()) => if state.hub != own && let Some(hub) = sessions.get(&state.hub) { hub.snapshot.send_replace(Some(Arc::new(Packet::Node(node,native,ready)))); },
                         Err(error) => notify.event(Event::Error(error.to_string())),
@@ -1445,22 +1466,32 @@ async fn run(
                         next.members.get_mut(&own).unwrap().address = local_address;
                         if controller {
                             ensure!(state.hub == own, "Add computers through the workspace controller");
-                            let mut member = *member;
-                            if let Some(saved) = state.members.get(&key) {
-                                member.preferences = saved.preferences.clone();
-                                member.input_ready = saved.input_ready;
-                                member.node.monitor_error = saved.node.monitor_error.clone();
-                            }
+                            let member = hello_observation(&state, *member);
                             next.members.insert(key.clone(), member);
                             next.revision = state.revision.checked_add(1).filter(|revision|*revision<u64::MAX).context("Workspace revision exhausted")?;
                         } else {
                             ensure!(state.members.len() <= 1 || state.hub == key, "Leave the existing workspace before joining another");
-                            next.hub = key.clone(); next.members.insert(key.clone(), *member);
+                            if state.hub != key {
+                                ensure!(!state.switch_pending(), "Wait for the pending monitor command before joining another workspace");
+                                // Revisions belong to a controller. A singleton's
+                                // larger counter cannot reject its new hub's State.
+                                next.revision = 0;
+                                let local = next.members.get_mut(&own).unwrap();
+                                local.input_ready = 0;
+                                local.node.monitor_error = None;
+                            }
+                            let member = hello_observation(&state, *member);
+                            next.hub = key.clone(); next.members.insert(key.clone(), member);
                         }
                         next.validate()?;
                         let connection = start_session(candidate, internal.clone());
                         if controller { connection.snapshot.send_replace(Some(Arc::new(Packet::State(Box::new(next.clone()))))); }
-                        else { let local=&next.members[&own];connection.snapshot.send_replace(Some(Arc::new(Packet::Node(Box::new(local.node.clone()),local.native_output,local.input_ready)))); }
+                        else {
+                            let local=&next.members[&own];
+                            // The first authoritative State has not arrived yet.
+                            // Telemetry must not carry another activation epoch.
+                            connection.snapshot.send_replace(Some(Arc::new(Packet::Node(Box::new(local.node.clone()),local.native_output,0))));
+                        }
                         ensure!(sessions.install(key, connection)?, "Workspace handover was superseded");
                         state = next;
                         connected_once = true;
@@ -1511,6 +1542,8 @@ async fn run(
 mod tests {
     use super::*;
     use std::time::Instant;
+
+    include!("net/reconnect_tests.rs");
 
     fn synthetic_session(generation: u8) -> (Session, queue::Receiver<Packet>) {
         let (commands, receive) = queue::channel(1);
