@@ -1,8 +1,15 @@
 //! Native virtual-file contracts. Metadata calls must never request contents.
-use crate::group::file_transfer::protocol::{Description, Operation};
 pub(crate) use crate::group::file_transfer::protocol::NativeConsumer;
+use crate::group::file_transfer::protocol::{Description, Operation};
 use anyhow::Result;
-use std::{fs::File, path::PathBuf, sync::{Arc, atomic::{AtomicBool, Ordering}}};
+use std::{
+    fs::File,
+    path::PathBuf,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum CompletionSupport {
@@ -56,21 +63,39 @@ pub(crate) trait PasteSession: Send + Sync {
     fn can_retry_move(&self) -> bool;
     fn native_complete(&self, result: NativeResult) -> Result<()>;
     fn open_verified_cancellable(&self, index: usize, cancel: &AtomicBool) -> Result<File> {
-        anyhow::ensure!(!cancel.load(Ordering::Acquire), "The native file request was cancelled");
+        anyhow::ensure!(
+            !cancel.load(Ordering::Acquire),
+            "The native file request was cancelled"
+        );
         let file = self.open_verified(index)?;
-        anyhow::ensure!(!cancel.load(Ordering::Acquire), "The native file request was cancelled");
+        anyhow::ensure!(
+            !cancel.load(Ordering::Acquire),
+            "The native file request was cancelled"
+        );
         Ok(file)
     }
     fn wait_verified_cancellable(&self, cancel: &AtomicBool) -> Result<()> {
-        anyhow::ensure!(!cancel.load(Ordering::Acquire), "The native file request was cancelled");
+        anyhow::ensure!(
+            !cancel.load(Ordering::Acquire),
+            "The native file request was cancelled"
+        );
         self.wait_verified()?;
-        anyhow::ensure!(!cancel.load(Ordering::Acquire), "The native file request was cancelled");
+        anyhow::ensure!(
+            !cancel.load(Ordering::Acquire),
+            "The native file request was cancelled"
+        );
         Ok(())
     }
     fn wait_unpaused_cancellable(&self, cancel: &AtomicBool) -> Result<()> {
-        anyhow::ensure!(!cancel.load(Ordering::Acquire), "The native file request was cancelled");
+        anyhow::ensure!(
+            !cancel.load(Ordering::Acquire),
+            "The native file request was cancelled"
+        );
         self.wait_unpaused()?;
-        anyhow::ensure!(!cancel.load(Ordering::Acquire), "The native file request was cancelled");
+        anyhow::ensure!(
+            !cancel.load(Ordering::Acquire),
+            "The native file request was cancelled"
+        );
         Ok(())
     }
 }

@@ -1,14 +1,14 @@
 //! User-authorized file exports over independent trusted-member connections.
 //! Original paths stay local; peers can request only a verified export's indices.
-pub mod protocol;
-mod storage;
 mod lazy;
+pub mod protocol;
 mod source_trash;
+mod storage;
 #[cfg(all(test, windows))]
 pub(crate) mod hosted_source_move {
+    pub(crate) use super::source_trash::with_hosted_native_trash;
     pub(crate) use super::storage::SourceSelection;
     pub(crate) use super::storage::source_move::{SourceMoveBinding, SourceMoveState};
-    pub(crate) use super::source_trash::with_hosted_native_trash;
 }
 #[cfg(test)]
 mod tests;
@@ -17,8 +17,8 @@ mod transport;
 use crate::{config, group::clipboard::Clipboard};
 use anyhow::{Context, Result, ensure};
 use eframe::egui;
-pub use protocol::{Operation, Origin};
 use protocol::{CHUNK, Kind, Manifest, Packet, Stamp};
+pub use protocol::{Operation, Origin};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
@@ -91,8 +91,12 @@ pub struct PasteView {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum FileEvent {
     /// Emitted once after the locally requested operation exists in snapshot().
-    PasteStarted { id: String },
-    SendStarted { id: String },
+    PasteStarted {
+        id: String,
+    },
+    SendStarted {
+        id: String,
+    },
 }
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct Transfer {
@@ -239,9 +243,20 @@ enum Command {
     Copied(Vec<PathBuf>),
     CopiedSelection(Option<crate::group::clipboard_files::Selection>),
     NativeBegin(Arc<lazy::Fetch>),
-    NativeResult(Arc<lazy::Session>, crate::group::clipboard_files::provider::NativeResult),
-    AcquireLease { offer: String, peer: String, lease: String },
-    ReleaseLease { offer: String, peer: String, lease: String },
+    NativeResult(
+        Arc<lazy::Session>,
+        crate::group::clipboard_files::provider::NativeResult,
+    ),
+    AcquireLease {
+        offer: String,
+        peer: String,
+        lease: String,
+    },
+    ReleaseLease {
+        offer: String,
+        peer: String,
+        lease: String,
+    },
     Cancel(String),
     Pause(String),
     Resume(String),
@@ -425,18 +440,22 @@ impl Service {
     }
     pub fn cancel(&self, id: &str) -> Result<()> {
         validate_job_id(id)?;
-        ensure!(!lazy::cleanup_started(&self.core, id),
-            "The native Move has finished; its originals are being finalized");
+        ensure!(
+            !lazy::cleanup_started(&self.core, id),
+            "The native Move has finished; its originals are being finalized"
+        );
         if let Some(job) = self.core.jobs.lock().unwrap().get(id) {
             let r = job.record.lock().unwrap();
-            ensure!(r.native_move.is_none() || r.move_outcome.is_some(),
-                "The native Move has finished; its originals are being finalized");
+            ensure!(
+                r.native_move.is_none() || r.move_outcome.is_some(),
+                "The native Move has finished; its originals are being finalized"
+            );
             if r.view.phase != Phase::Completed
                 || (r.view.direction == Direction::Receiving && r.view.origin == Origin::Clipboard)
             {
                 job.cancel.store(true, Ordering::Release);
                 job.cancelled.notify_waiters();
-            job.pause_changed.notify_all();
+                job.pause_changed.notify_all();
             }
         }
         self.commands
@@ -448,9 +467,13 @@ impl Service {
         validate_job_id(id)?;
         if let Some(job) = self.core.jobs.lock().unwrap().get(id) {
             let r = job.record.lock().unwrap();
-            ensure!(!r.view.phase.terminal(), "The file transfer is no longer active");
+            ensure!(
+                !r.view.phase.terminal(),
+                "The file transfer is no longer active"
+            );
         }
-        self.commands.try_send(Command::Pause(id.into()))
+        self.commands
+            .try_send(Command::Pause(id.into()))
             .context("The file transfer queue is full")?;
         Ok(())
     }
@@ -466,8 +489,10 @@ impl Service {
                 r.view.phase != Phase::Cancelled,
                 "A cancelled transfer cannot be resumed; send the files again"
             );
-            ensure!(!job.cancel.load(Ordering::Acquire),
-                "Paste or send the files again to retry this cancelled native operation");
+            ensure!(
+                !job.cancel.load(Ordering::Acquire),
+                "Paste or send the files again to retry this cancelled native operation"
+            );
         }
         self.commands
             .try_send(Command::Resume(id.into()))
@@ -622,21 +647,40 @@ impl Core {
             return Err(RetryLater("The workspace membership is temporarily unavailable").into());
         }
         ensure!(
-            self.allowed(&record.workspace, &record.view.peer,
-                if record.offer.is_some() && record.view.paste.is_some() { Origin::Send } else { record.view.origin }),
+            self.allowed(
+                &record.workspace,
+                &record.view.peer,
+                if record.offer.is_some() && record.view.paste.is_some() {
+                    Origin::Send
+                } else {
+                    record.view.origin
+                }
+            ),
             "The computer is no longer authorized for this file transfer"
         );
         Ok(())
     }
     fn phase(&self, job: &Job, phase: Phase, error: Option<String>) {
         let mut r = job.record.lock().unwrap();
-        let phase = if (r.user_paused || r.peer_paused) && !phase.terminal()
-            && r.native_move.is_none() { Phase::Paused } else { phase };
+        let phase =
+            if (r.user_paused || r.peer_paused) && !phase.terminal() && r.native_move.is_none() {
+                Phase::Paused
+            } else {
+                phase
+            };
         r.view.phase = phase;
         r.view.error = error;
         r.view.pause_reason = if phase == Phase::Paused {
-            Some(if r.user_paused { PauseReason::User } else if r.peer_paused { PauseReason::Peer } else { PauseReason::Connection })
-        } else { None };
+            Some(if r.user_paused {
+                PauseReason::User
+            } else if r.peer_paused {
+                PauseReason::Peer
+            } else {
+                PauseReason::Connection
+            })
+        } else {
+            None
+        };
         if let Some(paste) = &mut r.view.paste {
             paste.stage = match phase {
                 Phase::Preparing => PasteStage::Preparing,
@@ -651,8 +695,18 @@ impl Core {
         let id = r.view.id.clone();
         drop(r);
         if matches!(phase, Phase::Cancelled | Phase::Failed) {
-            lazy::failed(self, &id, job.record.lock().unwrap().view.error.clone()
-                .unwrap_or_else(|| "The file transfer was cancelled".into()), phase == Phase::Cancelled);
+            lazy::failed(
+                self,
+                &id,
+                job.record
+                    .lock()
+                    .unwrap()
+                    .view
+                    .error
+                    .clone()
+                    .unwrap_or_else(|| "The file transfer was cancelled".into()),
+                phase == Phase::Cancelled,
+            );
         }
         self.wake();
     }
@@ -910,7 +964,10 @@ async fn load(core: Arc<Core>) -> Result<()> {
                     // Upgrading must not turn that old metadata into new intent.
                     record.user_paused = true;
                     record.view.pause_reason = Some(PauseReason::User);
-                    record.view.error = Some("Choose Resume to continue this saved transfer, or paste the files again".into());
+                    record.view.error = Some(
+                        "Choose Resume to continue this saved transfer, or paste the files again"
+                            .into(),
+                    );
                 }
             }
             if record.view.direction == Direction::Sending {
@@ -1099,7 +1156,10 @@ async fn prepare_inner(
             peer_paused: false,
             offer: None,
             operation: Operation::Copy,
-            native_move: None, move_binding: None, move_outcome: None, move_grant: None,
+            native_move: None,
+            move_binding: None,
+            move_outcome: None,
+            move_grant: None,
             view: Transfer {
                 id: job_id(&id, &target),
                 peer: target,
@@ -1128,7 +1188,10 @@ async fn prepare_inner(
         if let Ok(job) = core.insert(record) {
             if origin == Origin::Send {
                 let id = job.record.lock().unwrap().view.id.clone();
-                core.events.lock().unwrap().push_back(FileEvent::SendStarted { id });
+                core.events
+                    .lock()
+                    .unwrap()
+                    .push_back(FileEvent::SendStarted { id });
                 core.wake();
             }
             jobs.push(job);
@@ -1488,8 +1551,12 @@ fn sent(core: &Core, job: &Job) {
     record.view.error = None;
     record.view.phase = if record.offer.is_some() && record.operation == Operation::Move {
         Phase::Verifying
-    } else { Phase::Completed };
-    if let Some(paste) = &mut record.view.paste { paste.stage = PasteStage::Delivered; }
+    } else {
+        Phase::Completed
+    };
+    if let Some(paste) = &mut record.view.paste {
+        paste.stage = PasteStage::Delivered;
+    }
     drop(record);
     core.wake();
 }
@@ -1505,9 +1572,12 @@ async fn incoming_connection(core: Arc<Core>, stream: TcpStream) -> Result<()> {
         transport::accept(stream, &core.identity, &trust.workspace_id, &peers).await?;
     let first = pipe.receive().await?;
     match first {
-        Packet::ClipboardOffer { id, description, stamp, operation } => {
-            lazy::incoming_offer(core, peer, id, description, stamp, operation, &mut pipe).await
-        }
+        Packet::ClipboardOffer {
+            id,
+            description,
+            stamp,
+            operation,
+        } => lazy::incoming_offer(core, peer, id, description, stamp, operation, &mut pipe).await,
         Packet::RetireOffer { id } => {
             protocol::valid_id(&id)?;
             lazy::retired_remote(&core, &peer, &id);
@@ -1521,9 +1591,19 @@ async fn incoming_connection(core: Arc<Core>, stream: TcpStream) -> Result<()> {
             lazy::local_lease(&core, &peer, &offer, &lease, true)?;
             pipe.send(&Packet::Queued).await
         }
-        Packet::PasteDemand { offer, id, operation, lease } => {
-            if let Err(error) = lazy::demand(core, peer, offer, id, operation, lease, &mut pipe).await {
-                pipe.send(&Packet::Error(format!("{error:#}").chars().take(2048).collect())).await?;
+        Packet::PasteDemand {
+            offer,
+            id,
+            operation,
+            lease,
+        } => {
+            if let Err(error) =
+                lazy::demand(core, peer, offer, id, operation, lease, &mut pipe).await
+            {
+                pipe.send(&Packet::Error(
+                    format!("{error:#}").chars().take(2048).collect(),
+                ))
+                .await?;
             }
             Ok(())
         }
@@ -1537,21 +1617,48 @@ async fn incoming_connection(core: Arc<Core>, stream: TcpStream) -> Result<()> {
             }
             pipe.send(&Packet::Queued).await
         }
-        Packet::PasteFailed { id, error, retryable } => {
+        Packet::PasteFailed {
+            id,
+            error,
+            retryable,
+        } => {
             protocol::valid_id(&id)?;
             let job = core.jobs.lock().unwrap().get(&job_id(&id, &peer)).cloned();
             if let Some(job) = job {
-                ensure!(job.record.lock().unwrap().view.direction == Direction::Receiving,
-                    "Only the sender can report preparation failure");
-                core.phase(&job, if retryable { Phase::Paused } else { Phase::Failed },
-                    Some(error.chars().take(2048).collect()));
+                ensure!(
+                    job.record.lock().unwrap().view.direction == Direction::Receiving,
+                    "Only the sender can report preparation failure"
+                );
+                core.phase(
+                    &job,
+                    if retryable {
+                        Phase::Paused
+                    } else {
+                        Phase::Failed
+                    },
+                    Some(error.chars().take(2048).collect()),
+                );
                 save(core.clone(), job).await?;
             }
             pipe.send(&Packet::Queued).await
         }
-        Packet::NativeMoveCommitted { offer, id, manifest, paste, consumer, entries } => {
-            if let Err(error) = lazy::source_move(core, peer, offer, id, manifest, paste, consumer, entries, &mut pipe).await {
-                pipe.send(&Packet::Error(format!("{error:#}").chars().take(2048).collect())).await?;
+        Packet::NativeMoveCommitted {
+            offer,
+            id,
+            manifest,
+            paste,
+            consumer,
+            entries,
+        } => {
+            if let Err(error) = lazy::source_move(
+                core, peer, offer, id, manifest, paste, consumer, entries, &mut pipe,
+            )
+            .await
+            {
+                pipe.send(&Packet::Error(
+                    format!("{error:#}").chars().take(2048).collect(),
+                ))
+                .await?;
             }
             Ok(())
         }
@@ -1560,7 +1667,8 @@ async fn incoming_connection(core: Arc<Core>, stream: TcpStream) -> Result<()> {
             // cannot create transfer intent, reserve a clipboard or read files.
             pipe.send(&Packet::Error(
                 "Update Desk Switch on both computers to paste shared files".into(),
-            )).await
+            ))
+            .await
         }
         control_packet @ (Packet::Resume { .. } | Packet::CancelTransfer { .. }) => {
             let (id, cancel) = match control_packet {
@@ -1604,17 +1712,26 @@ async fn incoming_connection(core: Arc<Core>, stream: TcpStream) -> Result<()> {
                     "The file transfer belongs to another workspace"
                 );
                 ensure!(
-                    core.allowed(&r.workspace, &r.view.peer,
-                        if r.offer.is_some() || cancel { Origin::Send } else { r.view.origin }),
+                    core.allowed(
+                        &r.workspace,
+                        &r.view.peer,
+                        if r.offer.is_some() || cancel {
+                            Origin::Send
+                        } else {
+                            r.view.origin
+                        }
+                    ),
                     "The computer is no longer authorized for this file transfer"
                 );
             }
             let native = {
                 let r = job.record.lock().unwrap();
-                ensure!((r.view.direction == Direction::Sending || r.offer.is_some())
-                    && (r.manifest.is_some() || r.offer.is_some())
-                    && !matches!(r.view.phase, Phase::Cancelled | Phase::Completed),
-                    "The requested file export cannot be resumed");
+                ensure!(
+                    (r.view.direction == Direction::Sending || r.offer.is_some())
+                        && (r.manifest.is_some() || r.offer.is_some())
+                        && !matches!(r.view.phase, Phase::Cancelled | Phase::Completed),
+                    "The requested file export cannot be resumed"
+                );
                 r.offer.is_some()
             };
             if native {
@@ -1638,16 +1755,22 @@ async fn incoming_connection(core: Arc<Core>, stream: TcpStream) -> Result<()> {
             let existing = core.jobs.lock().unwrap().get(&id).cloned();
             let native_demand = existing.as_ref().is_some_and(|job| {
                 let r = job.record.lock().unwrap();
-                r.offer.is_some() && r.view.paste.is_some()
+                r.offer.is_some()
+                    && r.view.paste.is_some()
                     && r.view.direction == Direction::Receiving
             });
             ensure!(
-                core.allowed(&trust.workspace_id, &peer,
-                    if native_demand { Origin::Send } else { origin }),
+                core.allowed(
+                    &trust.workspace_id,
+                    &peer,
+                    if native_demand { Origin::Send } else { origin }
+                ),
                 "Shared file clipboard is disabled or this computer is no longer trusted"
             );
-            ensure!(origin != Origin::Clipboard || existing.is_some(),
-                "Paste the copied files before receiving their contents");
+            ensure!(
+                origin != Origin::Clipboard || existing.is_some(),
+                "Paste the copied files before receiving their contents"
+            );
             ensure!(
                 (origin == Origin::Clipboard) == stamp.is_some(),
                 "Invalid file clipboard offer"
@@ -1731,7 +1854,10 @@ async fn incoming_connection(core: Arc<Core>, stream: TcpStream) -> Result<()> {
                     peer_paused: false,
                     offer: None,
                     operation: Operation::Copy,
-                    native_move: None, move_binding: None, move_outcome: None, move_grant: None,
+                    native_move: None,
+                    move_binding: None,
+                    move_outcome: None,
+                    move_grant: None,
                     view: Transfer {
                         id: id.clone(),
                         peer: peer.clone(),
@@ -1920,7 +2046,8 @@ async fn complete_receive(
 ) -> Result<()> {
     let r = job.record.lock().unwrap().clone();
     let native = r.offer.is_some() && r.view.paste.is_some();
-    let publish = !native && r.view.origin == Origin::Clipboard
+    let publish = !native
+        && r.view.origin == Origin::Clipboard
         && !job.cancel.load(Ordering::Acquire)
         && job.reserved.load(Ordering::Acquire)
         && !r.view.clipboard_skipped
@@ -1937,11 +2064,20 @@ async fn complete_receive(
     if native {
         {
             let mut record = job.record.lock().unwrap();
-            record.view.phase = if record.view.paste.as_ref().is_some_and(|paste| paste.reports_completion) {
+            record.view.phase = if record
+                .view
+                .paste
+                .as_ref()
+                .is_some_and(|paste| paste.reports_completion)
+            {
                 Phase::Verifying
-            } else { Phase::Completed };
+            } else {
+                Phase::Completed
+            };
             record.view.clipboard_skipped = false;
-            if let Some(paste) = &mut record.view.paste { paste.stage = PasteStage::Delivered; }
+            if let Some(paste) = &mut record.view.paste {
+                paste.stage = PasteStage::Delivered;
+            }
         }
         lazy::delivered(&core, &r.view.id, receive);
         core.wake();
@@ -1965,9 +2101,11 @@ async fn complete_receive(
 async fn cancel_job(core: Arc<Core>, job: Arc<Job>, tell_peer: bool) -> Result<()> {
     let _finalizer = job.move_finalizer.lock().await;
     let record = job.record.lock().unwrap().clone();
-    ensure!(!lazy::cleanup_started(&core, &record.view.id)
-        && (record.native_move.is_none() || record.move_outcome.is_some()),
-        "The native Move has finished; its originals are being finalized");
+    ensure!(
+        !lazy::cleanup_started(&core, &record.view.id)
+            && (record.native_move.is_none() || record.move_outcome.is_some()),
+        "The native Move has finished; its originals are being finalized"
+    );
     if record.view.phase == Phase::Completed && record.offer.is_none() {
         if record.view.origin == Origin::Clipboard && record.view.direction == Direction::Receiving
         {
