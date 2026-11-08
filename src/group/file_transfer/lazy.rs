@@ -1,4 +1,7 @@
 //! Metadata-only clipboard offers and demand-owned native content leases.
+// Native paste is implemented for Windows and Linux. On macOS these types stay
+// part of the shared protocol and tests but are never constructed at runtime.
+#![cfg_attr(target_os = "macos", allow(dead_code))]
 use super::*;
 use crate::group::clipboard_files::{
     Selection,
