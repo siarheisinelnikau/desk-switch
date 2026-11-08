@@ -14,6 +14,7 @@ use windows::Win32::{
     System::Com::CoAllowSetForegroundWindow,
     UI::Shell::{IWebBrowser2, ShellBrowserWindow},
 };
+use windows::core::BSTR;
 use windows_sys::Win32::{
     Foundation::CloseHandle,
     System::Threading::{
@@ -237,8 +238,8 @@ fn run_capture(fixture: Fixture, control: Arc<Mutex<Control>>) -> Result<serde_j
     let folder_text = fixture.folder.to_string_lossy();
     let folder_text = folder_text.strip_prefix(r"\\?\").unwrap_or(&folder_text);
     let url = format!("file:///{}", folder_text.replace('\\', "/"));
-    let target = VARIANT::from(url.as_str());
-    unsafe { owned.browser.Navigate2(&target, None, None, None, None) }
+    let target = BSTR::from(url.as_str());
+    unsafe { owned.browser.Navigate(&target, None, None, None, None) }
         .context("Explorer could not navigate to the private test folder")?;
     let deadline = Instant::now() + Duration::from_secs(20);
     loop {
