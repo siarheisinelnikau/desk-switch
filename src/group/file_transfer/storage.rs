@@ -258,6 +258,23 @@ fn source_absolute_directory(path: &Path) -> Result<Dir> {
     absolute_directory_with(path, false, true)
 }
 
+/// Open the source root without blocking a later rename of any descendant.
+#[cfg(windows)]
+fn source_root_directory(path: &Path) -> Result<Dir> {
+    use std::os::windows::fs::OpenOptionsExt;
+    let file = std::fs::OpenOptions::new()
+        .access_mode(0)
+        .custom_flags(0x0200_0000) // FILE_FLAG_BACKUP_SEMANTICS
+        .share_mode(0x1 | 0x2 | 0x4) // FILE_SHARE_READ | WRITE | DELETE
+        .open(path)?;
+    Ok(Dir::from_std_file(file))
+}
+
+#[cfg(not(windows))]
+fn source_root_directory(path: &Path) -> Result<Dir> {
+    Ok(Dir::open_ambient_dir(path, ambient_authority())?)
+}
+
 /// Capture capabilities allow normal local renames/deletes while a clipboard
 /// offer waits for paste. Only metadata operations use these shared handles.
 fn source_directory(parent: &Dir, name: &OsStr) -> Result<Dir> {
@@ -318,7 +335,11 @@ fn absolute_directory_with(path: &Path, create: bool, source: bool) -> Result<Di
         !root.as_os_str().is_empty(),
         "Choose an absolute local file or folder path"
     );
-    let mut current = Dir::open_ambient_dir(root, ambient_authority())?;
+    let mut current = if source {
+        source_root_directory(&root)?
+    } else {
+        Dir::open_ambient_dir(root, ambient_authority())?
+    };
     for name in names {
         current = if source {
             source_directory(&current, &name)?
@@ -569,9 +590,6 @@ struct SourceRoot {
     parent: Dir,
     parent_path: PathBuf,
     parent_identity: FileIdentity,
-    // A selected folder stays pinned from copy until paste. Individual source
-    // files deliberately have no content-capable handle before paste demand.
-    directory: Option<Dir>,
     entry: SourceEntry,
 }
 
@@ -586,7 +604,11 @@ impl SourceRoot {
         self.entry
             .metadata
             .check(&self.parent.symlink_metadata(&self.entry.name)?)?;
-        if let Some(directory) = &self.directory {
+        if self.entry.metadata.directory {
+            // Reopen for this check instead of retaining a child directory
+            // handle. On Windows a live child handle can block renaming the
+            // selected folder's parent while a clipboard offer waits.
+            let directory = source_directory(&self.parent, &self.entry.name)?;
             self.entry.metadata.check(&directory.dir_metadata()?)?;
         }
         Ok(())
@@ -693,7 +715,6 @@ impl SourceSelection {
                 parent,
                 parent_path,
                 parent_identity,
-                directory,
                 entry,
             };
             root.check_binding()?;
