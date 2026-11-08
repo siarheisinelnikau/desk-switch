@@ -71,8 +71,8 @@ impl Harness {
     fn provider(&self) -> Provider {
         let id = "12".repeat(16);
         let peer = self.peer_key();
+        let handle = job_id(&id, &peer);
         let remote = Arc::new(RemoteState {
-            handle: job_id(&id, &peer),
             id,
             workspace: self.core.trust.lock().unwrap().workspace_id.clone(),
             peer: peer.clone(),
@@ -88,8 +88,8 @@ impl Harness {
         });
         {
             let mut state = self.core.lazy.lock().unwrap();
-            state.remote = Some(remote.handle.clone());
-            state.remotes.insert(remote.handle.clone(), remote.clone());
+            state.remote = Some(handle.clone());
+            state.remotes.insert(handle, remote.clone());
         }
         Provider {
             core: Arc::downgrade(&self.core),
