@@ -170,6 +170,9 @@ pub(super) fn require_hosted_native_scope(quarantine: &Dir) -> Result<()> {
 /// Tests opt into an isolated fake Trash explicitly. Ordinary unit tests can
 /// never reach the user's Trash or the Windows Shell backend.
 #[cfg(test)]
+// The fake Trash helper is only used by the Windows and Linux source-cleanup
+// tests, so the macOS test build never calls it.
+#[cfg_attr(target_os = "macos", allow(dead_code))]
 pub(crate) fn with_test_trash<T>(directory: &Path, action: impl FnOnce() -> T) -> T {
     struct Restore(Option<PathBuf>);
     impl Drop for Restore {
