@@ -49,7 +49,6 @@ struct LocalOffer {
 
 struct RemoteState {
     id: String,
-    handle: String,
     workspace: String,
     peer: String,
     stamp: Stamp,
@@ -306,24 +305,22 @@ impl DemandProvider for Provider {
             );
             sessions.insert(session.id.clone(), Arc::downgrade(&session));
         }
-        if start {
-            if let Err(error) = core.commands.try_send(Command::NativeBegin(fetch.clone())) {
-                failed(
-                    &core,
-                    &fetch.id,
-                    "The file transfer queue is full".into(),
-                    false,
+        if start && let Err(error) = core.commands.try_send(Command::NativeBegin(fetch.clone())) {
+            failed(
+                &core,
+                &fetch.id,
+                "The file transfer queue is full".into(),
+                false,
+            );
+            let job = core.jobs.lock().unwrap().get(&fetch.id).cloned();
+            if let Some(job) = job {
+                core.phase(
+                    &job,
+                    Phase::Failed,
+                    Some("The file transfer queue is full".into()),
                 );
-                let job = core.jobs.lock().unwrap().get(&fetch.id).cloned();
-                if let Some(job) = job {
-                    core.phase(
-                        &job,
-                        Phase::Failed,
-                        Some("The file transfer queue is full".into()),
-                    );
-                }
-                return Err(error).context("The file transfer queue is full");
             }
+            return Err(error).context("The file transfer queue is full");
         }
         Ok(session)
     }
@@ -981,7 +978,6 @@ pub(super) async fn incoming_offer(
         );
         let remote = Arc::new(RemoteState {
             id,
-            handle: handle.clone(),
             workspace: trust.workspace_id.clone(),
             peer,
             stamp,
@@ -1604,24 +1600,24 @@ pub(super) fn retry_move(core: Arc<Core>, job: Arc<Job>) {
     }
     tokio::spawn(async move {
         let receipt = job.record.lock().unwrap().native_move.clone();
-        if let Some(receipt) = receipt {
-            if let Err(error) = finish_remote_move(core.clone(), job.clone(), receipt).await {
-                {
-                    let mut r = job.record.lock().unwrap();
-                    if r.move_outcome.is_none() {
-                        r.view.phase = Phase::Paused;
-                        r.view.pause_reason = Some(PauseReason::Connection);
-                        r.view.error = Some(format!(
-                            "Move confirmation will resume when the source reconnects: {error:#}"
-                        ));
-                        if let Some(paste) = &mut r.view.paste {
-                            paste.stage = PasteStage::RemovingOriginals;
-                        }
+        if let Some(receipt) = receipt
+            && let Err(error) = finish_remote_move(core.clone(), job.clone(), receipt).await
+        {
+            {
+                let mut r = job.record.lock().unwrap();
+                if r.move_outcome.is_none() {
+                    r.view.phase = Phase::Paused;
+                    r.view.pause_reason = Some(PauseReason::Connection);
+                    r.view.error = Some(format!(
+                        "Move confirmation will resume when the source reconnects: {error:#}"
+                    ));
+                    if let Some(paste) = &mut r.view.paste {
+                        paste.stage = PasteStage::RemovingOriginals;
                     }
                 }
-                core.wake();
-                let _ = save(core.clone(), job.clone()).await;
             }
+            core.wake();
+            let _ = save(core.clone(), job.clone()).await;
         }
         *job.retry.lock().unwrap() = Instant::now() + RETRY;
         job.control_running.store(false, Ordering::Release);
@@ -1686,17 +1682,29 @@ pub(super) async fn finish_remote_move(
     save(core, job).await
 }
 
+pub(super) struct SourceMoveRequest {
+    pub(super) offer: String,
+    pub(super) id: String,
+    pub(super) digest: String,
+    pub(super) paste: String,
+    pub(super) consumer: NativeConsumer,
+    pub(super) entries: Vec<u32>,
+}
+
 pub(super) async fn source_move(
     core: Arc<Core>,
     peer: String,
-    offer_id: String,
-    id: String,
-    digest: String,
-    paste: String,
-    consumer: NativeConsumer,
-    entries: Vec<u32>,
+    request: SourceMoveRequest,
     pipe: &mut transport::Connection,
 ) -> Result<()> {
+    let SourceMoveRequest {
+        offer: offer_id,
+        id,
+        digest,
+        paste,
+        consumer,
+        entries,
+    } = request;
     protocol::valid_id(&id)?;
     protocol::valid_id(&paste)?;
     consumer.validate()?;

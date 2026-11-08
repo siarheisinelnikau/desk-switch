@@ -237,10 +237,10 @@ fn run_capture(fixture: Fixture, control: Arc<Mutex<Control>>) -> Result<serde_j
     let deadline = Instant::now() + Duration::from_secs(20);
     loop {
         fixture.validate()?;
-        if let Some(path) = folder_of(&owned.browser) {
-            if same_path(&path, &fixture.folder) {
-                break;
-            }
+        if let Some(path) = folder_of(&owned.browser)
+            && same_path(&path, &fixture.folder)
+        {
+            break;
         }
         ensure!(
             Instant::now() < deadline,
@@ -383,13 +383,12 @@ fn isolated_ci_explorer_destination_capture() -> Result<()> {
             // The only window eligible for timeout cleanup was created by our
             // own COM factory, verified at the owned folder before being shown.
             // Never terminate Explorer or enumerate-and-close unrelated windows.
-            if let Some(window) = &active.owned {
-                if fixture.validate().is_ok()
-                    && window.folder == fixture.folder
-                    && window_matches(window)
-                {
-                    let _ = unsafe { PostMessageW(window.hwnd as HWND, WM_CLOSE, 0, 0) };
-                }
+            if let Some(window) = &active.owned
+                && fixture.validate().is_ok()
+                && window.folder == fixture.folder
+                && window_matches(window)
+            {
+                let _ = unsafe { PostMessageW(window.hwnd as HWND, WM_CLOSE, 0, 0) };
             }
             bail!(
                 "The hosted Explorer capture proof exceeded 30 seconds; only its owned window was asked to close"
