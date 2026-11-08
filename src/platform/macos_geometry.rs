@@ -98,16 +98,25 @@ pub(in crate::platform) fn position(x: f64, y: f64) -> Result<()> {
         "Invalid macOS cursor position"
     );
     ensure!(
+        // SAFETY: the argument is a plain `repr(C)` copy of two doubles with no
+        // pointers, and the call only reads it.
         unsafe { warp_mouse_cursor_position(Point { x, y }) } == 0,
         "macOS refused the cursor position"
     );
     Ok(())
 }
 pub(in crate::platform) fn cursor() -> Result<(f64, f64)> {
+    // SAFETY: a null source is the documented way to create an event that
+    // describes the current state. The returned event is owned by this
+    // function and released below.
     let event = unsafe { event_create(std::ptr::null()) };
     ensure!(!event.is_null(), "Cannot read the macOS cursor position");
+    // SAFETY: `event` was checked to be non-null and is still owned here, so
+    // the call reads a live event.
     let point = unsafe { event_location(event) };
     unsafe {
+        // SAFETY: `event` came from event_create, is owned by this function
+        // and is released exactly once.
         release(event);
     }
     ensure!(

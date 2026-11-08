@@ -73,6 +73,8 @@ impl Capture {
                         )
                         .context("initializing shared WASAPI capture capture at 48 kHz stereo")?;
                     let capture: IAudioCaptureClient =
+                        // SAFETY: the returned interface is owned by this
+                        // capture loop and is released when it ends.
                         unsafe { audio.as_iaudioclient().GetService()? };
                     audio.start_stream()?;
                     println!("Capturing {media:?} from {label}.");
@@ -129,11 +131,15 @@ fn record(
 ) -> Result<()> {
     let mut buffer = super::capture_frames::CaptureFrames::new(Instant::now());
     while !stop.load(Ordering::Acquire) {
+        // SAFETY: the capture client is owned by this loop and is only used
+        // while it is alive.
         while unsafe { capture.GetNextPacketSize()? } != 0 {
             let mut pointer = std::ptr::null_mut();
             let mut frames = 0;
             let mut flags = 0;
             unsafe {
+                // SAFETY: the three out-parameters are live locals and the
+                // null event arguments are allowed by the API.
                 capture.GetBuffer(&mut pointer, &mut frames, &mut flags, None, None)?;
             }
             let bytes = frames as usize * BLOCK_ALIGN;
@@ -153,14 +159,20 @@ fn record(
                         "WASAPI returned a null audio buffer"
                     );
                     if bytes != 0 {
-                        buffer
-                            .pending
-                            .extend(unsafe { std::slice::from_raw_parts(pointer, bytes) });
+                        buffer.pending.extend(unsafe {
+                            // SAFETY: the pointer is the capture buffer that
+                            // WASAPI just handed out and it holds exactly
+                            // `frames` frames of `BLOCK_ALIGN` bytes. The
+                            // slice is copied before the buffer is released.
+                            std::slice::from_raw_parts(pointer, bytes)
+                        });
                     }
                 }
                 Ok::<_, anyhow::Error>(())
             })();
             unsafe {
+                // SAFETY: the same frame count that GetBuffer reported is
+                // handed back, which is what the API requires.
                 capture.ReleaseBuffer(frames)?;
             }
             read?;
