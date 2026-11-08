@@ -17,8 +17,8 @@ use windows::{
         Storage::CloudFilters::{
             CF_CALLBACK_REGISTRATION, CF_CONNECT_FLAGS, CF_CONNECTION_KEY, CF_CREATE_FLAGS,
             CF_HYDRATE_FLAGS, CF_OPERATION_INFO, CF_OPERATION_PARAMETERS,
-            CF_PLACEHOLDER_CREATE_INFO, CF_PLACEHOLDER_INFO_CLASS, CF_PLATFORM_INFO,
-            CF_REGISTER_FLAGS, CF_SYNC_POLICIES, CF_SYNC_REGISTRATION, CF_SYNC_ROOT_INFO_CLASS,
+            CF_PLACEHOLDER_CREATE_INFO, CF_PLATFORM_INFO, CF_REGISTER_FLAGS, CF_SYNC_POLICIES,
+            CF_SYNC_REGISTRATION,
         },
         System::IO::OVERLAPPED,
     },
@@ -59,27 +59,6 @@ type ReportProviderProgress =
     unsafe extern "system" fn(CF_CONNECTION_KEY, i64, i64, i64) -> HRESULT;
 type HydratePlaceholder =
     unsafe extern "system" fn(HANDLE, i64, i64, CF_HYDRATE_FLAGS, *mut OVERLAPPED) -> HRESULT;
-type GetPlaceholderInfo = unsafe extern "system" fn(
-    HANDLE,
-    CF_PLACEHOLDER_INFO_CLASS,
-    *mut c_void,
-    u32,
-    *mut u32,
-) -> HRESULT;
-type GetSyncRootInfoByHandle = unsafe extern "system" fn(
-    HANDLE,
-    CF_SYNC_ROOT_INFO_CLASS,
-    *mut c_void,
-    u32,
-    *mut u32,
-) -> HRESULT;
-type GetSyncRootInfoByPath = unsafe extern "system" fn(
-    PCWSTR,
-    CF_SYNC_ROOT_INFO_CLASS,
-    *mut c_void,
-    u32,
-    *mut u32,
-) -> HRESULT;
 
 struct Module(HMODULE);
 
@@ -148,9 +127,6 @@ pub struct Api {
     execute: Execute,
     report_provider_progress: ReportProviderProgress,
     hydrate_placeholder: Option<HydratePlaceholder>,
-    get_placeholder_info: Option<GetPlaceholderInfo>,
-    get_sync_root_info_by_handle: Option<GetSyncRootInfoByHandle>,
-    get_sync_root_info_by_path: Option<GetSyncRootInfoByPath>,
     _module: Module,
 }
 
@@ -192,15 +168,6 @@ impl Api {
                 ReportProviderProgress
             ),
             hydrate_placeholder: optional!(c"CfHydratePlaceholder", HydratePlaceholder),
-            get_placeholder_info: optional!(c"CfGetPlaceholderInfo", GetPlaceholderInfo),
-            get_sync_root_info_by_handle: optional!(
-                c"CfGetSyncRootInfoByHandle",
-                GetSyncRootInfoByHandle
-            ),
-            get_sync_root_info_by_path: optional!(
-                c"CfGetSyncRootInfoByPath",
-                GetSyncRootInfoByPath
-            ),
             _module: module,
         });
         api.get_platform_info()
@@ -359,64 +326,6 @@ impl Api {
             )
         };
         check(status, "CfHydratePlaceholder")
-    }
-
-    /// # Safety
-    /// `handle` must be valid. `buffer` must be writable, correctly aligned for
-    /// the requested information class, and at least `buffer_length` bytes long.
-    pub unsafe fn get_placeholder_info(
-        &self,
-        handle: HANDLE,
-        info_class: CF_PLACEHOLDER_INFO_CLASS,
-        buffer: *mut c_void,
-        buffer_length: u32,
-    ) -> Result<u32> {
-        let function = self
-            .get_placeholder_info
-            .ok_or_else(|| anyhow!("Windows Cloud Files does not provide CfGetPlaceholderInfo"))?;
-        let mut returned = 0;
-        let status = unsafe { function(handle, info_class, buffer, buffer_length, &mut returned) };
-        check(status, "CfGetPlaceholderInfo")?;
-        Ok(returned)
-    }
-
-    /// # Safety
-    /// `handle` must be valid. `buffer` must be writable, correctly aligned for
-    /// the requested information class, and at least `buffer_length` bytes long.
-    pub unsafe fn get_sync_root_info_by_handle(
-        &self,
-        handle: HANDLE,
-        info_class: CF_SYNC_ROOT_INFO_CLASS,
-        buffer: *mut c_void,
-        buffer_length: u32,
-    ) -> Result<u32> {
-        let function = self.get_sync_root_info_by_handle.ok_or_else(|| {
-            anyhow!("Windows Cloud Files does not provide CfGetSyncRootInfoByHandle")
-        })?;
-        let mut returned = 0;
-        let status = unsafe { function(handle, info_class, buffer, buffer_length, &mut returned) };
-        check(status, "CfGetSyncRootInfoByHandle")?;
-        Ok(returned)
-    }
-
-    /// # Safety
-    /// `path` must be a valid NUL-terminated path. `buffer` must be writable,
-    /// correctly aligned for the requested information class, and at least
-    /// `buffer_length` bytes long.
-    pub unsafe fn get_sync_root_info_by_path(
-        &self,
-        path: PCWSTR,
-        info_class: CF_SYNC_ROOT_INFO_CLASS,
-        buffer: *mut c_void,
-        buffer_length: u32,
-    ) -> Result<u32> {
-        let function = self.get_sync_root_info_by_path.ok_or_else(|| {
-            anyhow!("Windows Cloud Files does not provide CfGetSyncRootInfoByPath")
-        })?;
-        let mut returned = 0;
-        let status = unsafe { function(path, info_class, buffer, buffer_length, &mut returned) };
-        check(status, "CfGetSyncRootInfoByPath")?;
-        Ok(returned)
     }
 }
 
