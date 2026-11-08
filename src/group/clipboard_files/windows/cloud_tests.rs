@@ -914,7 +914,7 @@ fn publish_fixture(
     clipboard_retry(|| native::write(std::slice::from_ref(&seed)))?;
     let expected = fixture.remember_sequence()?;
     let base = fixture.directory(&format!("cache/{name}"))?;
-    let binding = publish_at(offer.clone(), expected, &base)?
+    let binding = clipboard_retry(|| publish_at(offer.clone(), expected, &base))?
         .context("The initial isolated publication unexpectedly lost its clipboard serial")?;
     fixture.remember_sequence()?;
     let root = ROOTS
@@ -1199,7 +1199,7 @@ fn run_held_read(fixture: &mut Fixture, cancel: bool) -> Result<()> {
             make_offer(fixture, "stale", Operation::Copy, Shape::File, false)?;
         let base = fixture.directory("cache/stale")?;
         ensure!(
-            publish_at(stale.clone(), stale_sequence, &base)?.is_none(),
+            clipboard_retry(|| publish_at(stale.clone(), stale_sequence, &base))?.is_none(),
             "A stale remote publication replaced a newer local copy"
         );
         fixture.remember_rejected_roots(&base, &stale.description)?;
