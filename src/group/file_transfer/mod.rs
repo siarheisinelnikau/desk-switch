@@ -226,6 +226,7 @@ struct Core {
     prepare: Arc<Semaphore>,
     stopping: AtomicBool,
     error: Mutex<Option<String>>,
+    notice: Mutex<Option<String>>,
     collected: Mutex<BTreeSet<String>>,
     garbage: Mutex<Vec<(String, String)>>,
     reservations: Mutex<BTreeMap<String, u64>>,
@@ -348,6 +349,7 @@ impl Service {
             prepare: Arc::new(Semaphore::new(1)),
             stopping: AtomicBool::new(false),
             error: Mutex::new(None),
+            notice: Mutex::new(None),
             collected: Mutex::new(BTreeSet::new()),
             garbage: Mutex::new(Vec::new()),
             reservations: Mutex::new(BTreeMap::new()),
@@ -534,6 +536,11 @@ impl Service {
     pub fn error(&self) -> Option<String> {
         self.core.error.lock().unwrap().clone()
     }
+    /// Non-fatal clipboard/share feedback for the Transfers surface. A missing
+    /// or offline peer must not disable file sharing for the whole workspace.
+    pub fn take_notice(&self) -> Option<String> {
+        self.core.notice.lock().unwrap().take()
+    }
     /// Called by the existing clipboard tick. Native publication is acknowledged
     /// only after all files verify and the clipboard worker accepts the reservation.
     pub fn clipboard(&self, clipboard: &Clipboard) {
@@ -633,6 +640,10 @@ impl Core {
     }
     fn wake(&self) {
         self.ctx.request_repaint_of(egui::ViewportId::ROOT);
+    }
+    fn note(&self, message: impl Into<String>) {
+        *self.notice.lock().unwrap() = Some(message.into());
+        self.wake();
     }
     fn allowed(&self, workspace: &str, peer: &str, origin: Origin) -> bool {
         let trust = self.trust.lock().unwrap();
@@ -1027,7 +1038,15 @@ async fn run(
             },
             Some(command)=commands.recv()=>{match command {
                 Command::Send{id,target,paths}=>{let c=core.clone();tokio::spawn(async move{let _=prepare(c,id,vec![target],paths,Origin::Send).await;});},
-                Command::CopiedSelection(selection)=>{let generation=lazy::begin_capture(&core);let c=core.clone();tokio::spawn(async move{let _=lazy::capture(c,selection,generation).await;});},
+                Command::CopiedSelection(selection)=>{
+                    let generation=lazy::begin_capture(&core);
+                    let c=core.clone();
+                    tokio::spawn(async move {
+                        if let Err(error)=lazy::capture(c.clone(),selection,generation).await {
+                            c.note(format!("Could not share copied files: {error:#}"));
+                        }
+                    });
+                },
                 Command::NativeBegin(fetch)=>{let c=core.clone();tokio::spawn(async move{lazy::request(c,fetch).await;});},
                 Command::NativeResult(session,result)=>{let c=core.clone();tokio::spawn(async move{let _=lazy::native_result(c,session,result).await;});},
                 Command::AcquireLease{offer,peer,lease}=>{let c=core.clone();tokio::spawn(async move{let _=lazy::lease_remote(c,peer,offer,lease,false).await;});},

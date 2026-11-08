@@ -49,6 +49,7 @@ impl Harness {
             prepare: Arc::new(Semaphore::new(1)),
             stopping: AtomicBool::new(false),
             error: Mutex::new(None),
+            notice: Mutex::new(None),
             collected: Mutex::new(BTreeSet::new()),
             garbage: Mutex::new(Vec::new()),
             reservations: Mutex::new(BTreeMap::new()),
@@ -263,6 +264,31 @@ fn a_full_completion_queue_leaves_the_result_retryable_and_queues_it_once() {
         .native_complete(NativeResult::Failed("queue full test".into()))
         .unwrap();
     assert!(harness.commands.try_recv().is_err());
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn offline_peers_are_not_announced_and_never_make_file_sharing_fatal() {
+    let harness = Harness::new(4);
+    for peer in harness.core.trust.lock().unwrap().peers.values_mut() {
+        peer.online = false;
+    }
+    let path = harness.root.join("own/source.txt");
+    fs::write(&path, b"copied").unwrap();
+    let generation = begin_capture(&harness.core);
+    capture(
+        harness.core.clone(),
+        Some(Selection {
+            sequence: 1,
+            paths: vec![path],
+            operation: Operation::Copy,
+        }),
+        generation,
+    )
+    .await
+    .unwrap();
+    assert!(harness.core.error.lock().unwrap().is_none());
+    assert!(harness.core.notice.lock().unwrap().is_none());
+    assert_eq!(harness.core.lazy.lock().unwrap().locals.len(), 1);
 }
 
 #[tokio::test(flavor = "current_thread")]
