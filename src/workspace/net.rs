@@ -469,6 +469,32 @@ struct Arrival {
     result: Result<Candidate>,
 }
 
+/// Accepts one incoming connection and authenticates it on its own bounded
+/// task. The permit limits how many authentications run at the same time.
+fn spawn_incoming(
+    stream: tokio::net::TcpStream,
+    permit: tokio::sync::OwnedSemaphorePermit,
+    sender: queue::Sender<Arrival>,
+    identity: Identity,
+    name: String,
+    port: u16,
+) {
+    tokio::spawn(async move {
+        let _permit = permit;
+        if let Ok(Ok(candidate)) = timeout(
+            AUTH_TIMEOUT,
+            authenticate(stream, &identity, &name, false, None, port),
+        )
+        .await
+        {
+            let _ = sender.try_send(Arrival {
+                attempt: None,
+                result: Ok(candidate),
+            });
+        }
+    });
+}
+
 struct Dial {
     id: u64,
     addresses: Vec<SocketAddr>,
@@ -556,11 +582,10 @@ async fn run(
             incoming=listener.accept()=> {
                 let (stream,_)=incoming?;
                 let Ok(permit)=permits.clone().try_acquire_owned() else {continue};
-                let sender=send_candidates.clone();let identity=Identity {private:identity.private,public:identity.public};let name=local.borrow().name.clone();
-                tokio::spawn(async move {
-                    let _permit=permit;
-                    if let Ok(Ok(candidate))=timeout(AUTH_TIMEOUT,authenticate(stream,&identity,&name,false,None,port)).await {let _=sender.try_send(Arrival { attempt: None, result: Ok(candidate) });}
-                });
+                let sender=send_candidates.clone();
+                let identity=Identity {private:identity.private,public:identity.public};
+                let name=local.borrow().name.clone();
+                spawn_incoming(stream, permit, sender, identity, name, port);
             }
             command=commands.recv()=>match command {
                 Some(Command::Dial(addresses,mut key)) if dial.is_none()=> {
