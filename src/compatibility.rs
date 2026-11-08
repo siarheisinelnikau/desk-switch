@@ -2,11 +2,11 @@ use anyhow::{Result, ensure};
 use std::fmt;
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
-pub const PROTOCOL: u16 = 7;
+pub const PROTOCOL: u16 = 8;
 pub const BUILD_INFO: &str = concat!(
     "DESK-SWITCH-BUILD:{\"app\":\"",
     env!("CARGO_PKG_VERSION"),
-    "\",\"protocol\":7}"
+    "\",\"protocol\":8}"
 );
 const MAGIC: &[u8; 8] = b"DESKVER2";
 

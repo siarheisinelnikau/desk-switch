@@ -48,6 +48,9 @@ impl OutputLevel {
 pub struct Worker {
     pub cycle_input: bool,
     pub cycle_input_position: Option<u16>,
+    pub crossing: Option<crate::edge::Crossing>,
+    pub display_error: Option<(u64, String)>,
+    pub return_results: VecDeque<(u64, bool)>,
     pub kind: Kind,
     child: Option<Child>,
     input: Option<ChildStdin>,
@@ -170,6 +173,9 @@ impl Worker {
                 })?;
         }
         Ok(Self {
+            crossing: None,
+            display_error: None,
+            return_results: VecDeque::new(),
             cycle_input: false,
             cycle_input_position: None,
             kind,
@@ -273,6 +279,40 @@ impl Worker {
         Ok(())
     }
 
+    pub fn set_routes(&mut self, routes: &crate::edge::Routes) -> Result<()> {
+        routes.validate()?;
+        self.command(&format!("routes {}", serde_json::to_string(routes)?))
+    }
+
+    pub fn return_input(&mut self, activation: u64) -> Result<()> {
+        ensure!(activation != 0, "Invalid display activation");
+        self.command(&format!("return-input {activation}"))
+    }
+
+    pub fn switch_display(
+        &mut self,
+        activation: u64,
+        entry: Option<crate::edge::Entry>,
+    ) -> Result<()> {
+        ensure!(activation != 0, "Invalid display activation");
+        if let Some(entry) = entry {
+            entry.validate()?;
+        }
+        self.command(&format!(
+            "switch-display {}",
+            serde_json::to_string(&crate::lifecycle::DisplaySwitch { activation, entry })?
+        ))
+    }
+
+    pub fn enter_display(&mut self, activation: u64, entry: crate::edge::Entry) -> Result<()> {
+        ensure!(activation != 0, "Invalid display activation");
+        entry.validate()?;
+        self.command(&format!(
+            "enter-display {}",
+            serde_json::to_string(&crate::lifecycle::DisplayEntry { activation, entry })?
+        ))
+    }
+
     pub fn stop(&mut self) {
         if !self.running() || self.stopping {
             return;
@@ -308,6 +348,23 @@ impl Worker {
                 Event::CycleInputEdge(position) => {
                     self.cycle_input = true;
                     self.cycle_input_position = Some(position);
+                }
+                Event::EdgeCrossed(crossing) => {
+                    if crossing.revision != 0 && crossing.boundary != 0 {
+                        self.crossing = Some(crossing);
+                    }
+                }
+                Event::DisplayEntry { activation, error } => {
+                    self.display_error = error.map(|error| (activation, error));
+                }
+                Event::InputReturned {
+                    activation,
+                    completed,
+                } => {
+                    if self.return_results.len() == 32 {
+                        self.return_results.pop_front();
+                    }
+                    self.return_results.push_back((activation, completed));
                 }
                 Event::PeerVersion {
                     app,

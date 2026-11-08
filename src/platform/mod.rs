@@ -1,5 +1,7 @@
 mod host;
 #[cfg(target_os = "linux")]
+pub(crate) mod linux_geometry;
+#[cfg(target_os = "linux")]
 mod linux_host;
 #[cfg(target_os = "linux")]
 mod linux_monitor;
@@ -90,6 +92,7 @@ pub fn run(
     peer: Key,
     settings: Settings,
 ) -> Result<()> {
+    crate::lifecycle::install_routes(settings.routes.clone().unwrap_or_default())?;
     let video = settings
         .monitor
         .map(|(id, inputs)| {
@@ -169,4 +172,6 @@ pub struct MonitorInfo {
     pub error: Option<String>,
     #[serde(default)]
     pub fingerprint: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native: Option<crate::edge::NativeScreen>,
 }

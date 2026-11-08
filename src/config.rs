@@ -145,6 +145,8 @@ pub fn load_peer(dir: &Path) -> Result<Key> {
 pub struct FileSettings {
     pub monitor: Option<MonitorSettings>,
     pub edge: Option<EdgeSettings>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub routes: Option<crate::edge::Routes>,
     pub capture: Option<CaptureSettings>,
 }
 
@@ -227,6 +229,7 @@ impl Edge {
 pub struct Settings {
     pub monitor: Option<(String, Inputs)>,
     pub edge: Option<Edge>,
+    pub routes: Option<crate::edge::Routes>,
     #[cfg(any(windows, target_os = "macos"))]
     pub sharing: InputSharing,
     #[cfg(target_os = "linux")]
@@ -288,6 +291,9 @@ impl Settings {
     }
 
     fn from_document(config: FileSettings) -> Result<Self> {
+        if let Some(routes) = &config.routes {
+            routes.validate()?;
+        }
         let monitor = config
             .monitor
             .map(|m| {
@@ -344,6 +350,7 @@ impl Settings {
         Ok(Self {
             monitor,
             edge,
+            routes: config.routes,
             #[cfg(any(windows, target_os = "macos"))]
             sharing,
             #[cfg(target_os = "linux")]

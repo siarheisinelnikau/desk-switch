@@ -194,6 +194,20 @@ fn render_probe(
 }
 
 pub fn run(case: &str, dir: PathBuf) -> Result<()> {
+    if case.starts_with("shared-four-layout") {
+        anyhow::ensure!(
+            matches!(
+                case,
+                "shared-four-layout"
+                    | "shared-four-layout-overlap"
+                    | "shared-four-layout-offline"
+                    | "shared-four-layout-unavailable"
+                    | "shared-four-layout-stale"
+                    | "shared-four-layout-unknown"
+            ),
+            "unknown display arrangement fixture"
+        );
+    }
     anyhow::ensure!(
         dir.is_absolute(),
         "preview needs an isolated absolute directory"
@@ -248,6 +262,14 @@ pub fn run(case: &str, dir: PathBuf) -> Result<()> {
             }
             app.prefs.language = language;
             crate::i18n::set_language(&app.prefs.language);
+        }
+        if let Ok(theme) = std::env::var("DESK_SWITCH_PREVIEW_THEME") {
+            anyhow::ensure!(
+                ["system", "light", "dark"].contains(&theme.as_str()),
+                "Unknown preview theme"
+            );
+            app.prefs.theme = theme;
+            super::view::style(&ctx, &app.prefs.theme);
         }
         let frames = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
         let causes = std::sync::Arc::new(std::sync::Mutex::new(std::collections::BTreeMap::new()));
@@ -438,6 +460,7 @@ impl Desktop {
                 inputs: vec![17, 15],
                 error: None,
                 fingerprint: local.monitor.fingerprint.clone(),
+                native: None,
             });
             let input = match case {
                 "shared-pending" => None,
@@ -689,7 +712,7 @@ impl Desktop {
             for (index, (name, platform, key)) in [
                 ("Studio PC", "windows", self.public_key.clone()),
                 ("Ubuntu mini", "linux", "11".repeat(32)),
-                ("MacBook Pro", "macos", "33".repeat(32)),
+                ("Ubuntu laptop", "linux", "33".repeat(32)),
                 ("Office PC", "windows", "44".repeat(32)),
             ]
             .into_iter()
@@ -717,12 +740,58 @@ impl Desktop {
                 .into();
                 node.hardware.microphone_receive = true;
                 node.monitor.enabled = index < 2;
-                node.monitor.input = Some(if index == 0 { 15 } else { 17 });
+                node.monitor.id = format!("fixture-display-{index}");
+                node.monitor.name = if index < 2 {
+                    "Shared display"
+                } else if index == 2 {
+                    "Built-in display"
+                } else {
+                    "Office display"
+                }
+                .into();
+                node.monitor.fingerprint = format!("{:02x}", index + 11).repeat(32);
+                node.monitor.input = (index < 2).then_some(if index == 0 { 15 } else { 17 });
+                let varied = case.starts_with("shared-four-layout");
                 node.devices.displays = vec![crate::workspace::devices::Display {
                     id: node.monitor.id.clone(),
                     name: node.monitor.name.clone(),
                     fingerprint: node.monitor.fingerprint.clone(),
+                    native: Some(crate::edge::NativeScreen {
+                        native_id: format!("fixture-screen-{index}"),
+                        rect: crate::edge::ScreenRect {
+                            x: 0,
+                            y: 0,
+                            width: if varied && index == 3 { 2560 } else { 1920 },
+                            height: if varied && index == 2 {
+                                1200
+                            } else if varied && index == 3 {
+                                1440
+                            } else {
+                                1080
+                            },
+                        },
+                        epoch: index as u64 + 1,
+                    }),
                 }];
+                if varied && index == 0 {
+                    node.devices
+                        .displays
+                        .push(crate::workspace::devices::Display {
+                            id: "fixture-portrait".into(),
+                            name: "Portrait display".into(),
+                            fingerprint: "aa".repeat(32),
+                            native: Some(crate::edge::NativeScreen {
+                                native_id: "fixture-screen-portrait".into(),
+                                rect: crate::edge::ScreenRect {
+                                    x: -1080,
+                                    y: 0,
+                                    width: 1080,
+                                    height: 1920,
+                                },
+                                epoch: 10,
+                            }),
+                        });
+                }
                 node.shared = Default::default();
                 node.ack.clear();
                 if let Some(management) = &mut node.management {
@@ -763,8 +832,51 @@ impl Desktop {
                 active_monitor: Some("11".repeat(32)),
                 confirmed_monitor: Some("11".repeat(32)),
                 monitor_command: None,
+                layout: Default::default(),
+                active_display: None,
+                display_entry: None,
             };
             state.bind_microphone();
+            if case.starts_with("shared-four-layout") {
+                use crate::group::layout::{self, Point};
+                state.settings.edge = true;
+                state.layout = layout::draft(&state);
+                state.layout.revision = 1;
+                state
+                    .layout
+                    .positions
+                    .insert(layout::SHARED.into(), Point { x: 0, y: 0 });
+                state
+                    .layout
+                    .positions
+                    .insert("33".repeat(32), Point { x: 0, y: -1200 });
+                state
+                    .layout
+                    .positions
+                    .insert("44".repeat(32), Point { x: 1920, y: 0 });
+                if case == "shared-four-layout-overlap" {
+                    state
+                        .layout
+                        .positions
+                        .insert("44".repeat(32), Point { x: 1200, y: 200 });
+                }
+                if case == "shared-four-layout-offline" {
+                    state.members.get_mut(&"44".repeat(32)).unwrap().online = false;
+                }
+                if case == "shared-four-layout-unavailable" {
+                    state
+                        .members
+                        .get_mut(&"33".repeat(32))
+                        .unwrap()
+                        .node
+                        .devices
+                        .displays[0]
+                        .native = None;
+                }
+                if case == "shared-four-layout-unknown" {
+                    state.confirmed_monitor = None;
+                }
+            }
             self.group.workspace = Some(state);
             self.group.preview = true;
             self.group.selected = self.public_key.clone();
@@ -779,6 +891,26 @@ impl Desktop {
             }
             if case == "shared-four-ip" {
                 self.preview_manual_connection();
+            }
+            if case.starts_with("shared-four-layout") {
+                self.page = Page::Application;
+                let workspace = self.group.workspace.as_ref().unwrap();
+                self.group.layout_editor.open(workspace);
+                let focus = match case {
+                    "shared-four-layout-offline" | "shared-four-layout-overlap" => {
+                        Some("44".repeat(32))
+                    }
+                    "shared-four-layout-unavailable" => Some("33".repeat(32)),
+                    _ => None,
+                };
+                if let Some(computer) = focus {
+                    self.group
+                        .layout_editor
+                        .preview_select_computer(workspace, &computer);
+                }
+                if case == "shared-four-layout-stale" {
+                    self.group.workspace.as_mut().unwrap().layout.revision += 1;
+                }
             }
             self.preview_scroll = 0.0;
         }

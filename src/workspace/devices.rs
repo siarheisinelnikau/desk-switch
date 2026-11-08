@@ -55,9 +55,14 @@ pub struct Display {
     pub id: String,
     pub name: String,
     pub fingerprint: String,
+    #[serde(default)]
+    pub native: Option<crate::edge::NativeScreen>,
 }
 impl Display {
     pub fn validate(&self) -> Result<()> {
+        if let Some(native) = &self.native {
+            native.validate()?;
+        }
         ensure!(
             !self.id.is_empty()
                 && self.id.len() <= 1024
@@ -137,6 +142,7 @@ mod tests {
             id: "display-1".into(),
             name: "Desk monitor".into(),
             fingerprint: "ab".repeat(32),
+            native: None,
         };
         let mut inventory = Inventory {
             displays: vec![display.clone()],

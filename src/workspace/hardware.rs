@@ -137,6 +137,7 @@ fn display_inventory(displays: &[MonitorInfo]) -> Vec<super::devices::Display> {
             id: display.id.clone(),
             name,
             fingerprint: display.fingerprint.clone(),
+            native: display.native.clone(),
         };
         if display.validate().is_ok()
             && !result
@@ -671,6 +672,7 @@ mod tests {
             inputs: vec![15, 17],
             error: None,
             fingerprint: "ab".repeat(32),
+            native: None,
         };
         let mut displays = (0..40)
             .map(|index| display(format!("display-{index}")))

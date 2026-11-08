@@ -1,6 +1,7 @@
 mod group;
 mod group_compat;
 mod group_data;
+mod group_layout;
 mod group_monitor;
 #[cfg(target_os = "linux")]
 mod linux_activation;
