@@ -480,6 +480,7 @@ mod monitor_read_tests {
             inputs: Vec::new(),
             error: None,
             fingerprint: String::new(),
+            native: None,
         };
         let displays = vec![monitor("first"), monitor("second")];
         validate_monitor_read(&displays, "first", "first", false).unwrap();

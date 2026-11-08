@@ -63,6 +63,17 @@ fn canonical_address(address: SocketAddr) -> SocketAddr {
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub enum Action {
+    SetLayout {
+        expected: u64,
+        layout: super::layout::Layout,
+    },
+    ActivateDisplay {
+        target: super::layout::DisplayTarget,
+        entry: Option<crate::edge::Entry>,
+    },
+    CrossEdge {
+        crossing: crate::edge::Crossing,
+    },
     Settings {
         expected: u64,
         value: Settings,
@@ -459,6 +470,9 @@ fn load(dir: &Path, local: Member) -> Result<Workspace> {
             active_monitor: None,
             confirmed_monitor: None,
             monitor_command: None,
+            layout: Default::default(),
+            active_display: None,
+            display_entry: None,
         }
     };
     let mut local = local;
@@ -1004,6 +1018,15 @@ fn apply(
         "Unknown workspace member"
     );
     match action {
+        Action::SetLayout { expected, layout } => state.set_layout(expected, layout)?,
+        Action::ActivateDisplay { target, entry } => {
+            state.activate_display(source, target, entry)?
+        }
+        Action::CrossEdge { crossing } => {
+            if let Some(activation) = super::layout::resolve_crossing(state, source, crossing)? {
+                state.activate_display(source, activation.target, Some(activation.entry))?;
+            }
+        }
         Action::Settings { expected, value } => {
             state.set_settings(expected, value)?;
             state.bind_microphone();
@@ -1134,6 +1157,18 @@ fn local_action(
     internal: &Internal,
     receipts: &mut UpdateReceipts,
 ) -> Result<()> {
+    if matches!(
+        &action,
+        Action::SetLayout { .. } | Action::ActivateDisplay { .. } | Action::CrossEdge { .. }
+    ) {
+        ensure!(
+            state
+                .members
+                .get(&state.hub)
+                .is_some_and(Member::compatible),
+            "Update the workspace controller before changing display arrangements"
+        );
+    }
     if state.hub != own
         && !sessions.contains_key(&state.hub)
         && let Action::Invite { address, key } = &action
@@ -1450,14 +1485,7 @@ async fn run(
         if state != before {
             if state.hub == own {
                 state.bind_microphone();
-                if !state.switch_pending()
-                    && state
-                        .active_input
-                        .as_ref()
-                        .is_none_or(|key| !state.members.get(key).is_some_and(Member::compatible))
-                {
-                    state.active_input = state.plan().input;
-                }
+                state.reconcile_input();
                 broadcast(&sessions, &state);
             }
             notify.state(&state);

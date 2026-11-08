@@ -229,6 +229,7 @@ impl Form {
             sharing: self.sharing,
         });
         Ok(FileSettings {
+            routes: None,
             monitor,
             edge,
             capture,

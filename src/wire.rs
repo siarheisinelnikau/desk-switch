@@ -55,4 +55,26 @@ pub enum Message {
     Rejected(u64),
     SwitchRequested,
     SetupSwitchRequested,
+    PrepareDisplay {
+        id: u64,
+        generation: u64,
+        entry: Option<crate::edge::Entry>,
+    },
+    Reposition {
+        id: u64,
+        generation: u64,
+        entry: crate::edge::Entry,
+    },
+    Positioned {
+        id: u64,
+        generation: u64,
+    },
+    RepositionRejected {
+        id: u64,
+        generation: u64,
+    },
+    Crossed {
+        id: u64,
+        crossing: crate::edge::Crossing,
+    },
 }

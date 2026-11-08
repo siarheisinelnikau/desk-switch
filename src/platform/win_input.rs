@@ -2,6 +2,7 @@ use super::{host::Control, win_monitor};
 use crate::keys::scan_code;
 use crate::{
     config::Edge,
+    edge::{Entry, Hit, Router, Routes},
     gate::{Gate, Route},
     wire::Input,
 };
@@ -12,9 +13,9 @@ use std::{
     ptr::{null, null_mut},
     sync::Arc,
 };
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 use windows_sys::Win32::{
-    Foundation::{LPARAM, LRESULT, POINT, WPARAM},
+    Foundation::{HWND, LPARAM, LRESULT, POINT, WPARAM},
     Graphics::Gdi::{MONITOR_DEFAULTTONEAREST, MonitorFromPoint},
     System::LibraryLoader::GetModuleHandleW,
     UI::{
@@ -23,6 +24,7 @@ use windows_sys::Win32::{
         WindowsAndMessaging::*,
     },
 };
+use windows_sys::core::w;
 
 #[derive(Clone, Copy)]
 enum Owner {
@@ -41,6 +43,11 @@ struct HookData {
     sharing: crate::config::InputSharing,
     toggle_down: bool,
     emergency_down: bool,
+    group_routes: bool,
+    route_setting: watch::Receiver<Routes>,
+    router: Router,
+    geometry_dirty: bool,
+    route_notifications: bool,
 }
 
 thread_local! {
@@ -48,6 +55,32 @@ thread_local! {
 }
 
 impl HookData {
+    fn refresh_routes(&mut self) {
+        if !self.group_routes
+            || (!self.geometry_dirty && !self.route_setting.has_changed().unwrap_or(false))
+        {
+            return;
+        }
+        self.geometry_dirty = false;
+        let routes = self.route_setting.borrow_and_update().clone();
+        let screens = match self
+            .route_notifications
+            .then(win_monitor::native_screens)
+            .transpose()
+        {
+            Ok(None) => Vec::new(),
+            Ok(Some(screens)) => screens,
+            Err(error) => {
+                eprintln!("Windows display edges unavailable: {error:#}");
+                Vec::new()
+            }
+        };
+        if let Err(error) = self.router.configure(routes, &screens) {
+            self.router = Router::default();
+            eprintln!("Windows display routes rejected: {error:#}");
+        }
+    }
+
     fn emit(&self, token: u64, input: Input) {
         if self.input.try_send((token, input)).is_err() {
             self.gate.input_overflow(token);
@@ -122,6 +155,7 @@ impl HookData {
         if data.flags & LLKHF_INJECTED != 0 {
             return false;
         }
+        self.refresh_routes();
         let down = data.flags & LLKHF_UP == 0;
         if data.vkCode == u32::from(VK_F11) {
             if down && !self.emergency_down {
@@ -156,6 +190,7 @@ impl HookData {
         if data.flags & LLMHF_INJECTED != 0 || !self.sharing.mouse {
             return false;
         }
+        self.refresh_routes();
         let (token, route) = self.gate.current();
         let high = (data.mouseData >> 16) as u16;
         let button = match message {
@@ -187,6 +222,26 @@ impl HookData {
                 let dy = (data.pt.y - current.y).clamp(-16384, 16384);
                 match route {
                     Route::Remote if dx != 0 || dy != 0 => self.emit(token, Input::Move { dx, dy }),
+                    Route::Local if self.group_routes => {
+                        let (x, y, dx, dy) =
+                            (current.x.into(), current.y.into(), dx.into(), dy.into());
+                        // Query async key state only at an actual configured edge.
+                        // Ordinary pointer motion remains an in-memory lookup.
+                        let hit = if self.router.crossing_if(x, y, dx, dy, false).is_some() {
+                            let idle = !self.toggle_down && !self.emergency_down && self.idle();
+                            self.router.crossing_if(x, y, dx, dy, idle)
+                        } else {
+                            None
+                        };
+                        match hit {
+                            Some(Hit::Cross(crossing)) => {
+                                self.control(token, Control::Boundary { token, crossing });
+                                return true;
+                            }
+                            Some(Hit::Block) => return true,
+                            None => {}
+                        }
+                    }
                     Route::Local if let Some(edge) = &self.edge => {
                         let handle = unsafe { MonitorFromPoint(current, MONITOR_DEFAULTTONEAREST) };
                         if let Ok(screen) = win_monitor::screen(handle)
@@ -264,6 +319,74 @@ unsafe extern "system" fn mouse_hook(code: i32, wparam: WPARAM, lparam: LPARAM) 
 pub struct Hooks {
     keyboard: HHOOK,
     mouse: HHOOK,
+    _notifications: Option<Notifications>,
+    _coordinates: win_monitor::PhysicalCoordinates,
+}
+
+struct Notifications(HWND);
+
+impl Drop for Notifications {
+    fn drop(&mut self) {
+        unsafe {
+            DestroyWindow(self.0);
+        }
+    }
+}
+
+unsafe extern "system" fn display_notification(
+    window: HWND,
+    message: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
+    if matches!(
+        message,
+        WM_DISPLAYCHANGE | WM_SETTINGCHANGE | WM_DEVICECHANGE
+    ) {
+        DATA.with(|state| {
+            if let Ok(mut state) = state.try_borrow_mut()
+                && let Some(state) = state.as_mut()
+            {
+                state.geometry_dirty = true;
+            }
+        });
+        return 0;
+    }
+    unsafe { DefWindowProcW(window, message, wparam, lparam) }
+}
+
+fn notifications() -> Result<Notifications> {
+    let module = unsafe { GetModuleHandleW(null()) };
+    let class = WNDCLASSW {
+        lpfnWndProc: Some(display_notification),
+        hInstance: module,
+        lpszClassName: w!("DeskSwitchDisplayNotifications"),
+        ..Default::default()
+    };
+    unsafe {
+        RegisterClassW(&class);
+    }
+    let window = unsafe {
+        CreateWindowExW(
+            WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
+            class.lpszClassName,
+            w!("Desk Switch display notifications"),
+            0,
+            0,
+            0,
+            0,
+            0,
+            null_mut(),
+            null_mut(),
+            module,
+            null(),
+        )
+    };
+    ensure!(
+        !window.is_null(),
+        "cannot subscribe to Windows display changes"
+    );
+    Ok(Notifications(window))
 }
 
 impl Hooks {
@@ -274,12 +397,10 @@ impl Hooks {
         control: mpsc::Sender<Control>,
         input: mpsc::Sender<(u64, Input)>,
     ) -> Result<Self> {
-        let dpi =
-            unsafe { SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) };
-        ensure!(
-            dpi != 0 || edge.is_none(),
-            "per-monitor DPI awareness could not be enabled for edge mode"
-        );
+        unsafe {
+            SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+        }
+        let coordinates = win_monitor::PhysicalCoordinates::enter()?;
         if let Some(edge) = &mut edge
             && edge.screen == "auto"
         {
@@ -304,6 +425,14 @@ impl Hooks {
         unsafe {
             PeekMessageW(&mut msg, null_mut(), 0, 0, PM_NOREMOVE);
         }
+        let notifications = match notifications() {
+            Ok(notifications) => Some(notifications),
+            Err(error) => {
+                eprintln!("Windows automatic display edges disabled: {error:#}");
+                None
+            }
+        };
+        let route_notifications = notifications.is_some();
         let module = unsafe { GetModuleHandleW(null()) };
         let keyboard = unsafe { SetWindowsHookExW(WH_KEYBOARD_LL, Some(keyboard_hook), module, 0) };
         if keyboard.is_null() {
@@ -328,9 +457,19 @@ impl Hooks {
                 sharing,
                 toggle_down: false,
                 emergency_down: false,
+                group_routes: crate::lifecycle::group_input(),
+                route_setting: crate::lifecycle::routes(),
+                router: Router::default(),
+                geometry_dirty: true,
+                route_notifications,
             });
         });
-        Ok(Self { keyboard, mouse })
+        Ok(Self {
+            keyboard,
+            mouse,
+            _notifications: notifications,
+            _coordinates: coordinates,
+        })
     }
 
     pub fn run(&self) -> Result<()> {
@@ -346,6 +485,13 @@ impl Hooks {
                     DATA.with(|state| {
                         if let Some(state) = state.borrow().as_ref() {
                             state.toggle();
+                        }
+                    });
+                }
+                _ if msg.message == RESET_ENTRY => {
+                    DATA.with(|state| {
+                        if let Some(state) = state.borrow_mut().as_mut() {
+                            state.router.reset_entry();
                         }
                     });
                 }
@@ -371,6 +517,7 @@ impl Drop for Hooks {
 }
 
 pub fn center() -> Result<()> {
+    let _coordinates = win_monitor::PhysicalCoordinates::enter()?;
     let mut point = POINT::default();
     if unsafe { GetCursorPos(&mut point) } == 0 {
         return Err(io::Error::last_os_error()).context("reading the Windows cursor");
@@ -398,7 +545,54 @@ pub fn enter(edge: &Edge, position: u16) -> Result<()> {
     move_cursor(x, y)
 }
 
+pub fn enter_display(entry: Entry) -> Result<()> {
+    entry.resolve(&win_monitor::native_screens()?)?;
+    let (x, y) = entry.point();
+    move_cursor(x, y)
+}
+
+pub fn enter_display_current(
+    entry: Entry,
+    activation: u64,
+    routes: &watch::Receiver<Routes>,
+    canceled: &std::sync::Mutex<bool>,
+) -> Result<()> {
+    // Enumeration can be slow and must not block route publication. Only the
+    // final native mutation is linearized with cancellation and route changes.
+    entry.resolve(&win_monitor::native_screens()?)?;
+    let (x, y) = entry.point();
+    commit_display_entry(activation, routes, canceled, || move_cursor(x, y))
+}
+
+fn commit_display_entry(
+    activation: u64,
+    routes: &watch::Receiver<Routes>,
+    canceled: &std::sync::Mutex<bool>,
+    position: impl FnOnce() -> Result<()>,
+) -> Result<()> {
+    let canceled = canceled
+        .lock()
+        .map_err(|_| anyhow::anyhow!("Windows cursor entry was canceled"))?;
+    let current = routes.borrow();
+    ensure!(
+        !*canceled && current.activation == activation,
+        "The display activation changed before the cursor could enter"
+    );
+    position()
+}
+
+pub(super) fn cursor_position() -> Result<(i32, i32)> {
+    let _coordinates = win_monitor::PhysicalCoordinates::enter()?;
+    let mut point = POINT::default();
+    ensure!(
+        unsafe { GetCursorPos(&mut point) } != 0,
+        "cannot read the Windows cursor"
+    );
+    Ok((point.x, point.y))
+}
+
 fn move_cursor(x: f64, y: f64) -> Result<()> {
+    let _coordinates = win_monitor::PhysicalCoordinates::enter()?;
     if unsafe { SetCursorPos(x.round() as i32, y.round() as i32) } == 0 {
         return Err(io::Error::last_os_error()).context("positioning the Windows cursor");
     }
@@ -406,10 +600,52 @@ fn move_cursor(x: f64, y: f64) -> Result<()> {
 }
 
 pub const REQUEST_TOGGLE: u32 = WM_APP + 20;
+pub const RESET_ENTRY: u32 = WM_APP + 21;
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn completed_geometry_validation_cannot_position_a_newer_activation() {
+        let (send, routes) = watch::channel(Routes {
+            activation: 7,
+            ..Default::default()
+        });
+        let canceled = std::sync::Mutex::new(false);
+        let mut positioned = false;
+        let validate = || {
+            send.send_replace(Routes {
+                activation: 8,
+                ..Default::default()
+            });
+            Ok::<_, anyhow::Error>(())
+        };
+        validate().unwrap();
+        let result = commit_display_entry(7, &routes, &canceled, || {
+            positioned = true;
+            Ok(())
+        });
+        assert!(result.is_err());
+        assert!(!positioned);
+        let result = commit_display_entry(8, &routes, &canceled, || {
+            positioned = true;
+            Ok(())
+        });
+        assert!(result.is_ok() && positioned);
+    }
+
+    #[test]
+    fn canceled_entry_cannot_position_even_when_geometry_generation_is_unchanged() {
+        let (_send, routes) = watch::channel(Routes {
+            activation: 7,
+            ..Default::default()
+        });
+        let canceled = std::sync::Mutex::new(true);
+        let result = commit_display_entry(7, &routes, &canceled, || {
+            panic!("Canceled entry positioned the pointer")
+        });
+        assert!(result.is_err());
+    }
     #[test]
     fn disabled_keyboard_passes_through_while_mouse_is_shared() {
         let gate = Arc::new(Gate::new());
@@ -430,6 +666,11 @@ mod tests {
             },
             toggle_down: false,
             emergency_down: false,
+            group_routes: false,
+            route_setting: watch::channel(Routes::default()).1,
+            router: Router::default(),
+            geometry_dirty: false,
+            route_notifications: false,
         };
         assert!(!hooks.physical(
             30,

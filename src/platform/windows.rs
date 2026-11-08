@@ -1,11 +1,15 @@
 use super::win_input::{self, Hooks};
 use crate::{
     config::{Edge, Identity, Key},
+    edge::Entry,
     gate::Gate,
     video::{Inputs, VideoWorker},
 };
 use anyhow::Result;
-use std::{net::SocketAddr, sync::Arc};
+use std::{
+    net::SocketAddr,
+    sync::{Arc, Mutex},
+};
 use tokio::sync::mpsc;
 use windows_sys::Win32::{
     System::Threading::GetCurrentThreadId,
@@ -13,6 +17,15 @@ use windows_sys::Win32::{
 };
 
 struct WindowsCursor(u32, bool);
+
+struct PendingEntry(Arc<Mutex<bool>>);
+impl Drop for PendingEntry {
+    fn drop(&mut self) {
+        if let Ok(mut canceled) = self.0.lock() {
+            *canceled = true;
+        }
+    }
+}
 
 impl super::host::Cursor for WindowsCursor {
     async fn request_toggle(&self) -> Result<()> {
@@ -40,6 +53,23 @@ impl super::host::Cursor for WindowsCursor {
         } else {
             Ok(())
         }
+    }
+    async fn enter_display(&self, activation: u64, entry: Entry) -> Result<()> {
+        if self.1 {
+            let routes = crate::lifecycle::routes();
+            let canceled = Arc::new(Mutex::new(false));
+            let _pending = PendingEntry(Arc::clone(&canceled));
+            tokio::task::spawn_blocking(move || {
+                win_input::enter_display_current(entry, activation, &routes, &canceled)
+            })
+            .await
+            .map_err(|error| anyhow::anyhow!("Windows cursor worker stopped: {error}"))??;
+            anyhow::ensure!(
+                unsafe { PostThreadMessageW(self.0, win_input::RESET_ENTRY, 0, 0) } != 0,
+                "Windows input thread is unavailable"
+            );
+        }
+        Ok(())
     }
 }
 

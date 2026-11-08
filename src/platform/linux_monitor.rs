@@ -268,6 +268,12 @@ fn advertised_inputs(bus: u32) -> Result<Vec<u16>> {
 
 pub fn discover() -> Result<Vec<super::MonitorInfo>> {
     let displays = displays()?;
+    let native = super::linux_geometry::screens(
+        &displays
+            .iter()
+            .map(|display| display.id.clone())
+            .collect::<Vec<_>>(),
+    );
     Ok(displays
         .iter()
         .map(|display| {
@@ -285,15 +291,24 @@ pub fn discover() -> Result<Vec<super::MonitorInfo>> {
                 inputs,
                 error,
                 fingerprint: display.fingerprint.clone(),
+                native: native.get(&display.id).cloned(),
             }
         })
         .collect())
 }
 
 pub fn list_displays() -> Result<Vec<super::MonitorInfo>> {
-    Ok(displays()?
+    let displays = displays()?;
+    let native = super::linux_geometry::screens(
+        &displays
+            .iter()
+            .map(|display| display.id.clone())
+            .collect::<Vec<_>>(),
+    );
+    Ok(displays
         .into_iter()
         .map(|display| super::MonitorInfo {
+            native: native.get(&display.id).cloned(),
             id: display.id,
             name: display.connector.clone(),
             screen: display.connector,
@@ -320,6 +335,7 @@ pub fn read_monitor(id: &str) -> Result<super::MonitorInfo> {
         inputs: Vec::new(),
         error: None,
         fingerprint: display.fingerprint.clone(),
+        native: super::linux_geometry::screens(&[id.into()]).remove(id),
     })
 }
 
