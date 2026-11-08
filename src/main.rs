@@ -10,6 +10,7 @@ mod compatibility;
 mod config;
 mod controller;
 mod crash;
+mod diagnostics_log;
 mod discovery;
 mod edge;
 mod gate;
@@ -64,6 +65,7 @@ fn main() {
     #[cfg(not(test))]
     if let Ok(dir) = config::state_dir() {
         crash::install(&dir);
+        diagnostics_log::enable_if_requested(&dir);
     }
     #[cfg(windows)]
     if std::env::args().len() > 1
