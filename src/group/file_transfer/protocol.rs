@@ -160,7 +160,7 @@ impl Description {
 pub enum Operation {
     #[default]
     Copy,
-    /// Reserved for consumers that can prove successful final-destination commit.
+    /// A native consumer must prove successful final-destination commit.
     Move,
 }
 
