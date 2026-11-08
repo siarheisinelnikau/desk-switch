@@ -727,7 +727,7 @@ fn reopen_for_security(file: &impl AsRawHandle, access: u32) -> Result<File> {
         .share_mode(FILE_SHARE_READ.0 | FILE_SHARE_WRITE.0 | FILE_SHARE_DELETE.0)
         .custom_flags(FILE_FLAG_BACKUP_SEMANTICS.0 | FILE_FLAG_OPEN_REPARSE_POINT.0)
         .open(&path)?;
-    Ok(File::from(opened))
+    Ok(opened)
 }
 
 fn handle_path(file: &impl AsRawHandle) -> Result<PathBuf> {
