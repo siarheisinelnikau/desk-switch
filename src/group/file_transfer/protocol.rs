@@ -4,7 +4,9 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 
-pub const VERSION: u16 = 1;
+/// The authenticated channel version is separate from durable manifest format.
+pub const VERSION: u16 = 2;
+pub const MANIFEST_VERSION: u16 = 1;
 pub const CHUNK: usize = 48 * 1024;
 pub const MAX_ENTRIES: usize = 10_000;
 pub const MAX_TOTAL: u64 = 64 * 1024 * 1024 * 1024;
@@ -56,6 +58,138 @@ pub fn valid_component(name: &str) -> Result<()> {
     Ok(())
 }
 
+/// Names, kinds and lengths are safe to announce without reading file contents.
+/// Checksums belong to the immutable transfer prepared only after paste demand.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct Description {
+    pub name: String,
+    pub roots: Vec<String>,
+    pub entries: Vec<Descriptor>,
+    pub total: u64,
+}
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct Descriptor {
+    pub path: Vec<String>,
+    pub kind: DescriptorKind,
+}
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub enum DescriptorKind {
+    Directory,
+    File { size: u64 },
+}
+impl Description {
+    pub fn validate(&self) -> Result<()> {
+        ensure!(
+            !self.entries.is_empty()
+                && self.entries.len() <= MAX_ENTRIES
+                && !self.roots.is_empty()
+                && self.roots.len() <= self.entries.len()
+                && !self.name.is_empty()
+                && self.name.len() <= 512
+                && !self.name.chars().any(char::is_control)
+                && self.total <= MAX_TOTAL,
+            "The copied files exceed their sharing limits"
+        );
+        let mut roots = BTreeSet::new();
+        for root in &self.roots {
+            valid_component(root)?;
+            ensure!(
+                roots.insert(root.to_lowercase()),
+                "Duplicate copied file root"
+            );
+        }
+        let mut paths = BTreeMap::new();
+        let mut total = 0_u64;
+        for entry in &self.entries {
+            ensure!(
+                (1..=64).contains(&entry.path.len())
+                    && entry.path.iter().map(String::len).sum::<usize>() + entry.path.len() <= 4096,
+                "A copied file path is too deep or too long"
+            );
+            for component in &entry.path {
+                valid_component(component)?;
+            }
+            ensure!(
+                self.roots.contains(&entry.path[0]),
+                "Unknown copied file root"
+            );
+            let normalized = entry
+                .path
+                .iter()
+                .map(|v| v.to_lowercase())
+                .collect::<Vec<_>>();
+            ensure!(
+                paths.insert(normalized, entry).is_none(),
+                "Copied file paths collide"
+            );
+            if let DescriptorKind::File { size } = entry.kind {
+                total = total
+                    .checked_add(size)
+                    .filter(|v| *v <= MAX_TOTAL)
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("The copied files exceed their sharing limits")
+                    })?;
+            }
+        }
+        ensure!(total == self.total, "Invalid copied file total size");
+        for root in roots {
+            ensure!(paths.contains_key(&vec![root]), "Missing copied file root");
+        }
+        for path in paths.keys() {
+            if path.len() > 1 {
+                ensure!(
+                    paths.get(&path[..path.len() - 1]).is_some_and(|parent| {
+                        matches!(parent.kind, DescriptorKind::Directory)
+                            && parent.path == paths[path].path[..path.len() - 1]
+                    }),
+                    "A copied file parent folder is missing"
+                );
+            }
+        }
+        ensure!(
+            serde_json::to_vec(self)?.len() <= MAX_MANIFEST,
+            "Copied file metadata is too large"
+        );
+        Ok(())
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub enum Operation {
+    #[default]
+    Copy,
+    /// Reserved for consumers that can prove successful final-destination commit.
+    Move,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct NativeConsumer {
+    pub process_id: u32,
+    pub started: u64,
+    pub operation_id: String,
+}
+impl NativeConsumer {
+    pub fn validate(&self) -> Result<()> {
+        ensure!(
+            self.process_id > 0 && self.started > 0
+                && !self.operation_id.is_empty() && self.operation_id.len() <= 256
+                && !self.operation_id.chars().any(char::is_control),
+            "The native file operation could not be identified"
+        );
+        Ok(())
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub(crate) enum MoveOutcome {
+    Moved,
+    OriginalsRetained,
+    NeedsRecovery,
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Manifest {
@@ -81,7 +215,7 @@ impl Manifest {
     pub fn validate(&self) -> Result<()> {
         valid_id(&self.id)?;
         ensure!(
-            self.version == VERSION,
+            self.version == MANIFEST_VERSION,
             "Unsupported file transfer protocol"
         );
         ensure!(
@@ -165,6 +299,24 @@ impl Manifest {
         self.validate()?;
         Ok(hash(&serde_json::to_vec(self)?))
     }
+    pub fn description(&self) -> Description {
+        Description {
+            name: self.name.clone(),
+            roots: self.roots.clone(),
+            entries: self
+                .entries
+                .iter()
+                .map(|entry| Descriptor {
+                    path: entry.path.clone(),
+                    kind: match entry.kind {
+                        Kind::Directory => DescriptorKind::Directory,
+                        Kind::File { size, .. } => DescriptorKind::File { size },
+                    },
+                })
+                .collect(),
+            total: self.total,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -182,6 +334,34 @@ pub(crate) struct Stamp {
 /// A reconnect begins with the same manifest and receiver-verified prefix.
 #[derive(Debug, Deserialize, Serialize)]
 pub(crate) enum Packet {
+    ClipboardOffer {
+        id: String,
+        description: Description,
+        stamp: Stamp,
+        operation: Operation,
+    },
+    RetireOffer {
+        id: String,
+    },
+    LeaseOffer { offer: String, lease: String },
+    ReleaseOfferLease { offer: String, lease: String },
+    PasteDemand {
+        offer: String,
+        id: String,
+        operation: Operation,
+        lease: String,
+    },
+    PauseTransfer { id: String },
+    PasteFailed { id: String, error: String, retryable: bool },
+    NativeMoveCommitted {
+        offer: String,
+        id: String,
+        manifest: String,
+        paste: String,
+        consumer: NativeConsumer,
+        entries: Vec<u32>,
+    },
+    MoveFinalized { outcome: MoveOutcome },
     Announce {
         id: String,
         name: String,
@@ -228,7 +408,7 @@ mod tests {
     use super::*;
     fn fixture() -> Manifest {
         Manifest {
-            version: VERSION,
+            version: MANIFEST_VERSION,
             id: "12".repeat(16),
             name: "Folder".into(),
             roots: vec!["Folder".into()],
