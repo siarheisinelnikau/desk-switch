@@ -187,12 +187,12 @@ pub(super) fn capture(process_id: u32) -> Option<PathBuf> {
         Err(_) => {
             cancelled.store(true, Ordering::Release);
             let running = worker.active.lock().unwrap();
-            if let Some((active, thread_id)) = *running {
-                if active == id {
-                    // Zero means no server wait. Cancellation is best effort;
-                    // a noncooperating server can occupy only this one worker.
-                    let _ = unsafe { CoCancelCall(thread_id, 0) };
-                }
+            if let Some((active, thread_id)) = *running
+                && active == id
+            {
+                // Zero means no server wait. Cancellation is best effort;
+                // a noncooperating server can occupy only this one worker.
+                let _ = unsafe { CoCancelCall(thread_id, 0) };
             }
             None
         }

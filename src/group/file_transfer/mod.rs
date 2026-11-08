@@ -240,7 +240,6 @@ enum Command {
         target: String,
         paths: Vec<PathBuf>,
     },
-    Copied(Vec<PathBuf>),
     CopiedSelection(Option<crate::group::clipboard_files::Selection>),
     NativeBegin(Arc<lazy::Fetch>),
     NativeResult(
@@ -1025,7 +1024,6 @@ async fn run(
             },
             Some(command)=commands.recv()=>{match command {
                 Command::Send{id,target,paths}=>{let c=core.clone();tokio::spawn(async move{let _=prepare(c,id,vec![target],paths,Origin::Send).await;});},
-                Command::Copied(paths)=>{let generation=lazy::begin_capture(&core);let c=core.clone();tokio::spawn(async move{let _=lazy::capture(c,Some(crate::group::clipboard_files::Selection{sequence:0,paths,operation:Operation::Copy}),generation).await;});},
                 Command::CopiedSelection(selection)=>{let generation=lazy::begin_capture(&core);let c=core.clone();tokio::spawn(async move{let _=lazy::capture(c,selection,generation).await;});},
                 Command::NativeBegin(fetch)=>{let c=core.clone();tokio::spawn(async move{lazy::request(c,fetch).await;});},
                 Command::NativeResult(session,result)=>{let c=core.clone();tokio::spawn(async move{let _=lazy::native_result(c,session,result).await;});},
@@ -1658,7 +1656,17 @@ async fn incoming_connection(core: Arc<Core>, stream: TcpStream) -> Result<()> {
             entries,
         } => {
             if let Err(error) = lazy::source_move(
-                core, peer, offer, id, manifest, paste, consumer, entries, &mut pipe,
+                core,
+                peer,
+                lazy::SourceMoveRequest {
+                    offer,
+                    id,
+                    digest: manifest,
+                    paste,
+                    consumer,
+                    entries,
+                },
+                &mut pipe,
             )
             .await
             {

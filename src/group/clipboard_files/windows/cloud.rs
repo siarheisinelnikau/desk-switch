@@ -386,6 +386,9 @@ struct Cleanup {
     base: PathBuf,
     root_identity: Identity,
     marker: Vec<u8>,
+    // The native callback context points at the Arc inside this allocation.
+    // Boxing keeps that address stable when Cleanup moves to the cleanup thread.
+    #[allow(clippy::redundant_allocation)]
     context: Box<Arc<State>>,
     connection: Option<CF_CONNECTION_KEY>,
     registered: bool,
@@ -1157,12 +1160,10 @@ impl State {
         if std::env::var("GITHUB_ACTIONS").as_deref() == Ok("true")
             && std::env::var("RUNNER_ENVIRONMENT").as_deref() == Ok("github-hosted")
             && std::env::var("DESK_SWITCH_NATIVE_CLIPBOARD_TEST").as_deref() == Ok("1")
+            && let Some((expected, path)) = self.test_destination.lock().unwrap().as_ref()
+            && *expected == process
         {
-            if let Some((expected, path)) = self.test_destination.lock().unwrap().as_ref() {
-                if *expected == process {
-                    return Some(path.clone());
-                }
-            }
+            return Some(path.clone());
         }
         super::destination::capture(process)
     }
@@ -1196,10 +1197,12 @@ impl State {
                 .keys()
                 .any(|(_, id, started)| (*id, *started) == *key);
             let terminal = session.handle.is_terminal();
-            if !handles && terminal && self.offer.operation == Operation::Move {
-                if !session.handle.can_retry_move() || !self.moved.lock().unwrap().is_empty() {
-                    self.move_blocked.store(true, Ordering::Release);
-                }
+            if !handles
+                && terminal
+                && self.offer.operation == Operation::Move
+                && (!session.handle.can_retry_move() || !self.moved.lock().unwrap().is_empty())
+            {
+                self.move_blocked.store(true, Ordering::Release);
             }
             retain_native_session(self.offer.operation, handles, terminal)
         });
@@ -1308,10 +1311,10 @@ impl State {
             },
         );
         *self.native_activity.lock().unwrap() = Instant::now();
-        if self.offer.operation == Operation::Move {
-            if let Some(root) = self.owner.lock().unwrap().upgrade() {
-                monitor_move(&root);
-            }
+        if self.offer.operation == Operation::Move
+            && let Some(root) = self.owner.lock().unwrap().upgrade()
+        {
+            monitor_move(&root);
         }
         Ok(handle)
     }
@@ -1631,16 +1634,16 @@ fn hydrate(work: &Work, request: &Request) -> Result<()> {
     // Count only the filter's required demand from the external consumer.
     // Explicit pre-rename hydration and optional/speculative bytes never prove
     // that the native copy consumer requested a complete file.
-    if !request.self_process {
-        if let Some(consumer) = &request.consumer {
-            state
-                .consumer_reads
-                .lock()
-                .unwrap()
-                .entry((consumer.process_id, consumer.started, request.index))
-                .or_default()
-                .add(start, length, size)?;
-        }
+    if !request.self_process
+        && let Some(consumer) = &request.consumer
+    {
+        state
+            .consumer_reads
+            .lock()
+            .unwrap()
+            .entry((consumer.process_id, consumer.started, request.index))
+            .or_default()
+            .add(start, length, size)?;
     }
     state.ack_data(request, start, length, STATUS_OK)?;
     Ok(())
@@ -1673,21 +1676,19 @@ unsafe extern "system" fn fetch_callback(
             if let Err(error) = hydrate(&work, &request) {
                 let _ = work.root.state.fail_data(&request, STATUS_FAILED);
                 // A range cancellation does not cancel another reader's lease.
-                if !work.cancelled.load(Ordering::Acquire) {
-                    if let Some(consumer) = &request.consumer {
-                        if let Some(session) = work
-                            .root
-                            .state
-                            .sessions
-                            .lock()
-                            .unwrap()
-                            .get(&(consumer.process_id, consumer.started))
-                        {
-                            let _ = session
-                                .handle
-                                .native_complete(NativeResult::Failed(error.to_string()));
-                        }
-                    }
+                if !work.cancelled.load(Ordering::Acquire)
+                    && let Some(consumer) = &request.consumer
+                    && let Some(session) = work
+                        .root
+                        .state
+                        .sessions
+                        .lock()
+                        .unwrap()
+                        .get(&(consumer.process_id, consumer.started))
+                {
+                    let _ = session
+                        .handle
+                        .native_complete(NativeResult::Failed(error.to_string()));
                 }
             }
         });
@@ -2162,19 +2163,18 @@ fn start_move(root: Arc<Root>, request: Request, target: Option<PathBuf>) -> Res
     thread::spawn(move || {
         if let Err(error) = prepare_move(&work, &request, target) {
             let _ = work.root.state.ack_action(&request, kind, STATUS_FAILED);
-            if let Some(consumer) = &request.consumer {
-                if let Some(session) = work
+            if let Some(consumer) = &request.consumer
+                && let Some(session) = work
                     .root
                     .state
                     .sessions
                     .lock()
                     .unwrap()
                     .get(&(consumer.process_id, consumer.started))
-                {
-                    let _ = session.handle.native_complete(NativeResult::Failed(format!(
-                        "{error}; originals were retained"
-                    )));
-                }
+            {
+                let _ = session.handle.native_complete(NativeResult::Failed(format!(
+                    "{error}; originals were retained"
+                )));
             }
         }
     });

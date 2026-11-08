@@ -1174,7 +1174,7 @@ pub(super) fn protect_new_private_directory(directory: &Dir) -> Result<()> {
     );
     let mut security_information = DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION;
     if change_owner {
-        security_information = security_information | OWNER_SECURITY_INFORMATION;
+        security_information |= OWNER_SECURITY_INFORMATION;
     }
     let result = unsafe {
         SetSecurityInfo(
