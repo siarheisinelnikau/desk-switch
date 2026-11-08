@@ -79,9 +79,7 @@ impl Snapshot {
                 paste.operation == Operation::Move
                     && matches!(
                         paste.stage,
-                        PasteStage::NativeCompleted
-                            | PasteStage::RemovingOriginals
-                            | PasteStage::Moved
+                        PasteStage::RemovingOriginals | PasteStage::Moved
                     )
             }),
             name: transfer.name.clone(),
@@ -126,8 +124,6 @@ pub(super) fn status(transfer: &Transfer) -> &'static str {
             }
             PasteStage::Delivered if paste.reports_completion => "Finishing copy…",
             PasteStage::Delivered => "Files transferred",
-            PasteStage::NativeCompleted if paste.operation == Operation::Move => "Finishing move…",
-            PasteStage::NativeCompleted => "Copied",
             PasteStage::RemovingOriginals => "Removing originals…",
             PasteStage::OriginalsRetained => "Files copied; originals retained",
             PasteStage::Moved => "Moved",
@@ -163,11 +159,9 @@ pub(super) fn terminal(transfer: &Transfer) -> bool {
         return matches!(
             paste.stage,
             PasteStage::Cancelled | PasteStage::OriginalsRetained | PasteStage::Moved
-        ) || (paste.stage == PasteStage::NativeCompleted
-            && paste.operation == Operation::Copy)
-            || (paste.stage == PasteStage::Delivered
-                && !paste.reports_completion
-                && paste.operation == Operation::Copy);
+        ) || (paste.stage == PasteStage::Delivered
+            && !paste.reports_completion
+            && paste.operation == Operation::Copy);
     }
     matches!(transfer.phase, Phase::Completed | Phase::Cancelled)
 }
@@ -731,11 +725,8 @@ mod tests {
         transfer.paste.as_mut().unwrap().reports_completion = true;
         assert_eq!(status(&transfer), "Finishing copy…");
         assert!(!terminal(&transfer));
-        transfer.paste.as_mut().unwrap().stage = PasteStage::NativeCompleted;
-        assert_eq!(status(&transfer), "Copied");
-        assert!(terminal(&transfer));
         transfer.paste.as_mut().unwrap().operation = Operation::Move;
-        assert_eq!(status(&transfer), "Finishing move…");
+        assert_eq!(status(&transfer), "Waiting for move confirmation…");
         assert!(!terminal(&transfer));
         transfer.paste.as_mut().unwrap().stage = PasteStage::RemovingOriginals;
         assert_eq!(status(&transfer), "Removing originals…");

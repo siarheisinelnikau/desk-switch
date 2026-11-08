@@ -514,10 +514,6 @@ impl PasteSession for Session {
                 "The moved files have not been verified"
             );
         }
-        ensure!(
-            !matches!(result, NativeResult::Succeeded) || self.intent.operation == Operation::Copy,
-            "Moving originals requires a complete native Move receipt"
-        );
         if matches!(result, NativeResult::Cancelled | NativeResult::Failed(_)) {
             self.cancelled.store(true, Ordering::Release);
             self.fetch.changed.notify_all();
@@ -1580,21 +1576,6 @@ pub(super) async fn native_result(
                     save(core, job).await?;
                 }
             }
-        }
-        NativeResult::Succeeded => {
-            ensure!(
-                session.intent.operation == Operation::Copy,
-                "Move requires a complete native receipt"
-            );
-            {
-                let mut r = job.record.lock().unwrap();
-                if let Some(paste) = &mut r.view.paste {
-                    paste.stage = PasteStage::NativeCompleted;
-                }
-                r.view.phase = Phase::Completed;
-            }
-            core.wake();
-            save(core, job).await?;
         }
         NativeResult::MoveCommitted { consumer, entries } => {
             {
