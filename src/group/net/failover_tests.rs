@@ -179,6 +179,7 @@ impl FailoverWorkspace {
         self.computers[index].state.as_ref().unwrap()
     }
 
+    #[track_caller]
     fn wait(&mut self, condition: impl Fn(&[Computer], &[(usize, Event)]) -> bool) {
         let checked_from = self.checked_from;
         until(
@@ -191,6 +192,7 @@ impl FailoverWorkspace {
         );
     }
 
+    #[track_caller]
     fn wait_ready(&mut self, alive: &[usize]) {
         let keys = self.keys.clone();
         self.wait(|computers, events| {
@@ -268,6 +270,7 @@ impl FailoverWorkspace {
         );
     }
 
+    #[track_caller]
     fn clipboard(&mut self, sender: usize, value: bool, alive: &[usize]) {
         let mut settings = self.state(sender).settings.clone();
         settings.clipboard_enabled = value;

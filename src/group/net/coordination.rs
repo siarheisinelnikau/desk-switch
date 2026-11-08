@@ -627,7 +627,8 @@ impl Control {
         let key = member.node.key.clone();
         ensure!(
             self.trusted().contains(&key)
-                || self.joining.as_ref().is_some_and(|(peer, _)| peer == &key),
+                || self.joining.as_ref().is_some_and(|(peer, _)| peer == &key)
+                || self.additions.iter().any(|member| member.node.key == key),
             "Unknown workspace member"
         );
         member.input_ready = 0;
@@ -1460,6 +1461,122 @@ pub(super) async fn run(
 mod tests {
     use super::*;
     use crate::group::consensus::{Entry, Message, Rpc};
+
+    #[test]
+    fn approved_queued_observation_waits_for_prior_membership_without_gaining_authority() {
+        let all = model::tests::fixture(4);
+        let keys = all.members.keys().cloned().collect::<Vec<_>>();
+        let own = keys[0].clone();
+        let mut initial = all.clone();
+        initial.members.retain(|key, _| key == &own);
+        let mut engine = Engine::new(
+            own.clone(),
+            HardState::bootstrap(
+                own.clone(),
+                [own.clone()].into(),
+                serde_json::to_vec(&initial).unwrap(),
+            )
+            .unwrap(),
+            0,
+        )
+        .unwrap();
+        engine.tick(0).unwrap();
+        let mut admitted = all.clone();
+        admitted.members.retain(|key, _| keys[..2].contains(key));
+        admitted.revision += 1;
+        engine
+            .begin_add(keys[1].clone(), serde_json::to_vec(&admitted).unwrap(), 1)
+            .unwrap();
+        engine
+            .receive(
+                &keys[1],
+                Rpc {
+                    workspace_id: own.clone(),
+                    term: engine.hard_state().term,
+                    message: Message::Appended {
+                        probe: 1,
+                        success: true,
+                        matched: 2,
+                        conflict: 0,
+                    },
+                },
+                2,
+            )
+            .unwrap();
+        assert_eq!(engine.committed().0, 2);
+        assert!(engine.hard_state().configuration.joint.is_some());
+        assert!(engine.busy(), "The prior admission has not finalized");
+        let local = admitted.members[&own].clone();
+        let (events, _) = mpsc::channel();
+        let (incoming, _) = queue::channel(8);
+        let mut control = Control {
+            own: own.clone(),
+            dir: PathBuf::new(),
+            identity: config::Identity {
+                private: [0; 32],
+                public: [0; 32],
+            },
+            local: local.clone(),
+            canonical: admitted.clone(),
+            visible: admitted,
+            observed: [(own, local)].into(),
+            locations: Default::default(),
+            engine: Some(engine),
+            saved: None,
+            admission: None,
+            links: Default::default(),
+            internal: Internal {
+                sender: incoming,
+                dialing: Default::default(),
+            },
+            notify: Notify {
+                events,
+                snapshot: Default::default(),
+                clipboard: Default::default(),
+                ctx: egui::Context::default(),
+            },
+            receipts: Default::default(),
+            actions: Default::default(),
+            additions: [all.members[&keys[2]].clone()].into(),
+            joining: None,
+            last_coordination: None,
+            clock: Instant::now(),
+            connected_once: true,
+            state_dirty: true,
+            auto_dirty: true,
+            last_directory: None,
+            last_reconnect: Default::default(),
+            fail_commit_persist: false,
+        };
+        let mut observation = all.members[&keys[2]].clone();
+        observation.node.name = "Approved pending computer".into();
+        control
+            .packet(&keys[2], Packet::Observation(Box::new(observation)))
+            .unwrap();
+        control.refresh().unwrap();
+        assert!(control.observed.contains_key(&keys[2]));
+        assert!(!control.trusted().contains(&keys[2]));
+        assert!(!control.canonical.members.contains_key(&keys[2]));
+        assert!(!control.visible.members.contains_key(&keys[2]));
+        assert_eq!(control.engine.as_ref().unwrap().committed().0, 2);
+        assert!(control.action(&keys[2], Action::ReturnInput).is_err());
+        assert!(
+            control
+                .packet(
+                    &keys[2],
+                    Packet::Observation(Box::new(all.members[&keys[3]].clone()))
+                )
+                .is_err()
+        );
+        assert!(
+            control
+                .packet(
+                    &keys[3],
+                    Packet::Observation(Box::new(all.members[&keys[3]].clone()))
+                )
+                .is_err()
+        );
+    }
 
     #[test]
     fn maximum_prefix_and_pending_admission_fit_separate_workspace_packets() {
