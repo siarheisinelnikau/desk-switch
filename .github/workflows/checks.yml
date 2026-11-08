@@ -2,6 +2,13 @@ name: Checks
 
 on: [push, pull_request]
 
+permissions:
+  contents: read
+
+concurrency:
+  group: checks-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   checks:
     strategy:
@@ -10,7 +17,9 @@ jobs:
         os: [ubuntu-24.04, windows-2022]
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v7.0.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - if: runner.os == 'Linux'
         run: |
           sudo apt-get update -qq
@@ -24,7 +33,7 @@ jobs:
         if: runner.os == 'Linux'
         timeout-minutes: 2
         run: /usr/bin/python3 tools/test_linux_file_paste.py --out target/native-file-paste-proof
-      - uses: actions/upload-artifact@v7.0.2
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: runner.os == 'Linux' && always()
         with:
           name: ubuntu-native-file-paste-proof
@@ -40,7 +49,7 @@ jobs:
         if: runner.os == 'Windows'
         timeout-minutes: 7
         run: python tools/test_windows_file_paste.py --out target/windows-native-file-paste-proof
-      - uses: actions/upload-artifact@v7.0.2
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: runner.os == 'Windows' && always()
         with:
           name: windows-native-file-paste-proof
@@ -52,7 +61,7 @@ jobs:
         run: |
           cargo build --locked --profile diagnostic
           timeout 90s xvfb-run -a -s '-screen 0 1920x1080x24' /usr/bin/python3 tools/test_linux_tray.py --binary target/diagnostic/desk-switch --out target/linux-tray-proof
-      - uses: actions/upload-artifact@v7.0.2
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: runner.os == 'Linux' && always()
         with:
           name: ubuntu-tray-lifecycle-proof
