@@ -118,10 +118,10 @@ pub fn run(
                     cursor: WindowsCursor(hook_thread, sharing.mouse),
                 },
             ));
+            // SAFETY: the thread id belongs to the hook thread that owns this
+            // message queue, and PostThreadMessage copies its parameters
+            // instead of keeping the pointers.
             unsafe {
-                // SAFETY: the thread id belongs to the hook thread that owns
-                // this message queue, and PostThreadMessage copies its
-                // parameters instead of keeping the pointers.
                 PostThreadMessageW(hook_thread, WM_QUIT, 0, 0);
             }
             result

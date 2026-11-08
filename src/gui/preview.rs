@@ -363,6 +363,8 @@ fn run_native_preview(
             let backend = cc
                 .gl
                 .as_ref()
+                // SAFETY: the glow context is owned by the renderer that created it and
+                // stays alive for this frame.
                 .map(|gl| unsafe {
                     format!(
                         "Glow / OpenGL: {} / {}",

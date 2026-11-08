@@ -77,6 +77,9 @@ fn ddcutil(bus: u32, args: &[&str]) -> Result<String> {
     use std::os::unix::process::CommandExt;
     let parent = std::process::id();
     let mut command = Command::new("ddcutil");
+    // SAFETY: pre_exec runs between fork and exec in the child, where only
+    // async-signal-safe operations are allowed. The closure sets the parent
+    // death signal and reports failures through the exec pipe.
     unsafe {
         command.pre_exec(move || {
             if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM as libc::c_ulong) != 0 {

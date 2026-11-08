@@ -227,6 +227,8 @@ fn show_already_open_notice(dir: &std::path::Path) {
         .encode_utf16()
         .chain(Some(0))
         .collect::<Vec<_>>();
+    // SAFETY: the message and title are NUL-terminated UTF-16 buffers that
+    // outlive the call, and the window handle may be null.
     unsafe {
         MessageBoxW(
             std::ptr::null_mut(),
