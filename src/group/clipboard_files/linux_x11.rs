@@ -99,6 +99,7 @@ impl X11 {
         let (send, reply) = mpsc::sync_channel(1);
         self.queue(Command::Read(send), reply)
     }
+    #[cfg(test)]
     pub(super) fn write(&mut self, paths: &[PathBuf]) -> Result<()> {
         self.publish(paths, None).map(|_| ())
     }

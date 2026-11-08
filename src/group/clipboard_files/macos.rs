@@ -180,10 +180,6 @@ pub(super) fn read() -> Result<Option<Selection>> {
     })
 }
 
-pub(super) fn write(paths: &[PathBuf]) -> Result<()> {
-    write_impl(paths, None).map(|_| ())
-}
-
 pub(super) fn write_if_current(paths: &[PathBuf], expected: u64) -> Result<bool> {
     write_impl(paths, Some(expected))
 }
