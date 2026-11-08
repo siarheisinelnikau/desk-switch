@@ -215,6 +215,10 @@ struct HookState {
 }
 thread_local! { static MOTION_HOOK: RefCell<Option<HookState>> = const {RefCell::new(None)}; }
 
+// SAFETY: This callback is installed with SetWindowsHookExW as WH_MOUSE_LL, so
+// it must use the hook-procedure calling convention. Windows passes the hook
+// code and the message parameters as opaque values that are only forwarded to
+// CallNextHookEx.
 unsafe extern "system" fn native_motion_hook(code: i32, message: WPARAM, data: LPARAM) -> LRESULT {
     let blocked = code >= 0
         && MOTION_HOOK.with(|hook| {
@@ -229,6 +233,10 @@ unsafe extern "system" fn native_motion_hook(code: i32, message: WPARAM, data: L
                     .unwrap_or_else(|poison| poison.into_inner());
                 let before = state.crossing;
                 let blocked =
+                    // SAFETY: For a low-level mouse hook the OS documents `data`
+                    // as a pointer to an MSLLHOOKSTRUCT that stays valid for the
+                    // duration of the callback. The reference is only borrowed
+                    // while `state.mouse` reads it.
                     state.mouse(message as u32, unsafe { &*(data as *const MSLLHOOKSTRUCT) });
                 (blocked, state.crossing != before)
             };
@@ -241,12 +249,23 @@ unsafe extern "system" fn native_motion_hook(code: i32, message: WPARAM, data: L
     if blocked {
         1
     } else {
+        // SAFETY: A null hook handle is permitted and means the next hook in
+        // the chain is called. The parameters are forwarded unchanged, so no
+        // borrowed memory outlives this call.
         unsafe { CallNextHookEx(null_mut(), code, message, data) }
     }
 }
 
+// SAFETY: This callback is installed with SetWindowsHookExW as WH_KEYBOARD_LL,
+// so it must use the hook-procedure calling convention. Windows passes the
+// hook code and the message parameters as opaque values that are only
+// forwarded to CallNextHookEx.
 unsafe extern "system" fn native_key_hook(code: i32, message: WPARAM, data: LPARAM) -> LRESULT {
     if code >= 0 {
+        // SAFETY: For a low-level keyboard hook the OS documents `data` as a
+        // pointer to a KBDLLHOOKSTRUCT that stays valid for the duration of
+        // the callback. The reference is only borrowed for the `state.key`
+        // call below.
         let data = unsafe { &*(data as *const KBDLLHOOKSTRUCT) };
         MOTION_HOOK.with(|hook| {
             if let Some(hook) = hook.borrow().as_ref() {
@@ -258,6 +277,9 @@ unsafe extern "system" fn native_key_hook(code: i32, message: WPARAM, data: LPAR
             }
         });
     }
+    // SAFETY: A null hook handle is permitted for CallNextHookEx, and the
+    // parameters are forwarded unchanged, so nothing borrowed outlives this
+    // call.
     unsafe { CallNextHookEx(null_mut(), code, message, data) }
 }
 
@@ -287,10 +309,17 @@ impl MotionGuard {
             .map(usize::from)
             .contains(&code)
             {
+                // SAFETY: `code` is a virtual-key code below 256 and
+                // GetAsyncKeyState only reads the shared keyboard state without
+                // touching any pointer. The returned SHORT is read as a signed
+                // value to detect the pressed bit.
                 *held = unsafe { GetAsyncKeyState(code as i32) } < 0;
             }
         }
         let buttons = [VK_LBUTTON, VK_RBUTTON, VK_MBUTTON, VK_XBUTTON1, VK_XBUTTON2]
+            // SAFETY: Every value is a mouse-button virtual-key code and
+            // GetAsyncKeyState only reads the shared input state. The returned
+            // SHORT is read as a signed value to detect the pressed bit.
             .map(|code| unsafe { GetAsyncKeyState(i32::from(code)) } < 0);
         let state = Arc::new(Mutex::new(MotionState::new(point, keys, buttons)));
         let worker_state = Arc::clone(&state);
@@ -304,6 +333,11 @@ impl MotionGuard {
                 let setup = (|| -> Result<_> {
                     let coordinates = win_monitor::PhysicalCoordinates::enter()?;
                     let mut message = MSG::default();
+                    // SAFETY: `message` is a writable local MSG and the null
+                    // window handle selects this worker's own message queue.
+                    // The call creates that queue before the low-level hooks
+                    // are installed, which the hooks require to deliver their
+                    // callbacks on this thread.
                     unsafe {
                         PeekMessageW(&mut message, null_mut(), 0, 0, PM_NOREMOVE);
                     }
@@ -313,7 +347,15 @@ impl MotionGuard {
                             changed,
                         })
                     });
+                    // SAFETY: A null module path asks for the current process
+                    // module, which stays loaded for the process lifetime and
+                    // identifies the module that owns the hook callbacks.
                     let module = unsafe { GetModuleHandleW(null()) };
+                    // SAFETY: `native_motion_hook` is a static function with the
+                    // required hook-procedure calling convention, so it stays
+                    // valid while the hook is installed, and `module` is this
+                    // process's own module as required for a low-level hook. A
+                    // null result is checked by the caller.
                     let mouse = unsafe {
                         SetWindowsHookExW(WH_MOUSE_LL, Some(native_motion_hook), module, 0)
                     };
@@ -321,10 +363,19 @@ impl MotionGuard {
                         !mouse.is_null(),
                         "cannot install Windows native motion guard"
                     );
+                    // SAFETY: `native_key_hook` is a static function with the
+                    // required hook-procedure calling convention and outlives
+                    // the hook, and `module` is this process's own module. A
+                    // null result is checked and the mouse hook is unhooked
+                    // again.
                     let keyboard = unsafe {
                         SetWindowsHookExW(WH_KEYBOARD_LL, Some(native_key_hook), module, 0)
                     };
                     if keyboard.is_null() {
+                        // SAFETY: `mouse` is the handle returned by
+                        // SetWindowsHookExW on this thread and is unhooked
+                        // exactly once on this failure path. The handle is not
+                        // used afterwards.
                         unsafe {
                             UnhookWindowsHookEx(mouse);
                         }
@@ -335,11 +386,23 @@ impl MotionGuard {
                 match setup {
                     Ok((_coordinates, mouse, keyboard)) => {
                         worker_running.store(true, Ordering::Release);
+                        // SAFETY: GetCurrentThreadId returns the identifier of
+                        // this worker thread, which is published solely to post
+                        // WM_QUIT to its own message queue. It takes no
+                        // pointers and cannot fail.
                         if ready.send(Ok(unsafe { GetCurrentThreadId() })).is_ok() {
                             let mut message = MSG::default();
+                            // SAFETY: `message` is a writable local MSG and the
+                            // null window handle selects this worker's own
+                            // message queue. The call blocks until a message for
+                            // this thread arrives and WM_QUIT ends the loop.
                             while unsafe { GetMessageW(&mut message, null_mut(), 0, 0) } > 0 {}
                         }
                         worker_running.store(false, Ordering::Release);
+                        // SAFETY: Both handles were returned by
+                        // SetWindowsHookExW on this worker thread and are
+                        // unhooked exactly once, after the message loop ended,
+                        // so no callback can run afterwards.
                         unsafe {
                             UnhookWindowsHookEx(mouse);
                             UnhookWindowsHookEx(keyboard);
@@ -418,6 +481,10 @@ impl MotionGuard {
 impl Drop for MotionGuard {
     fn drop(&mut self) {
         let _ = self.active(false);
+        // SAFETY: `self.thread` identifies the worker thread that owns the
+        // motion hooks. The WM_QUIT message carries only the constant message
+        // id and no pointers, and a failed post only means the worker already
+        // exited.
         unsafe {
             PostThreadMessageW(self.thread, WM_QUIT, 0, 0);
         }
@@ -446,6 +513,10 @@ impl NativeSink {
     pub fn new(mut edge: Option<Edge>) -> Result<Self> {
         // Preserve physical coordinates for the receiver's cursor overlay too.
         // Scoped native operations also work when process awareness was set earlier.
+        // SAFETY: The awareness context is a system-provided value; the call
+        // only changes the DPI awareness of this process and reports whether
+        // it succeeded. It runs before any screen coordinate is read, which
+        // the following code depends on.
         unsafe {
             SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
         }
@@ -641,6 +712,10 @@ fn inject(event: Input) -> Result<()> {
 
 fn send(input: INPUT) -> Result<()> {
     ensure!(
+        // SAFETY: `input` is a fully initialized local INPUT, and the count and
+        // size arguments describe exactly one struct, so SendInput reads only
+        // that struct while the call is in progress. The call copies the
+        // struct into the system input queue and does not retain the pointer.
         unsafe { SendInput(1, &input, size_of::<INPUT>() as i32) } == 1,
         "Windows rejected SendInput; check the interactive desktop and application privileges"
     );
@@ -1286,6 +1361,9 @@ mod tests {
         let mut button_position = None;
         for input in queued {
             assert_eq!(input.r#type, INPUT_MOUSE);
+            // SAFETY: The assertion above proves that the union's mouse member
+            // is the initialized one, and `MOUSEINPUT` is a plain Copy value,
+            // so reading it cannot go out of bounds.
             let mouse = unsafe { input.Anonymous.mi };
             if mouse.dwFlags & MOUSEEVENTF_MOVE != 0 {
                 assert_eq!(mouse.dwFlags & MOUSEEVENTF_ABSOLUTE, 0);
