@@ -174,8 +174,10 @@ pub struct NativeConsumer {
 impl NativeConsumer {
     pub fn validate(&self) -> Result<()> {
         ensure!(
-            self.process_id > 0 && self.started > 0
-                && !self.operation_id.is_empty() && self.operation_id.len() <= 256
+            self.process_id > 0
+                && self.started > 0
+                && !self.operation_id.is_empty()
+                && self.operation_id.len() <= 256
                 && !self.operation_id.chars().any(char::is_control),
             "The native file operation could not be identified"
         );
@@ -343,16 +345,28 @@ pub(crate) enum Packet {
     RetireOffer {
         id: String,
     },
-    LeaseOffer { offer: String, lease: String },
-    ReleaseOfferLease { offer: String, lease: String },
+    LeaseOffer {
+        offer: String,
+        lease: String,
+    },
+    ReleaseOfferLease {
+        offer: String,
+        lease: String,
+    },
     PasteDemand {
         offer: String,
         id: String,
         operation: Operation,
         lease: String,
     },
-    PauseTransfer { id: String },
-    PasteFailed { id: String, error: String, retryable: bool },
+    PauseTransfer {
+        id: String,
+    },
+    PasteFailed {
+        id: String,
+        error: String,
+        retryable: bool,
+    },
     NativeMoveCommitted {
         offer: String,
         id: String,
@@ -361,7 +375,9 @@ pub(crate) enum Packet {
         consumer: NativeConsumer,
         entries: Vec<u32>,
     },
-    MoveFinalized { outcome: MoveOutcome },
+    MoveFinalized {
+        outcome: MoveOutcome,
+    },
     Announce {
         id: String,
         name: String,

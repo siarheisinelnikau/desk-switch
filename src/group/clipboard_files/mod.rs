@@ -58,7 +58,8 @@ pub(crate) fn write_if_current(paths: &[PathBuf], expected: u64) -> Result<bool>
 }
 
 pub(crate) fn publish_offer_if_current(
-    offer: RemoteOffer, expected: u64,
+    offer: RemoteOffer,
+    expected: u64,
 ) -> Result<Option<Box<dyn PublishedOffer>>> {
     #[cfg(windows)]
     return windows::publish_offer_if_current(offer, expected);
@@ -77,7 +78,10 @@ pub(crate) fn is_provider_path(path: &std::path::Path) -> bool {
     #[cfg(target_os = "linux")]
     return linux::is_provider_path(path);
     #[cfg(not(any(windows, target_os = "linux")))]
-    { let _ = path; false }
+    {
+        let _ = path;
+        false
+    }
 }
 
 /// Optional native compare-and-clear. Never emulate this with a separate read
@@ -88,5 +92,8 @@ pub(crate) fn clear_cut_if_current(paths: &[PathBuf], expected: u64) -> Result<b
     #[cfg(target_os = "linux")]
     return linux::clear_cut_if_current(paths, expected);
     #[cfg(not(any(windows, target_os = "linux")))]
-    { let _ = (paths, expected); Ok(false) }
+    {
+        let _ = (paths, expected);
+        Ok(false)
+    }
 }
