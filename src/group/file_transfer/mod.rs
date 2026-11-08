@@ -232,6 +232,12 @@ struct Core {
     reservations: Mutex<BTreeMap<String, u64>>,
     events: Mutex<VecDeque<FileEvent>>,
     lazy: Mutex<lazy::State>,
+    pending_results: Mutex<
+        VecDeque<(
+            Arc<lazy::Session>,
+            crate::group::clipboard_files::provider::NativeResult,
+        )>,
+    >,
     commands: mpsc::Sender<Command>,
 }
 enum Command {
@@ -355,6 +361,7 @@ impl Service {
             reservations: Mutex::new(BTreeMap::new()),
             events: Mutex::new(VecDeque::new()),
             lazy: Mutex::new(lazy::State::default()),
+            pending_results: Mutex::new(VecDeque::new()),
             commands: commands.clone(),
         });
         let (trust, updates) = watch::channel(TrustSnapshot::default());
@@ -644,6 +651,26 @@ impl Core {
     fn note(&self, message: impl Into<String>) {
         *self.notice.lock().unwrap() = Some(message.into());
         self.wake();
+    }
+    /// Native callbacks must not lose their terminal result when the bounded
+    /// command queue is busy. Retry queued results from the maintenance tick.
+    fn flush_pending_results(&self) {
+        let mut pending = self.pending_results.lock().unwrap();
+        let index = 0;
+        while index < pending.len() {
+            let (session, result) = pending.remove(index).unwrap();
+            match self
+                .commands
+                .try_send(Command::NativeResult(session, result))
+            {
+                Ok(()) => {}
+                Err(mpsc::error::TrySendError::Full(Command::NativeResult(session, result))) => {
+                    pending.insert(index, (session, result));
+                    break;
+                }
+                Err(_) => break,
+            }
+        }
     }
     fn allowed(&self, workspace: &str, peer: &str, origin: Origin) -> bool {
         let trust = self.trust.lock().unwrap();
