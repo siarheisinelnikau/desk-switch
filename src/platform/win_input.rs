@@ -94,6 +94,7 @@ impl HookData {
     }
 
     fn physical(&mut self, index: usize, button: bool, down: bool, input: Option<Input>) -> bool {
+        self.router.cancel_dwell();
         let (token, route) = self.gate.current();
         let owners = if button {
             &mut self.buttons[..]
@@ -152,6 +153,7 @@ impl HookData {
     }
 
     fn keyboard(&mut self, data: &KBDLLHOOKSTRUCT) -> bool {
+        self.router.cancel_dwell();
         if data.flags & LLKHF_INJECTED != 0 {
             return false;
         }
@@ -188,6 +190,7 @@ impl HookData {
 
     fn mouse(&mut self, message: u32, data: &MSLLHOOKSTRUCT) -> bool {
         if data.flags & LLMHF_INJECTED != 0 || !self.sharing.mouse {
+            self.router.cancel_dwell();
             return false;
         }
         self.refresh_routes();
@@ -227,12 +230,14 @@ impl HookData {
                             (current.x.into(), current.y.into(), dx.into(), dy.into());
                         // Query async key state only at an actual configured edge.
                         // Ordinary pointer motion remains an in-memory lookup.
-                        let hit = if self.router.crossing_if(x, y, dx, dy, false).is_some() {
-                            let idle = !self.toggle_down && !self.emergency_down && self.idle();
-                            self.router.crossing_if(x, y, dx, dy, idle)
-                        } else {
-                            None
-                        };
+                        let allow = !self.router.would_cross(x, y, dx, dy)
+                            || (!self.router.routes().policy.paused
+                                && !self.toggle_down
+                                && !self.emergency_down
+                                && self.idle());
+                        // Pullback must reach Router too, so pressure cannot remain
+                        // armed while the cursor moves away from an edge.
+                        let hit = self.router.crossing_if(x, y, dx, dy, allow);
                         match hit {
                             Some(Hit::Cross(crossing)) => {
                                 self.control(token, Control::Boundary { token, crossing });
@@ -348,6 +353,7 @@ unsafe extern "system" fn display_notification(
                 && let Some(state) = state.as_mut()
             {
                 state.geometry_dirty = true;
+                state.router.cancel_dwell();
             }
         });
         return 0;
@@ -483,7 +489,8 @@ impl Hooks {
                 }
                 _ if msg.message == REQUEST_TOGGLE => {
                     DATA.with(|state| {
-                        if let Some(state) = state.borrow().as_ref() {
+                        if let Some(state) = state.borrow_mut().as_mut() {
+                            state.router.cancel_dwell();
                             state.toggle();
                         }
                     });

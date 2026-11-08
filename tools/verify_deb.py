@@ -19,7 +19,7 @@ def check(package):
         actual = subprocess.check_output(["dpkg-deb", "--field", str(package), field], text=True).strip()
         assert actual == expected, (field, actual)
     dependencies = subprocess.check_output(["dpkg-deb", "--field", str(package), "Depends"], text=True)
-    for required in ["ddcutil", "pipewire-bin", "pipewire-pulse", "pulseaudio-utils", "acl", "udev", "python3", "pkexec", "polkitd", "openssl"]:
+    for required in ["ddcutil", "pipewire-bin", "pipewire-pulse", "pulseaudio-utils", "acl", "udev", "python3", "pkexec", "polkitd", "openssl", "libdbus-1-3", "zenity"]:
         assert any(re.fullmatch(r"\s*" + re.escape(required) + r"(?:\s*\([^)]*\))?\s*", dependency)
                    for dependency in dependencies.split(",")), f"{required} must be a required runtime dependency"
     with tempfile.TemporaryDirectory(prefix="desk-switch-deb-check-") as temporary:
@@ -61,6 +61,8 @@ def check(package):
         assert bundled.read_bytes() == original, "launcher must not mutate the package-owned executable"
         assert not (work / "user data/desk-switch/application/desk-switch").exists()
         assert (extracted / "usr/share/doc/desk-switch/rust-auto-updator-LICENSE").is_file()
+        for notice in ["cap-std-LICENSE-MIT", "rfd-LICENSE", "rfd-window-identifier-LICENSE"]:
+            assert (extracted / "usr/share/doc/desk-switch" / notice).read_bytes() == (ROOT / "assets/third-party/file-transfer" / notice).read_bytes()
         print("PASS: Debian metadata, required utilities, fixed password-free policies, pinned update key, menu icon, launcher, package-owned binary and third-party notices")
 
 

@@ -39,6 +39,8 @@ pub(super) struct Group {
     pub selected: String,
     pub request: Option<Request>,
     pub data: Data,
+    pub(super) coordination: Option<Coordination>,
+    pub(super) file_transfer: Option<crate::group::file_transfer::Service>,
     pub layout_editor: super::group_layout::Editor,
     network_log: std::collections::VecDeque<String>,
     network_reconnecting: std::collections::BTreeSet<String>,
@@ -76,6 +78,13 @@ pub(super) struct Group {
     pub clipboard: Option<crate::group::clipboard::Clipboard>,
 }
 
+#[derive(Clone, Copy)]
+pub(super) struct Coordination {
+    pub writable: bool,
+    pub online: usize,
+    pub quorum: usize,
+}
+
 #[derive(Clone, Copy, Default, PartialEq)]
 enum AddMode {
     #[default]
@@ -89,6 +98,26 @@ struct AddPending {
 }
 
 impl Group {
+    pub(super) fn writable(&self) -> bool {
+        self.coordination.is_none_or(|status| status.writable)
+    }
+
+    fn connection_status(&self, ui: &mut egui::Ui) {
+        if let Some(status) = self.coordination.filter(|status| !status.writable) {
+            let enough = status.online >= status.quorum;
+            ui.strong(tr(if enough {
+                "Reconnecting…"
+            } else {
+                "Waiting for another computer"
+            }));
+            ui.weak(tr(if enough {
+                "Shared controls will be available after reconnecting."
+            } else {
+                "Connect another saved computer to change shared settings."
+            }));
+        }
+    }
+
     fn log_network(&mut self, message: String) {
         let message = workspace::management::status_text(message, 288);
         if self.network_log.back() == Some(&message) {
@@ -210,6 +239,7 @@ impl Desktop {
                     Action::ReturnInput => {
                         let _ = state.return_input();
                     }
+                    Action::EdgePause(paused) => state.edge_paused = paused,
                     _ => {}
                 }
             }
@@ -281,6 +311,7 @@ impl Desktop {
                 self.group.probe = Some(workspace::hardware::Probe::start(ctx.clone())?);
                 self.group.clipboard =
                     Some(crate::group::clipboard::Clipboard::start(ctx.clone())?);
+                self.start_file_transfers(ctx);
                 self.prefs.discovery = true;
                 Ok::<_, anyhow::Error>(())
             })();
@@ -341,6 +372,18 @@ impl Desktop {
             .unwrap_or_default();
         for event in events {
             match event {
+                Event::Coordination {
+                    leader,
+                    writable,
+                    online,
+                    quorum,
+                } => {
+                    self.group.coordination = Some(Coordination {
+                        writable: writable && leader.is_some(),
+                        online,
+                        quorum,
+                    });
+                }
                 Event::Request(request) => {
                     self.page = Page::Overview;
                     self.group.add_open = false;
@@ -540,6 +583,7 @@ impl Desktop {
                     });
                 }
             }
+            self.update_file_transfers(&state);
             let specs = if self.quitting || self.install_pending {
                 BTreeMap::new()
             } else {
@@ -686,6 +730,7 @@ impl Desktop {
             "Share your devices across all connected computers. Change settings from any computer.",
         ));
         ui.add_space(12.0);
+        self.group.connection_status(ui);
         if let Some(request) = self.group.request.clone() {
             egui::Frame::group(ui.style())
                 .inner_margin(16)
@@ -784,9 +829,6 @@ impl Desktop {
                                         }
                                     });
                                     let mut roles = Vec::new();
-                                    if key == &state.hub {
-                                        roles.push(tr("Workspace coordinator"));
-                                    }
                                     if plan.input.as_ref() == Some(key) {
                                         roles.push(tr("Keyboard & mouse"));
                                     }
@@ -814,6 +856,7 @@ impl Desktop {
                                         if ui
                                             .add_enabled(
                                                 member.compatible()
+                                                    && self.group.writable()
                                                     && (!active || failed || video_needed)
                                                     && !state.switch_pending(),
                                                 egui::Button::new(tr(if failed {
@@ -833,10 +876,12 @@ impl Desktop {
                                             });
                                         }
                                         if ui.button(tr("Settings")).clicked() {
+                                            self.transfers.close();
                                             self.group.add_open = false;
                                             self.group.selected = key.clone();
                                             self.page = Page::Application;
                                         }
+                                        self.transfer_card_action(ui, key, member.compatible());
                                     });
                                     if let Some(error) = &member.node.monitor_error {
                                         ui.colored_label(
@@ -865,10 +910,10 @@ impl Desktop {
                     .as_ref()
                     .and_then(|clipboard| clipboard.status());
                 let mut arrange = false;
-                let layout_supported = state
-                    .members
-                    .get(&state.hub)
-                    .is_some_and(Member::compatible);
+                let layout_supported = self.group.writable();
+                if !self.group.writable() {
+                    ui.disable();
+                }
                 if ui.available_width() >= 700.0 {
                     ui.columns(2, |columns| {
                         arrange = sharing_toggles(
@@ -1058,19 +1103,15 @@ impl Desktop {
         let Some(state) = self.group.workspace.clone() else {
             return;
         };
+        self.group.connection_status(ui);
         ui.horizontal_wrapped(|ui| {
             ui.strong(tr("Workspace displays"));
             if ui
                 .add_enabled(
-                    state
-                        .members
-                        .get(&state.hub)
-                        .is_some_and(Member::compatible),
+                    self.group.writable(),
                     egui::Button::new(tr("Arrange displays…")),
                 )
-                .on_disabled_hover_text(tr(
-                    "Connect and update the workspace coordinator to arrange displays.",
-                ))
+                .on_disabled_hover_text(tr("Reconnect the workspace to arrange displays."))
                 .clicked()
             {
                 self.group.layout_editor.open(&state);
@@ -1079,6 +1120,30 @@ impl Desktop {
         ui.weak(tr(
             "Choose where the pointer goes when it reaches a screen edge.",
         ));
+        let mut settings = state.settings.clone();
+        ui.add_enabled_ui(self.group.writable(), |ui| {
+            ui.checkbox(
+                &mut settings.edge,
+                tr("Move between computers at the screen edge"),
+            );
+            ui.add_enabled_ui(settings.edge, |ui| {
+                edge_settings(ui, &mut settings);
+                if state.edge_paused {
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label(tr("Edge switching is paused"));
+                        if ui.small_button(tr("Resume edge switching")).clicked() {
+                            self.group_action(Action::EdgePause(false));
+                        }
+                    });
+                }
+            });
+        });
+        if settings != state.settings {
+            self.group_action(Action::Settings {
+                expected: state.revision,
+                value: settings,
+            });
+        }
         ui.add_space(12.0);
         ui.separator();
         ui.add_space(12.0);
@@ -1249,16 +1314,6 @@ impl Desktop {
                         .map(|version| version.app.as_str())
                         .unwrap_or("—")
                 ));
-                if self
-                    .group
-                    .workspace
-                    .as_ref()
-                    .is_some_and(|state| state.hub == member.node.key)
-                {
-                    ui.weak(tr(
-                        "Update this computer last to keep workspace management available.",
-                    ));
-                }
                 if management.update.failed {
                     ui.colored_label(ui.visuals().error_fg_color, tr(&management.update.status));
                 } else {
@@ -1330,6 +1385,9 @@ impl Desktop {
             .show(ui, |ui| {
                 ui.set_width(ui.available_width());
                 ui.strong(tr("Devices on this computer"));
+                if !self.group.writable() {
+                    ui.disable();
+                }
                 for (id, label, value, devices) in [
                     (
                         "member-keyboard",
@@ -1532,7 +1590,12 @@ fn sharing_toggles(
         }
     });
     ui.checkbox(&mut settings.clipboard_enabled, tr("Shared clipboard"));
-    ui.weak(tr("Text and images."));
+    ui.weak(tr("Text, images, files and folders."));
+    if settings.clipboard_enabled {
+        ui.weak(tr(
+            "Copied files become available to paste after the transfer completes.",
+        ));
+    }
     if let Some(status) = status {
         ui.weak(tr(status));
     }
@@ -1544,9 +1607,7 @@ fn sharing_toggles(
         );
         let button = ui
             .add_enabled(layout_supported, egui::Button::new(tr("Arrange displays…")))
-            .on_disabled_hover_text(tr(
-                "Connect and update the workspace coordinator to arrange displays.",
-            ));
+            .on_disabled_hover_text(tr("Reconnect the workspace to arrange displays."));
         arrange = (edge.changed() && settings.edge && layout_supported) || button.clicked();
     });
     ui.checkbox(
@@ -1560,6 +1621,41 @@ fn sharing_toggles(
         });
     }
     arrange
+}
+
+fn edge_settings(ui: &mut egui::Ui, settings: &mut model::Settings) {
+    ui.horizontal_wrapped(|ui| {
+        ui.label(tr("Edge delay"));
+        egui::ComboBox::from_id_salt("workspace-edge-delay")
+            .width(140.0)
+            .selected_text(if settings.edge_delay_ms == 0 {
+                tr("No delay")
+            } else {
+                format!("{} ms", settings.edge_delay_ms)
+            })
+            .show_ui(ui, |ui| {
+                for delay in [0, 150, 300, 500] {
+                    ui.selectable_value(
+                        &mut settings.edge_delay_ms,
+                        delay,
+                        if delay == 0 {
+                            tr("No delay")
+                        } else {
+                            format!("{delay} ms")
+                        },
+                    );
+                }
+            })
+            .response
+            .on_hover_text(tr(
+                "Keep pushing against the screen edge for the selected delay. Moving away cancels the switch.",
+            ));
+        ui.checkbox(
+            &mut settings.edge_protect_corners,
+            tr("Protect screen corners"),
+        )
+        .on_hover_text(tr("Avoid switching near the corners of a screen."));
+    });
 }
 
 fn sharing_sources(ui: &mut egui::Ui, settings: &mut model::Settings, state: &Workspace) {

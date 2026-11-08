@@ -510,6 +510,9 @@ async fn capture(
                 }
                 match event.destructure() {
                     EventSummary::Key(_, code, value) => {
+                        // Hotkeys and keys routed to the peer do not reach the
+                        // local portal, but must still cancel local edge dwell.
+                        portal.cancel_dwell();
                         let (control, input) = routing.key(device, code.0, value);
                         if let Some(control) = control
                             && controls.try_send(control).is_err()

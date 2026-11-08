@@ -16,6 +16,7 @@ mod preview;
 mod session;
 #[cfg(windows)]
 mod software;
+mod transfer;
 mod tray;
 mod view;
 mod worker;
@@ -93,6 +94,7 @@ pub struct Desktop {
     tray_error: Option<String>,
     tray_snapshot: tray::State,
     quick: popup::Popup,
+    transfers: transfer::Transfers,
     monitor_setup_open: bool,
     actions: Receiver<Action>,
     hidden: bool,
@@ -245,6 +247,7 @@ impl Desktop {
             tray_error,
             tray_snapshot: tray::State::default(),
             quick,
+            transfers: Default::default(),
             monitor_setup_open: false,
             actions,
             hidden: false,
@@ -655,6 +658,7 @@ impl Desktop {
     }
 
     fn tick(&mut self, ctx: &egui::Context) {
+        self.transfers.tick(ctx);
         #[cfg(debug_assertions)]
         if self.preview.is_some() {
             self.preview_tick(ctx);
