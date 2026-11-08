@@ -33,6 +33,8 @@ pub(super) struct Spec {
     display_entry: Option<crate::edge::Entry>,
     generation: u64,
     desired_remote: bool,
+    input_returned: bool,
+    input_request: u64,
     activate: bool,
     native: Option<AudioLevel>,
 }
@@ -68,6 +70,77 @@ struct Task {
     switch_failed: bool,
     restart_requested: bool,
     local_entry: Option<u64>,
+    manual_return: bool,
+    manual_request: u64,
+    retry_after_auth: bool,
+    retry_after: Option<std::time::Instant>,
+    restart_count: u8,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+enum SessionEffect {
+    Recovering,
+    Recovered,
+    ManualReturn,
+    None,
+}
+impl Task {
+    fn reconcile_intent(&mut self, wanted: &Spec) {
+        if self.manual_return
+            && (wanted.input_returned || wanted.input_request > self.manual_request)
+        {
+            self.manual_return = false;
+            if !self.retry_after_auth {
+                self.switch_failed = false;
+            }
+        }
+    }
+
+    fn input_session(&mut self, session: crate::lifecycle::InputSession) -> SessionEffect {
+        use crate::lifecycle::{InputSession, RecoveryReason};
+        match session {
+            InputSession::Recovery(reason) => {
+                self.switched = false;
+                self.was_remote = false;
+                self.local_entry = None;
+                self.cycling = false;
+                self.cycle_since = None;
+                self.switch_failed = true;
+                if reason == RecoveryReason::EmergencyKey {
+                    self.manual_return = true;
+                    self.manual_request = self.spec.input_request;
+                    self.retry_after_auth = false;
+                    self.retry_after = None;
+                    SessionEffect::ManualReturn
+                } else {
+                    self.retry_after_auth = true;
+                    SessionEffect::Recovering
+                }
+            }
+            InputSession::Authenticated => {
+                if !self.worker.input_authenticated || !self.worker.running() {
+                    return SessionEffect::None;
+                }
+                self.restart_count = 0;
+                self.retry_after = None;
+                if self.manual_return {
+                    return SessionEffect::None;
+                }
+                if self.retry_after_auth {
+                    self.switch_failed = false;
+                    self.retry_after_auth = false;
+                }
+                if self.worker.switch_error.is_none()
+                    && !self.switch_failed
+                    && self.worker.input_authenticated
+                {
+                    SessionEffect::Recovered
+                } else {
+                    SessionEffect::None
+                }
+            }
+        }
+    }
 }
 
 fn equivalent(a: &Spec, b: &Spec) -> bool {
@@ -82,6 +155,8 @@ fn equivalent(a: &Spec, b: &Spec) -> bool {
         spec.display_entry = None;
         spec.generation = 0;
         spec.desired_remote = false;
+        spec.input_returned = false;
+        spec.input_request = 0;
         if matches!(spec.kind, Kind::AudioReceive | Kind::MicrophoneReceive) {
             let mut args = Vec::new();
             let mut input = spec.args.into_iter();
@@ -109,6 +184,9 @@ pub(super) struct Data {
     tasks: BTreeMap<String, Task>,
     routing_cache: crate::group::layout::RoutingCache,
     pub error: Option<String>,
+    pub input_notice: Option<String>,
+    pub input_recovered: bool,
+    manual_request: Option<u64>,
     pub cycle: bool,
     pub cycle_position: Option<u16>,
     pub crossing: Option<crate::edge::Crossing>,
@@ -195,6 +273,8 @@ fn desired_with_routes(
         display_entry: None,
         generation: state.activation,
         desired_remote: false,
+        input_returned: state.input_intent == plan.input && state.active_input == plan.input,
+        input_request: state.input_request,
         activate: false,
         native: None,
     };
@@ -491,6 +571,8 @@ impl Data {
         for task in self.tasks.values_mut() {
             if task.switch_failed || !task.worker.running() {
                 task.restart_requested = true;
+                task.restart_count = 0;
+                task.retry_after = None;
                 task.worker.stop();
             }
         }
@@ -537,13 +619,54 @@ impl Data {
     }
     pub fn tick(&mut self, desired: BTreeMap<String, Spec>, root: &Path, ctx: &egui::Context) {
         self.input = None;
+        self.input_notice = None;
+        self.input_recovered = false;
         self.audio_playing = false;
         self.microphone_active = false;
         for (name, task) in &mut self.tasks {
+            if !desired
+                .get(name)
+                .is_some_and(|wanted| equivalent(&task.spec, wanted))
+            {
+                // A hotplug can remove the source or reverse this link's role.
+                // Release the old capture before consuming its queued events:
+                // its final recovery must not return the new owner's input.
+                task.worker.stop();
+                task.worker.poll();
+                if !task.worker.settled() {
+                    ctx.request_repaint_after(std::time::Duration::from_millis(50));
+                }
+                continue;
+            }
             if task.worker.poll() {
                 self.error = task.worker.logs.back().cloned();
-                if task.spec.input_host() && task.spec.desired_remote && !task.cycling {
-                    self.returned = true;
+                if task.spec.kind == Kind::Input {
+                    self.input_notice = self.error.clone();
+                    task.switch_failed = true;
+                    task.switched = false;
+                    task.was_remote = false;
+                    if !task.manual_return && task.restart_count < 3 {
+                        task.restart_count += 1;
+                        task.retry_after = Some(
+                            std::time::Instant::now()
+                                + std::time::Duration::from_secs(
+                                    3 * u64::from(task.restart_count).pow(2),
+                                ),
+                        );
+                    }
+                }
+            }
+            task.spec.input_request = desired[name].input_request;
+            while let Some(session) = task.worker.input_sessions.pop_front() {
+                match task.input_session(session) {
+                    SessionEffect::ManualReturn => {
+                        self.returned = true;
+                        self.manual_request = Some(task.manual_request);
+                        self.input_recovered = false;
+                    }
+                    SessionEffect::Recovering => self.input_recovered = false,
+                    SessionEffect::Recovered => self.input_recovered = true,
+                    SessionEffect::None => {}
                 }
             }
             while let Some((activation, completed)) = task.worker.return_results.pop_front() {
@@ -562,6 +685,17 @@ impl Data {
                 && !task.worker.running()
             {
                 task.restart_requested = true;
+                task.restart_count = 0;
+                task.retry_after = None;
+            }
+            if let Some(retry) = task.retry_after {
+                let remaining = retry.saturating_duration_since(std::time::Instant::now());
+                if remaining.is_zero() {
+                    task.restart_requested = true;
+                    task.retry_after = None;
+                } else {
+                    ctx.request_repaint_after(remaining);
+                }
             }
             if task.worker.cycle_input {
                 task.worker.cycle_input = false;
@@ -587,6 +721,7 @@ impl Data {
                 // A failed optional placement leaves the current input session
                 // usable. It must not become an emergency return or disconnect.
                 self.error = Some(error);
+                self.input_notice = self.error.clone();
             }
             if task.cycling
                 && task
@@ -610,20 +745,14 @@ impl Data {
                         && !task.cycling
                         && !task.worker.stopping
                     {
-                        self.returned = true;
                         task.was_remote = false;
+                        task.switched = false;
                     }
                 }
                 if let Some(error) = task.worker.new_switch_error.take() {
                     task.switch_failed = true;
                     self.error = Some(error);
-                    if task.spec.input_host()
-                        && task.spec.desired_remote
-                        && !task.cycling
-                        && !task.worker.stopping
-                    {
-                        self.returned = true;
-                    }
+                    self.input_notice = self.error.clone();
                 }
             }
             if let Some(level) = task.worker.output_level.changed.take() {
@@ -638,13 +767,13 @@ impl Data {
                     Kind::MicrophoneSend | Kind::MicrophoneReceive
                 ) && task.worker.audio_playing;
             }
-            if !desired
-                .get(name)
-                .is_some_and(|wanted| equivalent(&task.spec, wanted))
-            {
-                task.worker.stop();
-            }
         }
+        let restart_counts = self
+            .tasks
+            .iter()
+            .filter(|(_, task)| task.restart_requested)
+            .map(|(name, task)| (name.clone(), task.restart_count))
+            .collect::<BTreeMap<_, _>>();
         self.tasks.retain(|name, task| {
             !task.worker.settled()
                 || (!task.restart_requested
@@ -653,11 +782,19 @@ impl Data {
                         .is_some_and(|spec| equivalent(&task.spec, spec)))
         });
         for (name, spec) in desired {
+            if spec.kind == Kind::Input
+                && self
+                    .manual_request
+                    .is_some_and(|request| spec.input_returned || spec.input_request > request)
+            {
+                self.manual_request = None;
+            }
             if !self.tasks.contains_key(&name) {
                 match configure(root, &spec)
                     .and_then(|dir| Worker::start(spec.kind, &spec.args, &dir, ctx))
                 {
                     Ok(worker) => {
+                        let manual = self.manual_request.filter(|_| spec.kind == Kind::Input);
                         self.tasks.insert(
                             name.clone(),
                             Task {
@@ -668,9 +805,14 @@ impl Data {
                                 cycling: false,
                                 cycle_since: None,
                                 coordinated_return: None,
-                                switch_failed: false,
+                                switch_failed: manual.is_some(),
                                 restart_requested: false,
                                 local_entry: None,
+                                manual_return: manual.is_some(),
+                                manual_request: manual.unwrap_or(0),
+                                retry_after_auth: false,
+                                retry_after: None,
+                                restart_count: restart_counts.get(&name).copied().unwrap_or(0),
                             },
                         );
                     }
@@ -685,11 +827,19 @@ impl Data {
                 ctx.request_repaint_after(std::time::Duration::from_millis(50));
                 continue;
             }
+            task.reconcile_intent(&spec);
             if task.spec.generation != spec.generation {
                 task.spec.generation = spec.generation;
                 task.cycling = false;
                 task.cycle_since = None;
-                task.switch_failed = false;
+                if !task.manual_return
+                    || spec.input_returned
+                    || spec.input_request > task.manual_request
+                {
+                    task.switch_failed = false;
+                    task.manual_return = false;
+                    task.retry_after_auth = false;
+                }
                 // A new activation may retry a rejected switch, but must not
                 // toggle an already active destination back to the source.
                 task.switched =
@@ -729,9 +879,12 @@ impl Data {
             }
             task.spec.activate = spec.activate;
             task.spec.desired_remote = spec.desired_remote;
+            task.spec.input_returned = spec.input_returned;
+            task.spec.input_request = spec.input_request;
             if task.local_entry != Some(spec.generation)
                 && task.coordinated_return.is_none()
                 && spec.input_host()
+                && task.worker.input_authenticated
                 && let Some(entry) = spec.display_entry
                 && (!spec.desired_remote || task.switched)
                 && task.worker.input_status
@@ -750,6 +903,7 @@ impl Data {
                 && task.local_entry != Some(spec.generation)
                 && task.worker.input_status == Some(crate::lifecycle::InputStatus::Here)
                 && spec.input_host()
+                && task.worker.input_authenticated
                 && let Some(position) = spec.entry
                 && task
                     .worker
@@ -765,6 +919,7 @@ impl Data {
                 && task.coordinated_return.is_none()
                 && !task.switched
                 && !task.switch_failed
+                && task.worker.input_authenticated
                 && task.worker.input_status == Some(crate::lifecycle::InputStatus::Here)
             {
                 if let Err(error) = task
@@ -802,6 +957,193 @@ impl Data {
 mod tests {
     use super::*;
     use std::net::{Ipv6Addr, SocketAddr, SocketAddrV6};
+
+    fn input_session_fixture(spec: Spec) -> Task {
+        let ctx = egui::Context::default();
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("target/qa-input-session");
+        // This child only prints the test harness's help and exits.
+        let worker = Worker::start(Kind::Input, &["--help".into()], &root, &ctx).unwrap();
+        Task {
+            spec,
+            worker,
+            switched: true,
+            was_remote: true,
+            cycling: false,
+            cycle_since: None,
+            coordinated_return: None,
+            switch_failed: false,
+            restart_requested: false,
+            local_entry: None,
+            manual_return: false,
+            manual_request: 0,
+            retry_after_auth: false,
+            retry_after: None,
+            restart_count: 0,
+        }
+    }
+
+    #[test]
+    fn input_recovery_keeps_the_target_and_rearms_only_after_authentication() {
+        use crate::lifecycle::{InputSession, RecoveryReason};
+        let mut state = crate::group::model::tests::fixture(2);
+        let source = state.plan().input.unwrap();
+        let target = state
+            .members
+            .keys()
+            .find(|key| *key != &source)
+            .unwrap()
+            .clone();
+        state.activate(&source, &target, None).unwrap();
+        let spec = desired(&state, &source, &[], true).unwrap()["input"].clone();
+        let mut task = input_session_fixture(spec);
+        for reason in [
+            RecoveryReason::ConnectionLost,
+            RecoveryReason::HeartbeatTimeout,
+            RecoveryReason::LeaseExpired,
+            RecoveryReason::InputOverflow,
+            RecoveryReason::ControlOverflow,
+            RecoveryReason::SwitchFailed,
+        ] {
+            task.worker.input_authenticated = false;
+            assert_eq!(
+                task.input_session(InputSession::Recovery(reason)),
+                SessionEffect::Recovering
+            );
+            assert!(!task.switched && !task.was_remote && task.switch_failed);
+            assert!(!task.manual_return && task.spec.desired_remote);
+            assert_eq!(task.spec.peer, target);
+            task.worker.input_authenticated = true;
+            assert_eq!(
+                task.input_session(InputSession::Authenticated),
+                SessionEffect::Recovered
+            );
+            assert!(!task.switch_failed && !task.switched);
+        }
+        task.worker.force_stop();
+    }
+
+    #[test]
+    fn emergency_return_survives_reauthentication_and_auto_restore_but_accepts_new_user_intent() {
+        use crate::lifecycle::{InputSession, RecoveryReason};
+        let mut state = crate::group::model::tests::fixture(2);
+        let source = state.plan().input.unwrap();
+        let target = state
+            .members
+            .keys()
+            .find(|key| *key != &source)
+            .unwrap()
+            .clone();
+        state.activate(&source, &target, None).unwrap();
+        let spec = desired(&state, &source, &[], true).unwrap()["input"].clone();
+        let mut task = input_session_fixture(spec);
+        assert_eq!(
+            task.input_session(InputSession::Recovery(RecoveryReason::EmergencyKey)),
+            SessionEffect::ManualReturn
+        );
+        task.worker.input_authenticated = true;
+        assert_eq!(
+            task.input_session(InputSession::Authenticated),
+            SessionEffect::None
+        );
+        assert!(task.manual_return && task.switch_failed);
+        let request = state.input_request;
+        state.members.get_mut(&target).unwrap().online = false;
+        state.reconcile_input();
+        state.members.get_mut(&target).unwrap().online = true;
+        state.reconcile_input();
+        assert_eq!(state.input_request, request);
+        let automatic = desired(&state, &source, &[], true).unwrap()["input"].clone();
+        assert!(automatic.generation > task.spec.generation);
+        task.reconcile_intent(&automatic);
+        assert!(task.manual_return && task.switch_failed);
+
+        // A deliberate retry of the same server-side target is a new request,
+        // even though no physical monitor command is needed.
+        state.activate(&source, &target, None).unwrap();
+        let explicit = desired(&state, &source, &[], true).unwrap()["input"].clone();
+        assert!(explicit.input_request > request);
+        task.reconcile_intent(&explicit);
+        assert!(!task.manual_return && !task.switch_failed);
+        assert!(state.monitor_command.is_none());
+        task.worker.force_stop();
+    }
+
+    #[test]
+    fn moving_physical_input_reverses_roles_and_discards_the_old_hosts_queued_recovery() {
+        use crate::lifecycle::InputStatus;
+        let mut state = crate::group::model::tests::fixture(2);
+        let windows = state.plan().input.unwrap();
+        let ubuntu = state
+            .members
+            .keys()
+            .find(|key| *key != &windows)
+            .unwrap()
+            .clone();
+        state.active_input = Some(ubuntu.clone());
+        let old_host = desired(&state, &windows, &[], true).unwrap()["input"].clone();
+        assert!(old_host.input_host() && old_host.desired_remote);
+
+        let removed = state.members.get_mut(&windows).unwrap();
+        let keyboards = std::mem::take(&mut removed.node.devices.keyboards);
+        let mice = std::mem::take(&mut removed.node.devices.mice);
+        removed.node.hardware.keyboard = false;
+        removed.node.hardware.mouse = false;
+        assert!(
+            !desired(&state, &windows, &[], true)
+                .unwrap()
+                .contains_key("input")
+        );
+        let attached = state.members.get_mut(&ubuntu).unwrap();
+        attached.node.devices.keyboards = keyboards;
+        attached.node.devices.mice = mice;
+        attached.node.hardware.keyboard = true;
+        attached.node.hardware.mouse = true;
+        let receiver = desired(&state, &windows, &[], true).unwrap()["input"].clone();
+        let host = desired(&state, &ubuntu, &[], true).unwrap()["input"].clone();
+        assert!(!receiver.input_host());
+        assert_eq!(receiver.peer, ubuntu);
+        assert!(host.input_host() && !host.desired_remote && !host.activate);
+        assert_eq!(host.peer, windows);
+        assert!(!equivalent(&old_host, &receiver));
+
+        // The fixture child only prints the test harness's help. It never
+        // enters the application's native input/audio/monitor code.
+        let ctx = egui::Context::default();
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("target/qa-retired-input");
+        let mut worker = Worker::start(Kind::Input, &["--help".into()], &root, &ctx).unwrap();
+        worker.input_status = Some(InputStatus::Here);
+        worker.cycle_input = true;
+        worker.cycle_input_position = Some(12_345);
+        worker.new_switch_error = Some("The superseded host restored its local input".into());
+        let mut data = Data::default();
+        data.tasks.insert(
+            "input".into(),
+            Task {
+                spec: old_host,
+                worker,
+                switched: true,
+                was_remote: true,
+                cycling: false,
+                cycle_since: None,
+                coordinated_return: None,
+                switch_failed: false,
+                restart_requested: false,
+                local_entry: None,
+                manual_return: false,
+                manual_request: 0,
+                retry_after_auth: false,
+                retry_after: None,
+                restart_count: 0,
+            },
+        );
+        // During unplug there is no source. This must release the capture and
+        // ignore its already queued recovery before the new host is started.
+        data.tick(BTreeMap::new(), &root, &ctx);
+        assert!(!data.returned && !data.cycle);
+        assert!(data.input.is_none() && data.error.is_none());
+        assert!(data.tasks.values().all(|task| task.worker.stopping));
+        data.force_stop();
+    }
 
     #[test]
     fn arranging_a_third_display_updates_routes_without_restarting_input_and_carries_exact_entry() {

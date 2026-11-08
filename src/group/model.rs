@@ -236,6 +236,10 @@ pub struct Workspace {
     pub members: BTreeMap<Key, Member>,
     pub active_input: Option<Key>,
     #[serde(default)]
+    pub input_intent: Option<Key>,
+    #[serde(default)]
+    pub input_request: u64,
+    #[serde(default)]
     pub active_input_entry: Option<u16>,
     #[serde(default)]
     pub activation: u64,
@@ -260,6 +264,10 @@ impl Workspace {
     }
     pub fn validate(&self) -> Result<()> {
         self.layout.validate_shape()?;
+        ensure!(
+            self.input_request <= self.activation,
+            "Invalid input request"
+        );
         if let Some(target) = &self.active_display {
             ensure!(
                 self.members.contains_key(target.computer())
@@ -286,6 +294,7 @@ impl Workspace {
         }
         for key in [
             &self.active_input,
+            &self.input_intent,
             &self.active_monitor,
             &self.confirmed_monitor,
         ]
@@ -389,16 +398,43 @@ impl Workspace {
         Ok(())
     }
     pub fn reconcile_input(&mut self) {
-        if !self.switch_pending()
-            && self
-                .active_input
-                .as_ref()
-                .is_none_or(|key| !self.members.get(key).is_some_and(Member::compatible))
-        {
-            self.active_input = self.plan().input;
-            self.active_input_entry = None;
-            self.active_display = None;
-            self.display_entry = None;
+        if self.switch_pending() {
+            return;
+        }
+        // Older workspaces stored only the active target. Preserve that choice
+        // before a disconnected member forces borrowed input to fail open.
+        if self.input_intent.is_none() {
+            self.input_intent = self.active_input.clone();
+        }
+        let available = |key: &&Key| self.members.get(*key).is_some_and(Member::compatible);
+        let intended = self
+            .input_intent
+            .as_ref()
+            .filter(available)
+            .filter(|key| self.members[*key].node.monitor_error.is_none())
+            .cloned();
+        let destination = intended
+            .or_else(|| self.active_input.as_ref().filter(available).cloned())
+            .or_else(|| self.plan().input);
+        if self.active_input == destination {
+            return;
+        }
+        let Some(activation) = self.activation.checked_add(1) else {
+            return;
+        };
+        let Ok(revision) = self.next_revision() else {
+            return;
+        };
+        self.active_input = destination.clone();
+        self.active_input_entry = None;
+        self.active_display = None;
+        self.display_entry = None;
+        self.activation = activation;
+        self.revision = revision;
+        if let Some(destination) = destination {
+            // Restoring input never replays a physical monitor command. Its
+            // last confirmed selection and any command result remain intact.
+            self.members.get_mut(&destination).unwrap().input_ready = activation;
         }
     }
     pub fn activate_display(
@@ -464,6 +500,9 @@ impl Workspace {
             "Invalid system volume"
         );
         let mut member = self.members.get(key).context("Unknown computer")?.clone();
+        let monitor_binding_changed = member.node.monitor.enabled != node.monitor.enabled
+            || member.node.monitor.id != node.monitor.id
+            || member.node.monitor.input != node.monitor.input;
         // Monitor completion belongs to the authenticated command executor.
         // Ordinary Node snapshots cannot grant readiness or erase its failure.
         if let Some(command) = &self.monitor_command {
@@ -483,6 +522,9 @@ impl Workspace {
         }
         member.validate(&self.hub)?;
         self.members.insert(key.into(), member);
+        if monitor_binding_changed {
+            self.confirmed_monitor = None;
+        }
         Ok(())
     }
     /// An interrupted writer must acknowledge cancellation before another PC is
@@ -522,22 +564,20 @@ impl Workspace {
         if monitor {
             self.monitor_input(destination)?;
         }
-        if target.is_none()
-            && self.active_input.as_deref() == Some(destination)
-            && self.active_input_entry == position
-            && self.active_display == target
-            && self.display_entry == entry
-            && (!monitor || self.confirmed_monitor.as_deref() == Some(destination))
-            && member.node.monitor_error.is_none()
-        {
-            return Ok(());
-        }
+        // Even a matching target is a new explicit intent: F11 may have
+        // released the native route while its controller was unreachable.
+        // Physical monitor writes remain independently guarded below.
         let revision = self.next_revision()?;
         let activation = self
             .activation
             .checked_add(1)
             .context("Too many input switches")?;
-        let command = if monitor && self.confirmed_monitor.as_deref() != Some(destination) {
+        let explicit_pc_change = target.is_none()
+            && position.is_none()
+            && self.active_input.as_deref() != Some(destination);
+        let command = if monitor
+            && (self.confirmed_monitor.as_deref() != Some(destination) || explicit_pc_change)
+        {
             let eligible = |key: &str| {
                 self.members.get(key).is_some_and(|member| {
                     member.compatible()
@@ -568,6 +608,7 @@ impl Workspace {
             None
         };
         self.active_input = Some(destination.into());
+        self.input_intent = Some(destination.into());
         self.active_input_entry = position;
         self.active_display = target;
         self.display_entry = entry;
@@ -580,6 +621,7 @@ impl Workspace {
         self.monitor_command = command;
         self.revision = revision;
         self.activation = activation;
+        self.input_request = activation;
         Ok(())
     }
     pub fn monitor_result(&mut self, writer: &str, id: u64, error: Option<String>) -> Result<()> {
@@ -651,29 +693,23 @@ impl Workspace {
             !self.switch_pending(),
             "The previous switch is still finishing. Wait for the monitor before switching again."
         );
-        let source = self
-            .plan()
-            .input
-            .context("The input owner is unavailable")?;
-        if self.active_input.as_ref() == Some(&source)
-            && self.active_input_entry.is_none()
-            && self.active_display.is_none()
-            && self.display_entry.is_none()
-        {
-            return Ok(());
-        }
+        let source = self.plan().input;
         let revision = self.next_revision()?;
         let activation = self
             .activation
             .checked_add(1)
             .context("Too many input switches")?;
-        self.active_input = Some(source.clone());
+        self.active_input = source.clone();
+        self.input_intent = source.clone();
         self.active_input_entry = None;
         self.active_display = None;
         self.display_entry = None;
         self.revision = revision;
         self.activation = activation;
-        self.members.get_mut(&source).unwrap().input_ready = activation;
+        self.input_request = activation;
+        if let Some(source) = source {
+            self.members.get_mut(&source).unwrap().input_ready = activation;
+        }
         Ok(())
     }
     pub fn monitor_input(&self, destination: &str) -> Result<u16> {
@@ -992,6 +1028,8 @@ pub(crate) mod tests {
             settings: Settings::default(),
             members,
             active_input: None,
+            input_intent: None,
+            input_request: 0,
             active_input_entry: None,
             activation: 0,
             active_monitor: None,
@@ -1145,10 +1183,10 @@ pub(crate) mod tests {
         );
         let completed = state.clone();
         state.activate(&key(1), &key(2), Some(12_345)).unwrap();
-        assert_eq!(
-            state, completed,
-            "A completed duplicate must not send another monitor command"
-        );
+        assert!(state.monitor_command.is_none());
+        assert_eq!(state.confirmed_monitor, completed.confirmed_monitor);
+        assert_eq!(state.activation, completed.activation + 1);
+        assert_eq!(state.input_request, state.activation);
 
         state.activate(&key(1), &key(3), None).unwrap();
         assert_eq!(
@@ -1166,7 +1204,9 @@ pub(crate) mod tests {
         state.expire_monitor();
         assert!(state.switch_pending());
         assert!(state.activate(&key(1), &key(1), None).is_err());
-        state.monitor_result(&key(2), 3, None).unwrap();
+        state
+            .monitor_result(&key(2), state.activation, None)
+            .unwrap();
         assert!(!state.switch_pending());
         assert!(state.confirmed_monitor.is_none());
         state.activate(&key(1), &key(1), None).unwrap();
@@ -1206,7 +1246,10 @@ pub(crate) mod tests {
         assert!(!state.switch_pending());
         let returned = state.clone();
         state.return_input().unwrap();
-        assert_eq!(state, returned);
+        assert_eq!(state.active_input, returned.active_input);
+        assert_eq!(state.active_monitor, returned.active_monitor);
+        assert_eq!(state.monitor_command, returned.monitor_command);
+        assert_eq!(state.input_request, returned.input_request + 1);
     }
 
     #[test]
@@ -1297,6 +1340,186 @@ pub(crate) mod tests {
                 .update_node(&key(2), wrong_identity, None, 0)
                 .is_err()
         );
+    }
+
+    #[test]
+    fn explicit_pc_change_selects_the_monitor_once_even_when_confirmation_was_cached() {
+        let mut state = fixture(2);
+        state.settings.monitor_enabled = true;
+        let source = key(1);
+        let target = key(2);
+        state.activate(&source, &target, None).unwrap();
+        state
+            .monitor_result(&source, state.activation, None)
+            .unwrap();
+        state.return_input().unwrap();
+        assert_eq!(state.active_input.as_ref(), Some(&source));
+        assert_eq!(state.confirmed_monitor.as_ref(), Some(&target));
+
+        state.activate(&source, &target, None).unwrap();
+        let command = state.monitor_command.clone().unwrap();
+        assert_eq!(command.destination, target);
+        assert_eq!(command.writer, target);
+        assert_eq!(command.input, 16);
+        assert!(state.switch_pending());
+        assert_eq!(state.members[&target].input_ready, 0);
+        let pending = state.clone();
+        assert!(state.activate(&source, &target, None).is_err());
+        assert_eq!(state, pending);
+        state.monitor_result(&target, command.id, None).unwrap();
+        assert_eq!(state.members[&target].input_ready, state.activation);
+        let completed = state.activation;
+        state.activate(&source, &target, None).unwrap();
+        assert!(state.monitor_command.is_none());
+        assert_eq!(state.input_request, completed + 1);
+        state.validate().unwrap();
+    }
+
+    #[test]
+    fn monitor_binding_changes_invalidate_confirmation_but_cosmetic_updates_do_not() {
+        let mut original = fixture(2);
+        original.confirmed_monitor = Some(key(2));
+        let mut cosmetic = original.members[&key(1)].node.clone();
+        cosmetic.monitor.name = "A clearer monitor name".into();
+        original.update_node(&key(1), cosmetic, None, 0).unwrap();
+        assert_eq!(original.confirmed_monitor, Some(key(2)));
+        for changed in 0..3 {
+            let mut state = original.clone();
+            let mut node = state.members[&key(1)].node.clone();
+            match changed {
+                0 => node.monitor.id = "another-connector".into(),
+                1 => node.monitor.input = Some(99),
+                _ => node.monitor.enabled = false,
+            }
+            state.update_node(&key(1), node, None, 0).unwrap();
+            assert!(state.confirmed_monitor.is_none());
+            assert!(state.monitor_command.is_none());
+        }
+    }
+
+    #[test]
+    fn temporary_disconnect_restores_input_intent_without_repeating_monitor_commands() {
+        let mut state = fixture(2);
+        state.settings.monitor_enabled = true;
+        let source = key(1);
+        let target = key(2);
+        state.activate(&source, &target, None).unwrap();
+        state
+            .monitor_result(&source, state.activation, None)
+            .unwrap();
+        let monitor = state.active_monitor.clone();
+        let confirmed = state.confirmed_monitor.clone();
+        let command = state.monitor_command.clone();
+        let selected = state.activation;
+        state.members.get_mut(&target).unwrap().online = false;
+        state.reconcile_input();
+        assert_eq!(state.active_input.as_ref(), Some(&source));
+        assert_eq!(state.input_intent.as_ref(), Some(&target));
+        assert!(state.activation > selected);
+        assert_eq!(state.members[&source].input_ready, state.activation);
+        assert_eq!(state.monitor_command, command);
+
+        // The intention survives a restart while the destination is offline.
+        let mut restored: Workspace =
+            serde_json::from_slice(&serde_json::to_vec(&state).unwrap()).unwrap();
+        let fallback = restored.activation;
+        restored.members.get_mut(&target).unwrap().online = true;
+        restored.reconcile_input();
+        assert_eq!(restored.active_input.as_ref(), Some(&target));
+        assert_eq!(restored.input_intent.as_ref(), Some(&target));
+        assert!(restored.activation > fallback);
+        assert_eq!(restored.members[&target].input_ready, restored.activation);
+        assert_eq!(restored.active_monitor, monitor);
+        assert_eq!(restored.confirmed_monitor, confirmed);
+        assert_eq!(restored.monitor_command, command);
+        restored.validate().unwrap();
+
+        state.return_input().unwrap();
+        state.members.get_mut(&target).unwrap().online = true;
+        state.reconcile_input();
+        assert_eq!(state.active_input.as_ref(), Some(&source));
+        assert_eq!(state.input_intent.as_ref(), Some(&source));
+        assert_eq!(state.monitor_command, command);
+        assert_eq!(state.active_monitor, monitor);
+        state.validate().unwrap();
+    }
+
+    #[test]
+    fn recovery_intent_cannot_bypass_pending_or_failed_monitor_selection() {
+        let mut state = fixture(2);
+        state.settings.monitor_enabled = true;
+        let source = key(1);
+        let target = key(2);
+        state.activate(&source, &target, None).unwrap();
+        let pending = state.clone();
+        state.members.get_mut(&target).unwrap().online = false;
+        state.reconcile_input();
+        assert_eq!(state.activation, pending.activation);
+        assert_eq!(state.active_input, pending.active_input);
+        assert_eq!(state.monitor_command, pending.monitor_command);
+        state
+            .monitor_result(&source, state.activation, Some("DDCRC_RETRIES(EIO)".into()))
+            .unwrap();
+        state.reconcile_input();
+        assert_eq!(state.active_input.as_ref(), Some(&source));
+        let fallback = state.clone();
+        state.members.get_mut(&target).unwrap().online = true;
+        state.reconcile_input();
+        assert_eq!(state.active_input.as_ref(), Some(&source));
+        assert_eq!(state.input_intent.as_ref(), Some(&target));
+        assert_eq!(state.activation, fallback.activation);
+        assert_eq!(state.monitor_command, fallback.monitor_command);
+        state.validate().unwrap();
+    }
+
+    #[test]
+    fn physical_input_hotplug_moves_auto_owner_without_changing_the_monitor_or_manual_choice() {
+        let mut state = fixture(2);
+        let windows = key(1);
+        let ubuntu = key(2);
+        state.active_input = Some(ubuntu.clone());
+        state.active_monitor = Some(ubuntu.clone());
+        let monitor = state.active_monitor.clone();
+        let activation = state.activation;
+        assert_eq!(state.plan().input, Some(windows.clone()));
+
+        let mut unplugged = state.members[&windows].node.clone();
+        let keyboards = std::mem::take(&mut unplugged.devices.keyboards);
+        let mice = std::mem::take(&mut unplugged.devices.mice);
+        unplugged.hardware = workspace::hardware::hardware(
+            &unplugged.devices,
+            &state.members[&windows].preferences.devices,
+            true,
+        );
+        state.update_node(&windows, unplugged, None, 0).unwrap();
+        state.reconcile_input();
+        assert!(state.plan().input.is_none());
+        assert!(state.routes(&windows).input_targets.is_empty());
+        assert!(state.routes(&ubuntu).input_source.is_none());
+
+        let mut attached = state.members[&ubuntu].node.clone();
+        attached.devices.keyboards = keyboards;
+        attached.devices.mice = mice;
+        attached.hardware = workspace::hardware::hardware(
+            &attached.devices,
+            &state.members[&ubuntu].preferences.devices,
+            true,
+        );
+        state.update_node(&ubuntu, attached, None, 0).unwrap();
+        state.reconcile_input();
+        assert_eq!(state.plan().input, Some(ubuntu.clone()));
+        assert_eq!(state.routes(&windows).input_source.unwrap().key, ubuntu);
+        assert_eq!(state.routes(&ubuntu).input_targets[0].key, windows);
+        assert_eq!(state.active_input.as_ref(), Some(&ubuntu));
+        assert_eq!(state.active_monitor, monitor);
+        assert_eq!(state.activation, activation);
+        assert!(state.monitor_command.is_none());
+        state.validate().unwrap();
+
+        state.settings.input = Selection::Computer(windows.clone());
+        state.reconcile_input();
+        assert!(state.plan().input.is_none());
+        assert_eq!(state.settings.input, Selection::Computer(windows));
     }
 
     #[test]

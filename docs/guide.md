@@ -1,29 +1,31 @@
 # Desk Switch guide
 
-Your computers. One workspace. Share a keyboard, mouse, headphones or speakers, microphone and an optional clipboard across **three, four or more computers**. Control the workspace and each computer's settings from any member. Current releases support Windows and Ubuntu. Experimental macOS source remains in the repository and is excluded from current release downloads. A shared monitor can follow the selected computer through DDC/CI.
+Your computers. One workspace. Share a keyboard, mouse, headphones or speakers, microphone and an optional clipboard across **three, four or more computers**. Control the workspace and each computer's settings from any member. Releases support Windows and Ubuntu, with experimental Apple Silicon and Intel macOS bundles returning in **0.6.2**. A shared monitor can follow the selected computer through DDC/CI.
 
 ![A four-computer workspace with shared input, sound, microphone and clipboard controls](workspace-four-computers.png)
 
 ## Install
 
-Install the **same version on every computer** from [Releases](https://github.com/siarheisinelnikau/desk-switch/releases). Version 0.6.0 has two native downloads:
+Install the **same version on every computer** from [Releases](https://github.com/siarheisinelnikau/desk-switch/releases). Version **0.6.2** has four native downloads:
 
 | Platform | Download |
 | --- | --- |
-| Ubuntu 24.04/26.04, x86-64 | [desk-switch-v0.6.0-linux-x86-64.deb](https://github.com/siarheisinelnikau/desk-switch/releases/download/v0.6.0/desk-switch-v0.6.0-linux-x86-64.deb) |
-| Windows, x86-64 | [desk-switch-v0.6.0-windows-x86-64.exe](https://github.com/siarheisinelnikau/desk-switch/releases/download/v0.6.0/desk-switch-v0.6.0-windows-x86-64.exe) |
+| Ubuntu 24.04/26.04, x86-64 | [desk-switch-v0.6.2-linux-x86-64.deb](https://github.com/siarheisinelnikau/desk-switch/releases/download/v0.6.2/desk-switch-v0.6.2-linux-x86-64.deb) |
+| Windows, x86-64 | [desk-switch-v0.6.2-windows-x86-64.exe](https://github.com/siarheisinelnikau/desk-switch/releases/download/v0.6.2/desk-switch-v0.6.2-windows-x86-64.exe) |
+| macOS 13+, Apple Silicon (experimental) | [desk-switch-v0.6.2-macos-arm64.zip](https://github.com/siarheisinelnikau/desk-switch/releases/download/v0.6.2/desk-switch-v0.6.2-macos-arm64.zip) |
+| macOS 13+, Intel x86-64 (experimental) | [desk-switch-v0.6.2-macos-x86-64.zip](https://github.com/siarheisinelnikau/desk-switch/releases/download/v0.6.2/desk-switch-v0.6.2-macos-x86-64.zip) |
 
 ```sh
-sudo apt install ./desk-switch-v0.6.0-linux-x86-64.deb
+sudo apt install ./desk-switch-v0.6.2-linux-x86-64.deb
 ```
 
 Open **Desk Switch** from Ubuntu's application menu or run the Windows executable. New profiles use **English** and **Dark**. Existing language and theme choices are preserved. Russian, German, French, Spanish and Italian are also available; changes apply immediately to the window and tray.
 
 ## macOS (experimental)
 
-**macOS is excluded from 0.6.0 release downloads while support is prepared for stable use.** No 0.6.0 Mac installer or in-app update target is provided. Experimental source and the optional manual **macOS experimental checks** workflow remain available. **macOS functionality has not been tested on physical hardware.** Those compile/test/package checks do not verify real input devices, audio routing, permissions, monitor firmware or UI performance on a Mac. macOS 13 or newer is required.
+**Version 0.6.2 restores experimental Apple Silicon and Intel macOS app bundles and their signed in-app update targets.** Versions 0.6.0 and 0.6.1 remain Windows/Ubuntu-only. Both Mac architectures must pass native compile, test and package checks before publication. **macOS functionality has not been tested on physical hardware.** Those checks do not verify real input devices, audio routing, permissions, monitor firmware or UI performance on a Mac. macOS 13 or newer is required.
 
-For experimental bundles built from source, move the complete **Desk Switch.app** to **Applications** or **~/Applications** before opening it. The bundles and their embedded native helpers are ad-hoc signed, but are **not Developer ID signed or notarized**. Follow macOS's normal Open/Privacy & Security flow if Gatekeeper blocks the first launch. In-app updates verify the project's pinned Ed25519 signature and replace the complete application bundle, preserve the separate settings directory, and retain a rollback copy until the new GUI confirms startup. **~/Applications** supports updates without administrator credentials; a read-only or protected installation directory produces a clear error instead of requesting elevation.
+Unzip the archive for your Mac's architecture and move the complete **Desk Switch.app** to **Applications** or **~/Applications** before opening it. The bundles and their embedded native helpers are ad-hoc signed, but are **not Developer ID signed or notarized**. Follow macOS's normal Open/Privacy & Security flow if Gatekeeper blocks the first launch. In-app updates verify the project's pinned Ed25519 signature and replace the complete application bundle, preserve the separate settings directory, and retain a rollback copy until the new GUI confirms startup. **~/Applications** supports updates without administrator credentials; a read-only or protected installation directory produces a clear error instead of requesting elevation.
 
 The Mac adapter uses native OS APIs:
 
@@ -147,13 +149,13 @@ Login startup is enabled after the first launch and can be disabled in Settings 
 
 Automatic checks run at startup and every six hours by default and fetch **signed release metadata only**. They do not download an installer or install anything. **Download and install** explicitly downloads, verifies and installs the update on the selected computer, then restarts it as required. The persistent automatic-check toggle disables background checks; manual checking remains available. Settings, identities, workspace membership and user data survive updates. Older device-protocol versions wait for a compatible update before input or media sharing resumes.
 
-Each computer independently downloads from the canonical repository and verifies a pinned Ed25519 signature covering the exact artifact URL, version, size and SHA-256. Signed metadata is embedded in the release description; the current download list contains the Windows executable and Debian package. Both use the vendored [`rust-auto-updator` 0.4.1](https://github.com/siarheisinelnikau/rust-auto-updator) core.
+Each computer independently downloads from the canonical repository and verifies a pinned Ed25519 signature covering the exact artifact URL, version, size and SHA-256. Signed metadata is embedded in the release description. From 0.6.2, its targets cover the Windows executable, Ubuntu Debian package and both Mac app archives, using the vendored [`rust-auto-updator` 0.4.1](https://github.com/siarheisinelnikau/rust-auto-updator) core.
 
 An installed Ubuntu package updates without an application password prompt. Its fixed system helper accepts only a newer Desk Switch amd64 package whose exact bytes match the pinned project signature; it cannot install another package or an arbitrary file. Initial `.deb` installation still uses Ubuntu's normal administrator authorization. No generic system authorization policy is weakened.
 
 Recent service logs and diagnostics are synchronized over authenticated, encrypted workspace connections. Open **Settings → Advanced → Diagnostics → Copy diagnostics** to collect member state and recent service messages. Offline reports remain labelled as such. Snapshots are bounded and do not reconfigure device services.
 
-For the first upgrade from **0.4.8 or older**, install the current `.deb` or replace the `.exe` once on each computer: those releases do not support the architecture-labelled names and remote management. The saved **0.4.11** partner remains reachable through a limited management/update bridge while upgrading, so it can be updated from the computer already running 0.6.0. Device sharing waits for matching versions. Install **0.6.0 on every intended member** before creating a larger workspace. Portable Linux binaries are no longer distributed; the `.deb` uses its installed launcher and package-owned binary so future system updates work correctly.
+For the first upgrade from **0.4.8 or older**, install the current `.deb` or replace the `.exe` once on each computer: those releases do not support the architecture-labelled names and remote management. The saved **0.4.11** partner remains reachable through a limited management/update bridge while upgrading, so it can be updated from the computer already running the current version. Device sharing waits for matching versions. Install **0.6.2 on every intended member** before using its shared devices. Portable Linux binaries are no longer distributed; the `.deb` uses its installed launcher and package-owned binary so future system updates work correctly.
 
 ## Platform access
 
@@ -178,12 +180,12 @@ python3 tools/test_release_assets.py
 python3 tools/test_input_access.py
 cargo build --locked --release
 python3 tools/package_deb.py --binary target/release/desk-switch --out dist
-python3 tools/verify_deb.py dist/desk-switch-v0.6.0-linux-x86-64.deb
+python3 tools/verify_deb.py dist/desk-switch-v0.6.2-linux-x86-64.deb
 ```
 
 Tests use synthetic input/audio/monitor devices and isolated loopback connections. The multi-computer integration test links four encrypted peers, propagates settings, sends member-management requests and checks reconnect behavior, including an explicit pinned-controller connection with automatic connection disabled. Native listener tests authenticate IPv4 and IPv6 peers and exchange PCM without physical audio hardware. Clipboard tests use fake native backends or a private D-Bus with binary text/image payloads; the Node suite evaluates the shipped GNOME companion against a mocked Shell. They never use the user's clipboard or change a real monitor. A four-computer localhost test verifies networking and routing logic, not four physical computers.
 
-Release CI compiles, tests and packages Windows and Ubuntu only. Experimental macOS checks are available manually and do not gate publication; macOS remains untested on physical hardware. Real multicast discovery, input devices, desktop consent, VB-CABLE, audio quality, monitor firmware and OS permissions need target-machine testing.
+Release CI compiles, tests and packages Windows, Ubuntu, macOS Apple Silicon and macOS Intel. All four native jobs gate signing and publication. The additional **macOS experimental checks** workflow remains available manually. CI does not launch the app or exercise physical devices; macOS remains untested on physical hardware. Real multicast discovery, input devices, desktop consent, VB-CABLE, audio quality, monitor firmware and OS permissions need target-machine testing.
 
 GUI screenshots use isolated fixture computers and never switch a real monitor or grab input. Windows captures use a bounded native render-and-exit process. Linux captures use a private Xvfb display and private D-Bus. For optimized UI QA, build with `cargo build --locked --profile diagnostic --features eframe/__screenshot`. Set `DESK_SWITCH_CAPTURE_TO` to an absolute PNG path and run `target/diagnostic/desk-switch gui-preview shared-four --state-dir ABSOLUTE_ISOLATED_DIRECTORY`; capture exits after layout settles. A screenshot alone does not verify settled or hidden-window performance. Use a bounded render probe and inspect its actual renderer and frame counts before extended UI testing.
 
@@ -192,16 +194,16 @@ Additional isolated Linux checks:
 - `/usr/bin/python3 tools/test_portal_restore.py --binary target/debug/desk-switch` uses a private D-Bus and fake portal to test restore tokens and cancellation; it requires `python3-gi` and `dbus`.
 - `dbus-run-session -- python3 tools/test_microphone_pipewire.py` uses a separate PipeWire/WirePlumber server and a synthetic tone to check microphone PCM, gain and cleanup with hardware monitoring disabled; WirePlumber 0.5+ is required.
 
-Set `release/publish-request.json` to a **new** version tag to request both native installers. The isolated signing job uses the existing `DESK_SWITCH_UPDATE_SIGNING_KEY` secret in the `release` GitHub environment. It verifies the pinned identity and each artifact before signing. Publication independently downloads and checks the exact bytes, PE/ELF architecture, embedded build stamps and Debian package metadata before publishing stable. A missing or incorrect key stops publication; private keys are never committed or uploaded as artifacts. See [signing setup and backup](signing.md).
+Set `release/publish-request.json` to a **new** version tag to request all four native artifacts. The isolated signing job uses the existing `DESK_SWITCH_UPDATE_SIGNING_KEY` secret in the `release` GitHub environment. It verifies the pinned identity and each artifact before signing. Publication independently downloads and checks the exact bytes, PE/ELF/Mach-O architecture, embedded build stamps, Debian package metadata and safe Mac bundle contents before publishing stable. Mac packaging also checks the bundle and helper signatures without opening the app. A missing or incorrect key stops publication; private keys are never committed or uploaded as artifacts. See [signing setup and backup](signing.md).
 
 To hold a request while finishing changes, set `"hold": true` in `release/publish-request.json`. The request gate then skips native builds, signing and publication. Omit `hold` or set it to `false` to allow the normal pipeline. A newer request on the same Git ref cancels an unfinished older run, so the latest unpublished request supersedes it; cancellation does not rewrite published releases.
 
 To verify the pipeline without publishing, first ensure the request is not on hold, then open **Actions → Release → Run workflow** on `main` and leave **Publish a new version after build and signing checks** unchecked. Enable publication only for a prepared new version. Existing tags and signed releases must not be reused or overwritten.
 
-For local preparation with the existing private key, supply both tested installers:
+For local preparation with the existing private key, supply all four tested artifacts:
 
 ```sh
-python3 tools/prepare_release.py --tag vVERSION --windows PATH.exe --deb PATH.deb --out dist/signed
+python3 tools/prepare_release.py --tag vVERSION --windows PATH.exe --deb PATH.deb --macos-arm64 PATH-arm64.zip --macos-x86-64 PATH-x86-64.zip --out dist/signed
 ```
 
 The verified public `update.json` is saved in the `desk-switch-signed-metadata` Actions artifact and embedded in the release notes. The optional manifest-promotion workflow accepts `release/manifests/VERSION.json`, independently verifies its signature and public native artifacts, and preserves the readable release description. Back up signing credentials independently of the repository. The explicit application CLI remains available through `--help`; run `desk-switch --licenses` to print the license notices embedded in every standalone release.

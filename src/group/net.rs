@@ -465,6 +465,8 @@ fn load(dir: &Path, local: Member) -> Result<Workspace> {
             settings: Settings::from(&local.node.shared),
             members: BTreeMap::new(),
             active_input: None,
+            input_intent: None,
+            input_request: 0,
             active_input_entry: None,
             activation: 0,
             active_monitor: None,

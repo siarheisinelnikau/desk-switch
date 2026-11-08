@@ -376,6 +376,7 @@ pub struct Progress {
 pub struct Job {
     result: Receiver<Result<Outcome>>,
     progress: std::sync::Arc<std::sync::Mutex<Option<Progress>>>,
+    preparing: bool,
 }
 enum Operation {
     Check,
@@ -411,6 +412,7 @@ impl Job {
         executable: PathBuf,
         ctx: eframe::egui::Context,
     ) -> Result<Self> {
+        let preparing = matches!(&operation, Operation::Prepare { .. });
         let (send, result) = mpsc::channel();
         let progress = std::sync::Arc::new(std::sync::Mutex::new(None));
         let progress_send = progress.clone();
@@ -435,7 +437,14 @@ impl Job {
                 let _ = send.send(result);
                 ctx.request_repaint_of(eframe::egui::ViewportId::ROOT);
             })?;
-        Ok(Self { result, progress })
+        Ok(Self {
+            result,
+            progress,
+            preparing,
+        })
+    }
+    pub fn is_preparing(&self) -> bool {
+        self.preparing
     }
     pub fn poll(&self) -> Option<Result<Outcome>> {
         self.result.try_recv().ok()

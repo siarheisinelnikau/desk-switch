@@ -7,6 +7,7 @@ import ApplicationServices
 import CoreAudio
 import CoreGraphics
 import CoreMedia
+import CryptoKit
 import Foundation
 import IOKit
 import ScreenCaptureKit
@@ -155,12 +156,127 @@ func displays() throws {
     json(result)
 }
 
-func screenGeometryValue() throws -> [[String:Any]] {
+struct DesktopScreen {
+    let id: String, rect: CGRect, epoch: UInt64
+    var value: [String:Any] { ["id":id,"x":rect.minX,"y":rect.minY,"width":rect.width,"height":rect.height,"epoch":NSNumber(value:epoch)] }
+}
+func desktopScreens() throws -> [DesktopScreen] {
     var count=UInt32(0)
     guard CGGetActiveDisplayList(0,nil,&count) == .success, count<=128 else {throw fail("Cannot read macOS screen geometry")}
     var displays=[CGDirectDisplayID](repeating:0,count:Int(count))
     guard CGGetActiveDisplayList(count,&displays,&count) == .success else {throw fail("Cannot read macOS screen geometry")}
-    return displays.map {id -> [String:Any] in let bounds=CGDisplayBounds(id);return ["id":String(id),"x":bounds.minX,"y":bounds.minY,"width":bounds.width,"height":bounds.height]}
+    displays=Array(displays.prefix(Int(count))).sorted()
+    var topology=[[String:Any]]()
+    for id in displays {
+        let bounds=CGDisplayBounds(id)
+        guard [bounds.minX,bounds.minY,bounds.width,bounds.height].allSatisfy({$0.isFinite && $0.rounded() == $0}),bounds.width>=2,bounds.height>=2 else {throw fail("Invalid macOS screen geometry")}
+        let uuid=CFUUIDCreateString(nil,CGDisplayCreateUUIDFromDisplayID(id).takeRetainedValue())! as String
+        topology.append(["id":String(id),"uuid":uuid,"x":bounds.minX,"y":bounds.minY,"width":bounds.width,"height":bounds.height,"pixels_width":CGDisplayPixelsWide(id),"pixels_height":CGDisplayPixelsHigh(id),"rotation":CGDisplayRotation(id),"mirror":CGDisplayMirrorsDisplay(id)])
+    }
+    let data=try JSONSerialization.data(withJSONObject:topology,options:[.sortedKeys])
+    let digest=SHA256.hash(data:Data("Desk Switch macOS desktop v1\0".utf8)+data)
+    let epoch=max(1,digest.prefix(8).reduce(UInt64(0)) {($0<<8)|UInt64($1)})
+    return displays.map {DesktopScreen(id:String($0),rect:CGDisplayBounds($0),epoch:epoch)}
+}
+func screenGeometryValue() throws -> [[String:Any]] {try desktopScreens().map(\.value)}
+
+struct RouteRect: Decodable, Equatable {
+    let x: Int32, y: Int32, width: UInt32, height: UInt32
+    var rect: CGRect {CGRect(x:Double(x),y:Double(y),width:Double(width),height:Double(height))}
+}
+struct RouteBoundary: Decodable {
+    let id:UInt64, screen:RouteRect, geometry:UInt64, side:String, start:UInt16, end:UInt16
+    func position(_ point:CGPoint,_ dx:Double,_ dy:Double)->UInt16? {
+        let rect=screen.rect
+        guard rect.contains(point) else {return nil}
+        let t:Double
+        switch side {
+        case "left" where dx<0:t=(rect.minX-point.x)/dx
+        case "right" where dx>0:t=(rect.maxX-1-point.x)/dx
+        case "top" where dy<0:t=(rect.minY-point.y)/dy
+        case "bottom" where dy>0:t=(rect.maxY-1-point.y)/dy
+        default:return nil
+        }
+        guard t<=1 else {return nil}
+        let vertical=side=="left" || side=="right"
+        let offset=vertical ? point.y+max(0,t)*dy-rect.minY : point.x+max(0,t)*dx-rect.minX
+        let span=vertical ? rect.height : rect.width
+        guard offset>=0,offset<span else {return nil}
+        let position=UInt16((min(1,offset/max(1,span-1))*65535).rounded())
+        return position>=start && (position<end || end==UInt16.max && position==UInt16.max) ? position : nil
+    }
+}
+final class CaptureRoutes {
+    var enabled=false, revision:UInt64=0, activation:UInt64=0
+    var staged=[RouteBoundary](), boundaries=[RouteBoundary](), screens=[DesktopScreen]()
+    var indexed=[String:[RouteBoundary]](), latch:(CGRect,String)?, cooldown=CFAbsoluteTimeGetCurrent()
+    var latched:Bool {if case .some=latch {return true};return false}
+    func refresh(_ value:[DesktopScreen]) {
+        screens=value;indexed.removeAll()
+        for boundary in boundaries {
+            let matches=value.filter {$0.rect==boundary.screen.rect && $0.epoch==boundary.geometry}
+            if matches.count==1 {indexed[matches[0].id,default:[]].append(boundary)}
+        }
+    }
+    func resetEntry() {latch=nil;cooldown=CFAbsoluteTimeGetCurrent()+0.12}
+    func command(_ value:[String:Any]) {
+        switch value["kind"] as? String {
+        case "routes-start":staged.removeAll();boundaries.removeAll();indexed.removeAll()
+        case "routes-add":
+            if staged.count<4096,let object=value["boundary"],let data=try? JSONSerialization.data(withJSONObject:object),let boundary=try? JSONDecoder().decode(RouteBoundary.self,from:data),boundary.geometry != 0,boundary.start<boundary.end,boundary.screen.width>=2,boundary.screen.height>=2,["left","right","top","bottom"].contains(boundary.side) {staged.append(boundary)}
+        case "routes-commit":
+            guard let nextRevision=(value["revision"] as? NSNumber)?.uint64Value,let nextActivation=(value["activation"] as? NSNumber)?.uint64Value,nextRevision != 0 || staged.isEmpty else {return}
+            if activation != nextActivation {latch=nil}
+            revision=nextRevision;activation=nextActivation;boundaries=staged;staged.removeAll();refresh(screens)
+        default:break
+        }
+    }
+    // All records came from Rust's validated Routes. Native geometry still
+    // has to match before an edge may suppress a local physical event.
+    func clamp(_ point:CGPoint,_ dx:Double,_ dy:Double,_ allow:Bool)->CGPoint? {
+        guard enabled else {return nil}
+        var match:DesktopScreen?
+        for screen in screens where screen.rect.contains(point) {
+            if case .some=match {return nil}
+            match=screen
+        }
+        guard let screen=match else {return nil}
+        let rect=screen.rect
+        if let old=latch {
+            let inset=old.1=="left" ? point.x-rect.minX : old.1=="right" ? rect.maxX-1-point.x : old.1=="top" ? point.y-rect.minY : rect.maxY-1-point.y
+            if old.0 != rect || inset>=16 {latch=nil}
+        }
+        for boundary in indexed[screen.id] ?? [] {
+            if let position=boundary.position(point,dx,dy) {
+                if boundary.id != 0 && allow && !latched && CFAbsoluteTimeGetCurrent()>=cooldown {
+                    latch=(rect,boundary.side)
+                    json(["kind":"boundary","crossing":["revision":NSNumber(value:revision),"activation":NSNumber(value:activation),"boundary":NSNumber(value:boundary.id),"position":position]])
+                }
+                return CGPoint(x:min(max(point.x+dx,rect.minX),rect.maxX-1),y:min(max(point.y+dy,rect.minY),rect.maxY-1))
+            }
+        }
+        return nil
+    }
+}
+func layoutSelfTest() throws {
+    let rect=RouteRect(x:0,y:0,width:100,height:100)
+    let right=RouteBoundary(id:9,screen:rect,geometry:UInt64.max,side:"right",start:0,end:UInt16.max)
+    guard right.position(CGPoint(x:98,y:50),2,0) != nil,
+          right.position(CGPoint(x:50,y:50),2,0) == nil,
+          right.position(CGPoint(x:99,y:50),-2,0) == nil else {throw fail("Native layout edge projection failed")}
+    let routes=CaptureRoutes();routes.enabled=true
+    routes.refresh([DesktopScreen(id:"1",rect:rect.rect,epoch:UInt64.max)])
+    routes.command(["kind":"routes-start"])
+    let object:[String:Any]=["id":NSNumber(value:right.id),"screen":["x":0,"y":0,"width":100,"height":100],"geometry":NSNumber(value:UInt64.max),"side":"right","start":0,"end":65535]
+    routes.command(["kind":"routes-add","boundary":object])
+    routes.command(["kind":"routes-commit","revision":NSNumber(value:UInt64.max),"activation":NSNumber(value:UInt64.max)])
+    guard routes.revision==UInt64.max,routes.activation==UInt64.max,routes.indexed["1"]?.count==1,
+          routes.clamp(CGPoint(x:98,y:50),4,0,false)==CGPoint(x:99,y:50) else {throw fail("Native layout policy did not preserve its generation or blocked edge")}
+    routes.refresh([DesktopScreen(id:"1",rect:rect.rect,epoch:1)])
+    guard routes.clamp(CGPoint(x:98,y:50),4,0,false)==nil else {throw fail("Stale native display geometry was accepted")}
+    routes.refresh([DesktopScreen(id:"1",rect:rect.rect,epoch:UInt64.max),DesktopScreen(id:"2",rect:rect.rect,epoch:UInt64.max)])
+    guard routes.indexed.isEmpty else {throw fail("Ambiguous native geometry was accepted")}
+    print("Native layout policy: projection, 64-bit generations, blocked edges, stale and ambiguous geometry passed")
 }
 func edgePoint(_ display:CGDirectDisplayID,_ side:String,_ position:Int)->CGPoint {
     let bounds=CGDisplayBounds(display), fraction=Double(position)/65535
@@ -327,7 +443,10 @@ final class InputCapture {
     var keyboard = true, mouse = true
     var edgeDisplay: CGDirectDisplayID?, edgeSide="right", edgeAutomatic=false
     var keys = [Int64: Bool](), buttons = [Int64: Bool]()
+    let routes=CaptureRoutes()
+    var localPosition=CGPoint.zero
     func setMode(_ value: String) {
+        if mode != value && value=="local" {localPosition=CGEvent(source:nil)?.location ?? localPosition}
         mode = value; deadline = CFAbsoluteTimeGetCurrent() + 0.25
         if value == "remote" && mouse && !hidden { CGDisplayHideCursor(CGMainDisplayID()); hidden = true }
         if value == "local" && hidden { CGDisplayShowCursor(CGMainDisplayID()); hidden = false }
@@ -381,6 +500,16 @@ final class InputCapture {
             return owner ? nil : Unmanaged.passUnretained(event)
         case .mouseMoved, .leftMouseDragged, .rightMouseDragged, .otherMouseDragged:
             if remote && mouse { json(["kind": "move", "dx": event.getIntegerValueField(.mouseEventDeltaX), "dy": event.getIntegerValueField(.mouseEventDeltaY), "remote": true]); return nil }
+            if mouse && routes.enabled {
+                // Location deltas retain the user's macOS acceleration. At a
+                // physical screen limit the raw delta detects continued push.
+                let p=event.location,previous=localPosition
+                let rawX=Double(event.getIntegerValueField(.mouseEventDeltaX)),rawY=Double(event.getIntegerValueField(.mouseEventDeltaY))
+                let dx=p.x==previous.x ? rawX : p.x-previous.x,dy=p.y==previous.y ? rawY : p.y-previous.y
+                if let clamped=routes.clamp(previous,dx,dy,keys.isEmpty && buttons.isEmpty) {event.location=clamped;localPosition=clamped} else {localPosition=p}
+                return Unmanaged.passUnretained(event)
+            }
+            localPosition=event.location
             if mouse && keys.isEmpty && buttons.isEmpty, let display=edgeAutomatic ? CGMainDisplayID() : edgeDisplay, CGDisplayIsActive(display) != 0 {
                 let bounds=CGDisplayBounds(display), p=event.location
                 let dx=event.getIntegerValueField(.mouseEventDeltaX), dy=event.getIntegerValueField(.mouseEventDeltaY)
@@ -404,13 +533,16 @@ final class InputCapture {
         case "enter":
             let display=(value["screen"] as? String).flatMap(UInt32.init) ?? CGMainDisplayID()
             CGWarpMouseCursorPosition(edgePoint(display,value["side"] as? String ?? "left",value["position"] as? Int ?? 32768))
+        case "reset-entry":localPosition=CGEvent(source:nil)?.location ?? localPosition;routes.resetEntry()
+        case "routes-start","routes-add","routes-commit":routes.command(value)
         case "stop": setMode("local"); exit(0)
         default: break
         }
     }
     func run(_ sharing: [String]) throws {
         keyboard = sharing.first != "false"; mouse = sharing.dropFirst().first != "false"
-        if sharing.count>=4 && mouse {edgeAutomatic=sharing[2]=="auto";edgeDisplay=edgeAutomatic ? CGMainDisplayID() : UInt32(sharing[2]);edgeSide=sharing[3];guard let display=edgeDisplay, CGDisplayIsActive(display) != 0 else {throw fail("The selected macOS edge screen is unavailable")}}
+        routes.enabled=sharing.contains("--group")
+        if sharing.count>=4 && mouse && !routes.enabled {edgeAutomatic=sharing[2]=="auto";edgeDisplay=edgeAutomatic ? CGMainDisplayID() : UInt32(sharing[2]);edgeSide=sharing[3];guard let display=edgeDisplay, CGDisplayIsActive(display) != 0 else {throw fail("The selected macOS edge screen is unavailable")}}
         let options = [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true] as CFDictionary
         guard AXIsProcessTrustedWithOptions(options) else { throw fail("Allow Desk Switch in System Settings → Privacy & Security → Accessibility, then retry input sharing") }
         guard CGPreflightListenEventAccess() || CGRequestListenEventAccess() else { throw fail("Allow Desk Switch in System Settings → Privacy & Security → Input Monitoring, then retry input sharing") }
@@ -421,13 +553,23 @@ final class InputCapture {
             return Unmanaged<InputCapture>.fromOpaque(context).takeUnretainedValue().event(type,event)
         }, userInfo: Unmanaged.passUnretained(self).toOpaque()) else { throw fail("macOS refused the keyboard/mouse event tap; check Accessibility and Input Monitoring") }
         self.tap = tap
+        routes.refresh(try desktopScreens());localPosition=CGEvent(source:nil)?.location ?? .zero
+        CGDisplayRegisterReconfigurationCallback({_,flags,context in
+            if !flags.contains(.beginConfigurationFlag),let context=context {
+                let capture=Unmanaged<InputCapture>.fromOpaque(context).takeUnretainedValue()
+                DispatchQueue.main.async {
+                    if let screens=try? desktopScreens() {capture.routes.refresh(screens)} else {capture.routes.refresh([]);capture.setMode("local");json(["kind":"emergency"])}
+                    capture.localPosition=CGEvent(source:nil)?.location ?? .zero
+                }
+            }
+        },Unmanaged.passUnretained(self).toOpaque())
         CFRunLoopAddSource(CFRunLoopGetMain(), CFMachPortCreateRunLoopSource(nil, tap, 0), .commonModes)
         CGEvent.tapEnable(tap: tap, enable: true)
         let timer = CFRunLoopTimerCreateWithHandler(nil, CFAbsoluteTimeGetCurrent(), 0.05, 0, 0) { [self] _ in if CFAbsoluteTimeGetCurrent() >= deadline || getppid() == 1 { setMode("local") }; if getppid() == 1 { exit(0) } }
         CFRunLoopAddTimer(CFRunLoopGetMain(), timer, .commonModes)
         DispatchQueue.global(qos: .userInteractive).async { [self] in
             while let line = readLine() {
-                if let data = line.data(using: .utf8), let value = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] { DispatchQueue.main.async { self.command(value) } }
+                if line.utf8.count<=512,let data = line.data(using: .utf8), let value = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] { DispatchQueue.main.async { self.command(value) } }
             }
             DispatchQueue.main.async { self.setMode("local"); exit(0) }
         }
@@ -468,7 +610,7 @@ final class InputPlayback {
     func command(_ value: [String: Any]) {
         switch value["kind"] as? String {
         case "activate":
-            if let x=value["x"] as? Double, let y=value["y"] as? Double {position=CGPoint(x:x,y:y);CGWarpMouseCursorPosition(position)} else {position=CGEvent(source:nil)?.location ?? .zero}
+            if let x=value["x"] as? Double, let y=value["y"] as? Double {position=CGPoint(x:x,y:y);if value["warp"] as? Bool != false {CGWarpMouseCursorPosition(position)}} else {position=CGEvent(source:nil)?.location ?? .zero}
             active=true;deadline=CFAbsoluteTimeGetCurrent()+0.25
         case "lease":deadline=CFAbsoluteTimeGetCurrent()+0.25
         case "release": release()
@@ -479,10 +621,8 @@ final class InputPlayback {
             guard active, let code = value["code"] as? Int, (0...4).contains(code), let down = value["down"] as? Bool else { return }
             if down { buttons.insert(code) } else { buttons.remove(code) }; mouse(code,down)
         case "move":
-            guard active, let dx = value["dx"] as? Int, let dy = value["dy"] as? Int, abs(dx) <= 16384, abs(dy) <= 16384 else { return }
-            position.x += CGFloat(dx); position.y += CGFloat(dy)
-            let bounds = NSScreen.screens.reduce(CGRect.null) { result, screen in let id = (screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber)?.uint32Value ?? CGMainDisplayID(); return result.union(CGDisplayBounds(id)) }
-            if !bounds.isNull { position.x = min(max(position.x,bounds.minX),bounds.maxX-1); position.y = min(max(position.y,bounds.minY),bounds.maxY-1) }
+            guard active,let x=value["x"] as? Double,let y=value["y"] as? Double,x.isFinite,y.isFinite else {return}
+            position=CGPoint(x:x,y:y)
             let type: CGEventType = buttons.contains(0) ? .leftMouseDragged : buttons.contains(1) ? .rightMouseDragged : buttons.isEmpty ? .mouseMoved : .otherMouseDragged
             post(CGEvent(mouseEventSource: source, mouseType: type, mouseCursorPosition: position, mouseButton: .left))
         case "scroll":
@@ -523,6 +663,7 @@ final class InputPlayback {
         }
         CFRunLoopAddTimer(CFRunLoopGetMain(),timer,.commonModes)
         ready("macOS input receiver")
+        json(["kind":"geometry","screens":try screenGeometryValue()])
         if tap==nil {FileHandle.standardError.write(Data("The local F11 listener is unavailable; F11 on the input-owning PC still restores input. Enable Input Monitoring for a local emergency key.\n".utf8))}
         DispatchQueue.global(qos:.userInteractive).async {[self] in
             while let line=readLine() {
@@ -544,6 +685,7 @@ final class InputPlayback {
         do {
             switch args.first {
             case "--version": print("Desk Switch native helper 1")
+            case "layout-self-test":try layoutSelfTest()
             case "bundle-info":
                 guard args.count==2 else {throw fail("A bundle Info.plist path is required")}
                 let data=try Data(contentsOf:URL(fileURLWithPath:args[1]),options:.mappedIfSafe)
