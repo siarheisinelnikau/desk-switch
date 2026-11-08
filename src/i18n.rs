@@ -206,6 +206,35 @@ mod tests {
         );
     }
     #[test]
+    fn translated_catalogs_do_not_fall_back_to_english_sentences() {
+        // Proper nouns, platform names, and short words that are genuinely
+        // identical in a target language are allowed to stay unchanged.
+        const SHARED: &[&str] = &[
+            "Application",
+            "Audio",
+            "Computer:",
+            "Details",
+            "Microphone",
+            "Mouse",
+            "Offline",
+            "PC",
+            "Updates",
+        ];
+        for (index, catalog) in CATALOGS.iter().enumerate().skip(2) {
+            let language = LANGUAGES[index].0;
+            for (key, value) in catalog {
+                let english = &CATALOGS[1][key];
+                if value == english
+                    && english.split_whitespace().count() >= 3
+                    && !SHARED.contains(&value.as_str())
+                {
+                    panic!("{language} still uses the English text for {key:?}");
+                }
+            }
+        }
+    }
+
+    #[test]
     fn every_catalog_has_the_same_complete_set_of_keys() {
         let keys = CATALOGS[0].keys().collect::<Vec<_>>();
         assert!(keys.len() > 150, "translate the entire interface");

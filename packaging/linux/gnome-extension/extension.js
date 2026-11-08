@@ -32,6 +32,10 @@ const CLIPBOARD_INTERFACE = `<node><interface name="${CLIPBOARD_NAME}">
         <arg type="u" direction="in"/><arg type="ay" direction="in"/>
         <arg type="b" direction="out"/><arg type="u" direction="out"/>
     </method>
+    <method name="WriteFilesWithOperationIfCurrent">
+        <arg type="u" direction="in"/><arg type="u" direction="in"/><arg type="ay" direction="in"/>
+        <arg type="b" direction="out"/><arg type="u" direction="out"/>
+    </method>
     <method name="ActivateWindow"><arg type="s" direction="in"/></method>
     <method name="PointerState"><arg type="i" direction="out"/><arg type="i" direction="out"/></method>
 </interface></node>`;
@@ -152,7 +156,7 @@ export default class DeskSwitchTray extends Extension {
     }
 
     VersionAsync(_parameters, invocation) {
-        invocation.return_value(new GLib.Variant('(u)', [1]));
+        invocation.return_value(new GLib.Variant('(u)', [2]));
     }
 
     _processId(name) {
@@ -448,10 +452,8 @@ export default class DeskSwitchTray extends Extension {
         const lines = text.split(/\r?\n/);
         if (mime === 'x-special/gnome-copied-files') {
             const action = lines.shift();
-            if (action === 'cut')
-                return null;
-            if (action !== 'copy')
-                throw new Error('File clipboard does not contain a copy operation');
+            if (action !== 'copy' && action !== 'cut')
+                throw new Error('File clipboard does not contain a copy or cut operation');
         } else if (mime !== 'text/uri-list') {
             throw new Error('Unsupported file clipboard format');
         }
@@ -538,8 +540,8 @@ export default class DeskSwitchTray extends Extension {
             if (!this._alive || serial !== this._clipboardSerial)
                 throw new Error('The clipboard changed; retry the file copy');
             this._fileUris(mime, bytes);
-            // Preserve the genuine cut MIME for the Rust worker to suppress
-            // ancillary text. Its empty selection authorizes no export/move.
+            // Only URI metadata is read here. The Rust worker distinguishes
+            // explicit cut operations; no file contents are prepared on copy.
             invocation.return_value(new GLib.Variant('(usay)', [serial, mime, bytes]));
         } catch (error) {
             if (serial && serial === this._clipboardSerial && this._alive &&
@@ -549,9 +551,11 @@ export default class DeskSwitchTray extends Extension {
         }
     }
 
-    _prepareFileCopy(bytes) {
+    _prepareFileCopy(bytes, operation = 0) {
+        if (operation !== 0 && operation !== 1)
+            throw new Error('Unsupported file clipboard operation');
         const uris = this._fileUris('text/uri-list', bytes);
-        const copy = new TextEncoder().encode(['copy', ...uris].join('\n'));
+        const copy = new TextEncoder().encode([operation === 1 ? 'cut' : 'copy', ...uris].join('\n'));
         if (copy.length > FILE_CLIPBOARD_LIMIT)
             throw new Error('File clipboard exceeds the 1 MiB metadata limit');
         return copy;
@@ -579,11 +583,15 @@ export default class DeskSwitchTray extends Extension {
     }
 
     async WriteFilesIfCurrentAsync([expectedSerial, bytes], invocation) {
+        return this.WriteFilesWithOperationIfCurrentAsync([expectedSerial, 0, bytes], invocation);
+    }
+
+    async WriteFilesWithOperationIfCurrentAsync([expectedSerial, operation, bytes], invocation) {
         try {
             await this._authorizeCaller(invocation);
             if (!this._alive)
                 throw new Error('The clipboard companion is disabled');
-            const copy = this._prepareFileCopy(bytes);
+            const copy = this._prepareFileCopy(bytes, operation);
             // No await or main-loop yield is allowed between the reservation
             // check and native ownership change. Even an identical text recopy
             // invalidates the file download's earlier paste reservation.
@@ -615,7 +623,8 @@ export default class DeskSwitchTray extends Extension {
 
     _requestFocus(pid, role) {
         const title = role === 'main' ? 'Desk Switch' :
-            role === 'quick' ? 'Desk Switch quick controls' : null;
+            role === 'quick' ? 'Desk Switch quick controls' :
+            role === 'transfer' ? 'Desk Switch file transfer' : null;
         if (!title)
             throw new Error('Unknown Desk Switch window role');
         this._clearFocusRequest(pid);

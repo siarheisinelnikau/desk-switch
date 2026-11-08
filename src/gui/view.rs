@@ -824,6 +824,11 @@ fn device_picker(
 impl Desktop {
     pub(super) fn render(&mut self, root: &mut egui::Ui) {
         #[cfg(debug_assertions)]
+        if self.preview_file_progress {
+            self.file_progress.preview(root);
+            return;
+        }
+        #[cfg(debug_assertions)]
         if self.preview_popup {
             self.quick_preview(root);
             return;

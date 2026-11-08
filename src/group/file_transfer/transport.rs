@@ -321,7 +321,7 @@ mod tests {
             },
         }));
         let manifest = Manifest {
-            version: VERSION,
+            version: super::super::protocol::MANIFEST_VERSION,
             id: "cd".repeat(16),
             name: "Folder".into(),
             roots: vec!["Folder".into()],

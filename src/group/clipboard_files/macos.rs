@@ -1,5 +1,9 @@
-//! Eager, copy-only Finder file URLs. No text paths or file promises are used.
-use super::Selection;
+//! Finder file selections and explicit publication of verified local copies.
+use super::{
+    Selection,
+    provider::{PublishedOffer, RemoteOffer},
+};
+use crate::group::file_transfer::protocol::Operation;
 use anyhow::{Context, Result, ensure};
 use objc2::{
     ClassType, msg_send,
@@ -111,6 +115,7 @@ pub(super) fn read() -> Result<Option<Selection>> {
             return Ok(paths.map(|paths| Selection {
                 sequence: current,
                 paths,
+                operation: Operation::Copy,
             }));
         }
         let mut paths = Vec::new();
@@ -176,8 +181,19 @@ pub(super) fn read() -> Result<Option<Selection>> {
         Ok(paths.map(|paths| Selection {
             sequence: current,
             paths,
+            operation: Operation::Copy,
         }))
     })
+}
+
+pub(super) fn publish_offer_if_current(
+    _offer: RemoteOffer,
+    _expected: u64,
+) -> Result<Option<Box<dyn PublishedOffer>>> {
+    // AppKit file promises establish drag-and-drop support, not Finder Cmd+V.
+    // Until native paste is verified, leave the local pasteboard untouched and
+    // never replace demand-driven delivery with an eager transfer.
+    anyhow::bail!("File clipboard paste is unavailable on macOS. Use Send files instead.")
 }
 
 pub(super) fn write_if_current(paths: &[PathBuf], expected: u64) -> Result<bool> {
@@ -228,6 +244,40 @@ fn write_impl(paths: &[PathBuf], expected: Option<u64>) -> Result<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn unsupported_native_paste_never_requests_file_contents() {
+        use crate::group::{
+            clipboard_files::provider::{DemandProvider, PasteIntent, PasteSession},
+            file_transfer::protocol::{Description, Descriptor, DescriptorKind},
+        };
+        use std::sync::Arc;
+        struct UnexpectedDemand;
+        impl DemandProvider for UnexpectedDemand {
+            fn begin(&self, _intent: PasteIntent) -> Result<Arc<dyn PasteSession>> {
+                panic!("An unsupported native paste must not start a transfer")
+            }
+        }
+        for operation in [Operation::Copy, Operation::Move] {
+            let result = publish_offer_if_current(
+                RemoteOffer {
+                    id: "0".repeat(32),
+                    description: Description {
+                        name: "Untouched clipboard".into(),
+                        roots: vec!["file.txt".into()],
+                        entries: vec![Descriptor {
+                            path: vec!["file.txt".into()],
+                            kind: DescriptorKind::File { size: 0 },
+                        }],
+                        total: 0,
+                    },
+                    operation,
+                    provider: Arc::new(UnexpectedDemand),
+                },
+                0,
+            );
+            assert!(result.is_err_and(|error| error.to_string().contains("unavailable on macOS")));
+        }
+    }
     #[test]
     fn file_uris_preserve_spaces_unicode_and_literal_delimiters() {
         assert_eq!(

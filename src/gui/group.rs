@@ -1592,9 +1592,9 @@ fn sharing_toggles(
     ui.checkbox(&mut settings.clipboard_enabled, tr("Shared clipboard"));
     ui.weak(tr("Text, images, files and folders."));
     if settings.clipboard_enabled {
-        ui.weak(tr(
-            "Copied files become available to paste after the transfer completes.",
-        ));
+        ui.weak(tr("Copy or cut on one computer, paste on another."));
+        #[cfg(target_os = "macos")]
+        ui.weak(tr("Use Send files to receive files on this Mac."));
     }
     if let Some(status) = status {
         ui.weak(tr(status));

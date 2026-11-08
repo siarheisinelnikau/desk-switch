@@ -7,12 +7,14 @@ use std::time::Duration;
 pub(super) enum Role {
     Main,
     Quick,
+    Transfer,
 }
 impl Role {
     fn name(self) -> &'static str {
         match self {
             Self::Main => "main",
             Self::Quick => "quick",
+            Self::Transfer => "transfer",
         }
     }
 }
@@ -71,6 +73,14 @@ fn activate(connection: &mut Option<zbus::blocking::Connection>, role: Role) -> 
         "/io/github/siarheisinelnikau/DeskSwitch/Clipboard",
         "io.github.siarheisinelnikau.DeskSwitch.Clipboard",
     )?;
+    if matches!(role, Role::Transfer) {
+        let version: u32 = proxy.call("Version", &())?;
+        if version < 2 {
+            return Err(zbus::Error::Failure(
+                "Reload Desk Switch Tray in Extensions to show transfer windows.".into(),
+            ));
+        }
+    }
     proxy.call("ActivateWindow", &(role.name(),))
 }
 
@@ -111,21 +121,25 @@ mod tests {
             Some(address),
             std::env::var("DESK_SWITCH_ACTIVATION_PARENT_BUS").ok()
         );
-        struct Mock(Arc<Mutex<Vec<String>>>);
+        struct Mock(Arc<Mutex<Vec<String>>>, Arc<std::sync::atomic::AtomicU32>);
         #[zbus::interface(name = "io.github.siarheisinelnikau.DeskSwitch.Clipboard")]
         impl Mock {
+            fn version(&self) -> u32 {
+                self.1.load(std::sync::atomic::Ordering::Relaxed)
+            }
             fn activate_window(&self, role: String) {
                 self.0.lock().unwrap().push(role);
             }
         }
         let roles = Arc::new(Mutex::new(Vec::new()));
+        let version = Arc::new(std::sync::atomic::AtomicU32::new(1));
         let _server = zbus::blocking::connection::Builder::session()
             .unwrap()
             .name("io.github.siarheisinelnikau.DeskSwitch.Clipboard")
             .unwrap()
             .serve_at(
                 "/io/github/siarheisinelnikau/DeskSwitch/Clipboard",
-                Mock(roles.clone()),
+                Mock(roles.clone(), version.clone()),
             )
             .unwrap()
             .build()
@@ -133,6 +147,11 @@ mod tests {
         let mut connection = None;
         activate(&mut connection, Role::Main).unwrap();
         activate(&mut connection, Role::Quick).unwrap();
+        let error = activate(&mut connection, Role::Transfer).unwrap_err();
+        assert!(error.to_string().contains("Reload Desk Switch Tray"));
         assert_eq!(*roles.lock().unwrap(), ["main", "quick"]);
+        version.store(2, std::sync::atomic::Ordering::Relaxed);
+        activate(&mut connection, Role::Transfer).unwrap();
+        assert_eq!(*roles.lock().unwrap(), ["main", "quick", "transfer"]);
     }
 }

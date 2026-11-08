@@ -4,18 +4,22 @@
 //! local path. Exports are immutable owned snapshots. Receiver checkpoints are
 //! committed only after the corresponding bytes have been flushed, and are
 //! checked against the on-disk prefix before resuming.
-use super::protocol::{self, CHUNK, Entry, Kind, MAX_ENTRIES, MAX_MANIFEST, MAX_TOTAL, Manifest};
+use super::protocol::{
+    self, CHUNK, Description, Descriptor, DescriptorKind, Entry, Kind, MAX_ENTRIES, MAX_MANIFEST,
+    MAX_TOTAL, Manifest,
+};
 use anyhow::{Context, Result, bail, ensure};
 use cap_fs_ext::{DirExt, FollowSymlinks, OpenOptionsFollowExt};
 use cap_std::{
     ambient_authority,
     fs::{Dir, DirBuilder, File, Metadata, OpenOptions},
+    time::SystemTime,
 };
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use sha2::{Digest, Sha256};
 use std::{
     collections::{BTreeMap, BTreeSet},
-    ffi::OsStr,
+    ffi::{OsStr, OsString},
     io::{Read, Seek, SeekFrom, Write},
     path::{Component, Path, PathBuf},
     sync::{
@@ -23,6 +27,8 @@ use std::{
         atomic::{AtomicBool, AtomicU64, Ordering},
     },
 };
+
+pub mod source_move;
 
 const FORMAT: u16 = 1;
 const BUFFER: usize = 64 * 1024;
@@ -32,6 +38,16 @@ const MAX_CANCELLATIONS: usize = 65_536;
 static TEMP: AtomicU64 = AtomicU64::new(1);
 static NO_CANCEL: AtomicBool = AtomicBool::new(false);
 static CANCELLATIONS: Mutex<()> = Mutex::new(());
+
+// Observe source I/O boundaries on the current test thread. Capture must never
+// request a content-capable handle, and cancellation must interrupt verification
+// between buffers even when a cloud/FUSE open itself could hydrate file bytes.
+#[cfg(test)]
+thread_local! {
+    static CONTENT_OPENS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static HASH_BUFFERS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static AFTER_HASH_BUFFER: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
+}
 
 #[derive(Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -235,6 +251,62 @@ fn directory(parent: &Dir, name: &OsStr, create: bool) -> Result<Dir> {
 /// Open every component independently with no-follow semantics. In particular,
 /// a symlink in an ancestor cannot redirect a later source read or stage write.
 fn absolute_directory(path: &Path, create: bool) -> Result<Dir> {
+    absolute_directory_with(path, create, false)
+}
+
+fn source_absolute_directory(path: &Path) -> Result<Dir> {
+    absolute_directory_with(path, false, true)
+}
+
+/// Open the source root without blocking a later rename of any descendant.
+#[cfg(windows)]
+fn source_root_directory(path: &Path) -> Result<Dir> {
+    use std::os::windows::fs::OpenOptionsExt;
+    let file = std::fs::OpenOptions::new()
+        .access_mode(0)
+        .custom_flags(0x0200_0000) // FILE_FLAG_BACKUP_SEMANTICS
+        .share_mode(0x1 | 0x2 | 0x4) // FILE_SHARE_READ | WRITE | DELETE
+        .open(path)?;
+    Ok(Dir::from_std_file(file))
+}
+
+#[cfg(not(windows))]
+fn source_root_directory(path: &Path) -> Result<Dir> {
+    Ok(Dir::open_ambient_dir(path, ambient_authority())?)
+}
+
+/// Capture capabilities allow normal local renames/deletes while a clipboard
+/// offer waits for paste. Only metadata operations use these shared handles.
+fn source_directory(parent: &Dir, name: &OsStr) -> Result<Dir> {
+    #[cfg(windows)]
+    {
+        use cap_std::fs::OpenOptionsExt;
+        let mut options = OpenOptions::new();
+        options
+            // Do not request FILE_READ_DATA: if a racing substitution changes
+            // this name from a directory into a cloud file, even the rejected
+            // open must remain metadata-only and must not hydrate its bytes.
+            .access_mode(0)
+            .follow(FollowSymlinks::No)
+            // FILE_FLAG_BACKUP_SEMANTICS permits a directory handle.
+            .custom_flags(0x0200_0000)
+            // FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE.
+            .share_mode(0x1 | 0x2 | 0x4);
+        let file = parent.open_with(name, &options)?;
+        let metadata = file.metadata()?;
+        no_links(&metadata)?;
+        ensure!(metadata.is_dir(), "The copied source is not a folder");
+        Ok(Dir::from_std_file(file.into_std()))
+    }
+    #[cfg(not(windows))]
+    {
+        let directory = parent.open_dir_nofollow(name)?;
+        no_links(&directory.dir_metadata()?)?;
+        Ok(directory)
+    }
+}
+
+fn absolute_directory_with(path: &Path, create: bool, source: bool) -> Result<Dir> {
     ensure!(
         path.is_absolute(),
         "Choose an absolute local file or folder path"
@@ -263,14 +335,24 @@ fn absolute_directory(path: &Path, create: bool) -> Result<Dir> {
         !root.as_os_str().is_empty(),
         "Choose an absolute local file or folder path"
     );
-    let mut current = Dir::open_ambient_dir(root, ambient_authority())?;
+    let mut current = if source {
+        source_root_directory(&root)?
+    } else {
+        Dir::open_ambient_dir(root, ambient_authority())?
+    };
     for name in names {
-        current = directory(&current, &name, create)?;
+        current = if source {
+            source_directory(&current, &name)?
+        } else {
+            directory(&current, &name, create)?
+        };
     }
     Ok(current)
 }
 
 fn open_file(parent: &Dir, name: impl AsRef<Path>, write: bool, create: bool) -> Result<File> {
+    #[cfg(test)]
+    CONTENT_OPENS.with(|count| count.set(count.get() + 1));
     let mut options = OpenOptions::new();
     options
         .read(true)
@@ -397,6 +479,15 @@ fn hash_prefix(file: &mut File, length: u64, cancel: &AtomicBool) -> Result<Sha2
         file.read_exact(&mut buffer[..count])?;
         hash.update(&buffer[..count]);
         left -= count as u64;
+        #[cfg(test)]
+        {
+            HASH_BUFFERS.with(|count| count.set(count.get() + 1));
+            AFTER_HASH_BUFFER.with(|hook| {
+                if let Some(hook) = hook.borrow_mut().take() {
+                    hook();
+                }
+            });
+        }
     }
     Ok(hash)
 }
@@ -425,6 +516,322 @@ struct ExportOwner {
     format: u16,
     id: String,
     digest: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct FileIdentity {
+    device: u64,
+    inode: u64,
+}
+
+impl FileIdentity {
+    fn of(metadata: &Metadata) -> Result<Self> {
+        use cap_fs_ext::MetadataExt;
+        no_links(metadata)?;
+        // cap-std's Windows no-follow stat uses access_mode(0), which supplies
+        // handle identities without requesting FILE_READ_DATA. The extension
+        // returns those handle-derived IDs on Windows and dev/inode on Unix.
+        Ok(Self {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+        })
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct SourceMetadata {
+    identity: FileIdentity,
+    directory: bool,
+    length: u64,
+    modified: Option<SystemTime>,
+    created: Option<SystemTime>,
+    #[cfg(unix)]
+    changed: (i64, i64),
+}
+
+impl SourceMetadata {
+    fn of(metadata: &Metadata) -> Result<Self> {
+        no_links(metadata)?;
+        ensure!(
+            metadata.is_dir() || metadata.is_file(),
+            "Only regular files and folders can be transferred"
+        );
+        Ok(Self {
+            identity: FileIdentity::of(metadata)?,
+            directory: metadata.is_dir(),
+            length: metadata.len(),
+            modified: metadata.modified().ok(),
+            created: metadata.created().ok(),
+            #[cfg(unix)]
+            changed: {
+                use cap_std::fs::MetadataExt;
+                (metadata.ctime(), metadata.ctime_nsec())
+            },
+        })
+    }
+
+    fn check(&self, metadata: &Metadata) -> Result<()> {
+        ensure!(
+            self == &Self::of(metadata)?,
+            "A copied file or folder changed; copy the selection again"
+        );
+        Ok(())
+    }
+}
+
+struct SourceEntry {
+    name: OsString,
+    path: Vec<String>,
+    metadata: SourceMetadata,
+    children: Vec<SourceEntry>,
+}
+
+struct SourceRoot {
+    parent: Dir,
+    parent_path: PathBuf,
+    parent_identity: FileIdentity,
+    entry: SourceEntry,
+}
+
+impl SourceRoot {
+    fn check_binding(&self) -> Result<()> {
+        let current_parent = source_absolute_directory(&self.parent_path)?;
+        ensure!(
+            FileIdentity::of(&current_parent.dir_metadata()?)? == self.parent_identity
+                && FileIdentity::of(&self.parent.dir_metadata()?)? == self.parent_identity,
+            "The copied source folder moved or was replaced; copy the selection again"
+        );
+        self.entry
+            .metadata
+            .check(&self.parent.symlink_metadata(&self.entry.name)?)?;
+        if self.entry.metadata.directory {
+            // Reopen for this check instead of retaining a child directory
+            // handle. On Windows a live child handle can block renaming the
+            // selected folder's parent while a clipboard offer waits.
+            let directory = source_directory(&self.parent, &self.entry.name)?;
+            self.entry.metadata.check(&directory.dir_metadata()?)?;
+        }
+        Ok(())
+    }
+
+    fn pin_for_read(&self) -> Result<(Dir, Option<Dir>)> {
+        self.check_binding()?;
+        // cap-std intentionally prevents Windows directory replacement while
+        // its confined operations resolve relative names. Upgrade capture's
+        // share-delete metadata pins for the bounded, demanded snapshot only.
+        let parent = absolute_directory(&self.parent_path, false)?;
+        ensure!(
+            FileIdentity::of(&parent.dir_metadata()?)? == self.parent_identity,
+            "The copied source folder moved or was replaced; copy the selection again"
+        );
+        self.entry
+            .metadata
+            .check(&parent.symlink_metadata(&self.entry.name)?)?;
+        let directory = if self.entry.metadata.directory {
+            let directory = parent.open_dir_nofollow(&self.entry.name)?;
+            self.entry.metadata.check(&directory.dir_metadata()?)?;
+            Some(directory)
+        } else {
+            None
+        };
+        Ok((parent, directory))
+    }
+}
+
+/// An in-memory selection containing display metadata and directory capabilities
+/// only. Capturing it never opens source files for content, hashes them, creates
+/// transfer storage, or retains an ambient path as authority to read later.
+pub struct SourceSelection {
+    pub description: Description,
+    captured_description: Description,
+    roots: Vec<SourceRoot>,
+}
+
+impl SourceSelection {
+    pub fn capture(paths: &[PathBuf], cancel: &AtomicBool) -> Result<Self> {
+        cancelled(cancel)?;
+        ensure!(
+            !paths.is_empty() && paths.len() <= MAX_ENTRIES,
+            "Choose files or folders to send"
+        );
+        let mut description = Description {
+            name: String::new(),
+            roots: Vec::new(),
+            entries: Vec::new(),
+            total: 0,
+        };
+        let mut roots = Vec::new();
+        let mut used = BTreeSet::new();
+        // Reserve the envelope and display name, and account for the later
+        // manifest's checksums now so paste cannot exceed the metadata limit.
+        let mut metadata_bytes = 1024_usize;
+        for source in paths {
+            cancelled(cancel)?;
+            let name = source
+                .file_name()
+                .and_then(OsStr::to_str)
+                .context("File names must be valid Unicode")?;
+            protocol::valid_component(name)?;
+            let mut candidate = name.to_owned();
+            let mut unique = false;
+            for suffix in 2..=MAX_ENTRIES + 1 {
+                if used.insert(candidate.to_lowercase()) {
+                    unique = true;
+                    break;
+                }
+                candidate = format!("{name} ({suffix})");
+                protocol::valid_component(&candidate)?;
+            }
+            ensure!(unique, "File names collide");
+            metadata_bytes += serde_json::to_vec(&candidate)?.len() + 1;
+            ensure!(
+                metadata_bytes <= MAX_MANIFEST,
+                "Transfer metadata is too large"
+            );
+            let parent_path = source
+                .parent()
+                .context("Choose a file or folder")?
+                .to_owned();
+            let parent = source_absolute_directory(&parent_path)?;
+            let parent_identity = FileIdentity::of(&parent.dir_metadata()?)?;
+            let metadata = SourceMetadata::of(&parent.symlink_metadata(name)?)?;
+            let directory = if metadata.directory {
+                let directory = source_directory(&parent, OsStr::new(name))?;
+                metadata.check(&directory.dir_metadata()?)?;
+                Some(directory)
+            } else {
+                None
+            };
+            let entry = capture_source_entry(
+                &parent,
+                OsStr::new(name),
+                vec![candidate.clone()],
+                directory.as_ref(),
+                &mut description,
+                &mut metadata_bytes,
+                cancel,
+            )?;
+            let root = SourceRoot {
+                parent,
+                parent_path,
+                parent_identity,
+                entry,
+            };
+            root.check_binding()?;
+            roots.push(root);
+            description.roots.push(candidate);
+        }
+        description.name = if description.roots.len() == 1 {
+            description.roots[0].clone()
+        } else {
+            format!("{} items", description.roots.len())
+        };
+        description.validate()?;
+        cancelled(cancel)?;
+        Ok(Self {
+            captured_description: description.clone(),
+            description,
+            roots,
+        })
+    }
+
+    /// Read and spool the selected bytes only after a receiver demands them.
+    /// The same captured identities are checked around every source read.
+    pub fn prepare(
+        &self,
+        state_dir: &Path,
+        id: &str,
+        max_bytes: u64,
+        cancel: &AtomicBool,
+        progress: impl FnMut(u64),
+    ) -> Result<Export> {
+        Export::prepare_selection(state_dir, id, self, max_bytes, cancel, progress)
+    }
+}
+
+fn capture_source_entry(
+    parent: &Dir,
+    name: &OsStr,
+    path: Vec<String>,
+    pinned: Option<&Dir>,
+    description: &mut Description,
+    metadata_bytes: &mut usize,
+    cancel: &AtomicBool,
+) -> Result<SourceEntry> {
+    cancelled(cancel)?;
+    ensure!(
+        path.len() <= 64 && description.entries.len() < MAX_ENTRIES,
+        "The transfer contains too many files or nested folders"
+    );
+    ensure!(
+        path.iter().map(String::len).sum::<usize>() + path.len() <= 4096,
+        "The file transfer path is too deep or too long"
+    );
+    let metadata = SourceMetadata::of(&parent.symlink_metadata(name)?)?;
+    let kind = if metadata.directory {
+        DescriptorKind::Directory
+    } else {
+        description.total = description
+            .total
+            .checked_add(metadata.length)
+            .filter(|total| *total <= MAX_TOTAL)
+            .context("The copied files exceed their sharing limits")?;
+        DescriptorKind::File {
+            size: metadata.length,
+        }
+    };
+    charge_entry(
+        &Entry {
+            path: path.clone(),
+            kind: match kind {
+                DescriptorKind::Directory => Kind::Directory,
+                DescriptorKind::File { size } => Kind::File {
+                    size,
+                    sha256: "0".repeat(64),
+                },
+            },
+        },
+        metadata_bytes,
+    )?;
+    description.entries.push(Descriptor {
+        path: path.clone(),
+        kind,
+    });
+    let mut children = Vec::new();
+    if metadata.directory {
+        let directory = match pinned {
+            Some(directory) => directory.try_clone()?,
+            None => source_directory(parent, name)?,
+        };
+        metadata.check(&directory.dir_metadata()?)?;
+        // Retain only the bounded captured tree. Do not collect an unbounded
+        // sibling list, sort it, or open any child file to enumerate metadata.
+        for entry in directory.entries()? {
+            cancelled(cancel)?;
+            let name = entry?.file_name();
+            let text = name.to_str().context("File names must be valid Unicode")?;
+            protocol::valid_component(text)?;
+            let mut next = path.clone();
+            next.push(text.to_owned());
+            children.push(capture_source_entry(
+                &directory,
+                &name,
+                next,
+                None,
+                description,
+                metadata_bytes,
+                cancel,
+            )?);
+        }
+        metadata.check(&directory.dir_metadata()?)?;
+    }
+    metadata.check(&parent.symlink_metadata(name)?)?;
+    Ok(SourceEntry {
+        name: name.to_owned(),
+        path,
+        metadata,
+        children,
+    })
 }
 
 pub struct Export {
@@ -505,17 +912,41 @@ impl Export {
         paths: &[PathBuf],
         max_bytes: u64,
         cancel: &AtomicBool,
+        progress: impl FnMut(u64),
+    ) -> Result<Self> {
+        SourceSelection::capture(paths, cancel)?.prepare(state_dir, id, max_bytes, cancel, progress)
+    }
+
+    fn prepare_selection(
+        state_dir: &Path,
+        id: &str,
+        selection: &SourceSelection,
+        max_bytes: u64,
+        cancel: &AtomicBool,
         mut progress: impl FnMut(u64),
     ) -> Result<Self> {
+        cancelled(cancel)?;
         ensure!(
             max_bytes <= MAX_TOTAL,
             "Invalid file transfer storage budget"
         );
         protocol::valid_id(id)?;
+        selection.description.validate()?;
         ensure!(
-            !paths.is_empty() && paths.len() <= MAX_ENTRIES,
-            "Choose files or folders to send"
+            selection.description == selection.captured_description,
+            "The copied file selection metadata changed"
         );
+        ensure!(
+            selection.description.total <= max_bytes,
+            "The transfer exceeds the available file sharing storage budget"
+        );
+        let mut source_pins = Vec::with_capacity(selection.roots.len());
+        for source in &selection.roots {
+            cancelled(cancel)?;
+            let pins = source.pin_for_read()?;
+            check_source_entry(&pins.0, &source.entry, pins.1.as_ref(), cancel)?;
+            source_pins.push(pins);
+        }
         let state = absolute_directory(state_dir, true)?;
         let transfer = directory(&state, OsStr::new("file-transfer"), true)?;
         private_directory(&transfer)?;
@@ -548,41 +979,25 @@ impl Export {
                 entries: Vec::new(),
                 total: 0,
             };
-            let mut used = BTreeSet::new();
             // Reserve the fixed envelope and display-name budget. Charge each
             // serialized entry before copying its bytes, rather than allowing a
             // large local directory to build an oversized manifest in memory.
             let mut metadata_bytes = 1024_usize;
-            for source in paths {
+            for (source, (source_parent, source_directory)) in
+                selection.roots.iter().zip(&source_pins)
+            {
                 cancelled(cancel)?;
-                let name = source
-                    .file_name()
-                    .and_then(OsStr::to_str)
-                    .context("File names must be valid Unicode")?;
-                protocol::valid_component(name)?;
-                let mut candidate = name.to_owned();
-                for suffix in 2..=MAX_ENTRIES + 1 {
-                    if used.insert(candidate.to_lowercase()) {
-                        break;
-                    }
-                    candidate = format!("{name} ({suffix})");
-                    protocol::valid_component(&candidate)?;
-                }
-                ensure!(
-                    used.contains(&candidate.to_lowercase()),
-                    "File names collide"
-                );
+                source.check_binding()?;
+                let candidate = &source.entry.path[0];
                 metadata_bytes += serde_json::to_vec(&candidate)?.len() + 1;
                 ensure!(
                     metadata_bytes <= MAX_MANIFEST,
                     "Transfer metadata is too large"
                 );
-                let source_parent =
-                    absolute_directory(source.parent().context("Choose a file or folder")?, false)?;
                 snapshot_entry(
-                    &source_parent,
-                    OsStr::new(name),
-                    vec![candidate.clone()],
+                    source_parent,
+                    &source.entry,
+                    source_directory.as_ref(),
                     &blobs,
                     &mut manifest,
                     &mut SnapshotControl {
@@ -592,7 +1007,8 @@ impl Export {
                         progress: &mut progress,
                     },
                 )?;
-                manifest.roots.push(candidate);
+                source.check_binding()?;
+                manifest.roots.push(candidate.clone());
             }
             manifest.name = if manifest.roots.len() == 1 {
                 manifest.roots[0].clone()
@@ -600,6 +1016,21 @@ impl Export {
                 format!("{} items", manifest.roots.len())
             };
             manifest.validate()?;
+            ensure!(
+                manifest.description() == selection.description,
+                "The copied file selection changed before the transfer"
+            );
+            for (source, (source_parent, source_directory)) in
+                selection.roots.iter().zip(&source_pins)
+            {
+                source.check_binding()?;
+                check_source_entry(
+                    source_parent,
+                    &source.entry,
+                    source_directory.as_ref(),
+                    cancel,
+                )?;
+            }
             cancelled(cancel)?;
             sync_dir(&blobs)?;
             let encoded = serde_json::to_vec(&manifest)?;
@@ -741,13 +1172,15 @@ struct SnapshotControl<'a> {
 
 fn snapshot_entry(
     source: &Dir,
-    name: &OsStr,
-    path: Vec<String>,
+    selected: &SourceEntry,
+    pinned: Option<&Dir>,
     blobs: &Dir,
     manifest: &mut Manifest,
     control: &mut SnapshotControl<'_>,
 ) -> Result<()> {
     cancelled(control.cancel)?;
+    let name = &selected.name;
+    let path = &selected.path;
     ensure!(
         path.len() <= 64 && manifest.entries.len() < MAX_ENTRIES,
         "The transfer contains too many files or nested folders"
@@ -757,26 +1190,28 @@ fn snapshot_entry(
         "The file transfer path is too deep or too long"
     );
     let metadata = source.symlink_metadata(name)?;
-    no_links(&metadata)?;
+    selected.metadata.check(&metadata)?;
     if metadata.is_dir() {
-        let child = source.open_dir_nofollow(name)?;
-        no_links(&child.dir_metadata()?)?;
+        let child = match pinned {
+            Some(directory) => directory.try_clone()?,
+            None => source.open_dir_nofollow(name)?,
+        };
+        selected.metadata.check(&child.dir_metadata()?)?;
+        check_source_children(&child, &selected.children, control.cancel)?;
         let entry = Entry {
             path: path.clone(),
             kind: Kind::Directory,
         };
         charge_entry(&entry, control.metadata_bytes)?;
         manifest.entries.push(entry);
-        // Keep directory enumeration lazy: a deeply nested source should not
-        // retain one large sibling-name list at every recursion level.
-        for entry in child.entries()? {
-            let name = entry?.file_name();
-            let text = name.to_str().context("File names must be valid Unicode")?;
-            protocol::valid_component(text)?;
-            let mut next = path.clone();
-            next.push(text.to_owned());
-            snapshot_entry(&child, &name, next, blobs, manifest, control)?;
+        // Use the captured order, rather than trusting a later filesystem
+        // enumeration to preserve the manifest's numeric entry identities.
+        for entry in &selected.children {
+            snapshot_entry(&child, entry, None, blobs, manifest, control)?;
         }
+        check_source_children(&child, &selected.children, control.cancel)?;
+        selected.metadata.check(&child.dir_metadata()?)?;
+        selected.metadata.check(&source.symlink_metadata(name)?)?;
         return Ok(());
     }
     ensure!(
@@ -785,6 +1220,7 @@ fn snapshot_entry(
     );
     let mut file = open_file(source, name, false, false)?;
     let before = regular(&file, false)?;
+    selected.metadata.check(&before)?;
     let size = before.len();
     ensure!(
         manifest
@@ -794,7 +1230,7 @@ fn snapshot_entry(
         "The transfer exceeds the available file sharing storage budget"
     );
     let mut entry = Entry {
-        path,
+        path: path.clone(),
         kind: Kind::File {
             size,
             sha256: "0".repeat(64),
@@ -821,10 +1257,8 @@ fn snapshot_entry(
         "A source file changed while preparing the transfer"
     );
     let after = regular(&file, false)?;
-    ensure!(
-        before.len() == after.len() && before.modified().ok() == after.modified().ok(),
-        "A source file changed while preparing the transfer"
-    );
+    selected.metadata.check(&after)?;
+    selected.metadata.check(&source.symlink_metadata(name)?)?;
     target.sync_all()?;
     manifest.total += size;
     entry.kind = Kind::File {
@@ -832,6 +1266,57 @@ fn snapshot_entry(
         sha256: format!("{:x}", hash.finalize()),
     };
     manifest.entries.push(entry);
+    Ok(())
+}
+
+fn check_source_children(
+    directory: &Dir,
+    children: &[SourceEntry],
+    cancel: &AtomicBool,
+) -> Result<()> {
+    let mut names = children
+        .iter()
+        .map(|child| child.name.clone())
+        .collect::<BTreeSet<_>>();
+    for entry in directory.entries()? {
+        cancelled(cancel)?;
+        ensure!(
+            names.remove(&entry?.file_name()),
+            "A copied folder changed; copy the selection again"
+        );
+    }
+    ensure!(
+        names.is_empty(),
+        "A copied folder changed; copy the selection again"
+    );
+    Ok(())
+}
+
+fn check_source_entry(
+    parent: &Dir,
+    entry: &SourceEntry,
+    pinned: Option<&Dir>,
+    cancel: &AtomicBool,
+) -> Result<()> {
+    cancelled(cancel)?;
+    entry
+        .metadata
+        .check(&parent.symlink_metadata(&entry.name)?)?;
+    if entry.metadata.directory {
+        let directory = match pinned {
+            Some(directory) => directory.try_clone()?,
+            None => parent.open_dir_nofollow(&entry.name)?,
+        };
+        entry.metadata.check(&directory.dir_metadata()?)?;
+        check_source_children(&directory, &entry.children, cancel)?;
+        for child in &entry.children {
+            check_source_entry(&directory, child, None, cancel)?;
+        }
+        entry.metadata.check(&directory.dir_metadata()?)?;
+    }
+    entry
+        .metadata
+        .check(&parent.symlink_metadata(&entry.name)?)?;
     Ok(())
 }
 
@@ -877,6 +1362,9 @@ pub struct Receive {
     blobs: Option<Dir>,
     owner: ReceiverOwner,
     checked: BTreeMap<u32, (u64, Sha256)>,
+    // Pin the tree that was actually verified, not a later path supplied by a
+    // native clipboard consumer or a replaced public Downloads namespace.
+    finished_tree: Option<Dir>,
 }
 
 impl Receive {
@@ -944,7 +1432,7 @@ impl Receive {
         };
         private_directory(&stage)?;
         let blobs = directory(&stage, OsStr::new("blobs"), true)?;
-        Ok(Self {
+        let mut receive = Self {
             manifest,
             base,
             base_path: downloads.to_owned(),
@@ -952,7 +1440,89 @@ impl Receive {
             blobs: Some(blobs),
             owner,
             checked: BTreeMap::new(),
-        })
+            finished_tree: None,
+        };
+        if receive.owner.finished {
+            receive.finished_tree = Some(receive.completed_tree()?);
+        }
+        Ok(receive)
+    }
+
+    fn completed_tree(&self) -> Result<Dir> {
+        ensure!(
+            self.owner.finished && !self.owner.cancelled,
+            "The file transfer is not complete"
+        );
+        let name = self
+            .owner
+            .bundle
+            .as_ref()
+            .context("The completed receiving folder is missing")?;
+        self.valid_bundle_name(name)?;
+        let bundle = directory(&self.base, OsStr::new(name), false)?;
+        private_directory(&bundle)?;
+        ensure!(
+            read_json::<Binding>(&bundle, "transfer.json", CHECKPOINT_LIMIT)? == self.owner.binding,
+            "The receiving folder does not belong to this transfer"
+        );
+        directory(&bundle, OsStr::new("files"), false)
+    }
+
+    /// Supply a native virtual-file consumer with a read-only handle to one
+    /// completed manifest entry. No caller-controlled path is accepted. Hash
+    /// the pinned file again because the public finished copy is user-editable.
+    pub fn open_verified(&self, index: usize) -> Result<std::fs::File> {
+        self.open_verified_cancellable(index, &NO_CANCEL)
+    }
+
+    pub fn open_verified_cancellable(
+        &self,
+        index: usize,
+        cancel: &AtomicBool,
+    ) -> Result<std::fs::File> {
+        cancelled(cancel)?;
+        ensure!(
+            self.owner.finished && !self.owner.cancelled,
+            "The file transfer is not complete"
+        );
+        ensure!(
+            self.manifest.digest()? == self.owner.binding.manifest,
+            "The completed file manifest changed"
+        );
+        let entry = self
+            .manifest
+            .entries
+            .get(index)
+            .context("Unknown received file")?;
+        let Kind::File { size, sha256 } = &entry.kind else {
+            bail!("The requested entry is not a file");
+        };
+        let tree = self
+            .finished_tree
+            .as_ref()
+            .context("The verified receiving folder is closed")?;
+        let (parent, name) = path_parent(tree, &entry.path, false)?;
+        let mut file = open_file(&parent, &name, false, false)?;
+        let before = SourceMetadata::of(&regular(&file, true)?)?;
+        ensure!(
+            before.length == *size,
+            "The completed transfer file changed"
+        );
+        ensure!(
+            finished_hash(&hash_prefix(&mut file, *size, cancel)?) == *sha256,
+            "The completed transfer file failed verification"
+        );
+        cancelled(cancel)?;
+        let mut extra = [0];
+        ensure!(
+            file.read(&mut extra)? == 0,
+            "The completed transfer file changed"
+        );
+        before.check(&regular(&file, true)?)?;
+        before.check(&parent.symlink_metadata(&name)?)?;
+        file.seek(SeekFrom::Start(0))?;
+        cancelled(cancel)?;
+        Ok(file.into_std())
     }
 
     fn active(&self) -> Result<(&Dir, &Dir)> {
@@ -1178,11 +1748,12 @@ impl Receive {
     pub fn finish_with_cancel(&mut self, cancel: &AtomicBool) -> Result<Vec<PathBuf>> {
         ensure!(!self.owner.cancelled, "The file transfer was cancelled");
         let (bundle_name, bundle) = self.bundle()?;
-        if exists(&bundle, "files")? {
+        let files = if exists(&bundle, "files")? {
             let files = directory(&bundle, OsStr::new("files"), false)?;
             // Once the atomic rename committed, cancellation must never remove
             // or abandon the user's verified files.
             verify_tree(&files, &self.manifest, &NO_CANCEL)?;
+            files
         } else {
             cancelled(cancel)?;
             ensure!(
@@ -1219,9 +1790,11 @@ impl Receive {
             stage.rename("payload", &bundle, "files")?;
             sync_dir(&bundle)?;
             sync_dir(stage)?;
-        }
+            directory(&bundle, OsStr::new("files"), false)?
+        };
         self.owner.finished = true;
         self.persist()?;
+        self.finished_tree = Some(files);
         let paths = self
             .manifest
             .roots
@@ -1234,6 +1807,32 @@ impl Receive {
             let _ = blobs.remove_open_dir_all();
         }
         Ok(paths)
+    }
+
+    /// Remove a completed native-paste cache and its staging directory.
+    /// The caller must have exclusive ownership: this is used only for the
+    /// private native cache, never for a user-visible Downloads bundle.
+    pub fn remove_cache(&mut self) -> Result<()> {
+        // Drop every retained capability before removing the directories it
+        // points at; Windows refuses to delete a tree with live child handles.
+        self.stage = None;
+        self.blobs = None;
+        self.finished_tree = None;
+        if let Some(name) = self.owner.bundle.clone() {
+            self.valid_bundle_name(&name)?;
+            if exists(&self.base, &name)? {
+                let bundle = directory(&self.base, OsStr::new(&name), false)?;
+                private_directory(&bundle)?;
+                bundle.remove_open_dir_all()?;
+            }
+        }
+        let stage_name = format!(".partial-{}", self.manifest.id);
+        if exists(&self.base, &stage_name)? {
+            let stage = directory(&self.base, OsStr::new(&stage_name), false)?;
+            private_directory(&stage)?;
+            stage.remove_open_dir_all()?;
+        }
+        sync_dir(&self.base)
     }
 
     pub fn cancel(&mut self) -> Result<()> {
@@ -1336,6 +1935,7 @@ impl Receive {
             blobs: None,
             owner,
             checked: BTreeMap::new(),
+            finished_tree: None,
         };
         receive.cancel()
     }
@@ -1449,6 +2049,220 @@ mod tests {
             let _ = fs::remove_dir_all(&self.0);
         }
     }
+
+    #[test]
+    fn clipboard_inventory_never_opens_file_contents_or_creates_transfer_storage() {
+        let fixture = Fixture::new();
+        fs::create_dir_all(fixture.path("source/empty")).unwrap();
+        fs::write(fixture.path("source/data"), b"read only after paste").unwrap();
+        let before = CONTENT_OPENS.with(std::cell::Cell::get);
+        let selection = SourceSelection::capture(&[fixture.path("source")], &NO_CANCEL).unwrap();
+        assert_eq!(CONTENT_OPENS.with(std::cell::Cell::get), before);
+        assert!(!fixture.path("state").exists());
+        assert_eq!(selection.description.total, 21);
+        assert_eq!(selection.description.entries.len(), 3);
+        assert!(selection.description.entries.iter().any(|entry| {
+            entry.path == ["source", "empty"] && entry.kind == DescriptorKind::Directory
+        }));
+        let mut progress = Vec::new();
+        let export = selection
+            .prepare(
+                &fixture.path("state"),
+                "0123456789abcdef0123456789abcdef",
+                MAX_TOTAL,
+                &NO_CANCEL,
+                |bytes| progress.push(bytes),
+            )
+            .unwrap();
+        assert_eq!(export.manifest.description(), selection.description);
+        assert_eq!(progress.last(), Some(&21));
+        assert!(CONTENT_OPENS.with(std::cell::Cell::get) > before);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn metadata_inventory_succeeds_when_windows_denies_content_opens() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let fixture = Fixture::new();
+        let path = fixture.path("source");
+        fs::write(&path, b"content is locked").unwrap();
+        let guard = fs::OpenOptions::new()
+            .read(true)
+            .share_mode(0)
+            .open(&path)
+            .unwrap();
+        let before = CONTENT_OPENS.with(std::cell::Cell::get);
+        let selection = SourceSelection::capture(&[path], &NO_CANCEL).unwrap();
+        assert_eq!(CONTENT_OPENS.with(std::cell::Cell::get), before);
+        assert!(
+            selection
+                .prepare(
+                    &fixture.path("state"),
+                    "0123456789abcdef0123456789abcdef",
+                    MAX_TOTAL,
+                    &NO_CANCEL,
+                    |_| {},
+                )
+                .is_err()
+        );
+        drop(guard);
+        assert!(
+            selection
+                .prepare(
+                    &fixture.path("state"),
+                    "0123456789abcdef0123456789abcdef",
+                    MAX_TOTAL,
+                    &NO_CANCEL,
+                    |_| {},
+                )
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn inventory_rejects_changed_or_replaced_files_before_reading_any_contents() {
+        for replace in [false, true] {
+            let fixture = Fixture::new();
+            let path = fixture.path("source");
+            fs::write(&path, b"original").unwrap();
+            let selection =
+                SourceSelection::capture(std::slice::from_ref(&path), &NO_CANCEL).unwrap();
+            if replace {
+                fs::rename(&path, fixture.path("old-source")).unwrap();
+                fs::write(&path, b"original").unwrap();
+            } else {
+                fs::write(&path, b"changed length").unwrap();
+            }
+            let before = CONTENT_OPENS.with(std::cell::Cell::get);
+            assert!(
+                selection
+                    .prepare(
+                        &fixture.path("state"),
+                        "0123456789abcdef0123456789abcdef",
+                        MAX_TOTAL,
+                        &NO_CANCEL,
+                        |_| {},
+                    )
+                    .is_err()
+            );
+            assert_eq!(CONTENT_OPENS.with(std::cell::Cell::get), before);
+            assert!(!fixture.path("state").exists());
+        }
+    }
+
+    #[test]
+    fn clipboard_capture_allows_local_folder_renames_and_rejects_rebound_sources() {
+        for rename_parent in [false, true] {
+            let fixture = Fixture::new();
+            fs::create_dir_all(fixture.path("parent/source")).unwrap();
+            fs::write(fixture.path("parent/source/data"), b"original").unwrap();
+            let selection =
+                SourceSelection::capture(&[fixture.path("parent/source")], &NO_CANCEL).unwrap();
+            if rename_parent {
+                fs::rename(fixture.path("parent"), fixture.path("old-parent")).unwrap();
+                fs::create_dir_all(fixture.path("parent/source")).unwrap();
+                fs::write(fixture.path("parent/source/data"), b"replacement").unwrap();
+            } else {
+                fs::rename(
+                    fixture.path("parent/source"),
+                    fixture.path("parent/old-source"),
+                )
+                .unwrap();
+                fs::create_dir(fixture.path("parent/source")).unwrap();
+                fs::write(fixture.path("parent/source/data"), b"replacement").unwrap();
+            }
+            assert!(
+                selection
+                    .prepare(
+                        &fixture.path("state"),
+                        "0123456789abcdef0123456789abcdef",
+                        MAX_TOTAL,
+                        &NO_CANCEL,
+                        |_| {},
+                    )
+                    .is_err()
+            );
+            assert!(!fixture.path("state").exists());
+        }
+    }
+
+    #[test]
+    fn inventory_rejects_added_children_budget_changes_and_mutated_display_metadata() {
+        let fixture = Fixture::new();
+        fs::create_dir(fixture.path("source")).unwrap();
+        fs::write(fixture.path("source/data"), b"payload").unwrap();
+        let selection = SourceSelection::capture(&[fixture.path("source")], &NO_CANCEL).unwrap();
+        assert!(
+            selection
+                .prepare(
+                    &fixture.path("state"),
+                    "0123456789abcdef0123456789abcdef",
+                    6,
+                    &NO_CANCEL,
+                    |_| {},
+                )
+                .is_err()
+        );
+        assert!(!fixture.path("state").exists());
+        fs::write(fixture.path("source/new-data"), b"new").unwrap();
+        assert!(
+            selection
+                .prepare(
+                    &fixture.path("state"),
+                    "0123456789abcdef0123456789abcdef",
+                    MAX_TOTAL,
+                    &NO_CANCEL,
+                    |_| {},
+                )
+                .is_err()
+        );
+        let mut selection =
+            SourceSelection::capture(&[fixture.path("source/data")], &NO_CANCEL).unwrap();
+        selection.description.name = "different".into();
+        assert!(
+            selection
+                .prepare(
+                    &fixture.path("state"),
+                    "0123456789abcdef0123456789abcdef",
+                    MAX_TOTAL,
+                    &NO_CANCEL,
+                    |_| {},
+                )
+                .is_err()
+        );
+        assert!(!fixture.path("state").exists());
+        assert!(
+            SourceSelection::capture(&[fixture.path("source")], &AtomicBool::new(true)).is_err()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn inventory_rejects_directory_links_and_special_files_without_content_opens() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+        let fixture = Fixture::new();
+        fs::create_dir(fixture.path("source")).unwrap();
+        fs::create_dir(fixture.path("outside")).unwrap();
+        symlink(fixture.path("outside"), fixture.path("source/link")).unwrap();
+        let before = CONTENT_OPENS.with(std::cell::Cell::get);
+        assert!(SourceSelection::capture(&[fixture.path("source")], &NO_CANCEL).is_err());
+        fs::remove_file(fixture.path("source/link")).unwrap();
+        fs::write(fixture.path("source/unreadable"), b"private bytes").unwrap();
+        fs::set_permissions(
+            fixture.path("source/unreadable"),
+            fs::Permissions::from_mode(0o0),
+        )
+        .unwrap();
+        let selection = SourceSelection::capture(&[fixture.path("source")], &NO_CANCEL).unwrap();
+        assert_eq!(selection.description.total, 13);
+        assert_eq!(CONTENT_OPENS.with(std::cell::Cell::get), before);
+        let fifo =
+            std::ffi::CString::new(fixture.path("fifo").as_os_str().as_encoded_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+        assert!(SourceSelection::capture(&[fixture.path("fifo")], &NO_CANCEL).is_err());
+        assert_eq!(CONTENT_OPENS.with(std::cell::Cell::get), before);
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     fn directory_durability_reopens_a_capability_only_descriptor_for_real_fsync() {
@@ -1488,6 +2302,159 @@ mod tests {
             }
         }
     }
+
+    #[test]
+    fn native_consumers_receive_readonly_verified_handles_after_completion_and_restart() {
+        let fixture = Fixture::new();
+        fs::create_dir(fixture.path("source")).unwrap();
+        fs::write(fixture.path("source/data"), b"payload").unwrap();
+        let export = fixture.prepare(&[fixture.path("source")]);
+        let index = export
+            .manifest
+            .entries
+            .iter()
+            .position(|entry| matches!(entry.kind, Kind::File { .. }))
+            .unwrap();
+        let downloads = fixture.path("downloads");
+        let mut receiving =
+            Receive::open(&downloads, export.manifest.clone(), "peer", "workspace").unwrap();
+        assert!(receiving.open_verified(index).is_err());
+        copy(&export, &mut receiving);
+        receiving.finish().unwrap();
+        assert!(receiving.open_verified(0).is_err());
+        assert!(receiving.open_verified(usize::MAX).is_err());
+        let mut file = receiving.open_verified(index).unwrap();
+        assert!(file.write_all(b"forbidden").is_err());
+        assert!(file.set_len(0).is_err());
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes).unwrap();
+        assert_eq!(bytes, b"payload");
+        drop(file);
+        drop(receiving);
+        let receiving =
+            Receive::open(&downloads, export.manifest.clone(), "peer", "workspace").unwrap();
+        let mut file = receiving.open_verified(index).unwrap();
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes).unwrap();
+        assert_eq!(bytes, b"payload");
+    }
+
+    #[test]
+    fn native_verified_open_cancels_before_open_and_between_hash_buffers() {
+        let fixture = Fixture::new();
+        let bytes = vec![0xd3; BUFFER * 3 + 17];
+        fs::write(fixture.path("source"), &bytes).unwrap();
+        let export = fixture.prepare(&[fixture.path("source")]);
+        let mut receiving = Receive::open(
+            &fixture.path("downloads"),
+            export.manifest.clone(),
+            "peer",
+            "workspace",
+        )
+        .unwrap();
+        copy(&export, &mut receiving);
+        let roots = receiving.finish().unwrap();
+        let cancel = std::sync::Arc::new(AtomicBool::new(true));
+        let before_opens = CONTENT_OPENS.with(std::cell::Cell::get);
+        assert!(receiving.open_verified_cancellable(0, &cancel).is_err());
+        assert_eq!(CONTENT_OPENS.with(std::cell::Cell::get), before_opens);
+
+        cancel.store(false, Ordering::Release);
+        let before_buffers = HASH_BUFFERS.with(std::cell::Cell::get);
+        let request_cancel = cancel.clone();
+        AFTER_HASH_BUFFER.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move || {
+                request_cancel.store(true, Ordering::Release);
+            }));
+        });
+        let result = receiving.open_verified_cancellable(0, &cancel);
+        // Clear the test hook before any assertion, including on a regression
+        // that returns before reaching the first verification buffer.
+        AFTER_HASH_BUFFER.with(|hook| {
+            hook.borrow_mut().take();
+        });
+        assert!(cancel.load(Ordering::Acquire));
+        assert!(result.is_err());
+        assert_eq!(HASH_BUFFERS.with(std::cell::Cell::get), before_buffers + 1);
+        assert_eq!(fs::read(&roots[0]).unwrap(), bytes);
+
+        cancel.store(false, Ordering::Release);
+        let mut file = receiving.open_verified_cancellable(0, &cancel).unwrap();
+        assert!(file.write_all(b"forbidden").is_err());
+        let mut verified = Vec::new();
+        file.read_to_end(&mut verified).unwrap();
+        assert_eq!(verified, bytes);
+    }
+
+    #[test]
+    fn native_verified_open_rehashes_public_files_and_rejects_mutated_manifests() {
+        let fixture = Fixture::new();
+        fs::write(fixture.path("source"), b"payload").unwrap();
+        let export = fixture.prepare(&[fixture.path("source")]);
+        let mut receiving = Receive::open(
+            &fixture.path("downloads"),
+            export.manifest.clone(),
+            "peer",
+            "workspace",
+        )
+        .unwrap();
+        copy(&export, &mut receiving);
+        let paths = receiving.finish().unwrap();
+        fs::write(&paths[0], b"changed").unwrap();
+        assert!(receiving.open_verified(0).is_err());
+        fs::write(&paths[0], b"payload").unwrap();
+        assert!(receiving.open_verified(0).is_ok());
+        receiving.manifest.entries[0].path = vec!["outside".into()];
+        assert!(receiving.open_verified(0).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn native_verified_open_rejects_links_and_keeps_the_actual_finished_tree_pinned() {
+        use std::os::unix::fs::symlink;
+        let fixture = Fixture::new();
+        fs::create_dir_all(fixture.path("source/nested")).unwrap();
+        fs::write(fixture.path("source/nested/data"), b"payload").unwrap();
+        fs::write(fixture.path("outside"), b"private").unwrap();
+        let export = fixture.prepare(&[fixture.path("source")]);
+        let index = export
+            .manifest
+            .entries
+            .iter()
+            .position(|entry| matches!(entry.kind, Kind::File { .. }))
+            .unwrap();
+        let mut receiving = Receive::open(
+            &fixture.path("downloads"),
+            export.manifest.clone(),
+            "peer",
+            "workspace",
+        )
+        .unwrap();
+        copy(&export, &mut receiving);
+        let roots = receiving.finish().unwrap();
+        let data = roots[0].join("nested/data");
+        fs::remove_file(&data).unwrap();
+        symlink(fixture.path("outside"), &data).unwrap();
+        assert!(receiving.open_verified(index).is_err());
+        fs::remove_file(&data).unwrap();
+        fs::write(&data, b"payload").unwrap();
+        fs::rename(roots[0].join("nested"), roots[0].join("old-nested")).unwrap();
+        symlink(roots[0].join("old-nested"), roots[0].join("nested")).unwrap();
+        assert!(receiving.open_verified(index).is_err());
+        fs::remove_file(roots[0].join("nested")).unwrap();
+        fs::rename(roots[0].join("old-nested"), roots[0].join("nested")).unwrap();
+        let files = roots[0].parent().unwrap();
+        let pinned = files.with_file_name("original-files");
+        fs::rename(files, &pinned).unwrap();
+        fs::create_dir_all(files.join("source/nested")).unwrap();
+        fs::write(files.join("source/nested/data"), b"private").unwrap();
+        let mut file = receiving.open_verified(index).unwrap();
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes).unwrap();
+        assert_eq!(bytes, b"payload");
+        assert_eq!(fs::read(fixture.path("outside")).unwrap(), b"private");
+    }
+
     #[test]
     fn recursive_snapshots_preserve_empty_folders_and_never_read_changed_originals() {
         let fixture = Fixture::new();
@@ -1988,6 +2955,26 @@ mod tests {
             b"not our incomplete export"
         );
     }
+    #[test]
+    fn native_cache_removal_deletes_its_private_stage() {
+        let fixture = Fixture::new();
+        fs::create_dir(fixture.path("source")).unwrap();
+        fs::write(fixture.path("source/data"), b"cached").unwrap();
+        let export = fixture.prepare(&[fixture.path("source/data")]);
+        let downloads = fixture.path("downloads");
+        let stage = downloads.join(format!(".partial-{}", export.manifest.id));
+        let mut receive =
+            Receive::open(&downloads, export.manifest.clone(), "peer", "workspace").unwrap();
+        assert!(stage.exists());
+        receive.remove_cache().unwrap();
+        assert!(!stage.exists());
+        assert!(
+            !downloads
+                .join(format!("Transfer {}", &export.manifest.id[..12]))
+                .exists()
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn symlink_sources_ancestors_and_checkpoint_hardlinks_cannot_escape() {
