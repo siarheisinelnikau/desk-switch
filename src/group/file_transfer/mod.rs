@@ -331,6 +331,10 @@ impl Service {
     fn start_at(dir: PathBuf, downloads: PathBuf, port: u16, ctx: egui::Context) -> Result<Self> {
         let listener = listener(port).context("Could not open the file transfer connection")?;
         let identity = config::load_identity(&dir)?;
+        // Native clipboard handles cannot survive a process restart. Drop any
+        // private cache left by a crash; user-visible Downloads bundles are
+        // never stored here.
+        let _ = std::fs::remove_dir_all(dir.join("file-transfer/native-cache"));
         let (commands, receiver) = mpsc::channel(64);
         let core = Arc::new(Core {
             dir,
