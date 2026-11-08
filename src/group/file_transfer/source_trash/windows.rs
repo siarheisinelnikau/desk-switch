@@ -293,6 +293,10 @@ fn commit_sta(
     // BHID_Transfer is documented for folders: use the owned source parent,
     // not an untrusted file association or a handler on the payload itself.
     let transfer: ITransferSource =
+        // SAFETY: The Shell item was created in the single-threaded apartment
+        // of this worker thread, and this COM call runs on that same thread;
+        // the returned interface pointer is owned by the `transfer` binding and
+        // released before the apartment is torn down.
         unsafe { source_parent.BindToHandler(None::<&IBindCtx>, &BHID_Transfer) }
             .context("the source folder has no supported recycling handler")?;
     let sink: ITransferAdviseSink = SilentTransferSink {
@@ -300,6 +304,11 @@ fn commit_sta(
         deadline,
     }
     .into();
+    // SAFETY: `transfer` is a live ITransferSource pointer in this apartment
+    // and `sink` is a COM object created in the same apartment, so the advise
+    // registration is valid; the returned cookie is stored in the
+    // AdvisorySession guard, which removes the advice exactly once before the
+    // apartment ends.
     let cookie = unsafe { transfer.Advise(&sink) }
         .context("the recycling handler cannot suppress interactive decisions")?;
     let _advice = AdvisorySession {
@@ -325,6 +334,10 @@ fn commit_sta(
 
     // No RemoveItem, IFileOperation delete, copy/delete flag, overwrite flag,
     // recycle-if-possible flag, elevation, or permanent-delete fallback exists.
+    // SAFETY: The copy engine runs on this thread's single-threaded apartment
+    // with the advised sink that refuses every interactive decision, and both
+    // Shell items were created in that same apartment, so the recycle request
+    // cannot be answered by an unrelated handler.
     let recycled = unsafe { transfer.RecycleItem(&source_item, &destination, TSF_NORMAL.0 as u32) }
         .context(
             "Windows did not return a recycled item; inspect the quarantine before retrying",
@@ -425,6 +438,10 @@ struct VolumeAnchor {
 fn volume_anchor(quarantine_path: &Path, volume: u64) -> Result<VolumeAnchor> {
     let quarantine_wide = wide_path(quarantine_path)?;
     let mut root_buffer = vec![0u16; MAX_NATIVE_PATH];
+    // SAFETY: `quarantine_wide` is a NUL-terminated path that outlives the
+    // call, and `root_buffer` holds MAX_NATIVE_PATH u16 units, whose length
+    // the binding passes as the buffer size, so the call writes at most
+    // root_buffer.len() units into it.
     unsafe { GetVolumePathNameW(PCWSTR(quarantine_wide.as_ptr()), &mut root_buffer) }
         .context("could not establish the quarantine volume root")?;
     let root = path_from_terminated(&root_buffer)?;
@@ -437,11 +454,18 @@ fn volume_anchor(quarantine_path: &Path, volume: u64) -> Result<VolumeAnchor> {
     );
     let root_wide = wide_path(&root)?;
     ensure!(
+        // SAFETY: `root_wide` is a NUL-terminated path that outlives the call
+        // and the API only reads it, returning a drive type value; no buffer is
+        // written.
         unsafe { GetDriveTypeW(PCWSTR(root_wide.as_ptr())) } == LOCAL_FIXED_DRIVE,
         "this source volume has no supported local Recycle Bin"
     );
     let mut serial = 0u32;
     let mut filesystem = [0u16; 32];
+    // SAFETY: `root_wide` is a NUL-terminated path that outlives the call,
+    // `serial` is a live u32 that the call may fill, and `filesystem` is a
+    // live 32-unit u16 buffer whose length the binding passes as the buffer
+    // size, so the call writes at most filesystem.len() units into it.
     unsafe {
         GetVolumeInformationW(
             PCWSTR(root_wide.as_ptr()),
@@ -659,6 +683,9 @@ fn pin_directory_path(path: &Path) -> Result<DirectoryPins> {
 
 fn open_existing(path: &Path, sharing: FILE_SHARE_MODE, directory: bool) -> Result<File> {
     let wide = wide_path(path)?;
+    // SAFETY: `wide` is a NUL-terminated path that outlives the call, the
+    // requested access and sharing are fixed for this call, and no security
+    // attributes are supplied, so the call cannot inherit or leak a handle.
     let handle = unsafe {
         CreateFileW(
             PCWSTR(wide.as_ptr()),
@@ -673,6 +700,9 @@ fn open_existing(path: &Path, sharing: FILE_SHARE_MODE, directory: bool) -> Resu
     .context("could not protect an existing filesystem object")?;
     // Ownership is transferred exactly once; std::fs::File closes the handle
     // on every error and on normal return.
+    // SAFETY: The handle was just created by CreateFileW and is not used by
+    // any other owner, so ownership of that single handle is transferred to
+    // the returned File, whose Drop closes it exactly once on every path.
     let file = unsafe { File::from_raw_handle(handle.0) };
     let (_, information) = native_identity(&file)?;
     ensure!(
@@ -684,6 +714,9 @@ fn open_existing(path: &Path, sharing: FILE_SHARE_MODE, directory: bool) -> Resu
 
 fn native_identity(file: &impl AsRawHandle) -> Result<(Identity, BY_HANDLE_FILE_INFORMATION)> {
     let mut information = BY_HANDLE_FILE_INFORMATION::default();
+    // SAFETY: `file` owns a live handle that stays open across the call, and
+    // `information` is a live, writable structure of the exact native size
+    // that the call fills; the handle is only read, never closed here.
     unsafe { GetFileInformationByHandle(HANDLE(file.as_raw_handle()), &mut information) }
         .context("could not read the filesystem object's stable identity")?;
     ensure!(
@@ -732,6 +765,10 @@ fn reopen_for_security(file: &impl AsRawHandle, access: u32) -> Result<File> {
 
 fn handle_path(file: &impl AsRawHandle) -> Result<PathBuf> {
     let mut path = vec![0u16; MAX_NATIVE_PATH];
+    // SAFETY: `file` owns a live handle that stays open across the call, and
+    // `path` holds MAX_NATIVE_PATH u16 units whose length the binding passes
+    // as the buffer size, so the call writes at most path.len() units and
+    // returns the number of units written.
     let length = unsafe {
         GetFinalPathNameByHandleW(
             HANDLE(file.as_raw_handle()),
@@ -844,6 +881,9 @@ fn path_from_terminated(buffer: &[u16]) -> Result<PathBuf> {
 
 fn shell_item(path: &Path) -> Result<IShellItem> {
     let wide = wide_path(path)?;
+    // SAFETY: `wide` is a NUL-terminated path that outlives the call, and the
+    // Shell item is created in the caller's single-threaded apartment, which
+    // owns the returned interface pointer until it is dropped.
     unsafe { SHCreateItemFromParsingName(PCWSTR(wide.as_ptr()), None::<&IBindCtx>) }
         .context("could not bind the protected filesystem object to the Shell")
 }
@@ -852,6 +892,10 @@ fn virtual_recycle_item() -> Result<IShellItem> {
     // SHGetKnownFolderItem excludes virtual folders. The documented known
     // folder manager and GetShellItem expose this actual namespace location
     // without manufacturing a physical $Recycle.Bin directory or private data.
+    // SAFETY: The known-folder manager is created in the single-threaded
+    // apartment of this worker thread, and the returned interface pointer is
+    // owned by the `manager` binding, which releases it before the thread
+    // leaves the apartment.
     let manager: IKnownFolderManager = unsafe {
         CoCreateInstance(
             &KnownFolderManager,
@@ -860,17 +904,30 @@ fn virtual_recycle_item() -> Result<IShellItem> {
         )
     }
     .context("the Windows known-folder manager is unavailable")?;
+    // SAFETY: `manager` is a live IKnownFolderManager pointer in this
+    // apartment, and the returned IKnownFolder pointer is owned by the
+    // `folder` binding and released before the thread ends.
     let folder = unsafe { manager.GetFolder(&FOLDERID_RecycleBinFolder) }
         .context("the Windows Recycle Bin namespace is unavailable")?;
     ensure!(
+        // SAFETY: `folder` is a live IKnownFolder pointer created in this
+        // apartment; the call only reads the folder id and transfers no
+        // ownership.
         unsafe { folder.GetId() }? == FOLDERID_RecycleBinFolder,
         "the known-folder manager returned another namespace"
     );
+    // SAFETY: `folder` is a live IKnownFolder pointer in this apartment, and
+    // the returned IShellItem pointer is owned by the caller and released
+    // before the thread leaves the apartment.
     unsafe { folder.GetShellItem(0) }
         .context("could not obtain the actual Recycle Bin namespace item")
 }
 
 fn shell_item_path(item: &IShellItem) -> Result<PathBuf> {
+    // SAFETY: `item` is a live IShellItem pointer in this apartment, and
+    // GetDisplayName allocates the returned string with CoTaskMemAlloc and
+    // transfers that ownership to this code, which keeps it in the
+    // TaskAllocation guard.
     let name = unsafe { item.GetDisplayName(SIGDN_FILESYSPATH) }
         .context("the recycled Shell item has no verifiable filesystem path")?;
     let allocation = TaskAllocation(name.0.cast());
@@ -879,6 +936,10 @@ fn shell_item_path(item: &IShellItem) -> Result<PathBuf> {
         "the recycled Shell item returned an empty path"
     );
     let mut length = 0;
+    // SAFETY: `name.0` is the CoTaskMemAlloc'd NUL-terminated string that
+    // GetDisplayName returned and that the `allocation` guard still owns, and
+    // this scan reads one unit at a time until the terminator or
+    // MAX_NATIVE_PATH units, so it never reads past the allocation.
     while length < MAX_NATIVE_PATH && unsafe { *name.0.add(length) } != 0 {
         length += 1;
     }
@@ -886,6 +947,10 @@ fn shell_item_path(item: &IShellItem) -> Result<PathBuf> {
         length < MAX_NATIVE_PATH,
         "the recycled Shell item path is unbounded"
     );
+    // SAFETY: `name.0` points into the allocation that the `allocation` guard
+    // keeps alive until the end of this function, and `length` is the number
+    // of units before the terminator that the bounded scan just found, so the
+    // slice is in bounds, aligned and valid.
     let wide = unsafe { std::slice::from_raw_parts(name.0, length) };
     let path = ordinary_dos_path(wide);
     drop(allocation);
@@ -896,6 +961,9 @@ struct TaskAllocation(*mut c_void);
 
 impl Drop for TaskAllocation {
     fn drop(&mut self) {
+        // SAFETY: The pointer is the buffer that GetDisplayName allocated with
+        // CoTaskMemAlloc and transferred to this guard, so it is freed exactly
+        // once here with the matching allocator.
         unsafe { CoTaskMemFree(Some(self.0.cast_const())) };
     }
 }
@@ -904,6 +972,9 @@ struct LocalAllocation(*mut c_void);
 
 impl Drop for LocalAllocation {
     fn drop(&mut self) {
+        // SAFETY: The pointer is a block that the Windows API allocated with
+        // LocalAlloc and transferred to this guard, so it is released exactly
+        // once here with the matching LocalFree.
         unsafe { LocalFree(Some(HLOCAL(self.0))) };
     }
 }
@@ -912,16 +983,25 @@ struct TokenHandle(HANDLE);
 
 impl Drop for TokenHandle {
     fn drop(&mut self) {
+        // SAFETY: The handle is the process token that OpenProcessToken
+        // returned and that this guard owns, so it is closed exactly once here
+        // and no other path closes it.
         let _ = unsafe { CloseHandle(self.0) };
     }
 }
 
 fn process_user_sid() -> Result<String> {
     let mut token = HANDLE::default();
+    // SAFETY: `token` is a live local that the call fills with a new token
+    // handle, and the pseudo-handle returned by GetCurrentProcess must not be
+    // closed; the returned token is owned by the TokenHandle guard.
     unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) }
         .context("could not establish the process user for recycling")?;
     let token = TokenHandle(token);
     let mut required = 0u32;
+    // SAFETY: The call is made with a null buffer and a zero length only to
+    // query the required size; `required` is a live u32 that the call writes,
+    // and the token handle is the live owned handle.
     let _ = unsafe { GetTokenInformation(token.0, TokenUser, None, 0, &mut required) };
     ensure!(
         required as usize >= size_of::<TOKEN_USER>() && required as usize <= MAX_TOKEN_BYTES,
@@ -931,6 +1011,9 @@ fn process_user_sid() -> Result<String> {
     // TOKEN_USER; its SID points into this buffer until conversion completes.
     let words = (required as usize).div_ceil(size_of::<usize>());
     let mut buffer = vec![0usize; words];
+    // SAFETY: `buffer` holds at least `required` bytes and its usize elements
+    // give the pointer the alignment the native TOKEN_USER requires; the call
+    // writes at most `required` bytes into it and `required` stays a live u32.
     unsafe {
         GetTokenInformation(
             token.0,
@@ -941,21 +1024,36 @@ fn process_user_sid() -> Result<String> {
         )
     }
     .context("could not read the process user identity")?;
+    // SAFETY: The call above wrote a TOKEN_USER at the start of `buffer`, whose
+    // allocation is at least `required` bytes long and usize-aligned, so this
+    // initialized reference is aligned, in bounds and valid while `buffer` is
+    // alive.
     let user = unsafe { &*buffer.as_ptr().cast::<TOKEN_USER>() };
     sid_string(user.User.Sid)
 }
 
 fn sid_string(sid: PSID) -> Result<String> {
     let mut value = PWSTR::null();
+    // SAFETY: `sid` is a SID that the caller has already validated (it comes
+    // from a live security descriptor or from a checked access rule), and the
+    // call allocates the returned string with LocalAlloc, transferring that
+    // ownership to the LocalAllocation guard.
     unsafe { ConvertSidToStringSidW(sid, &mut value) }
         .context("could not read a filesystem owner SID")?;
     let _allocation = LocalAllocation(value.0.cast());
     ensure!(!value.is_null(), "the filesystem owner SID is empty");
     let mut length = 0;
+    // SAFETY: `value.0` is the LocalAlloc'd NUL-terminated SID string owned by
+    // the `_allocation` guard, and this scan reads one unit at a time until
+    // the terminator or 185 units, so it never reads past the allocation.
     while length <= 184 && unsafe { *value.0.add(length) } != 0 {
         length += 1;
     }
     ensure!(length <= 184, "the filesystem owner SID is unbounded");
+    // SAFETY: `value.0` points into the block that the `_allocation` guard
+    // keeps alive until the end of this function, and `length` is the number
+    // of units before the terminator that the bounded scan just found, so the
+    // slice is in bounds and valid.
     let value = String::from_utf16(unsafe { std::slice::from_raw_parts(value.0, length) })?;
     ensure!(
         value.starts_with("S-1-")
@@ -970,6 +1068,10 @@ fn sid_string(sid: PSID) -> Result<String> {
 fn owner_sid(file: &File) -> Result<String> {
     let mut owner = PSID::default();
     let mut descriptor = PSECURITY_DESCRIPTOR::default();
+    // SAFETY: `file` owns a live handle, and `owner` and `descriptor` are live
+    // locals that the call fills; the returned security descriptor is
+    // allocated by GetSecurityInfo and owned by the LocalAllocation guard,
+    // while the owner SID points into that descriptor.
     let result = unsafe {
         GetSecurityInfo(
             HANDLE(file.as_raw_handle()),
@@ -1005,6 +1107,11 @@ pub(super) fn verify_private_directory(directory: &Dir) -> Result<()> {
     let mut owner = PSID::default();
     let mut dacl: *mut ACL = std::ptr::null_mut();
     let mut descriptor = PSECURITY_DESCRIPTOR::default();
+    // SAFETY: `directory` owns a live handle, and `owner`, `dacl` and
+    // `descriptor` are live locals that the call fills; the descriptor is
+    // allocated by GetSecurityInfo and owned by the LocalAllocation guard, and
+    // the owner SID and the DACL point into it, so they stay valid for as
+    // long as that guard is alive.
     let result = unsafe {
         GetSecurityInfo(
             HANDLE(directory.as_raw_handle()),
@@ -1022,11 +1129,17 @@ pub(super) fn verify_private_directory(directory: &Dir) -> Result<()> {
         result.0 == 0
             && !owner.0.is_null()
             && !dacl.is_null()
+            // SAFETY: `dacl` is the non-null DACL inside the live security
+            // descriptor owned by the LocalAllocation guard, so IsValidAcl only
+            // inspects a structure that stays alive for the whole check.
             && unsafe { IsValidAcl(dacl) }.as_bool(),
         "the source quarantine has no provably private Windows ACL"
     );
     let mut control = 0u16;
     let mut revision = 0;
+    // SAFETY: `descriptor` is the live security descriptor owned by the
+    // LocalAllocation guard, and `control` and `revision` are live locals that
+    // the call writes; the descriptor outlives the call.
     unsafe { GetSecurityDescriptorControl(descriptor, &mut control, &mut revision) }
         .context("could not verify quarantine inheritance protection")?;
     ensure!(
@@ -1037,6 +1150,9 @@ pub(super) fn verify_private_directory(directory: &Dir) -> Result<()> {
         sid_string(owner)? == user,
         "the source quarantine is not owned by this user"
     );
+    // SAFETY: `dacl` is the non-null, validated ACL inside the live security
+    // descriptor owned by the LocalAllocation guard, so reading its header is
+    // in bounds and the guard keeps it alive.
     let ace_count = unsafe { (*dacl).AceCount } as u32;
     ensure!(
         ace_count <= 1024,
@@ -1044,12 +1160,19 @@ pub(super) fn verify_private_directory(directory: &Dir) -> Result<()> {
     );
     for index in 0..ace_count {
         let mut pointer = std::ptr::null_mut();
+        // SAFETY: `index` is below the AceCount that was read from this same
+        // ACL, and `pointer` is a live local that receives the address of an
+        // ACE inside that ACL, which the LocalAllocation guard keeps alive.
         unsafe { GetAce(dacl, index, &mut pointer) }
             .context("could not verify a source quarantine access rule")?;
         ensure!(
             !pointer.is_null(),
             "the source quarantine contains an empty access rule"
         );
+        // SAFETY: `pointer` is the non-null ACE address that GetAce returned inside
+        // the live ACL, and read_unaligned copies the fixed-size header
+        // without assuming alignment; the ACE stays alive through the
+        // LocalAllocation guard.
         let header = unsafe { std::ptr::read_unaligned(pointer.cast::<ACE_HEADER>()) };
         // ACE_HEADER types 0/1 are the documented ordinary allow/deny ACEs.
         // Conditional, object and callback grants are conservatively rejected.
@@ -1061,11 +1184,19 @@ pub(super) fn verify_private_directory(directory: &Dir) -> Result<()> {
             "the source quarantine has an unsupported access rule"
         );
         let ace = pointer.cast::<ACCESS_ALLOWED_ACE>();
+        // SAFETY: The ACE header proved that this is an allow ACE of at least
+        // size_of::<ACCESS_ALLOWED_ACE>() bytes, so the Mask field lies inside
+        // the ACE, and read_unaligned copies it without assuming alignment.
         let mask = unsafe { std::ptr::read_unaligned(std::ptr::addr_of!((*ace).Mask)) };
         if mask == 0 {
             continue;
         }
         let sid = PSID(
+            // SAFETY: The ACE was checked to be an allow ACE of at least
+            // size_of::<ACCESS_ALLOWED_ACE>() bytes, so its SidStart field
+            // lies inside the ACE; addr_of! only computes that address without
+            // reading it, and the ACE outlives the pointer through the
+            // LocalAllocation guard.
             unsafe { std::ptr::addr_of!((*ace).SidStart) }
                 .cast_mut()
                 .cast(),
@@ -1077,10 +1208,16 @@ pub(super) fn verify_private_directory(directory: &Dir) -> Result<()> {
             sid_offset + 8 <= header.AceSize as usize,
             "the access rule SID is truncated"
         );
+        // SAFETY: The SID header was proved to lie inside the access rule by the
+        // size check above, and this reads only the SubAuthorityCount byte at
+        // offset 1 of that header, so the read stays in bounds.
         let sub_authorities = unsafe { *sid.0.cast::<u8>().add(1) } as usize;
         ensure!(
             sub_authorities <= 15
                 && sid_offset + 8 + sub_authorities * 4 <= header.AceSize as usize
+                // SAFETY: `sid` points at the SID inside the validated access
+                // rule, and IsValidSid only inspects the SID structure that
+                // the access rule owns.
                 && unsafe { IsValidSid(sid) }.as_bool(),
             "the source quarantine access rule has no bounded valid SID"
         );
@@ -1145,6 +1282,10 @@ pub(super) fn protect_new_private_directory(directory: &Dir) -> Result<()> {
     let mut descriptor_wide: Vec<u16> = descriptor_text.encode_utf16().collect();
     descriptor_wide.push(0);
     let mut descriptor = PSECURITY_DESCRIPTOR::default();
+    // SAFETY: `descriptor_wide` is a NUL-terminated SDDL string that outlives
+    // the call, and `descriptor` is a live local that receives the new
+    // security descriptor, which the API allocates with LocalAlloc and this
+    // code owns through the LocalAllocation guard.
     unsafe {
         ConvertStringSecurityDescriptorToSecurityDescriptorW(
             PCWSTR(descriptor_wide.as_ptr()),
@@ -1158,14 +1299,26 @@ pub(super) fn protect_new_private_directory(directory: &Dir) -> Result<()> {
     let mut present = BOOL::default();
     let mut defaulted = BOOL::default();
     let mut dacl = std::ptr::null_mut();
+    // SAFETY: `descriptor` is the live security descriptor owned by the
+    // LocalAllocation guard, and `present`, `dacl` and `defaulted` are live
+    // locals that the call writes; the returned DACL points into that
+    // descriptor.
     unsafe { GetSecurityDescriptorDacl(descriptor, &mut present, &mut dacl, &mut defaulted) }
         .context("could not extract private quarantine access rules")?;
     ensure!(
-        present.as_bool() && !dacl.is_null() && unsafe { IsValidAcl(dacl) }.as_bool(),
+        present.as_bool()
+            && !dacl.is_null()
+            // SAFETY: `dacl` is the non-null DACL inside the live security
+            // descriptor owned by the LocalAllocation guard, so IsValidAcl only
+            // inspects a structure that stays alive for the whole check.
+            && unsafe { IsValidAcl(dacl) }.as_bool(),
         "private quarantine access rules are not a valid non-null DACL"
     );
     let mut desired_owner = PSID::default();
     let mut owner_defaulted = BOOL::default();
+    // SAFETY: `descriptor` is the live security descriptor owned by the
+    // LocalAllocation guard, and `desired_owner` and `owner_defaulted` are
+    // live locals; the returned owner SID points into that descriptor.
     unsafe { GetSecurityDescriptorOwner(descriptor, &mut desired_owner, &mut owner_defaulted) }
         .context("could not extract the intended quarantine owner")?;
     ensure!(
@@ -1181,6 +1334,11 @@ pub(super) fn protect_new_private_directory(directory: &Dir) -> Result<()> {
     if change_owner {
         security_information |= OWNER_SECURITY_INFORMATION;
     }
+    // SAFETY: `exact` owns the live handle of the exact directory whose identity
+    // was verified above, `desired_owner` is the owner SID inside the live
+    // descriptor owned by the LocalAllocation guard, and `dacl` is the
+    // validated DACL inside that same descriptor; both stay alive across the
+    // call.
     let result = unsafe {
         SetSecurityInfo(
             HANDLE(exact.as_raw_handle()),
@@ -1218,6 +1376,10 @@ struct Apartment;
 
 impl Apartment {
     fn new() -> Result<Self> {
+        // SAFETY: This recycling worker thread has not initialized COM before,
+        // so the call starts its apartment in single-threaded mode; the guard
+        // calls CoUninitialize exactly once on this same thread when it is
+        // dropped.
         unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE) }
             .ok()
             .context("could not initialize the dedicated recycling apartment")?;
@@ -1227,6 +1389,9 @@ impl Apartment {
 
 impl Drop for Apartment {
     fn drop(&mut self) {
+        // SAFETY: CoUninitialize must run on the thread that initialized COM;
+        // this guard was created by CoInitializeEx on the same recycling worker
+        // thread and is dropped exactly once there.
         unsafe { CoUninitialize() };
     }
 }
@@ -1238,6 +1403,11 @@ struct AdvisorySession<'a> {
 
 impl Drop for AdvisorySession<'_> {
     fn drop(&mut self) {
+        // SAFETY: `self.transfer` is the live ITransferSource pointer owned by
+        // the caller of commit_sta and `self.cookie` is the cookie that the
+        // matching Advise call returned; the guard drops before the apartment
+        // is torn down, so the advice is removed exactly once while the
+        // interface is still alive.
         let _ = unsafe { self.transfer.Unadvise(self.cookie) };
     }
 }
@@ -1423,6 +1593,10 @@ mod native_tests {
         let mut owner = PSID::default();
         let mut dacl: *mut ACL = std::ptr::null_mut();
         let mut descriptor = PSECURITY_DESCRIPTOR::default();
+        // SAFETY: `directory` owns a live handle, and `owner`, `dacl` and
+        // `descriptor` are live locals that the call fills; the descriptor is
+        // allocated by GetSecurityInfo and owned by the LocalAllocation guard,
+        // and the owner SID and the DACL point into it.
         let result = unsafe {
             GetSecurityInfo(
                 HANDLE(directory.as_raw_handle()),
@@ -1437,17 +1611,32 @@ mod native_tests {
         };
         let _allocation = LocalAllocation(descriptor.0);
         ensure!(
-            result.0 == 0 && !dacl.is_null() && unsafe { IsValidAcl(dacl) }.as_bool(),
+            result.0 == 0
+                && !dacl.is_null()
+                // SAFETY: `dacl` is the non-null DACL inside the live security
+                // descriptor owned by the LocalAllocation guard, so IsValidAcl
+                // only inspects a structure that stays alive for the check.
+                && unsafe { IsValidAcl(dacl) }.as_bool(),
             "the fixture ACL could not be captured"
         );
+        // SAFETY: `dacl` is the non-null, validated ACL inside the live
+        // security descriptor owned by the LocalAllocation guard, so reading its
+        // header is in bounds and the guard keeps it alive.
         let size = unsafe { (*dacl).AclSize } as usize;
         ensure!(
             (size_of::<ACL>()..=65535).contains(&size),
             "invalid fixture ACL size"
         );
+        // SAFETY: `dacl` points to the validated ACL inside the live security
+        // descriptor owned by the LocalAllocation guard, and `size` is that
+        // ACL's own AclSize, so the slice covers exactly the ACL bytes and
+        // stays valid while the guard is alive.
         let bytes = unsafe { std::slice::from_raw_parts(dacl.cast::<u8>(), size) }.to_vec();
         let mut control = 0u16;
         let mut revision = 0;
+        // SAFETY: `descriptor` is the live security descriptor owned by the
+        // LocalAllocation guard, and `control` and `revision` are live locals
+        // that the call writes; the descriptor outlives the call.
         unsafe { GetSecurityDescriptorControl(descriptor, &mut control, &mut revision) }?;
         ensure!(revision == 1, "unsupported fixture security revision");
         Ok(AclSnapshot {
@@ -1475,6 +1664,10 @@ mod native_tests {
         let mut wide: Vec<u16> = text.encode_utf16().collect();
         wide.push(0);
         let mut descriptor = PSECURITY_DESCRIPTOR::default();
+        // SAFETY: `wide` is a NUL-terminated SDDL string that outlives the
+        // call, and `descriptor` is a live local that receives the new
+        // security descriptor, which the API allocates with LocalAlloc and
+        // this code owns through the LocalAllocation guard.
         unsafe {
             ConvertStringSecurityDescriptorToSecurityDescriptorW(
                 PCWSTR(wide.as_ptr()),
@@ -1487,9 +1680,17 @@ mod native_tests {
         let mut present = BOOL::default();
         let mut defaulted = BOOL::default();
         let mut dacl = std::ptr::null_mut();
+        // SAFETY: `descriptor` is the live security descriptor owned by the
+        // LocalAllocation guard, and `present`, `dacl` and `defaulted` are live
+        // locals that the call writes; the returned DACL points into that
+        // descriptor.
         unsafe { GetSecurityDescriptorDacl(descriptor, &mut present, &mut dacl, &mut defaulted) }?;
         ensure!(present.as_bool() && !dacl.is_null(), "missing fixture DACL");
         require_empty_directory(directory)?;
+        // SAFETY: `exact` owns the live handle of the fixture parent directory
+        // whose identity was verified above, and `dacl` is the DACL inside the
+        // live descriptor owned by the LocalAllocation guard; both stay alive
+        // across the call.
         let result = unsafe {
             SetSecurityInfo(
                 HANDLE(exact.as_raw_handle()),
