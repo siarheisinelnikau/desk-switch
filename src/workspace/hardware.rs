@@ -364,6 +364,9 @@ fn physical_windows_device(interface: &str) -> bool {
     let instance = instance.replace('#', "\\");
     let wide = instance.encode_utf16().chain(Some(0)).collect::<Vec<_>>();
     let mut node = 0;
+    // SAFETY: `wide` is a NUL-terminated UTF-16 buffer that outlives the
+    // call, and `node` is a live `u32` that the call fills with the device
+    // node it locates.
     if unsafe { CM_Locate_DevNodeW(&mut node, wide.as_ptr(), CM_LOCATE_DEVNODE_NORMAL) }
         != CR_SUCCESS
     {
@@ -371,6 +374,9 @@ fn physical_windows_device(interface: &str) -> bool {
     }
     for _ in 0..24 {
         let mut id = [0u16; 512];
+        // SAFETY: `id` holds exactly 512 `u16` elements and the buffer length
+        // argument matches, so the call cannot write past the end of the
+        // array. The node was located above.
         if unsafe { CM_Get_Device_IDW(node, id.as_mut_ptr(), id.len() as u32, 0) } != CR_SUCCESS {
             return false;
         }
@@ -379,6 +385,8 @@ fn physical_windows_device(interface: &str) -> bool {
             return true;
         }
         let mut parent = 0;
+        // SAFETY: `parent` is a live `u32` that the call fills with the
+        // parent device node of `node`.
         if unsafe { CM_Get_Parent(&mut parent, node, 0) } != CR_SUCCESS {
             return false;
         }
@@ -400,6 +408,9 @@ pub fn input_devices() -> Result<Vec<InputEndpoint>> {
     for attempt in 0..4 {
         let mut count = 0;
         anyhow::ensure!(
+            // SAFETY: a null device list with a non-null count pointer is the
+            // documented way to ask for the number of devices; no buffer is
+            // written in this mode.
             unsafe { GetRawInputDeviceList(std::ptr::null_mut(), &mut count, size) } != u32::MAX,
             "Could not enumerate Windows input devices: {}",
             std::io::Error::last_os_error()
@@ -409,12 +420,17 @@ pub fn input_devices() -> Result<Vec<InputEndpoint>> {
             return Ok(Vec::new());
         }
         devices.resize(count as usize, RAWINPUTDEVICELIST::default());
+        // SAFETY: `devices` holds exactly `count` elements and the size
+        // argument describes one element, so the call writes at most `count`
+        // elements into the vector.
         let length = unsafe { GetRawInputDeviceList(devices.as_mut_ptr(), &mut count, size) };
         if length != u32::MAX {
             devices.truncate(length as usize);
             break;
         }
         anyhow::ensure!(
+            // SAFETY: GetLastError takes no arguments and only reads the
+            // calling thread's last error code.
             unsafe { GetLastError() } == ERROR_INSUFFICIENT_BUFFER && attempt < 3,
             "Could not refresh Windows input devices: {}",
             std::io::Error::last_os_error()
