@@ -44,9 +44,9 @@ use windows::Win32::Storage::FileSystem::{
     BY_HANDLE_FILE_INFORMATION, CreateFileW, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_HIDDEN,
     FILE_ATTRIBUTE_REPARSE_POINT, FILE_ATTRIBUTE_SYSTEM, FILE_FLAG_BACKUP_SEMANTICS,
     FILE_FLAG_OPEN_REPARSE_POINT, FILE_NAME_NORMALIZED, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE,
-    FILE_SHARE_MODE, FILE_SHARE_READ, GetDriveTypeW, GetFileInformationByHandle,
+    FILE_SHARE_MODE, FILE_SHARE_READ, FILE_SHARE_WRITE, GetDriveTypeW, GetFileInformationByHandle,
     GetFinalPathNameByHandleW, GetVolumeInformationW, GetVolumePathNameW, OPEN_EXISTING,
-    READ_CONTROL, ReOpenFile, VOLUME_NAME_DOS, WRITE_DAC, WRITE_OWNER,
+    READ_CONTROL, VOLUME_NAME_DOS, WRITE_DAC, WRITE_OWNER,
 };
 use windows::Win32::System::Com::{
     CLSCTX_INPROC_SERVER, COINIT_APARTMENTTHREADED, COINIT_DISABLE_OLE1DDE, CoCreateInstance,
@@ -715,6 +715,21 @@ fn verify_payload(file: &File, expected: Identity) -> Result<()> {
     Ok(())
 }
 
+/// Reopen the exact object for an ACL mutation. ReOpenFile cannot elevate a
+/// read-only capability to WRITE_DAC, so resolve the bounded DOS path from the
+/// owned handle and request the security access directly. Callers verify the
+/// file identity again before changing anything.
+fn reopen_for_security(file: &impl AsRawHandle, access: u32) -> Result<File> {
+    use std::os::windows::fs::OpenOptionsExt;
+    let path = handle_path(file)?;
+    let opened = std::fs::OpenOptions::new()
+        .access_mode(access)
+        .share_mode(FILE_SHARE_READ.0 | FILE_SHARE_WRITE.0 | FILE_SHARE_DELETE.0)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS.0 | FILE_FLAG_OPEN_REPARSE_POINT.0)
+        .open(&path)?;
+    Ok(File::from(opened))
+}
+
 fn handle_path(file: &impl AsRawHandle) -> Result<PathBuf> {
     let mut path = vec![0u16; MAX_NATIVE_PATH];
     let length = unsafe {
@@ -1095,16 +1110,11 @@ pub(super) fn protect_new_private_directory(directory: &Dir) -> Result<()> {
     );
     require_empty_directory(directory)?;
     let user = process_user_sid()?;
-    let handle = unsafe {
-        ReOpenFile(
-            HANDLE(directory.as_raw_handle()),
-            FILE_READ_ATTRIBUTES.0 | READ_CONTROL.0 | WRITE_DAC.0,
-            FILE_SHARE_READ,
-            FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
-        )
-    }
+    let mut exact = reopen_for_security(
+        directory,
+        FILE_READ_ATTRIBUTES.0 | READ_CONTROL.0 | WRITE_DAC.0,
+    )
     .context("could not safely reopen the new quarantine for private access rules")?;
-    let mut exact = unsafe { File::from_raw_handle(handle.0) };
     let prior_owner = owner_sid(&exact)?;
     ensure!(
         native_identity(&exact)?.0 == expected
@@ -1113,16 +1123,11 @@ pub(super) fn protect_new_private_directory(directory: &Dir) -> Result<()> {
     );
     let change_owner = prior_owner != user;
     if change_owner {
-        let handle = unsafe {
-            ReOpenFile(
-                HANDLE(exact.as_raw_handle()),
-                FILE_READ_ATTRIBUTES.0 | READ_CONTROL.0 | WRITE_DAC.0 | WRITE_OWNER.0,
-                FILE_SHARE_READ,
-                FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
-            )
-        }
+        let upgraded = reopen_for_security(
+            &exact,
+            FILE_READ_ATTRIBUTES.0 | READ_CONTROL.0 | WRITE_DAC.0 | WRITE_OWNER.0,
+        )
         .context("the fresh administrator-owned quarantine cannot grant current-user ownership")?;
-        let upgraded = unsafe { File::from_raw_handle(handle.0) };
         ensure!(
             native_identity(&upgraded)?.0 == expected && owner_sid(&upgraded)? == prior_owner,
             "the new quarantine changed while acquiring owner access"
@@ -1457,15 +1462,10 @@ mod native_tests {
         require_empty_directory(directory)?;
         let expected = native_identity(directory)?.0;
         let user = process_user_sid()?;
-        let handle = unsafe {
-            ReOpenFile(
-                HANDLE(directory.as_raw_handle()),
-                FILE_READ_ATTRIBUTES.0 | READ_CONTROL.0 | WRITE_DAC.0,
-                FILE_SHARE_READ,
-                FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
-            )
-        }?;
-        let exact = unsafe { File::from_raw_handle(handle.0) };
+        let exact = reopen_for_security(
+            directory,
+            FILE_READ_ATTRIBUTES.0 | READ_CONTROL.0 | WRITE_DAC.0,
+        )?;
         let owner = owner_sid(&exact)?;
         ensure!(
             native_identity(&exact)?.0 == expected && (owner == user || owner == "S-1-5-32-544"),
