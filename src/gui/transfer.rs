@@ -777,6 +777,14 @@ impl Desktop {
         if let Some(error) = &runtime_error {
             self.transfers.service_error = Some(format!("File sharing is unavailable: {error}"));
         }
+        if let Some(notice) = self
+            .group
+            .file_transfer
+            .as_ref()
+            .and_then(|service| service.take_notice())
+        {
+            self.transfers.error = Some(notice);
+        }
         let available = (self.group.file_transfer.is_some()
             && runtime_error.is_none()
             && workspace.authority.is_some())
