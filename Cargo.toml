@@ -28,7 +28,7 @@ dirs = "=6.0.0"
 cap-std = "=4.0.3"
 cap-fs-ext = "=4.0.3"
 rfd = { version = "=0.18.0", default-features = false, features = ["xdg-portal"] }
-zip = { version = "=4.6.1", default-features = false, features = ["deflate-flate2-zlib-rs"] }
+zip = { version = "=9.4.2", default-features = false, features = ["deflate-flate2-zlib-rs"] }
 toml = "0.9"
 tokio = { version = "1.48", features = ["rt", "macros", "net", "sync", "time", "io-util", "signal"] }
 
@@ -83,6 +83,12 @@ tray-icon = { version = "0.25", default-features = false }
 objc2 = "0.6"
 objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "NSPasteboard", "NSPasteboardItem", "NSEvent", "NSScreen"] }
 objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSArray", "NSString", "NSURL"] }
+
+[lints.clippy]
+# SAFETY audit in progress; see docs/unsafe-audit.md. Kept at `warn` so local
+# clippy runs list undocumented FFI blocks, while CI uses `-D warnings` together
+# with `-A clippy::undocumented_unsafe_blocks` until the audit reaches zero.
+undocumented_unsafe_blocks = "warn"
 
 [profile.release]
 lto = "thin"

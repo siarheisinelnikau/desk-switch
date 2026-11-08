@@ -216,7 +216,7 @@ fn extract(archive: &Path, destination: &Path, release: &Release) -> Result<Path
     let mut prefixes = BTreeMap::new();
     for index in 0..archive.len() {
         let mut file = archive.by_index(index)?;
-        let relative = entry(file.name())?;
+        let relative = entry(&file.name()?)?;
         let name = relative.to_string_lossy();
         ensure!(
             paths.insert(name.to_ascii_lowercase()),
