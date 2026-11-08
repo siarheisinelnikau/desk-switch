@@ -1,0 +1,106 @@
+name: Promote tested release
+
+on:
+  push:
+    branches: [main]
+    paths: [release/promotion-request.json]
+
+permissions:
+  contents: write
+  actions: read
+
+concurrency:
+  group: promote-tested-release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  promote:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Check release verification regressions
+        run: |
+          python3 tools/test_promote_release.py
+          python3 tools/test_release_assets.py
+          python3 tools/test_normalize_release_assets.py
+      - name: Verify the original tested and signed release candidate
+        id: verify
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python3 - <<'PY'
+          import json, os, re, subprocess, tomllib
+          from pathlib import Path
+
+          request = json.loads(Path('release/promotion-request.json').read_text())
+          assert set(request) == {'tag', 'source_sha', 'run_id'}, 'Unexpected promotion request fields'
+          version = tomllib.loads(Path('Cargo.toml').read_text())['package']['version']
+          tag, source, run_id = request['tag'], request['source_sha'], request['run_id']
+          assert re.fullmatch(r'v(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)', tag), 'Invalid stable tag'
+          assert tag == f'v{version}', 'Promotion must match the current application version'
+          assert re.fullmatch(r'[0-9a-f]{40}', source), 'Invalid tested source SHA'
+          assert type(run_id) is int and run_id > 0, 'Invalid original Release run ID'
+          repository = os.environ['GITHUB_REPOSITORY']
+
+          def api(path):
+              return json.loads(subprocess.check_output(['gh', 'api', f'repos/{repository}/{path}'], text=True))
+
+          ref = api(f'git/ref/tags/{tag}')
+          assert ref['object']['type'] == 'commit' and ref['object']['sha'] == source, 'Candidate tag does not point to the tested source'
+          run = api(f'actions/runs/{run_id}')
+          assert run['head_sha'] == source, 'Release run belongs to another source'
+          assert run['name'] == 'Release' and run['path'] == '.github/workflows/release.yml', 'Run is not the canonical Release workflow'
+          assert run['event'] == 'push' and run['head_branch'] == 'main', 'Expected the original main-branch release request'
+          assert run['repository']['full_name'] == repository and run['head_repository']['full_name'] == repository, 'Unexpected source repository'
+          original = api(f'actions/runs/{run_id}/attempts/1/jobs?per_page=100')
+          jobs = original['jobs']
+          assert original['total_count'] == len(jobs), 'Incomplete original job list'
+          by_name = {job['name']: job for job in jobs}
+          assert len(by_name) == len(jobs), 'Ambiguous original release jobs'
+          builds = {
+              'build (ubuntu-24.04, linux, desk-switch)',
+              'build (windows-2022, windows, desk-switch.exe, -C target-feature=+crt-static)',
+          }
+          assert {name for name in by_name if name.startswith('build (')} == builds, 'Expected exactly the Windows and Ubuntu builds'
+          for name in builds | {'request', 'sign'}:
+              job = by_name[name]
+              assert job['run_id'] == run_id and job['run_attempt'] == 1 and job['head_sha'] == source, f'Wrong provenance for {name}'
+              assert job['status'] == 'completed' and job['conclusion'] == 'success', f'Original {name} did not pass'
+          artifacts = api(f'actions/runs/{run_id}/artifacts?per_page=100&name=desk-switch-signed-metadata')
+          assert artifacts['total_count'] == len(artifacts['artifacts']) == 1, 'Expected one existing signed-metadata artifact'
+          artifact = artifacts['artifacts'][0]
+          assert artifact['name'] == 'desk-switch-signed-metadata' and not artifact['expired'], 'Signed metadata is unavailable'
+          assert artifact['workflow_run']['id'] == run_id and artifact['workflow_run']['head_sha'] == source, 'Signed metadata belongs to another source'
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
+              for key, value in {'run_id': run_id, 'artifact_id': artifact['id'], 'source_sha': source}.items():
+                  output.write(f'{key}={value}\n')
+          print(f'Validated original Release attempt 1 for {tag} at {source}; signed metadata artifact {artifact["id"]}.')
+          PY
+      - name: Download only the original signed metadata
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          artifact-ids: ${{ steps.verify.outputs.artifact_id }}
+          run-id: ${{ steps.verify.outputs.run_id }}
+          repository: ${{ github.repository }}
+          github-token: ${{ github.token }}
+          path: verified-metadata
+          merge-multiple: true
+      - name: Verify the existing assets and promote the signed release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          DESK_SWITCH_RELEASE_SOURCE_SHA: ${{ steps.verify.outputs.source_sha }}
+        run: |
+          python3 - <<'PY'
+          import shutil, tomllib
+          from pathlib import Path
+          directory = Path('verified-metadata')
+          assert sorted(path.name for path in directory.iterdir()) == ['update.json'], 'Unexpected metadata artifact contents'
+          version = tomllib.loads(Path('Cargo.toml').read_text())['package']['version']
+          manifest = Path(f'release/manifests/{version}.json')
+          manifest.parent.mkdir(parents=True, exist_ok=True)
+          shutil.copy2(directory / 'update.json', manifest)
+          PY
+          python3 tools/promote_release.py
