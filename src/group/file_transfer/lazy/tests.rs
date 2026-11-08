@@ -55,6 +55,7 @@ impl Harness {
             reservations: Mutex::new(BTreeMap::new()),
             events: Mutex::new(VecDeque::new()),
             lazy: Mutex::new(State::default()),
+            pending_results: Mutex::new(VecDeque::new()),
             commands,
         });
         Self {
@@ -242,24 +243,19 @@ fn a_full_completion_queue_leaves_the_result_retryable_and_queues_it_once() {
         .clone();
     let native = session(&fetch, reader.id());
     // NativeBegin occupies the only slot until the synthetic service drains it.
-    assert!(
-        reader
-            .native_complete(NativeResult::Failed("queue full test".into()))
-            .is_err()
-    );
-    assert!(!native.reported.load(Ordering::Acquire));
-    assert!(!native.reporting.load(Ordering::Acquire));
-    assert!(!fetch.state.lock().unwrap().cleanup_started);
-    assert!(Arc::ptr_eq(&harness.take_begin(), &fetch));
-
     reader
         .native_complete(NativeResult::Failed("queue full test".into()))
         .unwrap();
     assert!(native.reported.load(Ordering::Acquire));
     assert!(!native.reporting.load(Ordering::Acquire));
+    assert_eq!(harness.core.pending_results.lock().unwrap().len(), 1);
+    assert!(Arc::ptr_eq(&harness.take_begin(), &fetch));
+
+    harness.core.flush_pending_results();
     let (queued, result) = harness.take_result();
     assert!(Arc::ptr_eq(&queued, &native));
     assert!(matches!(result, NativeResult::Failed(_)));
+    assert!(harness.core.pending_results.lock().unwrap().is_empty());
     reader
         .native_complete(NativeResult::Failed("queue full test".into()))
         .unwrap();
