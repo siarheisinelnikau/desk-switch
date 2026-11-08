@@ -45,6 +45,8 @@ pub(super) struct PhysicalCoordinates(DPI_AWARENESS_CONTEXT);
 impl PhysicalCoordinates {
     pub(super) fn enter() -> Result<Self> {
         let previous =
+            // SAFETY: The requested context is a system-provided handle. A non-null
+            // previous context is saved and restored on this same thread by the guard.
             unsafe { SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) };
         ensure!(
             !previous.is_null(),
@@ -56,6 +58,8 @@ impl PhysicalCoordinates {
 
 impl Drop for PhysicalCoordinates {
     fn drop(&mut self) {
+        // SAFETY: `enter` accepted this guard only after Windows returned a non-null
+        // previous context, and the guard is dropped on the thread whose context it saved.
         unsafe {
             SetThreadDpiAwarenessContext(self.0);
         }
@@ -74,6 +78,8 @@ pub fn screen(handle: HMONITOR) -> Result<Screen> {
     let _coordinates = PhysicalCoordinates::enter()?;
     let mut info = MONITORINFOEXW::default();
     info.monitorInfo.cbSize = size_of::<MONITORINFOEXW>() as u32;
+    // SAFETY: Callers supply a live HMONITOR from monitor enumeration or
+    // MonitorFromPoint. `info` is writable and its size field matches MONITORINFOEXW.
     if unsafe { GetMonitorInfoW(handle, &mut info.monitorInfo) } == 0 {
         return Err(io::Error::last_os_error()).context("reading Windows monitor geometry");
     }
@@ -93,17 +99,23 @@ pub fn screen(handle: HMONITOR) -> Result<Screen> {
 
 pub fn screens() -> Result<Vec<Screen>> {
     let _coordinates = PhysicalCoordinates::enter()?;
+    // SAFETY: This has the MONITORENUMPROC calling convention. `output` is the
+    // exclusive Vec pointer passed to the synchronous EnumDisplayMonitors call below.
     unsafe extern "system" fn collect(
         handle: HMONITOR,
         _: HDC,
         _: *mut RECT,
         output: LPARAM,
     ) -> i32 {
+        // SAFETY: The vector outlives enumeration, is not accessed elsewhere during
+        // callbacks, and its allocation is not exposed to Windows.
         let output = unsafe { &mut *(output as *mut Vec<HMONITOR>) };
         output.push(handle);
         1
     }
     let mut monitors = Vec::new();
+    // SAFETY: Null DC and clipping rectangle are permitted. `monitors` remains alive
+    // and exclusively borrowed for every synchronous callback made by this call.
     if unsafe {
         EnumDisplayMonitors(
             null_mut(),
@@ -182,6 +194,8 @@ pub fn display_changes() -> Result<tokio::sync::watch::Receiver<u64>> {
         std::thread::Builder::new()
             .name("Desk Switch display notifications".into())
             .spawn(move || {
+                // SAFETY: A null module path requests the current process module, which
+                // remains loaded for the lifetime of this notification thread.
                 let module = unsafe { GetModuleHandleW(null()) };
                 let class = WNDCLASSW {
                     lpfnWndProc: Some(topology_notification),
@@ -189,10 +203,14 @@ pub fn display_changes() -> Result<tokio::sync::watch::Receiver<u64>> {
                     lpszClassName: w!("DeskSwitchReceiverDisplayNotifications"),
                     ..Default::default()
                 };
+                // SAFETY: `class` is fully readable, its class name is statically NUL
+                // terminated, and its callback has the required window-procedure ABI.
                 unsafe {
                     RegisterClassW(&class);
                 }
                 let mut sender = Box::new(thread_changes);
+                // SAFETY: The registered class and module are live. The boxed sender has
+                // a stable address and remains allocated until after DestroyWindow below.
                 let window = unsafe {
                     CreateWindowExW(
                         WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
@@ -215,12 +233,18 @@ pub fn display_changes() -> Result<tokio::sync::watch::Receiver<u64>> {
                 }
                 if ready.send(Ok(())).is_ok() {
                     let mut message = MSG::default();
+                    // SAFETY: `message` is writable; a null HWND retrieves messages for
+                    // this thread's queue without borrowing any other native object.
                     while unsafe { GetMessageW(&mut message, null_mut(), 0, 0) } > 0 {
+                        // SAFETY: This is the message just filled by GetMessageW on the
+                        // same thread that owns the destination window.
                         unsafe {
                             DispatchMessageW(&message);
                         }
                     }
                 }
+                // SAFETY: `window` was created by and is still owned by this thread;
+                // destruction completes before the boxed callback sender is released.
                 unsafe {
                     DestroyWindow(window);
                 }
@@ -238,6 +262,11 @@ pub fn display_changes() -> Result<tokio::sync::watch::Receiver<u64>> {
     }
 }
 
+// Window procedure for the display topology notification window.
+//
+// SAFETY: Windows calls this with the window it created for the registered
+// class. The procedure only reads the creation structure that Windows passes
+// with `WM_NCCREATE` and the value this procedure stored itself.
 unsafe extern "system" fn topology_notification(
     window: HWND,
     message: u32,
@@ -245,7 +274,12 @@ unsafe extern "system" fn topology_notification(
     lparam: LPARAM,
 ) -> LRESULT {
     if message == WM_NCCREATE {
+        // SAFETY: for WM_NCCREATE the message parameter points at the
+        // CREATESTRUCTW that Windows prepared for this window.
         let creation = unsafe { &*(lparam as *const CREATESTRUCTW) };
+        // SAFETY: `window` is the window being created and the value stored
+        // is the address of the boxed sender that the caller keeps alive
+        // until the window is destroyed.
         unsafe {
             SetWindowLongPtrW(window, GWLP_USERDATA, creation.lpCreateParams as isize);
         }
@@ -253,19 +287,27 @@ unsafe extern "system" fn topology_notification(
         message,
         WM_DISPLAYCHANGE | WM_SETTINGCHANGE | WM_DEVICECHANGE
     ) {
+        // SAFETY: the value was stored by this procedure from the creation
+        // parameters and is read back unchanged.
         let sender = unsafe { GetWindowLongPtrW(window, GWLP_USERDATA) }
             as *const tokio::sync::watch::Sender<u64>;
+        // SAFETY: the pointer refers to the boxed sender that the caller keeps
+        // alive for as long as this window exists.
         if let Some(sender) = unsafe { sender.as_ref() } {
             sender.send_modify(|generation| *generation = generation.wrapping_add(1));
         }
         return 0;
     }
+    // SAFETY: the default procedure only interprets the message and the
+    // window handle that Windows passed in.
     unsafe { DefWindowProcW(window, message, wparam, lparam) }
 }
 
 struct DeviceInfo(HDEVINFO);
 impl Drop for DeviceInfo {
     fn drop(&mut self) {
+        // SAFETY: the device information list is owned by this guard and is
+        // destroyed exactly once.
         unsafe {
             SetupDiDestroyDeviceInfoList(self.0);
         }
@@ -275,6 +317,8 @@ impl Drop for DeviceInfo {
 struct RegistryKey(HKEY);
 impl Drop for RegistryKey {
     fn drop(&mut self) {
+        // SAFETY: the registry key is owned by this guard and is closed
+        // exactly once.
         unsafe {
             RegCloseKey(self.0);
         }
@@ -282,6 +326,8 @@ impl Drop for RegistryKey {
 }
 
 fn edid(path: &[u16]) -> Result<Vec<u8>> {
+    // SAFETY: a null enumerator and class name create a device information
+    // set for the local system; the returned list is owned by the guard below.
     let list = unsafe { SetupDiCreateDeviceInfoList(null(), null_mut()) };
     ensure!(
         list != INVALID_HANDLE_VALUE as isize,
@@ -292,10 +338,14 @@ fn edid(path: &[u16]) -> Result<Vec<u8>> {
         cbSize: size_of::<SP_DEVICE_INTERFACE_DATA>() as u32,
         ..Default::default()
     };
+    // SAFETY: `path` is a NUL-terminated interface path and `interface` is a
+    // live out-parameter whose size field matches the structure.
     if unsafe { SetupDiOpenDeviceInterfaceW(list.0, path.as_ptr(), 0, &mut interface) } == 0 {
         return Err(io::Error::last_os_error()).context("opening the physical monitor interface");
     }
     let mut size = 0;
+    // SAFETY: a null detail buffer with a zero size only asks for the
+    // required buffer size, which is written to `size`.
     unsafe {
         SetupDiGetDeviceInterfaceDetailW(list.0, &interface, null_mut(), 0, &mut size, null_mut());
     }
@@ -311,6 +361,8 @@ fn edid(path: &[u16]) -> Result<Vec<u8>> {
     let header_size = 6;
     #[cfg(not(target_arch = "x86"))]
     let header_size = 8;
+    // SAFETY: the buffer holds at least `size` bytes and the header size is
+    // the documented value for this architecture.
     unsafe {
         (*detail).cbSize = header_size;
     }
@@ -318,12 +370,16 @@ fn edid(path: &[u16]) -> Result<Vec<u8>> {
         cbSize: size_of::<SP_DEVINFO_DATA>() as u32,
         ..Default::default()
     };
+    // SAFETY: `detail` points at a buffer of exactly `size` bytes and the
+    // call is told that size, so it cannot write past the buffer.
     if unsafe {
         SetupDiGetDeviceInterfaceDetailW(list.0, &interface, detail, size, null_mut(), &mut device)
     } == 0
     {
         return Err(io::Error::last_os_error()).context("finding the monitor device node");
     }
+    // SAFETY: the device information list and the device node are live, and
+    // the returned registry key is owned by the guard below.
     let key = unsafe {
         SetupDiOpenDevRegKey(
             list.0,
@@ -341,6 +397,9 @@ fn edid(path: &[u16]) -> Result<Vec<u8>> {
     let mut edid = vec![0; 4096];
     let mut length = edid.len() as u32;
     let mut kind = 0;
+    // SAFETY: the key is owned by the guard above, the value name is a static
+    // NUL-terminated string, and `edid` holds 4096 bytes with `length`
+    // stating that size, so the call cannot overflow it.
     let status = unsafe {
         RegQueryValueExW(
             key.0,
@@ -369,6 +428,8 @@ fn identity(screen: &Screen) -> Result<(String, String)> {
             cb: size_of::<DISPLAY_DEVICEW>() as u32,
             ..Default::default()
         };
+        // SAFETY: the display device name is a live GDI name and `device` is
+        // a writable out-parameter whose size field matches the structure.
         if unsafe {
             EnumDisplayDevicesW(
                 screen.gdi.as_ptr(),
@@ -401,6 +462,8 @@ fn identity(screen: &Screen) -> Result<(String, String)> {
 struct Physical(PHYSICAL_MONITOR);
 impl Drop for Physical {
     fn drop(&mut self) {
+        // SAFETY: the handle was opened by GetPhysicalMonitorsFromHMONITOR and
+        // is closed exactly once, with the same count it was opened with.
         unsafe {
             DestroyPhysicalMonitors(1, &self.0);
         }
@@ -409,6 +472,8 @@ impl Drop for Physical {
 
 fn physical(screen: &Screen) -> Result<Physical> {
     let mut count = 0;
+    // SAFETY: the screen owns a live monitor handle and `count` is a live
+    // out-parameter.
     if unsafe { GetNumberOfPhysicalMonitorsFromHMONITOR(screen.handle, &mut count) } == 0 {
         return Err(io::Error::last_os_error()).context("enumerating Windows DDC/CI handles");
     }
@@ -417,6 +482,8 @@ fn physical(screen: &Screen) -> Result<Physical> {
         "expected one physical monitor for this screen; found {count}"
     );
     let mut monitor = PHYSICAL_MONITOR::default();
+    // SAFETY: the count is exactly one and `monitor` holds one element, so
+    // the call writes exactly that element.
     if unsafe { GetPhysicalMonitorsFromHMONITOR(screen.handle, count, &mut monitor) } == 0 {
         return Err(io::Error::last_os_error()).context("opening Windows DDC/CI handle");
     }
@@ -442,6 +509,8 @@ fn select(id: &str) -> Result<Physical> {
 
 fn read(handle: HANDLE) -> Result<u16> {
     let mut value = 0;
+    // SAFETY: the handle is a live DDC/CI monitor handle and `value` is a
+    // live out-parameter; the null buffers are allowed by the API.
     if unsafe { GetVCPFeatureAndVCPFeatureReply(handle, 0x60, null_mut(), &mut value, null_mut()) }
         == 0
     {
@@ -465,6 +534,8 @@ impl Monitor for Ddc {
             "DDC write issued: process {}, input {input:#06x}; exactly one SetVCPFeature call.",
             std::process::id()
         );
+        // SAFETY: the monitor handle is owned by the `Physical` guard that
+        // stays alive for the duration of the call.
         if unsafe { SetVCPFeature(monitor.0.hPhysicalMonitor, 0x60, input.into()) } == 0 {
             return Err(io::Error::last_os_error()).context("Windows DDC/CI VCP 0x60 write failed");
         }
@@ -509,10 +580,14 @@ fn probe_physical(monitor: &Physical) -> Result<()> {
 fn advertised_inputs(handle: HANDLE) -> Vec<u16> {
     let mut length = 0;
     let mut codes = Vec::new();
+    // SAFETY: the handle is a live DDC/CI monitor handle and `length` is a
+    // live out-parameter.
     if unsafe { GetCapabilitiesStringLength(handle, &mut length) } != 0
         && (1..=32768).contains(&length)
     {
         let mut buffer = vec![0; length as usize];
+        // SAFETY: the buffer holds exactly `length` bytes and the call is
+        // told that length, so it cannot write past the buffer.
         if unsafe { CapabilitiesRequestAndCapabilitiesReply(handle, buffer.as_mut_ptr(), length) }
             != 0
             && let Ok(capabilities) = CStr::from_bytes_until_nul(&buffer)
@@ -581,6 +656,9 @@ pub fn list_displays() -> Result<Vec<super::MonitorInfo>> {
                     cb: size_of::<DISPLAY_DEVICEW>() as u32,
                     ..Default::default()
                 };
+                // SAFETY: the display device name is a live GDI name and
+                // `device` is a writable out-parameter whose size field
+                // matches the structure.
                 if unsafe {
                     EnumDisplayDevicesW(
                         screen.gdi.as_ptr(),
