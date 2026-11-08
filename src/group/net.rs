@@ -1875,12 +1875,14 @@ mod tests {
             }
         }
     }
+    #[track_caller]
     fn until(
         computers: &mut [Computer],
         forwarded: &mut Vec<(usize, Event)>,
         condition: impl Fn(&[Computer], &[(usize, Event)]) -> bool,
     ) {
         let since = Instant::now();
+        let caller = std::panic::Location::caller();
         loop {
             pump(computers, forwarded);
             if condition(computers, forwarded) {
@@ -1888,17 +1890,29 @@ mod tests {
             }
             assert!(
                 since.elapsed() < Duration::from_secs(20),
-                "Timed out: states={:?}, events={forwarded:?}",
+                "Timed out at {caller}: states=(hub,members,online,authority,revision,activation,source,active,intent,intent-health,coordination)={:?}, events={forwarded:?}",
                 computers
                     .iter()
-                    .map(|computer| computer.state.as_ref().map(|state| (
+                    .enumerate()
+                    .map(|(index, computer)| computer.state.as_ref().map(|state| (
                         &state.hub,
                         state.members.len(),
                         state
                             .members
                             .values()
                             .filter(|member| member.online)
-                            .count()
+                            .count(),
+                        &state.authority,
+                        state.revision,
+                        state.activation,
+                        state.plan().input,
+                        &state.active_input,
+                        &state.input_intent,
+                        state.input_intent.as_ref().map(|key| (
+                            state.members[key].compatible(),
+                            &state.members[key].node.monitor_error,
+                        )),
+                        failover_coordination(forwarded, index),
                     )))
                     .collect::<Vec<_>>()
             );
@@ -1931,6 +1945,33 @@ mod tests {
             .iter()
             .map(|computer| computer.member.node.key.clone())
             .collect::<Vec<_>>();
+        let ready = |computers: &[Computer], events: &[(usize, Event)], count: usize| {
+            let Some(first) = computers[0].state.as_ref() else {
+                return false;
+            };
+            let Some(leader) = keys[..count].iter().position(|key| key == &first.hub) else {
+                return false;
+            };
+            failover_coordination(events, leader)
+                .is_some_and(|(hub, writable, _, _)| writable && hub.as_ref() == Some(&first.hub))
+                && computers[..count].iter().all(|computer| {
+                    computer.state.as_ref().is_some_and(|state| {
+                        let mut reconciled = state.clone();
+                        reconciled.reconcile_input();
+                        state.authority.is_some()
+                            && state.authority == first.authority
+                            && state.revision == first.revision
+                            && state.activation == first.activation
+                            && state.workspace_id() == keys[0]
+                            && state.hub == first.hub
+                            && state.members.len() == count
+                            && state.members.values().all(|member| member.online)
+                            && state.active_input == reconciled.active_input
+                            && state.input_intent == reconciled.input_intent
+                            && state.activation == reconciled.activation
+                    })
+                })
+        };
         let mut forwarded = Vec::new();
         until(&mut computers, &mut forwarded, |computers, _| {
             computers.iter().all(|computer| computer.state.is_some())
@@ -1944,19 +1985,12 @@ mod tests {
                     key: keys[index].clone(),
                 })
                 .unwrap();
-            until(&mut computers, &mut forwarded, |computers, _| {
-                computers[0]
-                    .state
-                    .as_ref()
-                    .is_some_and(|state| state.members.len() == index + 1)
+            until(&mut computers, &mut forwarded, |computers, events| {
+                ready(computers, events, index + 1)
             });
         }
-        until(&mut computers, &mut forwarded, |computers, _| {
-            computers.iter().all(|computer| {
-                computer.state.as_ref().is_some_and(|state| {
-                    state.members.len() == 4 && state.members.values().all(|member| member.online)
-                })
-            })
+        until(&mut computers, &mut forwarded, |computers, events| {
+            ready(computers, events, 4)
         });
         let revision = computers[3].state.as_ref().unwrap().revision;
         let mut settings = computers[3].state.as_ref().unwrap().settings.clone();
