@@ -27,14 +27,10 @@ pub(crate) struct PasteIntent {
     pub consumer: Option<NativeConsumer>,
 }
 
-// Platform consumers use only the outcomes they can actually observe. Linux
-// reports MoveCommitted/Cancelled, Windows reports MoveCommitted/Failed, and
-// tests exercise Succeeded for a native Copy acknowledgement.
-#[allow(dead_code)]
+// Platform consumers report only the outcomes they can actually observe:
+// committed Move entries, cancellation, or a terminal failure.
 #[derive(Clone, Debug)]
 pub(crate) enum NativeResult {
-    /// A native consumer reported successful Copy, not just a completed cache.
-    Succeeded,
     /// Every declared entry in one explicitly cut native batch was committed.
     MoveCommitted {
         consumer: NativeConsumer,
