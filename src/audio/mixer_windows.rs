@@ -17,6 +17,8 @@ pub(super) struct Native {
 impl Native {
     pub fn open() -> Result<Self> {
         let com = super::super::output::Com::open()?;
+        // SAFETY: the returned interface pointer is owned by this backend,
+        // which stores it and releases it when the enumerator is dropped.
         let enumerator = unsafe { CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL) }?;
         Ok(Self {
             _com: com,
@@ -25,9 +27,20 @@ impl Native {
         })
     }
 }
+
+/// Takes ownership of a COM-allocated string and converts it to a `String`.
+///
+/// SAFETY: the caller must pass a `PWSTR` that was allocated by a COM API
+/// with `CoTaskMemAlloc`. This function frees it exactly once.
 unsafe fn take_string(value: windows::core::PWSTR) -> Result<String> {
+    // SAFETY: the string is NUL-terminated and stays owned by this function
+    // until it is freed below.
     let text = unsafe { value.to_string() };
-    unsafe { CoTaskMemFree(Some(value.0.cast())) };
+    unsafe {
+        // SAFETY: the pointer came from a COM allocation and is released
+        // exactly once here.
+        CoTaskMemFree(Some(value.0.cast()));
+    }
     Ok(text?)
 }
 impl Backend for Native {
@@ -35,6 +48,8 @@ impl Backend for Native {
         self.volumes.clear();
         let mut sessions = Vec::new();
         unsafe {
+            // SAFETY: the enumerator is owned by this backend and is only
+            // used while it is alive.
             let devices = self
                 .enumerator
                 .EnumAudioEndpoints(eRender, DEVICE_STATE_ACTIVE)?;
@@ -113,6 +128,8 @@ impl Backend for Native {
             .get(id)
             .context("Windows audio session disappeared")?;
         let result = unsafe {
+            // SAFETY: the volume interface is owned by this backend and the
+            // null event pointer is allowed by the API.
             volume
                 .SetMasterVolume(state.channels[0] as f32, std::ptr::null())
                 .and_then(|()| volume.SetMute(state.muted, std::ptr::null()))
