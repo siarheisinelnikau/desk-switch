@@ -458,6 +458,7 @@ impl SourceSelection {
     /// Consume the local selection once the service has authenticated a complete
     /// native Move receipt for this exact Cut, paste, export and verified bytes.
     /// A cache download, EOF, close/release, or Copy result must never call this.
+    #[cfg(test)]
     pub fn finalize_move(
         self,
         state_dir: &Path,
@@ -1381,6 +1382,7 @@ fn reconcile(journal: &Journal) -> Result<SourceMoveOutcome> {
 /// Shared recoverable-rename primitive for the platform Trash handoff. Callers
 /// must verify the moved identity afterwards; Linux's name-based primitive can
 /// capture a source substitution even though its target is never overwritten.
+#[cfg(any(target_os = "linux", test))]
 pub(crate) fn rename_for_trash(
     from: &Dir,
     source: &OsStr,
