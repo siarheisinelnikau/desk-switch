@@ -231,7 +231,12 @@ fn run_capture(fixture: Fixture, control: Arc<Mutex<Control>>) -> Result<serde_j
         fixture: fixture.clone(),
         known: None,
     };
-    let target = VARIANT::from(fixture.folder.to_string_lossy().as_ref());
+    // Explorer's Shell parser does not accept the verbatim `\\?\` prefix that
+    // canonicalize() returns. Navigate with the ordinary DOS spelling; the
+    // captured folder is normalized before comparison.
+    let folder_text = fixture.folder.to_string_lossy();
+    let folder_text = folder_text.strip_prefix(r"\\?\").unwrap_or(&folder_text);
+    let target = VARIANT::from(folder_text);
     unsafe { owned.browser.Navigate2(&target, None, None, None, None) }
         .context("Explorer could not navigate to the private test folder")?;
     let deadline = Instant::now() + Duration::from_secs(20);
