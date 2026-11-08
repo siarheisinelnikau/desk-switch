@@ -1208,6 +1208,19 @@ fn outcome_from_live(journal: &Journal) -> SourceMoveOutcome {
     }
 }
 
+/// No cleanup journal exists. The sender restarted before detaching any source,
+/// so a native Move remains a successful Copy with originals retained.
+#[derive(Debug)]
+pub struct NoSourceMoveJournal;
+
+impl std::fmt::Display for NoSourceMoveJournal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("No source Move recovery receipt was saved")
+    }
+}
+
+impl std::error::Error for NoSourceMoveJournal {}
+
 /// Read-only crash/duplicate reconciliation. A saved path can locate and verify
 /// an owned recovery payload; it can never authorize another source detachment.
 pub fn recover_source_move(
@@ -1217,8 +1230,9 @@ pub fn recover_source_move(
     let _guard = FINALIZING
         .lock()
         .map_err(|_| anyhow::anyhow!("Source Move recovery is unavailable"))?;
-    let directory = journal_directory(state_dir, false)?
-        .context("No source Move recovery receipt was saved")?;
+    let Some(directory) = journal_directory(state_dir, false)? else {
+        return Err(NoSourceMoveJournal.into());
+    };
     let name = binding.journal_name()?;
     reconcile(&load_journal(&directory, &name, binding)?)
 }
@@ -1794,6 +1808,20 @@ mod tests {
         assert_eq!(
             fs::read(fixture.path("source/second.txt")).unwrap(),
             b"changed by the user after the destination commit"
+        );
+    }
+
+    #[test]
+    fn a_missing_journal_is_terminal_and_never_detaches_originals() {
+        let fixture = Fixture::new();
+        fixture.write("source/report.txt", b"original");
+        let (selection, _manifest, binding) = fixture.prepare(&["source/report.txt"]);
+        let error = recover_source_move(&fixture.path("state"), &binding).unwrap_err();
+        assert!(error.downcast_ref::<NoSourceMoveJournal>().is_some());
+        drop(selection);
+        assert_eq!(
+            fs::read(fixture.path("source/report.txt")).unwrap(),
+            b"original"
         );
     }
 

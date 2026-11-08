@@ -92,6 +92,30 @@ pub(super) struct Fetch {
     lease: String,
 }
 
+impl Drop for Fetch {
+    fn drop(&mut self) {
+        let Some(core) = self.core.upgrade() else {
+            return;
+        };
+        // Keep the lazy-state lock while removing the private cache. A new
+        // paste for the same offer must either reuse this Fetch or wait until
+        // its files have been removed, never race the cleanup.
+        let state = core.lazy.lock().unwrap();
+        if state
+            .fetches
+            .get(&self.id)
+            .and_then(Weak::upgrade)
+            .is_some()
+        {
+            return;
+        }
+        let receive = self.state.lock().unwrap().verified.take();
+        if let Some(receive) = receive {
+            let _ = receive.lock().unwrap().remove_cache();
+        }
+    }
+}
+
 pub(super) struct Session {
     id: String,
     fetch: Arc<Fetch>,
@@ -1878,6 +1902,23 @@ pub(super) async fn source_move(
             result.locations,
             None,
         ),
+        // A missing journal means the sender restarted before any source was
+        // detached. Terminalize as Copy-with-originals-kept instead of retrying
+        // the same impossible cleanup forever.
+        Err(error)
+            if error
+                .downcast_ref::<storage::source_move::NoSourceMoveJournal>()
+                .is_some() =>
+        {
+            (
+                protocol::MoveOutcome::OriginalsRetained,
+                vec![],
+                Some(
+                    "The files were copied; the source cleanup record was unavailable, so originals were kept."
+                        .into(),
+                ),
+            )
+        }
         // An I/O error can occur after detach. It does not prove that originals
         // are still at their old names; retain the journal for source recovery.
         Err(error) => (
