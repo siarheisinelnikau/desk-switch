@@ -8,13 +8,14 @@ use std::{
     collections::VecDeque,
     path::PathBuf,
     sync::{Arc, Condvar, Mutex},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 pub type Content = (String, Vec<u8>, String);
 const LIMIT: usize = 8 * 1024 * 1024;
 const SIDE: usize = 4096;
 const INTERVAL: Duration = Duration::from_millis(400);
+const PUBLISH_RETRY: Duration = Duration::from_millis(250);
 
 #[derive(Clone, Debug, PartialEq)]
 enum Value {
@@ -252,7 +253,10 @@ mod gnome {
                 .build()?;
             let proxy = zbus::blocking::Proxy::new(&connection, NAME, PATH, NAME)?;
             let version: u32 = proxy.call("Version", &())?;
-            ensure!(version == 1, "Unsupported GNOME clipboard companion");
+            ensure!(
+                matches!(version, 1 | 2),
+                "Unsupported GNOME clipboard companion"
+            );
             Ok(Self {
                 connection,
                 serial: 0,
@@ -407,8 +411,14 @@ struct State {
     status: Option<String>,
     files_begin: Option<(u64, String, Option<u64>)>,
     files_incoming: Option<(u64, String, Vec<PathBuf>)>,
-    files_outgoing: Option<(u64, Vec<PathBuf>)>,
+    files_outgoing: Option<(u64, Option<super::clipboard_files::Selection>)>,
+    files_offer: Option<(
+        u64,
+        super::clipboard_files::provider::RemoteOffer,
+        Option<u64>,
+    )>,
     files_ready: VecDeque<(String, bool)>,
+    files_offer_retry_at: Option<Instant>,
     native_revision: Option<u64>,
     files_cancel: Option<(u64, String)>,
 }
@@ -493,6 +503,10 @@ impl Clipboard {
                 let mut engine = Engine::default();
                 let mut generation = 0;
                 let mut files = FileEngine::default();
+                let mut published: Option<(
+                    String,
+                    Box<dyn super::clipboard_files::provider::PublishedOffer>,
+                )> = None;
                 loop {
                     let mut state = worker.state.lock().unwrap();
                     while !state.enabled && !state.stop {
@@ -505,6 +519,7 @@ impl Clipboard {
                     if current != generation {
                         engine = Engine::default();
                         files = FileEngine::default();
+                        published = None;
                         generation = current;
                     }
                     let content = state
@@ -527,8 +542,25 @@ impl Clipboard {
                         .take()
                         .filter(|(epoch, _)| *epoch == current)
                         .map(|(_, id)| id);
+                    let retry_ready = state
+                        .files_offer_retry_at
+                        .is_none_or(|at| Instant::now() >= at);
+                    let offered = if retry_ready {
+                        state.files_offer_retry_at = None;
+                        state
+                            .files_offer
+                            .take()
+                            .filter(|(epoch, _, _)| *epoch == current)
+                            .map(|(_, offer, expected)| (offer, expected))
+                    } else {
+                        None
+                    };
+                    let retry_offer = offered.clone();
+                    let mut offer_attempted = false;
+                    let mut publication_failed = false;
                     drop(state);
-                    let mut outgoing_files = None;
+                    let mut outgoing_files: Option<Option<super::clipboard_files::Selection>> =
+                        None;
                     let mut ready = Vec::new();
                     let result = (|| {
                         // Disabling cancels queued operations. An OS call already
@@ -541,6 +573,12 @@ impl Clipboard {
                         }
                         let receiving_text = content.is_some();
                         if let Some(id) = cancelled_files {
+                            if published
+                                .as_ref()
+                                .is_some_and(|(current, _)| current == &id)
+                            {
+                                published = None;
+                            }
                             if files.reservation.as_ref() == Some(&id)
                                 || files
                                     .pending
@@ -555,17 +593,52 @@ impl Clipboard {
                             engine.receive(content)?;
                         }
                         let file_present = if native_files {
-                            let selection = super::clipboard_files::read()?;
-                            let present = selection.is_some();
-                            let pending = files.pending.as_ref().map(|(id, _)| id.clone());
-                            outgoing_files =
-                                files.observe(selection, super::clipboard_files::sequence());
-                            if files.pending.is_none()
-                                && let Some(id) = pending
-                            {
-                                ready.push((id, false));
+                            let own_offer = if let Some((_, binding)) = &published {
+                                binding.is_current()?
+                            } else {
+                                false
+                            };
+                            if own_offer {
+                                files.revision = published
+                                    .as_ref()
+                                    .and_then(|(_, binding)| binding.sequence());
+                                true
+                            } else {
+                                published = None;
+                                let selection = super::clipboard_files::read()?;
+                                let present = selection.is_some();
+                                let revision = super::clipboard_files::sequence();
+                                let changed =
+                                    files.observed != selection || files.revision != revision;
+                                let provider_path = selection.as_ref().is_some_and(|selection| {
+                                    selection
+                                        .paths
+                                        .iter()
+                                        .any(|path| super::clipboard_files::is_provider_path(path))
+                                });
+                                let operation = selection
+                                    .as_ref()
+                                    .map_or(super::file_transfer::Operation::Copy, |selection| {
+                                        selection.operation
+                                    });
+                                let pending = files.pending.as_ref().map(|(id, _)| id.clone());
+                                let outgoing = files.observe(selection, revision);
+                                if changed && !provider_path {
+                                    outgoing_files = Some(outgoing.map(|paths| {
+                                        super::clipboard_files::Selection {
+                                            sequence: revision.unwrap_or_default(),
+                                            paths,
+                                            operation,
+                                        }
+                                    }));
+                                }
+                                if files.pending.is_none()
+                                    && let Some(id) = pending
+                                {
+                                    ready.push((id, false));
+                                }
+                                present
                             }
-                            present
                         } else {
                             false
                         };
@@ -658,13 +731,64 @@ impl Clipboard {
                             files.reservation = None;
                             engine = Engine::default();
                         }
+                        if let Some((offer, expected)) = offered {
+                            offer_attempted = true;
+                            let id = offer.id.clone();
+                            let allowed = native_files
+                                && outgoing_files.is_none()
+                                && value.is_none()
+                                && !receiving_text
+                                && !applying_text
+                                && expected.is_some()
+                                && files.revision == expected;
+                            let binding = if allowed {
+                                match super::clipboard_files::publish_offer_if_current(
+                                    offer,
+                                    expected.unwrap(),
+                                ) {
+                                    Ok(binding) => binding,
+                                    Err(error) => {
+                                        // Keep the remote offer alive and retry
+                                        // after a short backoff. Retiring it
+                                        // here loses a transient D-Bus/Explorer
+                                        // busy result permanently.
+                                        publication_failed = true;
+                                        return Err(error);
+                                    }
+                                }
+                            } else {
+                                None
+                            };
+                            let accepted = binding.is_some();
+                            if let Some(binding) = binding {
+                                files.revision = binding.sequence();
+                                files.written = Some(binding.local_paths());
+                                published = Some((id.clone(), binding));
+                                engine = Engine::default();
+                            }
+                            ready.push((id, accepted));
+                        }
                         Ok(value)
                     })();
                     let mut state = worker.state.lock().unwrap();
                     if state.enabled && state.generation == current {
+                        if result.is_err()
+                            && publication_failed
+                            && state.files_offer.is_none()
+                            && let Some((offer, expected)) = retry_offer
+                        {
+                            state.files_offer = Some((current, offer, expected));
+                            state.files_offer_retry_at = Some(Instant::now() + PUBLISH_RETRY);
+                        } else if result.is_err()
+                            && !offer_attempted
+                            && state.files_offer.is_none()
+                            && let Some((offer, expected)) = retry_offer
+                        {
+                            state.files_offer = Some((current, offer, expected));
+                        }
                         state.native_revision = files.revision;
-                        if let Some(paths) = outgoing_files {
-                            state.files_outgoing = Some((current, paths));
+                        if let Some(selection) = outgoing_files {
+                            state.files_outgoing = Some((current, selection));
                             ctx.request_repaint_of(eframe::egui::ViewportId::ROOT);
                         }
                         for ready in ready {
@@ -692,14 +816,27 @@ impl Clipboard {
                     if state.stop {
                         break;
                     }
+                    let offer_retry_pending = state.files_offer.is_some()
+                        && state
+                            .files_offer_retry_at
+                            .is_some_and(|at| Instant::now() < at);
                     if state.incoming.is_none()
                         && state.files_begin.is_none()
                         && state.files_incoming.is_none()
                         && state.files_cancel.is_none()
+                        && state.files_offer.is_none()
                         && state.enabled
                         && state.generation == current
+                        && !offer_retry_pending
                     {
                         let _ = worker.wake.wait_timeout(state, INTERVAL).unwrap();
+                    } else if offer_retry_pending {
+                        let wait = state
+                            .files_offer_retry_at
+                            .map(|at| at.saturating_duration_since(Instant::now()))
+                            .unwrap_or(INTERVAL)
+                            .min(INTERVAL);
+                        let _ = worker.wake.wait_timeout(state, wait).unwrap();
                     }
                 }
             })?;
@@ -716,6 +853,8 @@ impl Clipboard {
             state.files_begin = None;
             state.files_incoming = None;
             state.files_outgoing = None;
+            state.files_offer = None;
+            state.files_offer_retry_at = None;
             state.files_ready.clear();
             state.native_revision = None;
             state.files_cancel = None;
@@ -742,7 +881,7 @@ impl Clipboard {
             .map(|(_, content)| vec![content])
             .unwrap_or_default()
     }
-    pub(crate) fn poll_files(&self) -> Vec<Vec<PathBuf>> {
+    pub(crate) fn poll_files(&self) -> Vec<Option<super::clipboard_files::Selection>> {
         let mut state = self.shared.state.lock().unwrap();
         let generation = state.generation;
         state
@@ -751,6 +890,14 @@ impl Clipboard {
             .filter(|(epoch, _)| state.enabled && *epoch == generation)
             .map(|(_, paths)| vec![paths])
             .unwrap_or_default()
+    }
+    pub(crate) fn receive_offer(&self, offer: super::clipboard_files::provider::RemoteOffer) {
+        let mut state = self.shared.state.lock().unwrap();
+        if state.enabled {
+            state.files_offer = Some((state.generation, offer, state.native_revision));
+            state.files_offer_retry_at = None;
+            self.shared.wake.notify_one();
+        }
     }
     pub(crate) fn begin_files(&self, id: String) {
         let mut state = self.shared.state.lock().unwrap();
@@ -907,6 +1054,7 @@ mod tests {
                 .observe(
                     Some(super::super::clipboard_files::Selection {
                         sequence: 10,
+                        operation: super::super::file_transfer::Operation::Copy,
                         paths: paths.clone()
                     }),
                     Some(10)
@@ -918,6 +1066,7 @@ mod tests {
             engine.observe(
                 Some(super::super::clipboard_files::Selection {
                     sequence: 11,
+                    operation: super::super::file_transfer::Operation::Copy,
                     paths: paths.clone()
                 }),
                 Some(11)
@@ -930,6 +1079,7 @@ mod tests {
                 .observe(
                     Some(super::super::clipboard_files::Selection {
                         sequence: 12,
+                        operation: super::super::file_transfer::Operation::Copy,
                         paths: vec![]
                     }),
                     Some(12)
