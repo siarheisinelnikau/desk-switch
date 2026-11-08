@@ -33,6 +33,9 @@ fn server(responses: Vec<String>) -> (reqwest::Url, thread::JoinHandle<Vec<Strin
                     Err(error) => panic!("{error}"),
                 }
             };
+            // On Windows, accepted sockets inherit the nonblocking mode. Only
+            // accept is polled; reading a request uses the bounded blocking API.
+            stream.set_nonblocking(false).unwrap();
             stream
                 .set_read_timeout(Some(Duration::from_secs(2)))
                 .unwrap();
