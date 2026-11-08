@@ -559,12 +559,9 @@ impl SourceSelection {
                 return Ok(outcome_from_live(&journal));
             }
         }
-        // Capture pins may permit sharing deletion, while temporary demand
-        // read pins may not. Consuming the selection releases every selected
-        // root pin before the identity-checked native rename handle is opened.
-        for root in &mut self.roots {
-            root.directory.take();
-        }
+        // Captured roots keep only their parent capability; the selected child
+        // is reopened for each bound read. Open the identity-checked native
+        // rename handle without a lingering child directory handle.
         for index in 0..journal.roots.len() {
             let result = detach_root(&journals, &name, &mut journal, index, &kinds);
             if let Err(error) = result {
