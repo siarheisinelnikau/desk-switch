@@ -365,10 +365,6 @@ impl Engine {
         )
     }
 
-    pub fn committed_data(&self) -> Option<&[u8]> {
-        (self.hard.commit_index > 0).then(|| self.committed().2)
-    }
-
     /// Seed an already-consented learner after a restart interrupted its first
     /// joint-entry delivery. The caller sends a committed directory first.
     /// This packet grants no leadership or application-side authority.
