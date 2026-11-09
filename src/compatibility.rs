@@ -53,8 +53,31 @@ impl Version {
         })
     }
 
+    fn compatible(&self, peer: &Self) -> bool {
+        if self.protocol != peer.protocol {
+            return false;
+        }
+        if self.app == peer.app {
+            return true;
+        }
+        let (Ok(local), Ok(remote)) = (
+            semver::Version::parse(&self.app),
+            semver::Version::parse(&peer.app),
+        ) else {
+            return false;
+        };
+        local.major == remote.major
+            && local.minor == remote.minor
+            && (local.major, local.minor) >= (0, 9)
+            && local.patch.abs_diff(remote.patch) <= 1
+            && local.pre.is_empty()
+            && remote.pre.is_empty()
+            && local.build.is_empty()
+            && remote.build.is_empty()
+    }
+
     pub fn require(&self, peer: Option<&Self>) -> Result<()> {
-        if peer != Some(self) {
+        if !peer.is_some_and(|peer| self.compatible(peer)) {
             return Err(Mismatch {
                 local: self.clone(),
                 peer: peer.cloned(),
@@ -143,6 +166,40 @@ mod tests {
                     "missing {language} legacy translation"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn adjacent_stable_patches_share_only_the_same_wire_protocol() {
+        let local = Version {
+            app: "0.9.1".into(),
+            protocol: 9,
+        };
+        for app in ["0.9.0", "0.9.2"] {
+            assert!(
+                local
+                    .require(Some(&Version {
+                        app: app.into(),
+                        protocol: 9
+                    }))
+                    .is_ok()
+            );
+        }
+        for (app, protocol) in [
+            ("0.9.2", 10),
+            ("0.9.3", 9),
+            ("0.9.2-rc.1", 9),
+            ("0.10.0", 9),
+            ("0.8.1", 9),
+        ] {
+            assert!(
+                local
+                    .require(Some(&Version {
+                        app: app.into(),
+                        protocol
+                    }))
+                    .is_err()
+            );
         }
     }
 

@@ -38,6 +38,7 @@ use tokio::{
 const PORT: u16 = 45881;
 const MAX_JOBS: usize = 128;
 const ACTIVE: usize = 4;
+const CHUNKS_IN_FLIGHT: usize = 8;
 const RETRY: Duration = Duration::from_secs(5);
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -1516,44 +1517,55 @@ async fn send_inner(core: Arc<Core>, job: Arc<Job>) -> Result<()> {
             "The receiver's saved file prefix failed verification"
         );
         core.progress(&job, complete + offset);
+        let mut pending = Vec::with_capacity(CHUNKS_IN_FLIGHT);
         while offset < *size {
-            core.check(&job)?;
-            let e = export.clone();
-            let position = offset;
-            let bytes = work(&core, &job, &mut pipe, move |_| {
-                e.read(index as u32, position, CHUNK)
-            })
-            .await?;
-            ensure!(
-                !bytes.is_empty() && bytes.len() <= CHUNK,
-                "The saved source export is incomplete"
-            );
-            let next = offset + bytes.len() as u64;
-            let digest = protocol::hash(&bytes);
-            pipe.send(&Packet::Chunk {
-                index: index as u32,
-                offset,
-                bytes,
-                digest,
-            })
-            .await?;
-            match receive_packet(&mut pipe, &core, &job).await? {
-                Packet::Ack {
-                    index: i,
-                    offset: n,
-                } if i == index as u32 && n == next => {}
-                Packet::Cancel => {
-                    job.record.lock().unwrap().cancel_notified = true;
-                    job.cancel.store(true, Ordering::Release);
-                    anyhow::bail!("The file transfer was cancelled");
+            let mut sent = offset;
+            for _ in 0..CHUNKS_IN_FLIGHT {
+                if sent == *size {
+                    break;
                 }
-                Packet::Error(error) => {
-                    anyhow::bail!("{}", crate::workspace::management::status_text(error, 512))
-                }
-                _ => anyhow::bail!("Invalid file transfer acknowledgement"),
+                core.check(&job)?;
+                let e = export.clone();
+                let position = sent;
+                let bytes = work(&core, &job, &mut pipe, move |_| {
+                    e.read(index as u32, position, CHUNK)
+                })
+                .await?;
+                ensure!(
+                    !bytes.is_empty() && bytes.len() <= CHUNK,
+                    "The saved source export is incomplete"
+                );
+                let next = sent + bytes.len() as u64;
+                let digest = protocol::hash(&bytes);
+                pipe.send(&Packet::Chunk {
+                    index: index as u32,
+                    offset: sent,
+                    bytes,
+                    digest,
+                })
+                .await?;
+                pending.push(next);
+                sent = next;
             }
-            offset = next;
-            core.progress(&job, complete + offset);
+            for next in pending.drain(..) {
+                match receive_packet(&mut pipe, &core, &job).await? {
+                    Packet::Ack {
+                        index: i,
+                        offset: n,
+                    } if i == index as u32 && n == next => {}
+                    Packet::Cancel => {
+                        job.record.lock().unwrap().cancel_notified = true;
+                        job.cancel.store(true, Ordering::Release);
+                        anyhow::bail!("The file transfer was cancelled");
+                    }
+                    Packet::Error(error) => {
+                        anyhow::bail!("{}", crate::workspace::management::status_text(error, 512))
+                    }
+                    _ => anyhow::bail!("Invalid file transfer acknowledgement"),
+                }
+                offset = next;
+                core.progress(&job, complete + offset);
+            }
         }
         complete += *size;
     }

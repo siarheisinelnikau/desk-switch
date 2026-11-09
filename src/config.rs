@@ -131,6 +131,46 @@ fn create_private(path: &Path, contents: &str) -> Result<()> {
     Ok(())
 }
 
+const RESET_WORKSPACE: &str = "reset-workspace";
+
+pub fn request_workspace_reset(dir: &Path) -> Result<()> {
+    let backup = Builder::new(NOISE.parse()?).generate_keypair()?;
+    create_private(&dir.join(RESET_WORKSPACE), &hex(&backup.public))
+}
+
+pub fn apply_workspace_reset(
+    dir: &Path,
+    clear_preferences: impl FnOnce() -> Result<()>,
+) -> Result<()> {
+    let marker = dir.join(RESET_WORKSPACE);
+    let id = match fs::read_to_string(&marker) {
+        Ok(id) => hex(&key(id.trim())?),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.into()),
+    };
+    let backup = dir.join(format!("workspace-backup-{id}"));
+    fs::create_dir_all(&backup)?;
+    for name in [
+        "identity",
+        "peer",
+        "workspace.json",
+        "workspace-consensus.json",
+        "workspace-admission.json",
+        "workspace-locations.json",
+    ] {
+        let source = dir.join(name);
+        let target = backup.join(name);
+        if source.exists() && !target.exists() {
+            fs::rename(&source, &target).with_context(|| format!("Backing up {name}"))?;
+        }
+    }
+    sync_directory(&backup)?;
+    clear_preferences()?;
+    sync_directory(dir)?;
+    fs::remove_file(marker)?;
+    sync_directory(dir)
+}
+
 pub fn create_identity(dir: &Path) -> Result<Identity> {
     let pair = Builder::new(NOISE.parse()?).generate_keypair()?;
     create_private(

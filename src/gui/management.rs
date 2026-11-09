@@ -36,6 +36,8 @@ impl Desktop {
                 version: self.update_version.clone(),
                 channel_version: self.update_channel_version.clone(),
                 ready: self.update_ready,
+                prepared: self.prepared_update.is_some()
+                    || (self.update_ready && self.candidate_update.is_none()),
                 checking: self.update_job.is_some(),
                 installing: self.install_pending
                     || self.install_job.is_some()
@@ -226,6 +228,19 @@ impl Desktop {
                 "This PC is installing an update"
             );
             match message {
+                Message::PrepareUpdate { version, .. } => {
+                    ensure!(
+                        !self.update_action_busy(),
+                        "Another update operation is already in progress."
+                    );
+                    ensure!(
+                        self.update_ready && self.update_version.as_ref() == Some(&version),
+                        "Check for updates on this computer first."
+                    );
+                    if self.prepared_update.is_none() {
+                        self.prepare_update(version, ctx);
+                    }
+                }
                 Message::CheckUpdates { .. } => {
                     ensure!(
                         !self.update_action_busy(),

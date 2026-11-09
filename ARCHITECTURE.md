@@ -29,7 +29,7 @@ All listeners are wildcard, dual-stack where the OS allows it (`src/listen.rs`, 
 | 45877/TCP | System audio | `workspace/mod.rs` `AUDIO_PORT` |
 | 45878/TCP | Legacy two-PC pair/control; advertised as `control-port` | `workspace/mod.rs` `PORT` |
 | 45879/TCP | Legacy two-PC microphone | `workspace/mod.rs` `MICROPHONE_PORT` |
-| 45880/TCP | Workspace (group) control mesh, protocol 2 | `group/model.rs` `PORT` |
+| 45880/TCP | Workspace (group) control mesh, protocol 3 | `group/model.rs` `PORT` |
 | 45881/TCP | File transfer | `group/file_transfer/mod.rs` `PORT` |
 | 49000+N/TCP | Microphone fan-out per sorted member index | `gui/group_data.rs:205-211` |
 
@@ -96,7 +96,7 @@ The product calls the linked set of computers a **workspace**. In code the word 
 
 ## 6. Consensus
 
-`src/group/consensus.rs` is a Raft-like engine with durable `HardState` (`workspace_id`, `term`, `voted_for`, `Configuration`, `learners`, `snapshot_index/term`, `commit_index`, `entries`), pre-vote, joint (two-set) membership changes, barriers and snapshots. Timing: 400 ms heartbeats, 2–4 s election timeout, max 256 members, 8 MiB max entry data, compaction after 32 entries or 8 MiB.
+`src/group/consensus.rs` is a Raft-like engine with durable `HardState` (`workspace_id`, `term`, `voted_for`, `Configuration`, `learners`, `snapshot_index/term`, `commit_index`, `entries`), pre-vote, joint (two-set) member admission and removal, barriers and snapshots. Timing: 400 ms heartbeats, 2–4 s election timeout, max 256 members, 8 MiB max entry data, compaction after 32 entries or 8 MiB.
 
 `Effect::{Send, Committed, Leadership}` is the only output. The caller must persist `hard_state()` atomically **before** delivering effects, and only `Committed` payloads reach application code. RPC identity comes from the pinned, Noise-authenticated link.
 
@@ -104,11 +104,11 @@ The product calls the linked set of computers a **workspace**. In code the word 
 
 ## 7. Wire formats and encryption
 
-- `compatibility.rs`: `PROTOCOL = 9` for the native device link, `MAGIC = b"DESKVER2"`, and `Version::require()` demands exact app-version and protocol equality. Workspace protocol is 2 (`group/model.rs`), management protocol 1, file-transfer protocol 2 / manifest 1.
+- `compatibility.rs`: `PROTOCOL = 9` for the native device link, `MAGIC = b"DESKVER2"`, and `Version::require()` requires native protocol equality and allows adjacent stable patches within a minor line starting at 0.9. Workspace protocol is 3 (`group/model.rs`), management protocol 1, file-transfer protocol 2 / manifest 1.
 - **Noise** (`snow`): `Noise_KK_25519_ChaChaPoly_BLAKE2s` for the pinned input/audio/monitor/file-transfer data links, and `Noise_XX_25519_ChaChaPoly_BLAKE2s` for pair/group control links. The version payload travels inside the first handshake messages, so incompatible peers are rejected before any application data.
 - `transport.rs`: 1-byte length record framing (max 128 bytes), `TCP_NODELAY`, 1750 ms lease, 250 ms ping, 500 ms I/O timeout; `bincode` with an explicit size limit and `reject_trailing_bytes`.
 - `group/net.rs` and `workspace/net.rs`: JSON frames over the authenticated link with 2-byte length prefixes.
-- `group/file_transfer/protocol.rs`: metadata-only `Description` first, then a `Manifest` with per-file SHA-256 (max 10 000 entries, 64 GiB total, 4 MiB manifest, depth 64, reserved Windows names rejected). Stop-and-wait 48 KiB chunks with explicit `Offer/Accepted/Ready/Chunk/Ack/Finish/Complete` packets and separate clipboard-offer/lease/native-result messages.
+- `group/file_transfer/protocol.rs`: metadata-only `Description` first, then a `Manifest` with per-file SHA-256 (max 10 000 entries, 64 GiB total, 4 MiB manifest, depth 64, reserved Windows names rejected). Windows of up to eight 48 KiB chunks with explicit `Offer/Accepted/Ready/Chunk/Ack/Finish/Complete` packets and separate clipboard-offer/lease/native-result messages.
 
 ## 8. Platform backends
 
