@@ -179,6 +179,8 @@ An installed Ubuntu package updates without an application password prompt. Its 
 
 Recent service logs and diagnostics are synchronized over authenticated, encrypted workspace connections. Open **Settings → Advanced → Diagnostics → Copy diagnostics** to collect member state and recent service messages. Offline reports remain labelled as such. Snapshots are bounded and do not reconfigure device services.
 
+Two files in the state directory help when the application stops before the report can be copied. `panic-report.txt` holds the last panic with its message, location and backtrace. `diagnostics.log` holds the recent service messages and is only written when it is requested with the environment variable `DESK_SWITCH_DIAGNOSTICS_LOG=1`; it is rotated at two megabytes and keeps one previous file. It can contain computer names, file paths and network addresses, so review it before sharing. The state directory is printed by the `state-dir` command.
+
 **Upgrading to 0.8.0:** install it on every member before resuming sharing. Native device protocol is **9** and workspace protocol is **2**; mixed versions temporarily disconnect from sharing. To update other computers remotely from one PC, finish those updates before upgrading that controlling PC. Each computer can also check and install its update locally.
 
 The **original coordinating computer must run 0.8.0 online once with a trusted quorum** to establish the canonical membership. It may be upgraded first or last. Independently cached old rosters cannot bootstrap a replacement safely. After this migration, a surviving majority can coordinate without the original computer. Settings, identities and display arrangements are preserved.

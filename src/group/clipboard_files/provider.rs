@@ -1,4 +1,7 @@
 //! Native virtual-file contracts. Metadata calls must never request contents.
+// macOS publishes no native paste offer yet, so these shared contracts are only
+// constructed by the Windows and Linux backends and by cross-platform tests.
+#![cfg_attr(target_os = "macos", allow(dead_code))]
 pub(crate) use crate::group::file_transfer::protocol::NativeConsumer;
 use crate::group::file_transfer::protocol::{Description, Operation};
 use anyhow::Result;

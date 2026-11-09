@@ -136,6 +136,10 @@ impl HookData {
             && !(1..=254).any(|vk| {
                 vk != i32::from(VK_F11)
                     && vk != i32::from(VK_F12)
+                    // SAFETY: `vk` is a virtual-key code in 1..=254, and
+                    // GetAsyncKeyState only reads the shared keyboard state
+                    // without touching any pointer. The returned SHORT is read
+                    // as a signed value to detect the pressed bit.
                     && unsafe { GetAsyncKeyState(vk) } < 0
             })
     }
@@ -220,6 +224,9 @@ impl HookData {
 
         if message == WM_MOUSEMOVE {
             let mut current = POINT::default();
+            // SAFETY: `current` is a writable local POINT and GetCursorPos only
+            // stores the pointer position into it. A zero return leaves the
+            // point untouched and is handled by the branch below.
             if unsafe { GetCursorPos(&mut current) } != 0 {
                 let dx = (data.pt.x - current.x).clamp(-16384, 16384);
                 let dy = (data.pt.y - current.y).clamp(-16384, 16384);
@@ -248,6 +255,10 @@ impl HookData {
                         }
                     }
                     Route::Local if let Some(edge) = &self.edge => {
+                        // SAFETY: `current` holds real screen coordinates, and
+                        // MONITOR_DEFAULTTONEAREST always resolves to a valid
+                        // HMONITOR of the desktop. The handle is only used to
+                        // look up a screen that the OS still owns.
                         let handle = unsafe { MonitorFromPoint(current, MONITOR_DEFAULTTONEAREST) };
                         if let Ok(screen) = win_monitor::screen(handle)
                             && screen.name.eq_ignore_ascii_case(&edge.screen)
@@ -281,6 +292,10 @@ impl HookData {
     }
 }
 
+// SAFETY: This callback is installed with SetWindowsHookExW as WH_KEYBOARD_LL,
+// so it must use the hook-procedure calling convention. Windows passes the
+// hook code and the message parameters as opaque values that are only
+// forwarded to CallNextHookEx.
 unsafe extern "system" fn keyboard_hook(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     if code >= 0
         && DATA.with(|state| {
@@ -289,6 +304,10 @@ unsafe extern "system" fn keyboard_hook(code: i32, wparam: WPARAM, lparam: LPARA
                 .ok()
                 .and_then(|mut state| {
                     state.as_mut().map(|state| {
+                        // SAFETY: For a low-level keyboard hook the OS documents
+                        // `lparam` as a pointer to a KBDLLHOOKSTRUCT that stays
+                        // valid for the duration of the callback. The reference
+                        // is only borrowed while `state.keyboard` reads it.
                         state.keyboard(unsafe { &*(lparam as *const KBDLLHOOKSTRUCT) })
                     })
                 })
@@ -297,9 +316,16 @@ unsafe extern "system" fn keyboard_hook(code: i32, wparam: WPARAM, lparam: LPARA
     {
         return 1;
     }
+    // SAFETY: A null hook handle is permitted and means the next hook in the
+    // chain is called. The parameters are forwarded unchanged, so no borrowed
+    // memory outlives this call.
     unsafe { CallNextHookEx(null_mut(), code, wparam, lparam) }
 }
 
+// SAFETY: This callback is installed with SetWindowsHookExW as WH_MOUSE_LL, so
+// it must use the hook-procedure calling convention. Windows passes the hook
+// code and the message parameters as opaque values that are only forwarded to
+// CallNextHookEx.
 unsafe extern "system" fn mouse_hook(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     if code >= 0
         && DATA.with(|state| {
@@ -308,6 +334,10 @@ unsafe extern "system" fn mouse_hook(code: i32, wparam: WPARAM, lparam: LPARAM) 
                 .ok()
                 .and_then(|mut state| {
                     state.as_mut().map(|state| {
+                        // SAFETY: For a low-level mouse hook the OS documents
+                        // `lparam` as a pointer to an MSLLHOOKSTRUCT that stays
+                        // valid for the duration of the callback. The reference
+                        // is only borrowed while `state.mouse` reads it.
                         state.mouse(wparam as u32, unsafe {
                             &*(lparam as *const MSLLHOOKSTRUCT)
                         })
@@ -318,6 +348,9 @@ unsafe extern "system" fn mouse_hook(code: i32, wparam: WPARAM, lparam: LPARAM) 
     {
         return 1;
     }
+    // SAFETY: A null hook handle is permitted for CallNextHookEx, and the
+    // parameters are forwarded unchanged, so nothing borrowed outlives the
+    // call.
     unsafe { CallNextHookEx(null_mut(), code, wparam, lparam) }
 }
 
@@ -332,12 +365,19 @@ struct Notifications(HWND);
 
 impl Drop for Notifications {
     fn drop(&mut self) {
+        // SAFETY: `self.0` is the window created by `notifications()` on this
+        // thread and is destroyed exactly once here. No other owner refers to
+        // the handle afterwards.
         unsafe {
             DestroyWindow(self.0);
         }
     }
 }
 
+// SAFETY: This is the window procedure registered for the notification class,
+// so it must use the required window-procedure calling convention. Windows
+// passes the live window handle and the message parameters, which are only
+// read here.
 unsafe extern "system" fn display_notification(
     window: HWND,
     message: u32,
@@ -358,10 +398,16 @@ unsafe extern "system" fn display_notification(
         });
         return 0;
     }
+    // SAFETY: The handle and parameters are the ones Windows passed for this
+    // live notification window, and DefWindowProcW interprets them without
+    // retaining any reference beyond the call.
     unsafe { DefWindowProcW(window, message, wparam, lparam) }
 }
 
 fn notifications() -> Result<Notifications> {
+    // SAFETY: A null module path asks for the current process module, which
+    // stays loaded for the process lifetime and is used to register the window
+    // class and to create the window.
     let module = unsafe { GetModuleHandleW(null()) };
     let class = WNDCLASSW {
         lpfnWndProc: Some(display_notification),
@@ -369,9 +415,17 @@ fn notifications() -> Result<Notifications> {
         lpszClassName: w!("DeskSwitchDisplayNotifications"),
         ..Default::default()
     };
+    // SAFETY: `class` is a fully initialized local WNDCLASSW whose class name
+    // is a static NUL-terminated wide string and whose procedure has the
+    // required window-procedure calling convention. A failed registration is
+    // tolerated because a class with that name stays registered for the
+    // process, so the window below can still be created.
     unsafe {
         RegisterClassW(&class);
     }
+    // SAFETY: The class was registered above and the module handle stays
+    // loaded, so the class and the window procedure it names remain valid.
+    // The returned handle is checked for null before it is stored.
     let window = unsafe {
         CreateWindowExW(
             WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
@@ -403,6 +457,10 @@ impl Hooks {
         control: mpsc::Sender<Control>,
         input: mpsc::Sender<(u64, Input)>,
     ) -> Result<Self> {
+        // SAFETY: The awareness context is a system-provided value; the call
+        // only changes the DPI awareness of this process and reports whether
+        // it succeeded. It runs before any coordinate is read, which the
+        // following `PhysicalCoordinates::enter` depends on.
         unsafe {
             SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
         }
@@ -428,6 +486,10 @@ impl Hooks {
             );
         }
         let mut msg = MSG::default();
+        // SAFETY: `msg` is a writable local MSG and the null window handle
+        // selects this thread's own message queue. The call creates that queue
+        // before the low-level hooks are installed, which is what the hooks
+        // require to deliver their callbacks.
         unsafe {
             PeekMessageW(&mut msg, null_mut(), 0, 0, PM_NOREMOVE);
         }
@@ -439,14 +501,30 @@ impl Hooks {
             }
         };
         let route_notifications = notifications.is_some();
+        // SAFETY: A null module path asks for the current process module, which
+        // stays loaded for the process lifetime and identifies the module that
+        // owns the hook callbacks.
         let module = unsafe { GetModuleHandleW(null()) };
+        // SAFETY: `keyboard_hook` is a static function with the required
+        // hook-procedure calling convention, so it stays valid for as long as
+        // the hook is installed, and `module` is this process's own module,
+        // which is required for a low-level hook. A null result is checked by
+        // the caller.
         let keyboard = unsafe { SetWindowsHookExW(WH_KEYBOARD_LL, Some(keyboard_hook), module, 0) };
         if keyboard.is_null() {
             return Err(io::Error::last_os_error()).context("installing the Windows keyboard hook");
         }
+        // SAFETY: `mouse_hook` is a static function with the required
+        // hook-procedure calling convention and outlives the hook, and
+        // `module` is this process's own module. A null result is checked by
+        // the caller.
         let mouse = unsafe { SetWindowsHookExW(WH_MOUSE_LL, Some(mouse_hook), module, 0) };
         if mouse.is_null() {
             let error = io::Error::last_os_error();
+            // SAFETY: `keyboard` is the handle returned by SetWindowsHookExW and
+            // is unhooked exactly once, here on the failure path where the
+            // mouse hook could not be installed. The handle is not used
+            // afterwards.
             unsafe {
                 UnhookWindowsHookEx(keyboard);
             }
@@ -481,6 +559,9 @@ impl Hooks {
     pub fn run(&self) -> Result<()> {
         let mut msg = MSG::default();
         loop {
+            // SAFETY: `msg` is a writable local MSG and the null window handle
+            // selects this thread's own message queue. The call returns only
+            // after a message for this thread was stored in `msg`.
             match unsafe { GetMessageW(&mut msg, null_mut(), 0, 0) } {
                 0 => return Ok(()),
                 -1 => {
@@ -502,6 +583,10 @@ impl Hooks {
                         }
                     });
                 }
+                // SAFETY: `msg` was filled by GetMessageW on this thread, so its
+                // payload is still owned by this queue entry. TranslateMessage
+                // only posts to this thread's queue and DispatchMessageW calls
+                // the window procedure registered for this process.
                 _ => unsafe {
                     TranslateMessage(&msg);
                     DispatchMessageW(&msg);
@@ -513,6 +598,9 @@ impl Hooks {
 
 impl Drop for Hooks {
     fn drop(&mut self) {
+        // SAFETY: Both handles were returned by SetWindowsHookExW in `install`
+        // and are unhooked exactly once here. `Drop` runs a single time and
+        // neither handle is used afterwards.
         unsafe {
             UnhookWindowsHookEx(self.keyboard);
             UnhookWindowsHookEx(self.mouse);
@@ -526,9 +614,16 @@ impl Drop for Hooks {
 pub fn center() -> Result<()> {
     let _coordinates = win_monitor::PhysicalCoordinates::enter()?;
     let mut point = POINT::default();
+    // SAFETY: `point` is a writable local POINT and GetCursorPos only stores
+    // the current pointer position into it. A zero return is turned into an
+    // error below.
     if unsafe { GetCursorPos(&mut point) } == 0 {
         return Err(io::Error::last_os_error()).context("reading the Windows cursor");
     }
+    // SAFETY: `point` holds real screen coordinates and
+    // MONITOR_DEFAULTTONEAREST always resolves to a valid HMONITOR of the
+    // desktop. The handle is only queried by `win_monitor::screen` and is
+    // never taken over.
     let screen = win_monitor::screen(unsafe { MonitorFromPoint(point, MONITOR_DEFAULTTONEAREST) })?;
     move_cursor(
         screen.rect.x + screen.rect.width / 2.0,
@@ -592,6 +687,9 @@ pub(super) fn cursor_position() -> Result<(i32, i32)> {
     let _coordinates = win_monitor::PhysicalCoordinates::enter()?;
     let mut point = POINT::default();
     ensure!(
+        // SAFETY: `point` is a writable local POINT; GetCursorPos stores the
+        // pointer position into it and the result is only read while `point` is
+        // alive.
         unsafe { GetCursorPos(&mut point) } != 0,
         "cannot read the Windows cursor"
     );
@@ -600,6 +698,9 @@ pub(super) fn cursor_position() -> Result<(i32, i32)> {
 
 fn move_cursor(x: f64, y: f64) -> Result<()> {
     let _coordinates = win_monitor::PhysicalCoordinates::enter()?;
+    // SAFETY: The rounded coordinates are passed by value, so no pointer or
+    // borrowed memory is involved. A zero return means Windows refused the
+    // move and is reported as an error below.
     if unsafe { SetCursorPos(x.round() as i32, y.round() as i32) } == 0 {
         return Err(io::Error::last_os_error()).context("positioning the Windows cursor");
     }

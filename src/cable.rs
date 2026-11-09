@@ -294,12 +294,16 @@ fn launch_installer(installer: &Path, directory: &Path) -> Result<()> {
             WindowsAndMessaging::SW_SHOWNORMAL,
         },
     };
+    // SAFETY: the apartment is initialized for this thread and the
+    // matching CoUninitialize runs in the guard below, on the same thread.
     unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE) }
         .ok()
         .context("Could not initialize the Windows installer launcher")?;
     struct Apartment;
     impl Drop for Apartment {
         fn drop(&mut self) {
+            // SAFETY: this matches the successful CoInitializeEx above on
+            // the same thread, and it runs exactly once.
             unsafe {
                 CoUninitialize();
             }
@@ -309,6 +313,9 @@ fn launch_installer(installer: &Path, directory: &Path) -> Result<()> {
     let file = shell_wide(installer.as_os_str());
     let directory = shell_wide(directory.as_os_str());
     let verb = shell_wide(std::ffi::OsStr::new("runas"));
+    // SAFETY: SHELLEXECUTEINFOW is a plain C structure of flags, integers
+    // and pointers, so the all-zero bit pattern is a valid value and every
+    // pointer field is a null pointer.
     let mut info: SHELLEXECUTEINFOW = unsafe { std::mem::zeroed() };
     info.cbSize = std::mem::size_of::<SHELLEXECUTEINFOW>() as u32;
     info.fMask =
@@ -319,7 +326,11 @@ fn launch_installer(installer: &Path, directory: &Path) -> Result<()> {
     // The official standalone installer stays visible. Do not invent silent
     // flags or treat its launch as a completed driver installation.
     info.nShow = SW_SHOWNORMAL;
+    // SAFETY: every pointer field of `info` refers to a NUL-terminated
+    // buffer that outlives the call, and the structure is fully initialized.
     if unsafe { ShellExecuteExW(&mut info) } == 0 {
+        // SAFETY: GetLastError takes no arguments and only reads the calling
+        // thread's last error code.
         let error = unsafe { GetLastError() };
         if error == ERROR_CANCELLED {
             anyhow::bail!("The Windows administrator prompt was cancelled");
@@ -328,6 +339,8 @@ fn launch_installer(installer: &Path, directory: &Path) -> Result<()> {
             .context("Could not open the official VB-CABLE installer");
     }
     if !info.hProcess.is_null() {
+        // SAFETY: SEE_MASK_NOCLOSEPROCESS asked the shell to return the
+        // process handle, and it is closed exactly once here.
         unsafe {
             CloseHandle(info.hProcess);
         }

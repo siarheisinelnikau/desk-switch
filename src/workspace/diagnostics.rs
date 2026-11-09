@@ -36,7 +36,10 @@ impl Diagnostics {
         if self.logs.len() == LINES {
             self.logs.remove(0);
         }
-        self.logs.push(line);
+        self.logs.push(line.clone());
+        // The optional file sink keeps the last messages when the application
+        // stops before the report can be copied.
+        crate::diagnostics_log::append(service, &line);
     }
 }
 

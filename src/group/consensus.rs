@@ -2782,4 +2782,152 @@ mod tests {
         assert!(!decoded.barrier);
         decoded.validate().unwrap();
     }
+
+    /// Cuts every link between two groups so the halves behave as separate
+    /// partitions while all nodes stay online.
+    fn split(cluster: &mut Cluster, left: &[usize], right: &[usize]) {
+        cluster.blocked.clear();
+        for one in left {
+            for other in right {
+                cluster.blocked.insert((key(*one), key(*other)));
+                cluster.blocked.insert((key(*other), key(*one)));
+            }
+        }
+    }
+
+    fn writable_leaders(cluster: &Cluster) -> Vec<(Key, u64)> {
+        cluster
+            .nodes
+            .iter()
+            .filter(|(_, node)| node.writable())
+            .map(|(own, node)| (own.clone(), node.hard_state().term))
+            .collect()
+    }
+
+    #[test]
+    fn a_minority_partition_never_elects_a_coordinator() {
+        let mut cluster = Cluster::new(4);
+        let leader = cluster.elect();
+        cluster.propose(&leader, b"agreed before the split");
+        cluster.until(|cluster| {
+            cluster
+                .nodes
+                .values()
+                .all(|node| node.committed().2 == b"agreed before the split")
+        });
+        // Two of four voters are not a majority, so neither half may accept
+        // a workspace change while the split lasts.
+        split(&mut cluster, &[1, 2], &[3, 4]);
+        for _ in 0..120 {
+            cluster.step(100);
+        }
+        assert!(
+            writable_leaders(&cluster).is_empty(),
+            "A minority partition elected a coordinator: {:?}",
+            writable_leaders(&cluster)
+        );
+        for node in cluster.nodes.values() {
+            assert_eq!(node.committed().2, b"agreed before the split");
+        }
+        // Healing the partition restores exactly one coordinator.
+        cluster.blocked.clear();
+        cluster.until(|cluster| writable_leaders(cluster).len() == 1);
+        assert_eq!(writable_leaders(&cluster).len(), 1);
+    }
+
+    #[test]
+    fn two_majories_never_lead_the_same_term_and_the_cluster_reconverges() {
+        let mut cluster = Cluster::new(6);
+        let leader = cluster.elect();
+        cluster.propose(&leader, b"agreed before the split");
+        cluster.until(|cluster| {
+            cluster
+                .nodes
+                .values()
+                .all(|node| node.committed().2 == b"agreed before the split")
+        });
+        // Both halves hold three of six voters, so both may run an election.
+        split(&mut cluster, &[1, 2, 3], &[4, 5, 6]);
+        for _ in 0..200 {
+            cluster.step(100);
+        }
+        let leaders = writable_leaders(&cluster);
+        assert!(
+            leaders.len() <= 2,
+            "More than one coordinator per majority: {leaders:?}"
+        );
+        let terms = leaders.iter().map(|(_, term)| *term).collect::<Vec<_>>();
+        let mut unique = terms.clone();
+        unique.sort_unstable();
+        unique.dedup();
+        assert_eq!(
+            unique.len(),
+            terms.len(),
+            "Two coordinators claimed the same term: {leaders:?}"
+        );
+        // After healing, one coordinator survives and every node agrees.
+        cluster.blocked.clear();
+        for _ in 0..400 {
+            cluster.step(100);
+            if writable_leaders(&cluster).len() == 1 {
+                break;
+            }
+        }
+        assert_eq!(writable_leaders(&cluster).len(), 1);
+        for _ in 0..200 {
+            cluster.step(100);
+            let values = cluster
+                .nodes
+                .values()
+                .map(|node| node.committed().2.to_vec())
+                .collect::<Vec<_>>();
+            if values.windows(2).all(|pair| pair[0] == pair[1]) {
+                return;
+            }
+        }
+        panic!("The cluster did not converge on one committed value");
+    }
+
+    #[test]
+    fn a_leader_that_cannot_replicate_never_commits_the_change() {
+        let mut cluster = Cluster::new(3);
+        let leader = cluster.elect();
+        cluster.propose(&leader, b"agreed change");
+        cluster.until(|cluster| {
+            cluster
+                .nodes
+                .values()
+                .all(|node| node.committed().2 == b"agreed change")
+        });
+        // Without acknowledgements the new entry must stay uncommitted.
+        cluster.drop_replication = true;
+        let effects = cluster
+            .nodes
+            .get_mut(&leader)
+            .unwrap()
+            .propose(b"unreplicated change".to_vec(), cluster.now)
+            .unwrap();
+        cluster.stage(&leader, effects);
+        cluster.drain();
+        assert_eq!(
+            cluster.nodes[&leader].committed().2,
+            b"agreed change",
+            "A change was committed without a quorum"
+        );
+        assert!(cluster.nodes[&leader].busy());
+        // Restoring replication lets the cluster commit and converge again.
+        cluster.drop_replication = false;
+        for _ in 0..300 {
+            cluster.step(100);
+            let values = cluster
+                .nodes
+                .values()
+                .map(|node| node.committed().2.to_vec())
+                .collect::<Vec<_>>();
+            if values.windows(2).all(|pair| pair[0] == pair[1]) && values[0] != b"agreed change" {
+                return;
+            }
+        }
+        panic!("The cluster did not converge after the replication returned");
+    }
 }

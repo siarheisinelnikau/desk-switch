@@ -171,6 +171,8 @@ mod native {
     struct Key(HKEY);
     impl Drop for Key {
         fn drop(&mut self) {
+            // SAFETY: the key handle is owned by this guard and is closed
+            // exactly once, when the guard is dropped.
             unsafe {
                 RegCloseKey(self.0);
             }
@@ -179,6 +181,10 @@ mod native {
 
     pub fn sync(enabled: bool, executable: &Path, state: &Path) -> Result<()> {
         let mut handle = ptr::null_mut();
+        // SAFETY: the key path is a NUL-terminated UTF-16 buffer whose
+        // temporary lives until the end of this statement, so it outlives
+        // the call. `handle` is a live out-parameter that receives the
+        // opened key, which is then owned by the `Key` guard.
         let code = unsafe {
             RegCreateKeyExW(
                 HKEY_CURRENT_USER,
@@ -200,6 +206,8 @@ mod native {
         let key = Key(handle);
         let name = wide("Desk Switch");
         if !enabled {
+            // SAFETY: `name` is a NUL-terminated UTF-16 buffer that outlives
+            // the call, and the key handle is owned by the guard above.
             let code = unsafe { RegDeleteValueW(key.0, name.as_ptr()) };
             ensure!(
                 code == ERROR_SUCCESS || code == ERROR_FILE_NOT_FOUND,
@@ -227,6 +235,9 @@ mod native {
         let value = wide(&command);
         let mut old = vec![0u16; 1024];
         let mut bytes = (old.len() * 2) as u32;
+        // SAFETY: `name` is a NUL-terminated UTF-16 buffer that outlives
+        // the call. `old` holds exactly 1024 `u16` elements and `bytes`
+        // states that size, so the call cannot write past the buffer.
         let code = unsafe {
             RegGetValueW(
                 key.0,
@@ -241,6 +252,9 @@ mod native {
         if code == ERROR_SUCCESS && old.get(..bytes as usize / 2) == Some(value.as_slice()) {
             return Ok(());
         }
+        // SAFETY: `name` and `value` are NUL-terminated UTF-16 buffers
+        // that outlive the call, the byte count matches the value buffer,
+        // and the key handle is owned by the guard above.
         let code = unsafe {
             RegSetValueExW(
                 key.0,

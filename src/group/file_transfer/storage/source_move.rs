@@ -459,6 +459,9 @@ impl SourceSelection {
     /// native Move receipt for this exact Cut, paste, export and verified bytes.
     /// A cache download, EOF, close/release, or Copy result must never call this.
     #[cfg(test)]
+    // The progress-free wrapper is only used by the Windows and Linux
+    // source-cleanup tests, so the macOS test build never calls it.
+    #[cfg_attr(target_os = "macos", allow(dead_code))]
     pub fn finalize_move(
         self,
         state_dir: &Path,
@@ -1416,6 +1419,7 @@ pub(crate) fn rename_for_trash(
     )
 }
 
+#[cfg_attr(target_os = "macos", allow(dead_code))]
 fn single_component(name: &OsStr) -> Result<()> {
     let mut components = Path::new(name).components();
     ensure!(
@@ -1444,6 +1448,8 @@ fn rename_no_replace(
     let target = CString::new(target.as_bytes())?;
     // Both names are single, locally captured/generated components relative to
     // pinned directories. Linux NOREPLACE fails atomically on every collision.
+    // SAFETY: both names are NUL-terminated C strings that outlive the call,
+    // and the directory descriptors stay open for its duration.
     let result = unsafe {
         libc::renameat2(
             from.as_raw_fd(),
@@ -1532,6 +1538,8 @@ fn rename_no_replace(
     // The zeroed, usize-aligned allocation includes the complete variable tail.
     // flags=0 means ReplaceIfExists=false. RootDirectory pins the target instead
     // of resolving an ambient absolute path that another process could replace.
+    // SAFETY: `info` points at the zeroed, usize-aligned allocation that also
+    // holds the variable tail, so every field write stays in bounds.
     unsafe {
         (*info).root_directory = to.as_raw_handle();
         (*info).file_name_length = u32::try_from(wide.len() * size_of::<u16>())?;
@@ -1548,6 +1556,8 @@ fn rename_no_replace(
     // FILE_RENAME_INFORMATION documents both no-replace behavior and a target
     // name relative to RootDirectory. FileRenameInformation is class 10:
     // https://learn.microsoft.com/windows-hardware/drivers/ddi/ntifs/ns-ntifs-_file_rename_information
+    // SAFETY: the information buffer is the live allocation prepared above and
+    // the file handle stays open for the duration of the call.
     let status = unsafe {
         NtSetInformationFile(
             source_handle.as_raw_handle(),
@@ -1569,6 +1579,8 @@ fn rename_no_replace(
         // A pending/unsupported native operation is not a completion receipt.
         // The durable intent remains available for read-only reconciliation.
         Err(
+            // SAFETY: the call takes a status code and returns a plain error number
+            // without touching memory.
             std::io::Error::from_raw_os_error(unsafe { RtlNtStatusToDosError(status) } as i32)
                 .into(),
         )

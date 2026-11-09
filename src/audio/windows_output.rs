@@ -28,6 +28,8 @@ struct AudioScheduling(HANDLE);
 impl AudioScheduling {
     fn new() -> Self {
         let mut task = 0;
+        // SAFETY: the task out-parameter is a live `u32` and the returned
+        // thread handle is owned by this guard, which reverts it on drop.
         let handle = unsafe { AvSetMmThreadCharacteristicsW(w!("Audio"), &mut task) };
         if handle.is_null() {
             eprintln!(
@@ -40,6 +42,10 @@ impl AudioScheduling {
 impl Drop for AudioScheduling {
     fn drop(&mut self) {
         if !self.0.is_null() {
+            // SAFETY: the handle was returned by
+            // AvSetMmThreadCharacteristicsW and is reverted exactly once.
+            // SAFETY: the handle was returned by AvSetMmThreadCharacteristicsW and is
+            // reverted exactly once.
             unsafe {
                 AvRevertMmThreadCharacteristics(self.0);
             }
@@ -225,7 +231,13 @@ impl Output {
             .initialize_client(&format, &Direction::Render, &mode)
             .context("opening shared-mode WASAPI playback")?;
         let session: windows::Win32::Media::Audio::IAudioSessionControl =
+            // SAFETY: the returned interface is owned by this playback loop
+            // and is released when it ends.
             unsafe { audio.as_iaudioclient().GetService()? };
+        // SAFETY: the session interface is owned by this loop and the null
+        // event pointer is allowed by the API.
+        // SAFETY: the session interface is owned by this loop and the null event
+        // pointer is allowed by the API.
         unsafe {
             session.SetGroupingParam(&super::SESSION_GROUP, std::ptr::null())?;
         }
