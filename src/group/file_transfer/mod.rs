@@ -90,6 +90,7 @@ pub struct PasteView {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum FileEvent {
     /// Emitted once after the locally requested operation exists in snapshot().
+    #[cfg_attr(target_os = "macos", allow(dead_code))]
     PasteStarted {
         id: String,
     },
@@ -247,11 +248,13 @@ enum Command {
         paths: Vec<PathBuf>,
     },
     CopiedSelection(Option<crate::group::clipboard_files::Selection>),
+    #[cfg_attr(target_os = "macos", allow(dead_code))]
     NativeBegin(Arc<lazy::Fetch>),
     NativeResult(
         Arc<lazy::Session>,
         crate::group::clipboard_files::provider::NativeResult,
     ),
+    #[cfg_attr(target_os = "macos", allow(dead_code))]
     AcquireLease {
         offer: String,
         peer: String,

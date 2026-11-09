@@ -1,0 +1,54 @@
+name: Supply chain
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "23 5 * * 2"
+  pull_request:
+    paths:
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "deny.toml"
+      - "THIRD-PARTY-NOTICES.md"
+      - "locales/**"
+      - "src/**"
+      - "tools/**"
+      - "docs/unsafe-audit.md"
+      - ".github/workflows/supply-chain.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: supply-chain-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  audit:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          shared-key: supply-chain
+      - uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2.90.3
+        with:
+          tool: cargo-deny,cargo-audit
+      - name: Check advisories, licenses, duplicate versions and sources
+        run: cargo deny check
+      - name: Check the RustSec advisory database
+        run: >-
+          cargo audit
+          --ignore RUSTSEC-2025-0141
+          --ignore RUSTSEC-2026-0370
+          --ignore RUSTSEC-2026-0371
+          --ignore RUSTSEC-2026-0372
+      - name: Check the committed third-party notice inventory
+        run: python3 tools/gen_third_party_notices.py --check
+      - name: Check that translated strings exist in every catalog
+        run: python3 tools/check_i18n_keys.py
+      - name: Report the remaining undocumented unsafe blocks
+        run: python3 tools/audit_unsafe.py

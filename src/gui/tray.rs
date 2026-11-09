@@ -328,6 +328,7 @@ mod native {
                 }
             }));
             #[cfg(windows)]
+            // SAFETY: the call only reads a system metric and touches no memory.
             let metric = unsafe {
                 windows_sys::Win32::UI::WindowsAndMessaging::GetSystemMetrics(
                     windows_sys::Win32::UI::WindowsAndMessaging::SM_CXSMICON,

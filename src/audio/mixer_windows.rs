@@ -17,6 +17,8 @@ pub(super) struct Native {
 impl Native {
     pub fn open() -> Result<Self> {
         let com = super::super::output::Com::open()?;
+        // SAFETY: the returned interface pointer is owned by this backend,
+        // which stores it and releases it when the enumerator is dropped.
         let enumerator = unsafe { CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL) }?;
         Ok(Self {
             _com: com,
@@ -25,15 +27,29 @@ impl Native {
         })
     }
 }
+
+/// Takes ownership of a COM-allocated string and converts it to a `String`.
+// Takes ownership of a COM-allocated string and converts it to a `String`.
+//
+// SAFETY: the caller must pass a `PWSTR` that was allocated by a COM API
+// with `CoTaskMemAlloc`. This function frees it exactly once.
 unsafe fn take_string(value: windows::core::PWSTR) -> Result<String> {
+    // SAFETY: the string is NUL-terminated and stays owned by this function
+    // until it is freed below.
     let text = unsafe { value.to_string() };
-    unsafe { CoTaskMemFree(Some(value.0.cast())) };
+    // SAFETY: the pointer came from a COM allocation and is released
+    // exactly once here.
+    unsafe {
+        CoTaskMemFree(Some(value.0.cast()));
+    }
     Ok(text?)
 }
 impl Backend for Native {
     fn sessions(&mut self) -> Result<Vec<Session>> {
         self.volumes.clear();
         let mut sessions = Vec::new();
+        // SAFETY: the enumerator is owned by this backend and is only
+        // used while it is alive.
         unsafe {
             let devices = self
                 .enumerator
@@ -112,6 +128,8 @@ impl Backend for Native {
             .volumes
             .get(id)
             .context("Windows audio session disappeared")?;
+        // SAFETY: the volume interface is owned by this backend and the
+        // null event pointer is allowed by the API.
         let result = unsafe {
             volume
                 .SetMasterVolume(state.channels[0] as f32, std::ptr::null())

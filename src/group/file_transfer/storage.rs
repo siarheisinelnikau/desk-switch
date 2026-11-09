@@ -228,6 +228,8 @@ fn private_directory(dir: &Dir) -> Result<()> {
     {
         use cap_std::fs::MetadataExt;
         ensure!(
+            // SAFETY: the call takes no arguments and only reads the calling process
+            // credentials.
             metadata.uid() == unsafe { libc::geteuid() } && metadata.mode() & 0o077 == 0,
             "Transfer storage must be private to the current user"
         );
@@ -2258,6 +2260,8 @@ mod tests {
         assert_eq!(CONTENT_OPENS.with(std::cell::Cell::get), before);
         let fifo =
             std::ffi::CString::new(fixture.path("fifo").as_os_str().as_encoded_bytes()).unwrap();
+        // SAFETY: `fifo` is a NUL-terminated path inside the disposable fixture
+        // directory and the call only creates the node.
         assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
         assert!(SourceSelection::capture(&[fixture.path("fifo")], &NO_CANCEL).is_err());
         assert_eq!(CONTENT_OPENS.with(std::cell::Cell::get), before);
@@ -2270,6 +2274,8 @@ mod tests {
         let fixture = Fixture::new();
         let parent = absolute_directory(&fixture.0, false).unwrap();
         let child = directory(&parent, OsStr::new("durable"), true).unwrap();
+        // SAFETY: the descriptor is open and the call only reads its status
+        // flags.
         let flags = unsafe { libc::fcntl(child.as_raw_fd(), libc::F_GETFL) };
         assert!(
             flags >= 0 && flags & libc::O_PATH != 0,

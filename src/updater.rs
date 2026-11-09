@@ -797,6 +797,9 @@ fn install_signed_package(archive: &Path, envelope: &Path) -> Result<()> {
         .stdin(Stdio::null());
     // Older pkexec versions close inherited descriptors one by one. Bound the
     // child-only descriptor limit, as the generic Debian installer does.
+    // SAFETY: pre_exec runs between fork and exec in the child, where only
+    // async-signal-safe operations are allowed. The closure only lowers the
+    // descriptor limit.
     unsafe {
         command.pre_exec(|| {
             let mut limits = libc::rlimit {
