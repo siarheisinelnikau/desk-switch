@@ -92,10 +92,7 @@ fn main() {
             .set("InternalName", "desk-switch")
             .set(
                 "OriginalFilename",
-                &format!(
-                    "desk-switch-v{}-windows-x86-64.exe",
-                    env!("CARGO_PKG_VERSION")
-                ),
+                &format!("desk-switch-v{}.exe", env!("CARGO_PKG_VERSION")),
             )
             .compile()
             .expect("embedding the Desk Switch application icon and version");

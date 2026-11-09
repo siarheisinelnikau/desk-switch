@@ -6,17 +6,17 @@ Your computers. One workspace. Share a keyboard, mouse, headphones or speakers, 
 
 ## Install
 
-Install the **same version on every computer** from [Releases](https://github.com/siarheisinelnikau/desk-switch/releases). Version **0.8.0** has four native downloads:
+Install the **same version on every computer** from [Releases](https://github.com/siarheisinelnikau/desk-switch/releases). Version **0.8.1** has four native downloads:
 
 | Platform | Download |
 | --- | --- |
-| Ubuntu 24.04/26.04, x86-64 | [desk-switch-v0.8.0-linux-x86-64.deb](https://github.com/siarheisinelnikau/desk-switch/releases/download/v0.8.0/desk-switch-v0.8.0-linux-x86-64.deb) |
-| Windows, x86-64 | [desk-switch-v0.8.0-windows-x86-64.exe](https://github.com/siarheisinelnikau/desk-switch/releases/download/v0.8.0/desk-switch-v0.8.0-windows-x86-64.exe) |
-| macOS 13+, Apple Silicon (experimental) | [desk-switch-v0.8.0-macos-arm64.zip](https://github.com/siarheisinelnikau/desk-switch/releases/download/v0.8.0/desk-switch-v0.8.0-macos-arm64.zip) |
-| macOS 13+, Intel x86-64 (experimental) | [desk-switch-v0.8.0-macos-x86-64.zip](https://github.com/siarheisinelnikau/desk-switch/releases/download/v0.8.0/desk-switch-v0.8.0-macos-x86-64.zip) |
+| Ubuntu 24.04/26.04, x86-64 | [desk-switch-v0.8.1-linux-x86-64.deb](https://github.com/siarheisinelnikau/desk-switch/releases/download/v0.8.1/desk-switch-v0.8.1-linux-x86-64.deb) |
+| Windows, x86-64 | [desk-switch-v0.8.1.exe](https://github.com/siarheisinelnikau/desk-switch/releases/download/v0.8.1/desk-switch-v0.8.1.exe) |
+| macOS 13+, Apple Silicon (experimental) | [desk-switch-v0.8.1-macos-arm64.zip](https://github.com/siarheisinelnikau/desk-switch/releases/download/v0.8.1/desk-switch-v0.8.1-macos-arm64.zip) |
+| macOS 13+, Intel x86-64 (experimental) | [desk-switch-v0.8.1-macos-x86-64.zip](https://github.com/siarheisinelnikau/desk-switch/releases/download/v0.8.1/desk-switch-v0.8.1-macos-x86-64.zip) |
 
 ```sh
-sudo apt install ./desk-switch-v0.8.0-linux-x86-64.deb
+sudo apt install ./desk-switch-v0.8.1-linux-x86-64.deb
 ```
 
 Open **Desk Switch** from Ubuntu's application menu or run the Windows executable. New profiles use **English** and **Dark**. Existing language and theme choices are preserved. Russian, German, French, Spanish and Italian are also available; changes apply immediately to the window and tray.
@@ -181,9 +181,9 @@ Recent service logs and diagnostics are synchronized over authenticated, encrypt
 
 Two files in the state directory help when the application stops before the report can be copied. `panic-report.txt` holds the last panic with its message, location and backtrace. `diagnostics.log` holds the recent service messages and is only written when it is requested with the environment variable `DESK_SWITCH_DIAGNOSTICS_LOG=1`; it is rotated at two megabytes and keeps one previous file. It can contain computer names, file paths and network addresses, so review it before sharing. The state directory is printed by the `state-dir` command.
 
-**Upgrading to 0.8.0:** install it on every member before resuming sharing. Native device protocol is **9** and workspace protocol is **2**; mixed versions temporarily disconnect from sharing. To update other computers remotely from one PC, finish those updates before upgrading that controlling PC. Each computer can also check and install its update locally.
+When upgrading to **0.8.1**, install it on every member before resuming sharing. Native device protocol is **9** and workspace protocol is **2**. Mixed versions temporarily disconnect from sharing. To update other computers remotely from one PC, finish those updates before upgrading that controlling PC. Each computer can also check and install its update locally.
 
-The **original coordinating computer must run 0.8.0 online once with a trusted quorum** to establish the canonical membership. It may be upgraded first or last. Independently cached old rosters cannot bootstrap a replacement safely. After this migration, a surviving majority can coordinate without the original computer. Settings, identities and display arrangements are preserved.
+When migrating an older workspace that has yet to establish its canonical membership, bring the **original coordinating computer online on the new version with a trusted quorum** once. It may be upgraded first or last. After this migration, any surviving majority can coordinate. Settings, identities and display arrangements are preserved.
 
 If an older installation cannot select the current downloads, install the matching current `.deb`, `.exe` or complete `.app` once; keep its separate settings directory. Portable Linux binaries are no longer distributed. The `.deb` uses its installed launcher and package-owned binary so future system updates work correctly.
 
@@ -211,7 +211,7 @@ python3 tools/test_release_assets.py
 python3 tools/test_input_access.py
 cargo build --locked --release
 python3 tools/package_deb.py --binary target/release/desk-switch --out dist
-python3 tools/verify_deb.py dist/desk-switch-v0.8.0-linux-x86-64.deb
+python3 tools/verify_deb.py dist/desk-switch-v0.8.1-linux-x86-64.deb
 ```
 
 Tests use synthetic input/audio/monitor devices and isolated loopback connections. The multi-computer integration test links four encrypted peers, propagates settings, sends member-management requests and checks reconnect behavior, including an explicit pinned-controller connection with automatic connection disabled. Native listener tests authenticate IPv4 and IPv6 peers and exchange PCM without physical audio hardware. Clipboard tests use fake native backends or a private D-Bus with binary text/image payloads; the Node suite evaluates the shipped GNOME companion against a mocked Shell. They never use the user's clipboard or change a real monitor. A four-computer localhost test verifies networking and routing logic, not four physical computers.

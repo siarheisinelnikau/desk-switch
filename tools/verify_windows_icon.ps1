@@ -76,7 +76,11 @@ if ($ExpectedVersion -notmatch '^[0-9]+\.[0-9]+\.[0-9]+$') {
 }
 $version = [Diagnostics.FileVersionInfo]::GetVersionInfo($exe)
 $versionPattern = '^' + [regex]::Escape($ExpectedVersion) + '(?:\.0)?$'
-$expectedName = "desk-switch-v$ExpectedVersion-windows-x86-64.exe"
+$expectedName = if ([version]$ExpectedVersion -lt [version]'0.8.1') {
+    "desk-switch-v$ExpectedVersion-windows-x86-64.exe"
+} else {
+    "desk-switch-v$ExpectedVersion.exe"
+}
 if ($version.ProductName -ne 'Desk Switch' -or $version.FileDescription -ne 'Desk Switch' -or
     $version.ProductVersion -notmatch $versionPattern -or $version.FileVersion -notmatch $versionPattern -or
     $version.OriginalFilename -ne $expectedName) {

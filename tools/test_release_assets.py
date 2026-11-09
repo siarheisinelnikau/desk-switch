@@ -109,10 +109,20 @@ class ReleaseAssetsTests(unittest.TestCase):
                     candidate_updates(candidate, version)
 
     def test_macos_returns_at_062_with_numeric_version_ordering(self):
-        for version in ["0.6.2", "0.6.10", "0.7.0", "0.10.0", "1.0.0"]:
+        for version in ["0.6.2", "0.6.10", "0.7.0", "0.8.0"]:
             with self.subTest(version=version):
                 self.assertEqual(asset_names(version), {
                     "windows-x86_64": f"desk-switch-v{version}-windows-x86-64.exe",
+                    "linux-x86_64-deb": f"desk-switch-v{version}-linux-x86-64.deb",
+                    "macos-arm64-app": f"desk-switch-v{version}-macos-arm64.zip",
+                    "macos-x86_64-app": f"desk-switch-v{version}-macos-x86-64.zip",
+                })
+
+    def test_single_windows_executable_uses_the_short_versioned_name(self):
+        for version in ["0.8.1", "0.10.0", "1.0.0"]:
+            with self.subTest(version=version):
+                self.assertEqual(asset_names(version), {
+                    "windows-x86_64": f"desk-switch-v{version}.exe",
                     "linux-x86_64-deb": f"desk-switch-v{version}-linux-x86-64.deb",
                     "macos-arm64-app": f"desk-switch-v{version}-macos-arm64.zip",
                     "macos-x86_64-app": f"desk-switch-v{version}-macos-x86-64.zip",

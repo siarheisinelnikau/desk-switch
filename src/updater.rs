@@ -1298,11 +1298,12 @@ mod shared_tests {
     use super::*;
     #[test]
     fn library_download_must_match_the_pinned_signed_artifact() {
-        let config = shared_config(Path::new("/tmp/desk-switch-shared-fixture")).unwrap();
+        let mut config = shared_config(Path::new("/tmp/desk-switch-shared-fixture")).unwrap();
+        config.current_version = "0.8.0".parse().unwrap();
         let filename = if cfg!(windows) {
-            "desk-switch-v99.0.0-windows-x86-64.exe"
+            "desk-switch-v0.8.1.exe"
         } else {
-            "desk-switch-v99.0.0-linux-x86-64.deb"
+            "desk-switch-v0.8.1-linux-x86-64.deb"
         };
         let key = if cfg!(windows) {
             WINDOWS
@@ -1310,15 +1311,15 @@ mod shared_tests {
             "linux-x86_64-deb"
         };
         let url = format!(
-            "https://github.com/siarheisinelnikau/desk-switch/releases/download/v99.0.0/{filename}"
+            "https://github.com/siarheisinelnikau/desk-switch/releases/download/v0.8.1/{filename}"
         );
         let hash = "11".repeat(32);
-        let json = serde_json::json!({"tag_name":"v99.0.0","html_url":"https://github.com/siarheisinelnikau/desk-switch/releases/tag/v99.0.0","draft":false,"prerelease":false,"assets":[{"name":filename,"browser_download_url":url,"size":1024,"digest":format!("sha256:{hash}")}]}).to_string();
+        let json = serde_json::json!({"tag_name":"v0.8.1","html_url":"https://github.com/siarheisinelnikau/desk-switch/releases/tag/v0.8.1","draft":false,"prerelease":false,"assets":[{"name":filename,"browser_download_url":url,"size":1024,"digest":format!("sha256:{hash}")}]}).to_string();
         let latest = rust_auto_updator::parse_release(&json, &config)
             .unwrap()
             .unwrap();
         let mut signed = Release {
-            version: "99.0.0".into(),
+            version: "0.8.1".into(),
             protocol: 2,
             targets: BTreeMap::from([(
                 key.into(),
@@ -1333,7 +1334,7 @@ mod shared_tests {
         signed.targets.get_mut(key).unwrap().sha256 = "22".repeat(32);
         assert!(verify_shared_asset(&signed, &latest, key).is_err());
         signed.targets.get_mut(key).unwrap().sha256 = "11".repeat(32);
-        signed.version = "98.0.0".into();
+        signed.version = "0.8.2".into();
         assert!(verify_shared_asset(&signed, &latest, key).is_err());
     }
 }
