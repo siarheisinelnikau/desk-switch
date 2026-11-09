@@ -35,9 +35,9 @@ thread_local! {
 
 fn pasteboard() -> Result<Retained<NSPasteboard>> {
     // Match arboard's nullable lookup when no Aqua pasteboard is available.
-    // SAFETY: the message takes no arguments and returns a retained
-    // pasteboard, which the optional keeps owned.
     let board: Option<Retained<NSPasteboard>> =
+        // SAFETY: the message takes no arguments and returns a retained
+        // pasteboard, which the optional keeps owned.
         unsafe { msg_send![NSPasteboard::class(), generalPasteboard] };
     board.context("The macOS system pasteboard is unavailable")
 }

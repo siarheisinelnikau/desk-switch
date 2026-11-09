@@ -270,6 +270,8 @@ impl Fixture {
     }
 
     fn remember_sequence(&self) -> Result<u64> {
+        // SAFETY: The call only reads the clipboard serial number; it takes no
+        // pointer and needs no open clipboard.
         let sequence = u64::from(unsafe { native::GetClipboardSequenceNumber() });
         ensure!(
             sequence != 0,
@@ -293,10 +295,21 @@ impl Fixture {
                         return Ok(());
                     };
                     let _clipboard = native::Clipboard::open(owner.0)?;
+                    // SAFETY: The call only reads the current clipboard owner window handle
+                    // and compares it with the fixture's own owner window; it takes
+                    // no pointer and needs no open clipboard.
                     if unsafe { native::GetClipboardOwner() } == owner.0
+                        // SAFETY: The call only reads the clipboard serial number, which must
+                        // still equal the serial this fixture published; it takes no pointer and
+                        // needs no open clipboard.
                         && u64::from(unsafe { native::GetClipboardSequenceNumber() }) == expected
                     {
                         ensure!(
+                            // SAFETY: The clipboard is open on this thread for the whole call, because
+                            // the `Clipboard` guard above holds it open for this thread, and the
+                            // owner and serial checks above prove that this fixture's own window
+                            // still owns this exact clipboard content; emptying it therefore
+                            // discards only this test's own data.
                             unsafe { native::EmptyClipboard() } != 0,
                             "Could not release fixture clipboard"
                         );
@@ -892,11 +905,23 @@ fn make_offer(
 
 fn raw_clipboard_paths() -> Result<Vec<PathBuf>> {
     let _clipboard = native::Clipboard::open(ptr::null_mut())?;
+    // SAFETY: The clipboard is open on this thread for the whole call, because
+    // the `Clipboard` guard above holds it open for this thread, so
+    // `GetClipboardData` returns the moveable global block that holds the
+    // CF_HDROP selection; it stays valid until the clipboard is closed and is
+    // locked before it is read.
     let memory = unsafe { native::GetClipboardData(native::CF_HDROP) };
     ensure!(!memory.is_null(), "The real CF_HDROP fixture is missing");
+    // SAFETY: `memory` is the non-null moveable global block returned by
+    // `GetClipboardData`, and `GlobalSize` only reports the size of that block.
     let size = unsafe { native::GlobalSize(memory) };
     ensure!((native::DROP_HEADER + 2..=native::MAX_METADATA).contains(&size));
     let (_lock, data) = native::Locked::new(memory)?;
+    // SAFETY: `data` is the locked global block and `size` is exactly the
+    // `GlobalSize` of that same block, so the slice covers exactly the locked
+    // allocation and no more; the size was also checked against the accepted
+    // metadata limit above, and the `_lock` guard keeps the block locked and
+    // alive while the slice is decoded.
     native::decode_drop(unsafe { std::slice::from_raw_parts(data, size) })
 }
 
@@ -1209,6 +1234,9 @@ fn run_held_read(fixture: &mut Fixture, cancel: bool) -> Result<()> {
         ensure!(
             selection.paths == [ordinary_dos_path(&newer)] && selection.sequence == newer_sequence
         );
+        // SAFETY: The call only reads the clipboard serial number, which must
+        // still equal the newer local copy this fixture published; it takes no
+        // pointer and needs no open clipboard.
         ensure!(u64::from(unsafe { native::GetClipboardSequenceNumber() }) == newer_sequence);
     }
 
