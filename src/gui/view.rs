@@ -1024,7 +1024,7 @@ impl Desktop {
                             .id_salt("workspace-settings-scroll")
                             .auto_shrink([false, false])
                             .show(ui, |ui| {
-                                if self.group.workspace.is_some() {
+                                if self.group.workspace.is_some() || self.group.removed {
                                     self.group_settings(ui);
                                 } else {
                                     self.application(ui);

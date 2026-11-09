@@ -62,7 +62,8 @@ impl Configuration {
         }
         if let Some(joint) = &self.joint {
             ensure!(
-                self.voters.is_subset(joint) && joint.len() == self.voters.len() + 1,
+                (self.voters.is_subset(joint) && joint.len() == self.voters.len() + 1)
+                    || (joint.is_subset(&self.voters) && joint.len() + 1 == self.voters.len()),
                 "Invalid joint workspace membership"
             );
         }
@@ -75,6 +76,10 @@ impl Configuration {
             members.extend(joint.iter().cloned());
         }
         members
+    }
+
+    pub fn state_members(&self) -> &BTreeSet<Key> {
+        self.joint.as_ref().unwrap_or(&self.voters)
     }
 
     fn quorum(&self, votes: &BTreeSet<Key>) -> bool {
@@ -515,6 +520,11 @@ impl Engine {
     pub fn leader(&self) -> Option<&str> {
         self.leader.as_deref()
     }
+    pub fn removed(&self) -> bool {
+        self.hard.configuration.voters.contains(&self.own)
+            && !self.hard.configuration.state_members().contains(&self.own)
+    }
+
     pub fn writable(&self) -> bool {
         self.writable
     }
@@ -571,6 +581,37 @@ impl Engine {
         );
         let mut next = old.clone();
         next.insert(peer);
+        self.change_membership(old, next, data)
+    }
+
+    pub fn begin_remove(&mut self, peer: &str, data: Vec<u8>, now_ms: u64) -> Result<Vec<Effect>> {
+        self.observe(now_ms)?;
+        self.can_propose(now_ms)?;
+        ensure!(
+            !self.busy(),
+            "A workspace membership change is still committing"
+        );
+        ensure!(peer != self.own, "The coordinator cannot remove itself");
+        let old = self.hard.configuration.voters.clone();
+        let mut next = old.clone();
+        ensure!(next.remove(peer), "This computer is not a workspace voter");
+        let remaining = Configuration {
+            voters: next.clone(),
+            joint: None,
+        };
+        ensure!(
+            remaining.quorum(&self.recent_voters(now_ms)),
+            "Connect a majority of the remaining computers before removing this computer"
+        );
+        self.change_membership(old, next, data)
+    }
+
+    fn change_membership(
+        &mut self,
+        old: BTreeSet<Key>,
+        next: BTreeSet<Key>,
+        data: Vec<u8>,
+    ) -> Result<Vec<Effect>> {
         let configuration = Configuration {
             voters: old,
             joint: Some(next),
@@ -912,7 +953,7 @@ impl Engine {
                         self.next_index
                             .insert(from.into(), previous.max(matched).saturating_add(1));
                         self.advance_commit(&mut effects)?;
-                        if matched < self.last_index() {
+                        if matched < self.last_index() && self.members().contains(from) {
                             self.replicate(from, &mut effects);
                         }
                     } else if let Some(current) = probe.checked_add(1)
@@ -1238,18 +1279,21 @@ impl Engine {
         self.matched.insert(self.own.clone(), index);
         Ok(index)
     }
-    fn recent_quorum(&self, now: u64) -> bool {
+    fn recent_voters(&self, now: u64) -> BTreeSet<Key> {
         let mut votes = BTreeSet::from([self.own.clone()]);
         for (key, seen) in &self.last_contact {
             if now.saturating_sub(*seen) < ELECTION_MIN_MS {
                 votes.insert(key.clone());
             }
         }
+        votes
+    }
+    fn recent_quorum(&self, now: u64) -> bool {
         // An admitted learner cannot vote until it receives the pending joint
         // entry. Keep the existing leader alive using committed voters while
         // it replicates that entry. Elections and commits still require the
         // latest joint configuration, and busy() blocks unrelated proposals.
-        self.hard.configuration.quorum(&votes)
+        self.hard.configuration.quorum(&self.recent_voters(now))
     }
     fn can_propose(&self, now: u64) -> Result<()> {
         ensure!(
@@ -1342,8 +1386,21 @@ impl Engine {
         if self.last_index() == self.hard.commit_index
             && let Some(next) = self.hard.configuration.joint.clone()
         {
+            // Deliver the committed joint change to retiring voters before
+            // the final configuration stops routing replication to them.
+            for peer in self
+                .hard
+                .configuration
+                .voters
+                .difference(&next)
+                .cloned()
+                .collect::<Vec<_>>()
+            {
+                self.replicate(&peer, effects);
+            }
+            let single = next.len() == 1 && next.contains(&self.own);
             let data = self.committed().2.to_vec();
-            self.append(
+            let index = self.append(
                 data,
                 Some(Configuration {
                     voters: next,
@@ -1351,6 +1408,9 @@ impl Engine {
                 }),
                 false,
             )?;
+            if single {
+                self.commit_to(index, effects)?;
+            }
             self.replicate_all(effects);
         }
         Ok(())
@@ -1483,7 +1543,9 @@ mod tests {
                             continue;
                         }
                         if self.enabled.contains(&from)
+                            && !self.nodes[&from].removed()
                             && self.enabled.contains(&target)
+                            && self.nodes[&target].members().contains(&from)
                             && !self.blocked.contains(&(from.clone(), target.clone()))
                         {
                             let effects = self
@@ -1717,6 +1779,77 @@ mod tests {
         for node in cluster.nodes.values() {
             node.hard.validate().unwrap();
         }
+    }
+
+    #[test]
+    fn removal_commits_with_both_majorities_and_survives_restart() {
+        let mut cluster = Cluster::new(3);
+        cluster.until(|cluster| cluster.nodes.values().any(Engine::writable));
+        let leader = cluster
+            .nodes
+            .iter()
+            .find(|(_, engine)| engine.writable())
+            .unwrap()
+            .0
+            .clone();
+        let retired = cluster
+            .nodes
+            .keys()
+            .find(|key| **key != leader)
+            .unwrap()
+            .clone();
+        cluster.enabled.remove(&retired);
+        let effects = cluster
+            .nodes
+            .get_mut(&leader)
+            .unwrap()
+            .begin_remove(&retired, b"removed".to_vec(), cluster.now)
+            .unwrap();
+        cluster.stage(&leader, effects);
+        cluster.drain();
+        cluster.until(|cluster| {
+            cluster.enabled.iter().all(|key| {
+                let node = &cluster.nodes[key];
+                node.hard.configuration.joint.is_none() && !node.voters().contains(&retired)
+            })
+        });
+        cluster.restart(&leader);
+        assert_eq!(cluster.data(&leader), b"removed");
+        assert!(!cluster.nodes[&leader].members().contains(&retired));
+    }
+
+    #[test]
+    fn removing_a_peer_from_a_pair_finishes_with_one_voter() {
+        let mut cluster = Cluster::new(2);
+        cluster.until(|cluster| cluster.nodes.values().any(Engine::writable));
+        let leader = cluster
+            .nodes
+            .iter()
+            .find(|(_, engine)| engine.writable())
+            .unwrap()
+            .0
+            .clone();
+        let retired = cluster
+            .nodes
+            .keys()
+            .find(|key| **key != leader)
+            .unwrap()
+            .clone();
+        let effects = cluster
+            .nodes
+            .get_mut(&leader)
+            .unwrap()
+            .begin_remove(&retired, b"single".to_vec(), cluster.now)
+            .unwrap();
+        cluster.stage(&leader, effects);
+        cluster.drain();
+        assert!(!cluster.nodes[&leader].busy());
+        assert!(cluster.nodes[&retired].removed());
+        assert_eq!(
+            cluster.nodes[&leader].voters(),
+            BTreeSet::from([leader.clone()])
+        );
+        assert_eq!(cluster.data(&leader), b"single");
     }
 
     #[test]

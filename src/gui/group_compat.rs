@@ -184,7 +184,7 @@ impl Desktop {
     }
 
     pub(super) fn tick_group_compat(&mut self, ctx: &egui::Context) {
-        if self.group.preview {
+        if self.group.preview || self.group.workspace.is_none() {
             return;
         }
         let pinned = config::load_peer(&self.dir)
@@ -204,6 +204,16 @@ impl Desktop {
             };
         }
         let Some(pinned) = pinned else { return };
+        if self
+            .group
+            .workspace
+            .as_ref()
+            .is_some_and(|state| state.authority.is_some() && !state.members.contains_key(&pinned))
+        {
+            self.group.compat.suspended = true;
+            self.pair.service.take();
+            return;
+        }
         let now = Instant::now();
         if current_group_peer(self.group.workspace.as_ref(), &pinned)
             && self.paired_update.is_none()
