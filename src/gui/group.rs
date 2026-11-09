@@ -47,6 +47,7 @@ pub(super) struct Group {
     pub layout_editor: super::group_layout::Editor,
     network_log: std::collections::VecDeque<String>,
     network_reconnecting: std::collections::BTreeSet<String>,
+    pub(super) incompatible_workspaces: BTreeMap<String, String>,
     pub return_pending: bool,
     return_request: Option<u64>,
     return_retry_at: Option<std::time::Instant>,
@@ -439,7 +440,38 @@ impl Desktop {
                         "Connection to {name} interrupted; reconnecting: {reason}"
                     ));
                 }
+                Event::IncompatibleWorkspace {
+                    key,
+                    address,
+                    version,
+                } => {
+                    if self.group.add_pending.as_ref().is_some_and(|pending| {
+                        if pending.key.is_empty() {
+                            pending.address.ip().to_canonical() == address.ip().to_canonical()
+                        } else {
+                            pending.key == key
+                        }
+                    }) {
+                        self.group.add_pending = None;
+                        self.group.add_result = Some((
+                            "Update both computers to compatible versions before connecting."
+                                .into(),
+                            true,
+                        ));
+                    }
+                    if self
+                        .group
+                        .workspace
+                        .as_ref()
+                        .is_some_and(|state| state.members.contains_key(&key))
+                    {
+                        self.group.incompatible_workspaces.insert(key, version);
+                    }
+                }
                 Event::State(state) => {
+                    self.group.incompatible_workspaces.retain(|key, _| {
+                        state.members.get(key).is_some_and(|member| !member.online)
+                    });
                     let restored =
                         self.group
                             .network_reconnecting
@@ -508,7 +540,25 @@ impl Desktop {
                             Some((format!("{}: {}", tr("Connected"), member.node.name), false));
                         self.group.add_pending = None;
                     }
+                    let reconnected = state
+                        .members
+                        .iter()
+                        .filter(|(key, member)| {
+                            member.online
+                                && *key != &self.public_key
+                                && self
+                                    .group
+                                    .workspace
+                                    .as_ref()
+                                    .and_then(|old| old.members.get(*key))
+                                    .is_none_or(|old| !old.online)
+                        })
+                        .map(|(key, _)| key.clone())
+                        .collect::<Vec<_>>();
                     self.group.workspace = Some(*state);
+                    for key in reconnected {
+                        self.retry_updates_for(&key);
+                    }
                 }
                 Event::Management { source, message } => {
                     if let workspace::management::Message::Reply {
@@ -522,27 +572,11 @@ impl Desktop {
                     self.group.reply_target = None;
                 }
                 Event::Update { source, message } => {
-                    let current = self.paired_update.is_some()
-                        && self.group.update_target.as_ref() == Some(&source);
-                    if current {
-                        self.receive_update(message, ctx);
-                    } else if let workspace::update::Message::Prepare { id, .. } = &message {
-                        if self.update_action_busy() || self.download_action.is_some() {
-                            let _ = self.update_send_to(
-                                &source,
-                                workspace::update::Message::Failed {
-                                    id: *id,
-                                    message: "Another update operation is already in progress."
-                                        .into(),
-                                },
-                            );
-                        } else {
-                            self.group.update_target = Some(source);
-                            self.receive_update(message, ctx);
-                        }
-                    }
+                    self.receive_update_from(&source, message, ctx)
                 }
-                Event::UpdateSent(message) => self.sent_update(&message, ctx),
+                Event::UpdateSent { target, message } => {
+                    self.sent_update_to(&target, &message, ctx)
+                }
                 Event::Clipboard {
                     source,
                     mime,
@@ -842,15 +876,20 @@ impl Desktop {
                                         "macos" => "macOS",
                                         _ => "Computer",
                                     };
+                                    let incompatible = self.group.incompatible_workspaces.get(key);
                                     ui.weak(format!(
                                         "{platform} · {} · {}",
-                                        member
-                                            .node
-                                            .version
-                                            .as_ref()
-                                            .map(|version| version.app.as_str())
+                                        incompatible
+                                            .map(String::as_str)
+                                            .or_else(|| member
+                                                .node
+                                                .version
+                                                .as_ref()
+                                                .map(|version| version.app.as_str()))
                                             .unwrap_or("—"),
-                                        tr(if member.online {
+                                        tr(if incompatible.is_some() {
+                                            "Update required"
+                                        } else if member.online {
                                             "Connected"
                                         } else {
                                             "Offline"
@@ -887,7 +926,9 @@ impl Desktop {
                                     } else {
                                         roles.join(" · ")
                                     });
-                                    if member.online && !member.compatible() {
+                                    if incompatible.is_some()
+                                        || member.online && !member.compatible()
+                                    {
                                         ui.horizontal_wrapped(|ui| {
                                             ui.weak(tr("Update required to share devices."));
                                             if ui.link(tr("Updates")).clicked() {
@@ -1455,16 +1496,11 @@ impl Desktop {
                         .show_percentage(),
                     );
                 }
-                if self.group.update_target.as_ref() == Some(&member.node.key)
-                    && let Some((status, failed)) = &self.peer_update_status
-                {
+                if let Some(update) = self.remote_updates.get(&member.node.key) {
+                    let (status, failed) = update.status();
                     ui.colored_label(
-                        if *failed {
-                            ui.visuals().error_fg_color
-                        } else {
-                            ui.visuals().text_color()
-                        },
-                        tr(status),
+                        if failed { ui.visuals().error_fg_color } else { ui.visuals().text_color() },
+                        tr(&status),
                     );
                 }
                 if !member.online {
@@ -1473,12 +1509,13 @@ impl Desktop {
                 if management.update.prepared {
                     ui.label(tr("Update verified and ready to install."));
                 }
-                ui.weak(tr("When updating several computers, prepare them first. Install on the other computers before restarting this one."));
+                ui.weak(tr("Prepare updates to download them without restarting. Each computer installs independently."));
+                let busy = self.update_target_busy(&member.node.key);
                 ui.horizontal_wrapped(|ui| {
                     if ui
                         .add_enabled(
                             member.online
-                                && !self.update_action_busy()
+                                && !busy
                                 && !management.update.checking
                                 && !management.update.installing,
                             egui::Button::new(tr("Check for updates")),
@@ -1488,6 +1525,7 @@ impl Desktop {
                         if local {
                             self.check_updates(ctx);
                         } else {
+                            self.clear_remote_update_result(&member.node.key);
                             self.group_action(Action::Manage {
                                 target: member.node.key.clone(),
                                 message: workspace::management::Message::CheckUpdates {
@@ -1501,7 +1539,7 @@ impl Desktop {
                             member.compatible()
                                 && management.update.can_install()
                                 && !management.update.prepared
-                                && !self.update_action_busy(),
+                                && !busy,
                             egui::Button::new(tr("Prepare update")),
                         )
                         .clicked()
@@ -1523,7 +1561,7 @@ impl Desktop {
                         .add_enabled(
                             member.online
                                 && management.update.can_install()
-                                && !self.update_action_busy(),
+                                && !busy,
                             egui::Button::new(tr(if management.update.prepared {
                                 "Install and restart"
                             } else {

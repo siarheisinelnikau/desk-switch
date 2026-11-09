@@ -228,6 +228,8 @@ struct Hello {
     port: u16,
     #[serde(default)]
     control_protocol: Option<u16>,
+    #[serde(default)]
+    workspace_protocol: Option<u16>,
 }
 impl Hello {
     fn validate(&self) -> Result<()> {
@@ -285,6 +287,7 @@ pub(crate) struct Candidate {
     requested: bool,
     pub(crate) address: SocketAddr,
     pub(crate) version: Version,
+    pub(crate) workspace_protocol: Option<u16>,
 }
 pub(crate) async fn authenticate(
     stream: TcpStream,
@@ -336,6 +339,7 @@ async fn authenticate_version(
         protocol: version.protocol,
         port,
         control_protocol: Some(super::management::PROTOCOL),
+        workspace_protocol: Some(crate::group::model::PROTOCOL),
     })?;
     let mut remote = None;
     let mut buffer = vec![0; LIMIT];
@@ -381,6 +385,7 @@ async fn authenticate_version(
         outgoing,
         requested: outgoing,
         address,
+        workspace_protocol: remote.workspace_protocol,
     })
 }
 
@@ -1050,6 +1055,7 @@ mod tests {
         let request = super::super::update::Message::Prepare {
             id: 42,
             version: "99.0.0".into(),
+            install_when_ready: false,
         };
         a.service.update(request.clone()).unwrap();
         a.wait(|event| matches!(event, Event::UpdateSent(message) if *message == request));
@@ -1230,6 +1236,7 @@ mod tests {
             protocol: newer.protocol,
             port: 4001,
             control_protocol: Some(99),
+            workspace_protocol: None,
         };
         assert!(unsupported.validate().is_err());
     }
