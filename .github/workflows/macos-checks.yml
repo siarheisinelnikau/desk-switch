@@ -50,9 +50,7 @@ jobs:
           shared-key: macos-checks-${{ matrix.target }}
       - run: rustup show active-toolchain
       - run: cargo fmt --all --check
-      # The SAFETY audit is in progress, so undocumented FFI blocks are reported
-      # by `cargo clippy` but do not fail the build. See docs/unsafe-audit.md.
-      - run: cargo clippy --locked --all-targets --target ${{ matrix.target }} -- -D warnings -A clippy::undocumented_unsafe_blocks
+      - run: cargo clippy --locked --all-targets --target ${{ matrix.target }} -- -D warnings
       - run: cargo test --locked --target ${{ matrix.target }}
       - run: cargo test --locked -p rust-auto-updator --lib --target ${{ matrix.target }}
       - run: cargo build --locked --release --target ${{ matrix.target }}

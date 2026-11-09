@@ -86,10 +86,9 @@ objc2-app-kit = { version = "0.3", default-features = false, features = ["std", 
 objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSArray", "NSString", "NSURL"] }
 
 [lints.clippy]
-# SAFETY audit in progress; see docs/unsafe-audit.md. Kept at `warn` so local
-# clippy runs list undocumented FFI blocks, while CI uses `-D warnings` together
-# with `-A clippy::undocumented_unsafe_blocks` until the audit reaches zero.
-undocumented_unsafe_blocks = "warn"
+# Every unsafe block documents the invariant that makes it sound. The audit is
+# complete, so the lint is enforced; see docs/unsafe-audit.md.
+undocumented_unsafe_blocks = "deny"
 
 [profile.release]
 lto = "thin"

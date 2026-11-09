@@ -249,6 +249,11 @@ impl PasteSession for TestSession {
 }
 
 fn consumer() -> Consumer {
+    // SAFETY: `geteuid` takes no pointer arguments and returns the effective
+    // user id of the calling process, so the call has no memory or lifetime
+    // precondition; the value is the owner of this process's fixture files, and
+    // `Consumer::resolve` binds it to the same process identity it reads from
+    // `/proc`.
     Consumer::resolve(std::process::id(), unsafe { libc::geteuid() }).unwrap()
 }
 fn handle(state: &State, index: usize, owner: Consumer) -> (u64, Arc<OpenHandle>) {
@@ -573,7 +578,16 @@ fn paused_native_read_sleeps_and_cancel_returns_an_error_without_fake_eof() {
 fn native_process_identity_resolves_threads_to_one_started_process() {
     let expected = consumer();
     let actual = std::thread::spawn(|| {
+        // SAFETY: `SYS_gettid` takes no arguments, so the variadic `syscall` call
+        // needs no extra arguments, and it cannot fail; it returns the calling
+        // thread's kernel thread id, which the kernel keeps positive and below its
+        // pid limit, so the `as u32` cast is lossless and the value names this
+        // thread's `/proc/<tid>` entry.
         let tid = unsafe { libc::syscall(libc::SYS_gettid) as u32 };
+        // SAFETY: `geteuid` takes no pointer arguments and returns the effective
+        // user id of the calling thread, which is the same for every thread of this
+        // process, so the call has no memory or lifetime precondition; the value
+        // identifies the owner of the files this thread reads.
         Consumer::resolve(tid, unsafe { libc::geteuid() }).unwrap()
     })
     .join()
@@ -634,6 +648,10 @@ fn hosted_native_gate() -> PathBuf {
         runtime.starts_with(&runner) && runtime != runner,
         "The runtime must be disposable runner storage"
     );
+    // SAFETY: `geteuid` takes no pointer arguments and returns the effective
+    // user id of the calling process, so the call has no memory or lifetime
+    // precondition; `verify_private_directory` compares it with the owner of
+    // the runtime directory, which must be this same effective user.
     verify_private_directory(&runtime, unsafe { libc::geteuid() }).unwrap();
     assert!(
         Path::new("/dev/fuse").exists(),
@@ -728,6 +746,10 @@ fn process_cpu() -> Duration {
         tv_nsec: 0,
     };
     assert_eq!(
+        // SAFETY: `value` is a live, fully initialised `libc::timespec` local that
+        // outlives the call, so the pointer is valid for exactly one `timespec`
+        // write; `CLOCK_PROCESS_CPUTIME_ID` is a supported clock source that fills
+        // both members of that struct and reports failure only in the return value.
         unsafe { libc::clock_gettime(libc::CLOCK_PROCESS_CPUTIME_ID, &mut value) },
         0
     );

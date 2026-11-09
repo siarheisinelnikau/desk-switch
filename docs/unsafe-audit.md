@@ -32,7 +32,7 @@ Prefer a narrow safe wrapper over a raw call. A wrapper that owns the handle, va
 
 ## Enforcement
 
-`clippy::undocumented_unsafe_blocks` is enabled at `warn` level in `Cargo.toml`, so a plain `cargo clippy` lists every undocumented block. CI keeps `-D warnings` for every other lint and adds `-A clippy::undocumented_unsafe_blocks` while the audit is in progress; the allowance is removed once the count reaches zero and the lint becomes `deny`.
+`clippy::undocumented_unsafe_blocks` is enabled at `deny` level in `Cargo.toml`, so a new unsafe block without a `// SAFETY:` comment fails `cargo clippy` and therefore CI and the release build. The audit reached zero undocumented blocks, which is why the lint can be enforced instead of merely reported.
 
 `tools/audit_unsafe.py` reports the remaining undocumented blocks per file:
 
