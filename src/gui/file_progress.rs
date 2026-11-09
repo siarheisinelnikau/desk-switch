@@ -381,17 +381,6 @@ impl Progress {
             if ui.ctx().input(|input| {
                 input.viewport().close_requested() || input.key_pressed(egui::Key::Escape)
             }) {
-                enqueue(
-                    &commands,
-                    &root,
-                    Command::Close(
-                        snapshots
-                            .iter()
-                            .filter(|snapshot| snapshot.cancel)
-                            .map(|snapshot| snapshot.id.clone())
-                            .collect(),
-                    ),
-                );
                 state.lock().unwrap().open = false;
                 ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
                 return;

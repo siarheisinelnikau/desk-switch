@@ -28,6 +28,7 @@ pub enum Command {
     GroupLevel { key: [u8; 32], level: AudioLevel },
     Target([u8; 32]),
     EdgePause(bool),
+    LocalSharingPause(bool),
 }
 
 #[derive(Clone, Default, PartialEq)]
@@ -47,6 +48,7 @@ struct Snapshot {
     keyboard: bool,
     mouse: bool,
     microphone: bool,
+    local_sharing_pause: Option<bool>,
     can_disable_keyboard: bool,
     can_disable_mouse: bool,
     levels: Vec<Level>,
@@ -201,6 +203,22 @@ fn position(ctx: &egui::Context, x: i32, y: i32) -> egui::Rect {
 
 impl Desktop {
     pub(super) fn quick_action(&mut self, command: Command) {
+        if let Command::LocalSharingPause(paused) = command {
+            self.prefs.pause_local_sharing = paused;
+            let result = self.prefs.save(&self.dir);
+            if !paused && result.is_err() {
+                self.prefs.pause_local_sharing = true;
+            }
+            self.message(
+                result,
+                if paused {
+                    "Sharing paused on this computer."
+                } else {
+                    "Sharing resumed on this computer."
+                },
+            );
+            return;
+        }
         if let Some(state) = self.group.workspace.clone() {
             use crate::group::net::Action as GroupAction;
             if !self.group.writable() {
@@ -248,7 +266,7 @@ impl Desktop {
                         key: crate::config::hex(&key),
                     });
                 }
-                Command::Level { .. } => {}
+                Command::Level { .. } | Command::LocalSharingPause(_) => {}
             }
             return;
         }
@@ -293,7 +311,10 @@ impl Desktop {
                 let Some(key) = key else { return };
                 self.prefs.workspace.shared.audio_levels.insert(key, level);
             }
-            Command::GroupLevel { .. } | Command::Target(_) | Command::EdgePause(_) => {}
+            Command::GroupLevel { .. }
+            | Command::Target(_)
+            | Command::EdgePause(_)
+            | Command::LocalSharingPause(_) => {}
         }
         self.shared_changed();
     }
@@ -400,6 +421,7 @@ impl Desktop {
             snapshot.keyboard = workspace.settings.keyboard_enabled;
             snapshot.mouse = workspace.settings.mouse_enabled;
             snapshot.microphone = workspace.settings.microphone_enabled;
+            snapshot.local_sharing_pause = Some(self.prefs.pause_local_sharing);
             snapshot.monitor = false;
             snapshot.peer = format!(
                 "{} {}",
@@ -704,6 +726,16 @@ fn body(
                 }
             }
         });
+    if let Some(mut paused) = snapshot.local_sharing_pause
+        && ui
+            .checkbox(
+                &mut paused,
+                tr("Pause microphone and clipboard on this computer"),
+            )
+            .changed()
+    {
+        send(Action::Quick(Command::LocalSharingPause(paused)));
+    }
     if !snapshot.output.is_empty() {
         ui.add(
             egui::Label::new(

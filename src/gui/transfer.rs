@@ -702,7 +702,9 @@ impl Desktop {
                     )
                 })
                 .collect(),
-            clipboard_enabled: trusted && workspace.settings.clipboard_enabled,
+            clipboard_enabled: trusted
+                && workspace.settings.clipboard_enabled
+                && !self.prefs.pause_local_sharing,
         });
         if let Some(clipboard) = &self.group.clipboard {
             service.clipboard(clipboard);

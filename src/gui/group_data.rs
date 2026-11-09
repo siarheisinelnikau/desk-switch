@@ -20,7 +20,7 @@ use std::{
 pub(super) struct Spec {
     name: String,
     peer: String,
-    kind: Kind,
+    pub(super) kind: Kind,
     args: Vec<String>,
     capture: Vec<PathBuf>,
     keyboard: Option<PathBuf>,

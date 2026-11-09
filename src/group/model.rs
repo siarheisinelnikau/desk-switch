@@ -12,7 +12,7 @@ use std::{collections::BTreeMap, net::SocketAddr};
 
 pub type Key = String;
 pub const PORT: u16 = 45880;
-pub const PROTOCOL: u16 = 2;
+pub const PROTOCOL: u16 = 3;
 
 pub fn valid_key(key: &str) -> Result<()> {
     ensure!(
@@ -393,6 +393,65 @@ impl Workspace {
         }
         Ok(())
     }
+    pub fn remove_member(&mut self, key: &str) -> Result<()> {
+        ensure!(key != self.hub, "The coordinator cannot remove itself");
+        ensure!(self.members.contains_key(key), "Unknown computer");
+        ensure!(
+            !self.switch_pending(),
+            "Wait for the monitor switch to finish"
+        );
+        let revision = self.next_revision()?;
+        if self.layout.positions.contains_key(key) {
+            self.layout.revision = self
+                .layout
+                .revision
+                .checked_add(1)
+                .filter(|revision| *revision < u64::MAX)
+                .context("Display arrangement revision exhausted")?;
+            self.layout.positions.remove(key);
+        }
+        let borrowed_source = self.plan().input.as_deref() == Some(key)
+            || matches!(&self.settings.input, Selection::Computer(source) if source == key);
+        self.members.remove(key);
+        for selection in [
+            &mut self.settings.input,
+            &mut self.settings.audio,
+            &mut self.settings.microphone,
+        ] {
+            if matches!(selection, Selection::Computer(computer) if computer == key) {
+                *selection = Selection::Auto;
+            }
+        }
+        if self
+            .settings
+            .microphone_binding
+            .as_ref()
+            .is_some_and(|binding| binding.computer == key)
+        {
+            self.settings.microphone_enabled = false;
+            self.settings.microphone_binding = None;
+        }
+        for monitor in [&mut self.active_monitor, &mut self.confirmed_monitor] {
+            if monitor.as_deref() == Some(key) {
+                *monitor = None;
+            }
+        }
+        if self
+            .monitor_command
+            .as_ref()
+            .is_some_and(|command| command.writer == key || command.destination == key)
+        {
+            self.monitor_command = None;
+        }
+        if borrowed_source || self.active_input.as_deref() == Some(key) {
+            self.return_input()?;
+        } else if self.input_intent.as_deref() == Some(key) {
+            self.input_intent = self.active_input.clone();
+        }
+        self.revision = revision;
+        self.validate()
+    }
+
     pub fn set_settings(&mut self, expected: u64, settings: Settings) -> Result<()> {
         ensure!(
             self.revision == expected,

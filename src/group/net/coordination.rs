@@ -62,7 +62,7 @@ fn validate_image(image: &HardState) -> Result<Workspace> {
     validate_workspace_data(
         &image.snapshot,
         &image.workspace_id,
-        Some(&image.configuration.members()),
+        Some(image.configuration.state_members()),
     )
 }
 
@@ -115,7 +115,7 @@ fn validate_rpc_data(engine: &Engine, rpc: &crate::group::consensus::Rpc) -> Res
                     .filter(|entry| entry.index <= *prev_index)
                 {
                     if let Some(configuration) = &entry.configuration {
-                        keys = configuration.members();
+                        keys = configuration.state_members().clone();
                     }
                 }
                 Some(keys)
@@ -133,7 +133,7 @@ fn validate_rpc_data(engine: &Engine, rpc: &crate::group::consensus::Rpc) -> Res
                     continue;
                 }
                 if let Some(configuration) = &entry.configuration {
-                    roster = Some(configuration.members());
+                    roster = Some(configuration.state_members().clone());
                 }
                 validate_workspace_data(&entry.data, &rpc.workspace_id, roster.as_ref())?;
             }
@@ -143,7 +143,7 @@ fn validate_rpc_data(engine: &Engine, rpc: &crate::group::consensus::Rpc) -> Res
             data,
             ..
         } => {
-            validate_workspace_data(data, &rpc.workspace_id, Some(&configuration.members()))?;
+            validate_workspace_data(data, &rpc.workspace_id, Some(configuration.state_members()))?;
         }
         Message::StageJoint { entry, .. } => {
             ensure!(!entry.barrier, "Invalid membership seed barrier");
@@ -154,7 +154,7 @@ fn validate_rpc_data(engine: &Engine, rpc: &crate::group::consensus::Rpc) -> Res
             validate_workspace_data(
                 &entry.data,
                 &rpc.workspace_id,
-                Some(&configuration.members()),
+                Some(configuration.state_members()),
             )?;
         }
         _ => {}
@@ -512,6 +512,15 @@ impl Control {
         if !self.canonical.members.contains_key(&self.own) {
             return Ok(());
         }
+        let trusted = self.trusted();
+        self.links.active.retain(|key, _| {
+            trusted.contains(key)
+                || self.joining.as_ref().is_some_and(|(peer, _)| peer == key)
+                || self.additions.iter().any(|member| member.node.key == *key)
+        });
+        self.links
+            .retired
+            .retain(|key, _| self.links.active.contains_key(key));
         let mut state = self.canonical.clone();
         let confirmation = state.confirmed_monitor.clone();
         for (key, observation) in &self.observed {
@@ -720,10 +729,10 @@ impl Control {
                     &self.identity,
                     &self.local,
                     &state,
-                    address,
-                    key,
+                    (address, key),
                     Intent::Mesh,
                     self.internal.clone(),
+                    None,
                 );
             }
         }
@@ -928,10 +937,10 @@ impl Control {
                     &self.identity,
                     &self.local,
                     &self.handshake(),
-                    address,
-                    expected,
+                    (address, expected),
                     Intent::Mesh,
                     self.internal.clone(),
+                    None,
                 );
                 self.connected_once = true;
                 return Ok(());
@@ -1004,6 +1013,26 @@ impl Control {
     fn packet(&mut self, key: &str, packet: Packet) -> Result<()> {
         match packet {
             Packet::Ping => {}
+            Packet::PairingPrompt(request) => {
+                ensure!(
+                    self.canonical.members.contains_key(key)
+                        && self.engine.as_ref().and_then(Engine::leader) == Some(key),
+                    "Invalid workspace invitation sender"
+                );
+                ensure!(
+                    request.name.len() <= 256
+                        && !request.name.chars().any(char::is_control)
+                        && request.code.len() <= 32
+                        && !request.code.chars().any(char::is_control),
+                    "Invalid workspace invitation"
+                );
+                self.notify.event(Event::Request(request));
+            }
+            Packet::PairingExpired(id) => {
+                if self.canonical.members.contains_key(key) {
+                    self.notify.event(Event::RequestExpired(id));
+                }
+            }
             Packet::Bootstrap(image) => self.bootstrap(key, *image)?,
             Packet::Consensus(rpc) => {
                 ensure!(self.trusted().contains(key), "Unknown consensus sender");
@@ -1188,6 +1217,10 @@ impl Control {
             self.proposal_effects(result, Some(&source))?;
         } else if let Some((source, action)) = self.actions.pop_front() {
             let mut candidate = self.visible.clone();
+            let retiring = match &action {
+                Action::RemoveMember { key } => Some(key.clone()),
+                _ => None,
+            };
             match apply(
                 action,
                 &source,
@@ -1201,11 +1234,13 @@ impl Control {
                 Ok(()) => {
                     if candidate != self.visible {
                         candidate.validate()?;
-                        let result = self
-                            .engine
-                            .as_mut()
-                            .unwrap()
-                            .propose(serde_json::to_vec(&candidate)?, now);
+                        let engine = self.engine.as_mut().unwrap();
+                        let data = serde_json::to_vec(&candidate)?;
+                        let result = if let Some(key) = retiring {
+                            engine.begin_remove(&key, data, now)
+                        } else {
+                            engine.propose(data, now)
+                        };
                         self.proposal_effects(result, Some(&source))?;
                     }
                 }
@@ -1264,6 +1299,11 @@ impl Control {
         self.coordination();
         Ok(())
     }
+}
+
+struct PendingApproval {
+    owner: Option<String>,
+    reply: oneshot::Sender<bool>,
 }
 
 pub(super) async fn run(
@@ -1362,6 +1402,10 @@ pub(super) async fn run(
         fail_commit_persist: false,
     };
     control.persist()?;
+    if control.engine.as_ref().is_some_and(Engine::removed) {
+        control.notify.event(Event::Removed);
+        return Ok(());
+    }
     if let Some(engine) = &mut control.engine {
         let result = engine.tick(0);
         control.effects(result)?;
@@ -1374,7 +1418,7 @@ pub(super) async fn run(
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut reconnect = tokio::time::interval(Duration::from_secs(3));
     reconnect.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    let mut approvals: BTreeMap<String, oneshot::Sender<bool>> = BTreeMap::new();
+    let mut approvals = BTreeMap::<[u8; 32], PendingApproval>::new();
     loop {
         tokio::select! {
             accepted = listener.accept() => {
@@ -1391,7 +1435,7 @@ pub(super) async fn run(
                             let candidate = timeout(AUTH, workspace::net::authenticate(stream, &identity, &local.node.name, false, None, local.address.port())).await??;
                             let key = config::hex(&candidate.key);
                             if state.members.contains_key(&key) { peer = key; }
-                            setup(candidate, local, state, Intent::Invite, internal.clone(), None).await
+                            setup(candidate, local, state, Intent::Invite, internal.clone(), None, None).await
                         }.await;
                         if let Err(error) = result { let _ = internal.send(Incoming::Closed(peer, None, Some(error))).await; }
                     });
@@ -1399,12 +1443,21 @@ pub(super) async fn run(
             }
             command = commands.recv() => match command {
                 Some(Command::Disconnect) | None => break,
-                Some(Command::Approve(key, accept)) => { if let Some(reply) = approvals.remove(&key) { let _ = reply.send(accept); } }
                 #[cfg(test)]
                 Some(Command::Raw(target, packet)) => { let _ = send(&control.links, &target, *packet); }
                 #[cfg(test)]
                 Some(Command::FailCommitPersistence(armed)) => { control.fail_commit_persist = true; let _ = armed.send(()); }
                 Some(Command::Action(action)) => {
+                    if let Action::ApproveInvite { id, accept } = *action {
+                        if approvals.get(&id).is_some_and(|pending| pending.owner.is_none()) {
+                            if let Some(pending) = approvals.remove(&id) {
+                                let _ = pending.reply.send(accept);
+                            }
+                        } else if let Some(leader) = control.engine.as_ref().and_then(Engine::leader) {
+                            let _ = send(&control.links, leader, Packet::Action(Action::ApproveInvite { id, accept }));
+                        }
+                        continue;
+                    }
                     if let Err(error) = control.action(&own, *action) {
                         if error.downcast_ref::<LocalStateFailure>().is_some() { return Err(error); }
                         control.user_error(&own, error);
@@ -1433,8 +1486,20 @@ pub(super) async fn run(
             }
             _ = reconnect.tick() => { control.dial_saved(); }
             event = incoming.recv() => match event.context("Workspace event loop stopped")? {
-                Incoming::Consent { request, accept } => {
-                    if !approvals.contains_key(&request.key) { approvals.insert(request.key.clone(), accept); control.notify.event(Event::Request(request)); }
+                Incoming::Consent { owner, request, accept } => {
+                    if approvals.len() < 16 {
+                        let id = request.id;
+                        if let Some(key) = &owner {
+                            if !control.canonical.members.contains_key(key)
+                                || send(&control.links, key, Packet::PairingPrompt(request)).is_err()
+                            {
+                                continue;
+                            }
+                        } else {
+                            control.notify.event(Event::Request(request));
+                        }
+                        approvals.insert(id, PendingApproval { owner, reply: accept });
+                    }
                 }
                 Incoming::Ready { candidate, member, controller, mesh, workspace_id, dial: _dial } => {
                     if let Err(error) = control.ready(candidate, *member, controller, mesh, workspace_id) {
@@ -1443,7 +1508,19 @@ pub(super) async fn run(
                     }
                 }
                 Incoming::Packet(key, generation, packet) => {
-                    if control.links.packet(&key, generation) && let Err(error) = control.packet(&key, packet) {
+                    if !control.links.packet(&key, generation) {
+                        continue;
+                    }
+                    if let Packet::Action(Action::ApproveInvite { id, accept }) = packet {
+                        if control.canonical.members.contains_key(&key)
+                            && approvals.get(&id).is_some_and(|pending| pending.owner.as_ref() == Some(&key))
+                            && let Some(pending) = approvals.remove(&id)
+                        {
+                            let _ = pending.reply.send(accept);
+                        }
+                        continue;
+                    }
+                    if let Err(error) = control.packet(&key, packet) {
                         if error.downcast_ref::<LocalStateFailure>().is_some() { return Err(error); }
                         control.user_error(&key, error);
                     }
@@ -1462,6 +1539,21 @@ pub(super) async fn run(
                     if !control.links.contains_key(&key) { control.connection_error(key, error, true); }
                 }
             }
+        }
+        approvals.retain(|id, pending| {
+            if !pending.reply.is_closed() {
+                return true;
+            }
+            if let Some(key) = &pending.owner {
+                let _ = send(&control.links, key, Packet::PairingExpired(*id));
+            } else {
+                control.notify.event(Event::RequestExpired(*id));
+            }
+            false
+        });
+        if control.engine.as_ref().is_some_and(Engine::removed) {
+            control.notify.event(Event::Removed);
+            break;
         }
         control.drive()?;
         control.directory();

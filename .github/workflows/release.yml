@@ -95,6 +95,10 @@ jobs:
         env:
           DESK_SWITCH_NATIVE_CLIPBOARD_TEST: "1"
         run: cargo test --locked group::clipboard_files::windows::tests::isolated_ci_native_file_clipboard_roundtrip -- --ignored --exact --nocapture
+      - name: Verify Windows window restore and idle rendering
+        if: runner.os == 'Windows'
+        timeout-minutes: 2
+        run: cargo test --locked gui::software::smoke::native_two_window_lifecycle_stays_painted_and_sleeps_when_settled -- --ignored --exact --nocapture
       - name: Check native Windows file paste and recoverable Move
         if: runner.os == 'Windows'
         timeout-minutes: 7

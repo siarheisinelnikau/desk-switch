@@ -38,6 +38,8 @@ pub struct Update {
     pub version: Option<String>,
     pub channel_version: Option<String>,
     pub ready: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub prepared: bool,
     pub checking: bool,
     pub installing: bool,
     pub failed: bool,
@@ -106,6 +108,10 @@ pub enum Message {
     CheckUpdates {
         id: u64,
     },
+    PrepareUpdate {
+        id: u64,
+        version: String,
+    },
     SetApplication {
         id: u64,
         expected: Application,
@@ -123,6 +129,7 @@ impl Message {
             Self::SetMonitor { id, .. } | Self::ReadMonitor { id, .. } => *id,
             Self::ExtractCable { id, .. }
             | Self::CheckUpdates { id }
+            | Self::PrepareUpdate { id, .. }
             | Self::SetApplication { id, .. }
             | Self::Reply { id, .. } => *id,
         }
@@ -130,6 +137,7 @@ impl Message {
     pub fn validate(&self) -> Result<()> {
         ensure!(self.id() > 0, "invalid management request");
         match self {
+            Self::PrepareUpdate { version, .. } => stable_version(version)?,
             Self::ReadMonitor { monitor, .. } => {
                 ensure!(
                     !monitor.is_empty()

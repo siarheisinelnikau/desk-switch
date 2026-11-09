@@ -8,7 +8,7 @@ use crate::{
         model::{self, Member, Workspace},
         net::{Action, Event, Service},
     },
-    workspace::{self, Node, Selection, net::Request},
+    workspace::{self, Node, Selection},
 };
 use anyhow::{Context, Result};
 use eframe::egui::{self, Color32, RichText};
@@ -37,7 +37,10 @@ pub(super) struct Group {
     pub service: Option<Service>,
     pub workspace: Option<Workspace>,
     pub selected: String,
-    pub request: Option<Request>,
+    remove_confirmation: Option<String>,
+    reset_confirmation: bool,
+    pub(super) removed: bool,
+    requests: std::collections::VecDeque<(std::time::Instant, crate::group::net::Request)>,
     pub data: Data,
     pub(super) coordination: Option<Coordination>,
     pub(super) file_transfer: Option<crate::group::file_transfer::Service>,
@@ -110,6 +113,12 @@ impl Group {
             } else {
                 "Waiting for another computer"
             }));
+            ui.weak(format!(
+                "{}: {} / {}",
+                tr("Connected / needed"),
+                status.online,
+                status.quorum,
+            ));
             ui.weak(tr(if enough {
                 "Shared controls will be available after reconnecting."
             } else {
@@ -285,7 +294,7 @@ impl Desktop {
         });
     }
     pub(super) fn tick_group(&mut self, ctx: &egui::Context) {
-        if self.group.preview {
+        if self.group.preview || self.group.removed {
             return;
         }
         if self.group.service.is_none() && !self.quitting && self.discovery_error.is_none() {
@@ -384,11 +393,31 @@ impl Desktop {
                         quorum,
                     });
                 }
+                Event::Removed => {
+                    self.group.removed = true;
+                    self.group.service.take();
+                    self.group.file_transfer.take();
+                    self.group.clipboard.take();
+                    self.group.data.stop();
+                    self.stop_pair();
+                    self.page = Page::Application;
+                    self.action(super::Action::Show, ctx);
+                    return;
+                }
                 Event::Request(request) => {
                     self.page = Page::Overview;
                     self.group.add_open = false;
-                    self.group.request = Some(request);
-                    self.action(super::Action::Show, ctx);
+                    if self.group.requests.len() < 16 {
+                        let timeout = crate::group::net::CONSENT_TIMEOUT;
+                        self.group
+                            .requests
+                            .push_back((std::time::Instant::now() + timeout, request));
+                        ctx.request_repaint_after_for(timeout, egui::ViewportId::ROOT);
+                        self.action(super::Action::Show, ctx);
+                    }
+                }
+                Event::RequestExpired(id) => {
+                    self.group.requests.retain(|(_, request)| request.id != id)
                 }
                 Event::Error(error) => {
                     self.group.log_network(error.clone());
@@ -522,6 +551,7 @@ impl Desktop {
                 } => {
                     if self.group.workspace.as_ref().is_some_and(|state| {
                         state.settings.clipboard_enabled
+                            && !self.prefs.pause_local_sharing
                             && state.members.get(&source).is_some_and(Member::compatible)
                     }) && let Some(clipboard) = &self.group.clipboard
                     {
@@ -574,8 +604,9 @@ impl Desktop {
                 .map(|node| node.name.clone())
                 .unwrap_or_default();
             if let Some(clipboard) = &self.group.clipboard {
-                clipboard.enabled(state.settings.clipboard_enabled);
-                for (mime, bytes, digest) in clipboard.poll() {
+                let enabled = state.settings.clipboard_enabled && !self.prefs.pause_local_sharing;
+                clipboard.enabled(enabled);
+                for (mime, bytes, digest) in clipboard.poll().into_iter().filter(|_| enabled) {
                     self.group_action(Action::Clipboard {
                         mime,
                         bytes,
@@ -584,7 +615,7 @@ impl Desktop {
                 }
             }
             self.update_file_transfers(&state);
-            let specs = if self.quitting || self.install_pending {
+            let mut specs = if self.quitting || self.install_pending {
                 BTreeMap::new()
             } else {
                 match self.group.data.desired(
@@ -600,6 +631,9 @@ impl Desktop {
                     }
                 }
             };
+            if self.prefs.pause_local_sharing {
+                specs.retain(|_, spec| spec.kind != super::worker::Kind::MicrophoneSend);
+            }
             self.group.data.tick(specs, &self.dir, ctx);
             #[cfg(target_os = "linux")]
             self.request_group_input_access_if_needed(ctx);
@@ -731,19 +765,25 @@ impl Desktop {
         ));
         ui.add_space(12.0);
         self.group.connection_status(ui);
-        if let Some(request) = self.group.request.clone() {
+        let now = std::time::Instant::now();
+        self.group.requests.retain(|(deadline, _)| *deadline > now);
+        if let Some((_, request)) = self.group.requests.front().cloned() {
             egui::Frame::group(ui.style())
                 .inner_margin(16)
                 .show(ui, |ui| {
                     ui.strong(format!("{} · {}", tr("Connection request"), request.name));
                     ui.label(format!("{}: {}", tr("Security code"), request.code));
                     ui.horizontal(|ui| {
-                        for (text, accept) in [("Allow", true), ("Decline", false)] {
-                            if ui.button(tr(text)).clicked() {
-                                if let Some(service) = &self.group.service {
-                                    service.approve(request.key.clone(), accept);
+                        for (text, accept) in [("Codes match", true), ("Decline", false)] {
+                            if ui.button(tr(text)).clicked()
+                                && let Some(service) = &self.group.service
+                            {
+                                match service.approve(request.id, accept) {
+                                    Ok(()) => {
+                                        self.group.requests.pop_front();
+                                    }
+                                    Err(error) => self.notice = Some((format!("{error:#}"), true)),
                                 }
-                                self.group.request = None;
                             }
                         }
                     });
@@ -847,6 +887,26 @@ impl Desktop {
                                     } else {
                                         roles.join(" · ")
                                     });
+                                    if member.online && !member.compatible() {
+                                        ui.horizontal_wrapped(|ui| {
+                                            ui.weak(tr("Update required to share devices."));
+                                            if ui.link(tr("Updates")).clicked() {
+                                                self.group.selected = key.clone();
+                                                self.page = Page::Application;
+                                            }
+                                        });
+                                    } else if !member.online {
+                                        ui.weak(tr(
+                                            "Open Desk Switch on this computer to reconnect.",
+                                        ));
+                                    } else if member.node.input_error.is_some() {
+                                        ui.horizontal_wrapped(|ui| {
+                                            ui.weak(tr("Keyboard and mouse need attention."));
+                                            if ui.link(tr("Diagnostics")).clicked() {
+                                                self.page = Page::Diagnostics;
+                                            }
+                                        });
+                                    }
                                     ui.horizontal_wrapped(|ui| {
                                         let active = state.active_input.as_ref() == Some(key);
                                         let failed = active && member.node.monitor_error.is_some();
@@ -1012,16 +1072,16 @@ impl Desktop {
         match result {
             Ok(()) => {
                 self.group.add_result = Some((
-                    "Connection requested. Approve it on the other computer.".into(),
+                    "Connection requested. Compare the security codes on both computers.".into(),
                     false,
                 ));
                 self.group.add_pending = Some(AddPending {
                     address,
                     key,
-                    until: std::time::Instant::now() + std::time::Duration::from_secs(60),
+                    until: std::time::Instant::now() + std::time::Duration::from_secs(100),
                 });
                 ctx.request_repaint_after_for(
-                    std::time::Duration::from_secs(60),
+                    std::time::Duration::from_secs(100),
                     egui::ViewportId::ROOT,
                 );
             }
@@ -1100,10 +1160,18 @@ impl Desktop {
 
     pub(super) fn group_settings(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
+        if self.group.removed {
+            ui.label(tr("This computer was removed from the workspace."));
+            self.workspace_recovery(ui, &ctx);
+            return;
+        }
         let Some(state) = self.group.workspace.clone() else {
             return;
         };
         self.group.connection_status(ui);
+        if state.members.len() > 1 && !self.group.writable() {
+            self.workspace_recovery(ui, &ctx);
+        }
         ui.horizontal_wrapped(|ui| {
             ui.strong(tr("Workspace displays"));
             if ui
@@ -1175,6 +1243,37 @@ impl Desktop {
             self.peer_key = member.node.key.clone();
         }
         ui.label(tr("Changes apply to the selected computer."));
+        if !local && member.node.key != state.hub {
+            if ui
+                .add_enabled(
+                    self.group.writable() && !self.group.monitor_busy(),
+                    egui::Button::new(tr("Remove computer…")),
+                )
+                .clicked()
+            {
+                self.group.remove_confirmation = Some(member.node.key.clone());
+            }
+            if self.group.remove_confirmation.as_ref() == Some(&member.node.key) {
+                ui.label(tr("This computer will need approval to join again."));
+                ui.horizontal(|ui| {
+                    if ui
+                        .add_enabled(
+                            self.group.writable(),
+                            egui::Button::new(tr("Remove computer")),
+                        )
+                        .clicked()
+                    {
+                        self.group.remove_confirmation = None;
+                        self.group_action(Action::RemoveMember {
+                            key: member.node.key.clone(),
+                        });
+                    }
+                    if ui.button(tr("Cancel")).clicked() {
+                        self.group.remove_confirmation = None;
+                    }
+                });
+            }
+        }
         ui.add_space(12.0);
         if ui.available_width() >= 740.0 {
             ui.columns(2, |columns| {
@@ -1195,6 +1294,35 @@ impl Desktop {
             self.group_monitor_settings(ui, &member, local, &ctx);
         }
     }
+    fn workspace_recovery(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        if ui.button(tr("Start a new workspace…")).clicked() {
+            self.group.reset_confirmation = true;
+        }
+        if self.group.reset_confirmation {
+            ui.label(tr("Desk Switch will quit. Open it again to start a new workspace with your local preferences. You will need to approve each computer again."));
+            ui.horizontal(|ui| {
+                if ui
+                    .add_enabled(
+                        !self.update_action_busy() && !self.group.monitor_busy(),
+                        egui::Button::new(tr("Create workspace and quit")),
+                    )
+                    .clicked()
+                {
+                    let result = crate::config::request_workspace_reset(&self.dir);
+                    self.group.reset_confirmation = false;
+                    if let Err(error) = result {
+                        self.notice = Some((format!("{error:#}"), true));
+                    } else {
+                        self.action(super::Action::Quit, ctx);
+                    }
+                }
+                if ui.button(tr("Cancel")).clicked() {
+                    self.group.reset_confirmation = false;
+                }
+            });
+        }
+    }
+
     pub(super) fn group_layout_dialog(&mut self, ctx: &egui::Context) {
         let Some(state) = self.group.workspace.as_ref() else {
             self.group.layout_editor.close();
@@ -1342,6 +1470,10 @@ impl Desktop {
                 if !member.online {
                     ui.weak(tr("Offline"));
                 }
+                if management.update.prepared {
+                    ui.label(tr("Update verified and ready to install."));
+                }
+                ui.weak(tr("When updating several computers, prepare them first. Install on the other computers before restarting this one."));
                 ui.horizontal_wrapped(|ui| {
                     if ui
                         .add_enabled(
@@ -1366,10 +1498,37 @@ impl Desktop {
                     }
                     if ui
                         .add_enabled(
+                            member.compatible()
+                                && management.update.can_install()
+                                && !management.update.prepared
+                                && !self.update_action_busy(),
+                            egui::Button::new(tr("Prepare update")),
+                        )
+                        .clicked()
+                        && let Some(version) = management.update.version.clone()
+                    {
+                        if local {
+                            self.prepare_update(version, ctx);
+                        } else {
+                            self.group_action(Action::Manage {
+                                target: member.node.key.clone(),
+                                message: workspace::management::Message::PrepareUpdate {
+                                    id: super::management::request_id(),
+                                    version,
+                                },
+                            });
+                        }
+                    }
+                    if ui
+                        .add_enabled(
                             member.online
                                 && management.update.can_install()
                                 && !self.update_action_busy(),
-                            egui::Button::new(tr("Download and install")),
+                            egui::Button::new(tr(if management.update.prepared {
+                                "Install and restart"
+                            } else {
+                                "Download and install"
+                            })),
                         )
                         .clicked()
                     {
@@ -1717,6 +1876,42 @@ pub(super) fn selection(
     });
 }
 
+fn shared_diagnostics(state: &Workspace, own: &str, local: &Node) -> String {
+    use std::fmt::Write;
+    let mut report = format!(
+        "Desk Switch {} / protocol {}\nWorkspace protocol: {}\n",
+        crate::compatibility::VERSION,
+        crate::compatibility::PROTOCOL,
+        model::PROTOCOL,
+    );
+    for (index, (key, member)) in state.members.iter().enumerate() {
+        let node = if key == own { local } else { &member.node };
+        let platform = match node.diagnostics.platform.as_str() {
+            "windows" => "Windows",
+            "linux" => "Ubuntu",
+            "macos" => "macOS",
+            _ => "Unknown",
+        };
+        let version = node
+            .version
+            .as_ref()
+            .and_then(|version| semver::Version::parse(&version.app).ok())
+            .map(|version| format!("{}.{}.{}", version.major, version.minor, version.patch))
+            .unwrap_or_else(|| "unknown".into());
+        let _ = writeln!(
+            report,
+            "Computer {} ({platform}, {version}): online={}, input error={}, audio error={}, microphone error={}, monitor error={}",
+            index + 1,
+            member.online,
+            node.input_error.is_some(),
+            node.audio_error.is_some(),
+            node.microphone_error.is_some(),
+            node.monitor_error.is_some(),
+        );
+    }
+    report
+}
+
 impl Desktop {
     pub(super) fn group_diagnostics(&self, ui: &mut egui::Ui) {
         let Some(state) = &self.group.workspace else {
@@ -1744,6 +1939,10 @@ impl Desktop {
         ));
         ui.add_space(12.0);
         if ui.button(tr("Copy diagnostics")).clicked() {
+            ui.ctx()
+                .copy_text(shared_diagnostics(state, &self.public_key, &local));
+        }
+        if ui.button(tr("Copy full diagnostics")).clicked() {
             // Workspace and Node contain public connection/settings state, never
             // the private identity. Refresh local worker output at copy time.
             let mut snapshot = state.clone();
@@ -1765,7 +1964,7 @@ impl Desktop {
             ui.ctx().copy_text(report);
         }
         ui.weak(tr(
-            "The copied report includes all computers and workspace settings. Offline computers show the last received diagnostics.",
+            "Full diagnostics include computer names, network addresses, settings and recent logs.",
         ));
         ui.add_space(12.0);
 

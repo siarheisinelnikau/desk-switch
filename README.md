@@ -4,7 +4,7 @@
 
 ![Desk Switch workspace with four connected computers](docs/workspace-four-computers.png)
 
-Download matching versions from [Releases](https://github.com/siarheisinelnikau/desk-switch/releases/latest) for **Windows x86-64**, **Ubuntu 24.04/26.04 x86-64**, or **macOS 13+ Apple Silicon/Intel**. Link and approve computers with **+ Add a computer**. Select a card to switch, **F12** to cycle, or **F11** to return input.
+Download matching versions from [Releases](https://github.com/siarheisinelnikau/desk-switch/releases/latest) for **Windows x86-64**, **Ubuntu 24.04/26.04 x86-64**, or **macOS 13+ Apple Silicon/Intel**. Link computers with **+ Add a computer** and confirm matching codes on both ends. Select a card to switch, **F12** to cycle, or **F11** to return input.
 
 ## What it does
 
