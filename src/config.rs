@@ -7,6 +7,7 @@ use std::{
     fs::{self, OpenOptions},
     io::Write,
     path::{Path, PathBuf},
+    sync::atomic::{AtomicU64, Ordering},
 };
 
 pub const NOISE: &str = "Noise_KK_25519_ChaChaPoly_BLAKE2s";
@@ -276,6 +277,11 @@ pub fn read_settings(dir: &Path) -> Result<FileSettings> {
 }
 
 pub fn write_atomic(path: &Path, contents: &str) -> Result<()> {
+    static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+    write_atomic_with_counter(path, contents, &TEMP_COUNTER)
+}
+
+fn write_atomic_with_counter(path: &Path, contents: &str, counter: &AtomicU64) -> Result<()> {
     let directory = path.parent().context("settings path has no directory")?;
     let mut builder = fs::DirBuilder::new();
     builder.recursive(true);
@@ -285,32 +291,35 @@ pub fn write_atomic(path: &Path, contents: &str) -> Result<()> {
         builder.mode(0o700);
     }
     builder.create(directory)?;
-    static TEMP_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let temp = path.with_extension(format!(
-        "{}.{}.tmp",
-        std::process::id(),
-        TEMP_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-    ));
-    let result = (|| {
-        let mut options = OpenOptions::new();
-        options.write(true).create_new(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            options.mode(0o600);
-        }
-        let mut file = options.open(&temp)?;
-        file.write_all(contents.as_bytes())?;
-        file.sync_all()?;
-        drop(file);
-        fs::rename(&temp, path)?;
-        sync_directory(directory)?;
-        Ok::<_, anyhow::Error>(())
-    })();
-    if result.is_err() {
-        let _ = fs::remove_file(&temp);
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
     }
-    result
+    let (temp, mut file) = loop {
+        let temp = path.with_extension(format!(
+            "{}.{}.tmp",
+            std::process::id(),
+            counter.fetch_add(1, Ordering::Relaxed)
+        ));
+        match options.open(&temp) {
+            Ok(file) => break (temp, file),
+            // An interrupted write can leave this name behind across PID reuse.
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error.into()),
+        }
+    };
+    let written = file
+        .write_all(contents.as_bytes())
+        .and_then(|()| file.sync_all());
+    drop(file);
+    if let Err(error) = written.and_then(|()| fs::rename(&temp, path)) {
+        let _ = fs::remove_file(&temp);
+        return Err(error.into());
+    }
+    sync_directory(directory)
 }
 
 pub fn save_settings(dir: &Path, document: &FileSettings) -> Result<()> {
@@ -445,7 +454,7 @@ mod tests {
     }
 
     #[test]
-    fn atomic_writes_replace_the_target_without_leaving_temporary_files() {
+    fn atomic_write_replaces_target_without_touching_an_existing_temporary_file() {
         let dir = std::env::temp_dir().join(format!(
             "desk-switch-atomic-{}-{}",
             std::process::id(),
@@ -456,13 +465,14 @@ mod tests {
         ));
         let path = dir.join("settings.toml");
         write_atomic(&path, "first").unwrap();
-        write_atomic(&path, "second").unwrap();
+        let existing = path.with_extension(format!("{}.0.tmp", std::process::id()));
+        fs::write(&existing, "interrupted save").unwrap();
+
+        write_atomic_with_counter(&path, "second", &AtomicU64::new(0)).unwrap();
+
         assert_eq!(fs::read_to_string(&path).unwrap(), "second");
-        let names = fs::read_dir(&dir)
-            .unwrap()
-            .map(|entry| entry.unwrap().file_name())
-            .collect::<Vec<_>>();
-        assert_eq!(names, vec![std::ffi::OsString::from("settings.toml")]);
+        assert_eq!(fs::read_to_string(&existing).unwrap(), "interrupted save");
+        assert_eq!(fs::read_dir(&dir).unwrap().count(), 2);
         fs::remove_dir_all(dir).unwrap();
     }
 }
