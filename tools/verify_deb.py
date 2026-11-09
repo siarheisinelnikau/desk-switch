@@ -63,6 +63,7 @@ def check(package):
         assert (extracted / "usr/share/doc/desk-switch/rust-auto-updator-LICENSE").is_file()
         for notice in ["cap-std-LICENSE-MIT", "rfd-LICENSE", "rfd-window-identifier-LICENSE", "fuser-LICENSE-MIT", "nix-LICENSE-MIT", "page-size-LICENSE-MIT", "ref-cast-LICENSE-MIT"]:
             assert (extracted / "usr/share/doc/desk-switch" / notice).read_bytes() == (ROOT / "assets/third-party/file-transfer" / notice).read_bytes()
+        assert (extracted / "usr/share/doc/desk-switch/THIRD-PARTY-NOTICES.md").read_bytes() == (ROOT / "THIRD-PARTY-NOTICES.md").read_bytes()
         print("PASS: Debian metadata, required utilities, fixed password-free policies, pinned update key, menu icon, launcher, package-owned binary and third-party notices")
 
 

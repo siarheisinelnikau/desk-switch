@@ -166,6 +166,8 @@ fn position(ctx: &egui::Context, x: i32, y: i32) -> egui::Rect {
         }
     }
     #[cfg(windows)]
+    // SAFETY: the calls below only read the cursor position and the monitor
+    // metrics of the current desktop.
     unsafe {
         use windows_sys::Win32::{Foundation::POINT, Graphics::Gdi::*, UI::HiDpi::*};
         let point = POINT { x, y };

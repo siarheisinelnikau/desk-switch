@@ -65,6 +65,9 @@ pub struct TrashReceipt {
 // Receipts are short-lived status values. Boxing would add an allocation to
 // every inspection while the largest variant is only a few hundred bytes.
 #[allow(clippy::large_enum_variant)]
+// Recycling a native Move source is only driven by the Windows and Linux paste
+// backends; on macOS the receipt variants are never constructed.
+#[cfg_attr(target_os = "macos", allow(dead_code))]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum TrashStatus {
     Pending,
@@ -167,6 +170,9 @@ pub(super) fn require_hosted_native_scope(quarantine: &Dir) -> Result<()> {
 /// Tests opt into an isolated fake Trash explicitly. Ordinary unit tests can
 /// never reach the user's Trash or the Windows Shell backend.
 #[cfg(test)]
+// The fake Trash helper is only used by the Windows and Linux source-cleanup
+// tests, so the macOS test build never calls it.
+#[cfg_attr(target_os = "macos", allow(dead_code))]
 pub(crate) fn with_test_trash<T>(directory: &Path, action: impl FnOnce() -> T) -> T {
     struct Restore(Option<PathBuf>);
     impl Drop for Restore {
@@ -314,6 +320,8 @@ pub(super) fn require_private_dir(directory: &Dir) -> Result<()> {
     {
         use cap_std::fs::MetadataExt;
         ensure!(
+            // SAFETY: the call takes no arguments and only reads the calling process
+            // credentials.
             metadata.uid() == unsafe { libc::geteuid() } && metadata.mode() & 0o077 == 0,
             "Source Trash storage must be private to this user"
         );
@@ -724,8 +732,12 @@ fn deletion_date() -> Result<String> {
             .duration_since(std::time::UNIX_EPOCH)?
             .as_secs();
         let stamp = libc::time_t::try_from(now)?;
+        // SAFETY: `libc::tm` is a plain C structure of integers and pointers, so
+        // the all-zero bit pattern is a valid value.
         let mut local: libc::tm = unsafe { std::mem::zeroed() };
         ensure!(
+            // SAFETY: `stamp` is a live time value and `local` is a live structure of
+            // the size the call writes.
             !unsafe { libc::localtime_r(&stamp, &mut local) }.is_null(),
             "The local Trash timestamp is unavailable"
         );

@@ -30,6 +30,9 @@ impl Drop for PendingEntry {
 impl super::host::Cursor for WindowsCursor {
     async fn request_toggle(&self) -> Result<()> {
         anyhow::ensure!(
+            // SAFETY: the thread id was captured from the running input
+            // thread, and PostThreadMessage copies its parameters into the
+            // target queue instead of keeping the pointers.
             unsafe { PostThreadMessageW(self.0, win_input::REQUEST_TOGGLE, 0, 0) } != 0,
             "Windows input thread is unavailable"
         );
@@ -65,6 +68,9 @@ impl super::host::Cursor for WindowsCursor {
             .await
             .map_err(|error| anyhow::anyhow!("Windows cursor worker stopped: {error}"))??;
             anyhow::ensure!(
+                // SAFETY: the thread id was captured from the running input
+                // thread, and PostThreadMessage copies its parameters into the
+                // target queue instead of keeping the pointers.
                 unsafe { PostThreadMessageW(self.0, win_input::RESET_ENTRY, 0, 0) } != 0,
                 "Windows input thread is unavailable"
             );
@@ -91,6 +97,8 @@ pub fn run(
         control_tx,
         input_tx,
     )?;
+    // SAFETY: GetCurrentThreadId takes no arguments and returns the id of the
+    // calling thread, which is the thread that owns the hook message queue.
     let hook_thread = unsafe { GetCurrentThreadId() };
     let runtime = crate::runtime()?;
     let thread = std::thread::Builder::new()
@@ -110,6 +118,9 @@ pub fn run(
                     cursor: WindowsCursor(hook_thread, sharing.mouse),
                 },
             ));
+            // SAFETY: the thread id belongs to the hook thread that owns this
+            // message queue, and PostThreadMessage copies its parameters
+            // instead of keeping the pointers.
             unsafe {
                 PostThreadMessageW(hook_thread, WM_QUIT, 0, 0);
             }

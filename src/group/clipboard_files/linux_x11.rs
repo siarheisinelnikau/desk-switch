@@ -218,6 +218,7 @@ impl X11 {
                 .saturating_duration_since(Instant::now())
                 .as_millis()
                 .clamp(1, i32::MAX as u128) as i32;
+            // SAFETY: `fd` is a live descriptor and the call waits for exactly that one.
             let result = unsafe { libc::poll(&mut fd, 1, millis) };
             if result < 0 {
                 let error = std::io::Error::last_os_error();
@@ -455,6 +456,8 @@ impl Owner {
                     revents: 0,
                 },
             ];
+            // SAFETY: the pointer refers to the live vector of exactly `fds.len()`
+            // descriptors and the count matches.
             let ready = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as _, timeout) };
             if ready < 0 {
                 let error = std::io::Error::last_os_error();
@@ -865,6 +868,7 @@ impl Owner {
                 .saturating_duration_since(Instant::now())
                 .as_millis()
                 .clamp(1, i32::MAX as u128) as i32;
+            // SAFETY: `fd` is a live descriptor and the call waits for exactly that one.
             let result = unsafe { libc::poll(&mut fd, 1, wait) };
             if result < 0 {
                 let error = std::io::Error::last_os_error();

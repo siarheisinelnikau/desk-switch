@@ -1,0 +1,8 @@
+blank_issues_enabled: true
+contact_links:
+  - name: User guide
+    url: https://github.com/siarheisinelnikau/desk-switch/blob/main/docs/guide.md
+    about: Installation, pairing, monitor switching and file sharing instructions.
+  - name: Release signing and verification
+    url: https://github.com/siarheisinelnikau/desk-switch/blob/main/docs/signing.md
+    about: How installers are built, signed and promoted.

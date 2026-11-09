@@ -43,6 +43,9 @@ struct Message {
 }
 
 #[link(name = "user32")]
+// SAFETY: The declarations below match the documented `user32.dll` exports with
+// the `WINAPI` (`extern "system"`) calling convention and the exact argument
+// and return types those exports use, so the linker binds the real functions.
 unsafe extern "system" {
     fn OpenClipboard(owner: Handle) -> i32;
     fn CloseClipboard() -> i32;
@@ -75,6 +78,10 @@ unsafe extern "system" {
     fn PostMessageW(window: Handle, message: u32, wparam: usize, lparam: isize) -> i32;
 }
 #[link(name = "kernel32")]
+// SAFETY: The declarations below match the documented `kernel32.dll` exports
+// with the `WINAPI` (`extern "system"`) calling convention and the exact
+// argument and return types those exports use, so the linker binds the real
+// functions.
 unsafe extern "system" {
     fn GlobalAlloc(flags: u32, bytes: usize) -> Handle;
     fn GlobalFree(memory: Handle) -> Handle;
@@ -101,6 +108,9 @@ impl Clipboard {
         // A busy clipboard is a transient worker error. Do not sleep or spin
         // here; the sharing worker retains its pending write and retries later.
         ensure!(
+            // SAFETY: `owner` is either a null HWND, which OpenClipboard accepts, or the
+            // message-only window this process created; the call only borrows the handle
+            // and the returned guard closes the clipboard exactly once.
             unsafe { OpenClipboard(owner) } != 0,
             "Windows clipboard is temporarily busy"
         );
@@ -109,6 +119,9 @@ impl Clipboard {
 }
 impl Drop for Clipboard {
     fn drop(&mut self) {
+        // SAFETY: This guard exists only after a successful `OpenClipboard` on this
+        // thread and Windows allows one open clipboard per thread, so the drop closes
+        // exactly the lock this guard took, and only once.
         unsafe { CloseClipboard() };
     }
 }
@@ -116,6 +129,9 @@ impl Drop for Clipboard {
 struct Locked(Handle);
 impl Locked {
     fn new(memory: Handle) -> Result<(Self, *mut u8)> {
+        // SAFETY: `memory` is a live moveable global-memory handle owned by the
+        // caller, so `GlobalLock` returns a pointer to its locked block that stays
+        // valid until the returned guard unlocks it in `Drop`.
         let data = unsafe { GlobalLock(memory) }.cast::<u8>();
         if data.is_null() {
             return Err(os_error("Could not lock Windows clipboard data"));
@@ -125,6 +141,8 @@ impl Locked {
 }
 impl Drop for Locked {
     fn drop(&mut self) {
+        // SAFETY: `Locked` holds the lock this thread took on `self.0` in
+        // `Locked::new`, and that lock is released exactly once when this guard drops.
         unsafe { GlobalUnlock(self.0) };
     }
 }
@@ -132,16 +150,25 @@ impl Drop for Locked {
 struct Allocation(Handle);
 impl Allocation {
     fn new(bytes: &[u8]) -> Result<Self> {
+        // SAFETY: The flags request a moveable, zero-initialized global block of
+        // exactly `bytes.len()` bytes; a non-null result is owned by the `Allocation`
+        // wrapper and freed exactly once in `Drop`.
         let memory = unsafe { GlobalAlloc(GMEM_MOVEABLE | GMEM_ZEROINIT, bytes.len()) };
         if memory.is_null() {
             return Err(os_error("Could not allocate Windows clipboard data"));
         }
         let allocated = Self(memory);
         let (_lock, data) = Locked::new(memory)?;
+        // SAFETY: `data` points at the locked global block that was allocated with
+        // exactly `bytes.len()` bytes and the source slice is separate Rust memory, so
+        // the copy stays in bounds and does not overlap.
         unsafe { ptr::copy_nonoverlapping(bytes.as_ptr(), data, bytes.len()) };
         Ok(allocated)
     }
     fn publish(mut self, format: u32) -> Result<()> {
+        // SAFETY: The clipboard is open on this thread and `self.0` is a moveable
+        // global block this wrapper owns; on success Windows takes that ownership, and
+        // on failure the block is still freed by `Drop`.
         if unsafe { SetClipboardData(format, self.0) }.is_null() {
             return Err(os_error("Could not publish Windows clipboard files"));
         }
@@ -154,6 +181,9 @@ impl Allocation {
 impl Drop for Allocation {
     fn drop(&mut self) {
         if !self.0.is_null() {
+            // SAFETY: `self.0` is non-null only while this wrapper still owns the
+            // block; `publish` clears it once Windows has taken ownership, so the block is
+            // freed exactly once here.
             unsafe { GlobalFree(self.0) };
         }
     }
@@ -174,19 +204,33 @@ impl Owner {
                     }
                 };
                 if ready.send(Ok(window as usize)).is_err() {
+                    // SAFETY: The window was created on this thread by `Self::window()` and the
+                    // receiver is gone, so this is its only owner and it is destroyed once.
                     unsafe { DestroyWindow(window) };
                     return;
                 }
                 // Other applications can synchronously notify the clipboard
                 // owner when replacing it. Keep this thread in a real message
                 // loop even while the opt-in clipboard worker is asleep.
+                // SAFETY: `Message` is a `repr(C)` struct of integers and a null-able
+                // window handle, so the all-zero bit pattern is a valid value that
+                // `GetMessageW` fills in.
                 let mut message: Message = unsafe { std::mem::zeroed() };
+                // SAFETY: `message` is a live, writable `Message` and `window` is the
+                // message-only window this thread created, so the call fills the struct that
+                // the loop dispatches below.
                 while unsafe { GetMessageW(&mut message, window, 0, 0) } > 0 {
+                    // SAFETY: `message` was filled by the `GetMessageW` call above and is not
+                    // modified in between, so the pointer refers to the message being dispatched.
                     unsafe { DispatchMessageW(&message) };
+                    // SAFETY: `window` is the message-only window created on this thread;
+                    // `IsWindow` only inspects the handle value and never dereferences it.
                     if unsafe { IsWindow(window) } == 0 {
                         return;
                     }
                 }
+                // SAFETY: The window was created by `Self::window()` on this thread, which
+                // owns it, so it is destroyed exactly once when the message loop ends.
                 unsafe { DestroyWindow(window) };
             })?;
         let window = result
@@ -201,6 +245,9 @@ impl Owner {
         // A message-only window is never shown or rendered. EmptyClipboard
         // needs a real owner HWND; opening with NULL for a write would leave
         // the clipboard owner NULL and make SetClipboardData fail.
+        // SAFETY: `class` and `title` are NUL-terminated UTF-16 buffers that outlive
+        // the call, every other argument is a constant, and a non-null result is the
+        // window this thread then owns.
         let window = unsafe {
             CreateWindowExW(
                 0,
@@ -228,6 +275,9 @@ impl Drop for Owner {
         // STATIC's default WM_CLOSE handler destroys the owned window on its
         // message thread; that thread then exits. Do not block a caller or the
         // GUI waiting for shutdown.
+        // SAFETY: `self.0` is the message-only window created on the owner thread
+        // and still alive here; the post only queues a WM_CLOSE for that thread, which
+        // destroys the window.
         unsafe { PostMessageW(self.0, 0x0010, 0, 0) }; // WM_CLOSE
     }
 }
@@ -299,6 +349,8 @@ fn ansi_path(bytes: &[u8]) -> Result<PathBuf> {
     // A legacy ANSI CF_HDROP explicitly uses the user's active Windows code
     // page, not UTF-8. Keep this conversion at the Win32 boundary.
     const MB_ERR_INVALID_CHARS: u32 = 0x0008;
+    // SAFETY: `bytes` is a live slice whose length was converted to `length`,
+    // and the null destination with capacity 0 only asks for the required size.
     let needed = unsafe {
         MultiByteToWideChar(
             0,
@@ -313,6 +365,9 @@ fn ansi_path(bytes: &[u8]) -> Result<PathBuf> {
         return Err(os_error("Could not decode Windows file clipboard paths"));
     }
     let mut wide = vec![0; needed as usize];
+    // SAFETY: `wide` holds exactly the `needed` UTF-16 units the previous call
+    // reported and the call writes at most that many, while `bytes` stays the
+    // live `length`-byte source.
     let written = unsafe {
         MultiByteToWideChar(
             0,
@@ -425,6 +480,8 @@ fn encode_drop(paths: &[PathBuf]) -> Result<Vec<u8>> {
 
 fn preferred_format() -> Result<u32> {
     let name = "Preferred DropEffect\0".encode_utf16().collect::<Vec<_>>();
+    // SAFETY: `name` is a NUL-terminated UTF-16 buffer that outlives the call,
+    // which only reads it and returns the registered format id.
     let format = unsafe { RegisterClipboardFormatW(name.as_ptr()) };
     if format == 0 {
         return Err(os_error("Could not register Windows file clipboard format"));
@@ -451,21 +508,31 @@ fn drop_operation(bytes: Option<&[u8]>) -> Result<Option<Operation>> {
 
 fn preferred_operation(_clipboard: &Clipboard) -> Result<Option<Operation>> {
     let format = preferred_format()?;
+    // SAFETY: The clipboard is open on this thread for the whole call, so this
+    // query sees the same format set that the reads below observe.
     if unsafe { IsClipboardFormatAvailable(format) } == 0 {
         return drop_operation(None);
     }
+    // SAFETY: The clipboard is open on this thread for the whole call, so
+    // `GetClipboardData` returns the moveable global block that holds this
+    // format; it stays valid until the clipboard is closed and is locked before it
+    // is read.
     let memory = unsafe { GetClipboardData(format) };
     if memory.is_null() {
         return Err(os_error(
             "Could not read Windows file clipboard drop effect",
         ));
     }
+    // SAFETY: `memory` is the non-null moveable global block returned by
+    // `GetClipboardData`, and `GlobalSize` only reports the size of that block.
     let length = unsafe { GlobalSize(memory) };
     ensure!(
         (4..=MAX_METADATA).contains(&length),
         "Windows file clipboard drop effect is malformed"
     );
     let (_lock, bytes) = Locked::new(memory)?;
+    // SAFETY: `bytes` is the locked global block whose `GlobalSize` is `length`,
+    // and the `_lock` guard keeps it locked and alive while the slice is read.
     drop_operation(Some(unsafe { std::slice::from_raw_parts(bytes, length) }))
 }
 
@@ -479,6 +546,8 @@ fn sequence_matches(expected: Option<u64>, actual: u32) -> bool {
 }
 
 pub(super) fn read() -> Result<Option<super::Selection>> {
+    // SAFETY: The call only inspects the current clipboard format list and needs
+    // no open clipboard; `CF_HDROP` is the standard file-drop format id.
     if unsafe { IsClipboardFormatAvailable(CF_HDROP) } == 0 {
         return Ok(None);
     }
@@ -488,10 +557,14 @@ pub(super) fn read() -> Result<Option<super::Selection>> {
 fn read_locked(clipboard: &Clipboard, suppress_provider: bool) -> Result<Option<super::Selection>> {
     // Formats may change between IsClipboardFormatAvailable and OpenClipboard.
     // Both Preferred DropEffect and CF_HDROP must be read under this same lock.
+    // SAFETY: The clipboard is open on this thread for the whole call, so this
+    // query sees the same format set that the reads below observe.
     if unsafe { IsClipboardFormatAvailable(CF_HDROP) } == 0 {
         return Ok(None);
     }
     let Some(operation) = preferred_operation(clipboard)? else {
+        // SAFETY: The call only reads the clipboard's serial number; it takes no
+        // pointer and needs no open clipboard.
         let sequence = u64::from(unsafe { GetClipboardSequenceNumber() });
         ensure!(
             sequence != 0,
@@ -505,20 +578,30 @@ fn read_locked(clipboard: &Clipboard, suppress_provider: bool) -> Result<Option<
             operation: Operation::Copy,
         }));
     };
+    // SAFETY: The clipboard is open on this thread for the whole call, so
+    // `GetClipboardData` returns the moveable global block that holds the
+    // CF_HDROP selection; it stays valid until the clipboard is closed and is
+    // locked before it is read.
     let memory = unsafe { GetClipboardData(CF_HDROP) };
     if memory.is_null() {
         return Err(os_error("Could not read Windows clipboard files"));
     }
+    // SAFETY: `memory` is the non-null moveable global block returned by
+    // `GetClipboardData`, and `GlobalSize` only reports the size of that block.
     let length = unsafe { GlobalSize(memory) };
     ensure!(
         (DROP_HEADER + 2..=MAX_METADATA).contains(&length),
         "File clipboard data exceeds the 1 MiB limit or is malformed"
     );
     let (_lock, bytes) = Locked::new(memory)?;
+    // SAFETY: `bytes` is the locked global block whose `GlobalSize` is `length`,
+    // and the `_lock` guard keeps it locked and alive while the slice is decoded.
     let mut paths = decode_drop(unsafe { std::slice::from_raw_parts(bytes, length) })?;
     if suppress_provider && cloud::owns_paths(&paths) {
         paths.clear();
     }
+    // SAFETY: The call only reads the clipboard's serial number; it takes no
+    // pointer and needs no open clipboard.
     let sequence = u64::from(unsafe { GetClipboardSequenceNumber() });
     ensure!(
         sequence != 0,
@@ -551,6 +634,8 @@ pub(super) fn clear_cut_if_current(paths: &[PathBuf], expected: u64) -> Result<b
             *owner = Some(Owner::create()?);
         }
         let clipboard = Clipboard::open(owner.as_ref().unwrap().0)?;
+        // SAFETY: The clipboard is open on this thread, so this serial read is
+        // protected by the same native lock as the empty below.
         if !sequence_matches(Some(expected), unsafe { GetClipboardSequenceNumber() }) {
             return Ok(false);
         }
@@ -564,6 +649,9 @@ pub(super) fn clear_cut_if_current(paths: &[PathBuf], expected: u64) -> Result<b
             return Ok(false);
         }
         ensure!(
+            // SAFETY: The clipboard is open on this thread for the whole call, and
+            // `EmptyClipboard` only drops the formats the current owner published under
+            // that lock.
             unsafe { EmptyClipboard() } != 0,
             "Could not clear the completed Cut selection"
         );
@@ -612,14 +700,21 @@ fn publish_paths(
         // This check is protected by the same native lock as EmptyClipboard.
         // A newer local copy cannot be overwritten between comparison and
         // publication by another application.
+        // SAFETY: The clipboard is open on this thread, so this serial read is
+        // protected by the same native lock as the empty below.
         if !sequence_matches(expected, unsafe { GetClipboardSequenceNumber() }) {
             return Ok(None);
         }
+        // SAFETY: The clipboard is open on this thread and the publication below
+        // re-fills it, so no other application can observe or replace the contents in
+        // between.
         if unsafe { EmptyClipboard() } == 0 {
             return Err(os_error("Could not prepare Windows file clipboard"));
         }
         effect.publish(format)?;
         files.publish(CF_HDROP)?;
+        // SAFETY: The call only reads the clipboard's serial number; it takes no
+        // pointer and needs no open clipboard.
         let sequence = u64::from(unsafe { GetClipboardSequenceNumber() });
         ensure!(
             sequence != 0,
@@ -779,6 +874,8 @@ mod tests {
             }
         }
         fn remember(&self) -> u64 {
+            // SAFETY: The call only reads the clipboard's serial number; it takes no
+            // pointer and needs no open clipboard.
             let sequence = u64::from(unsafe { GetClipboardSequenceNumber() });
             assert_ne!(sequence, 0);
             self.last_sequence.set(sequence);
@@ -821,6 +918,8 @@ mod tests {
                 );
                 let _clipboard = Clipboard::open(owner)?;
                 ensure!(
+                    // SAFETY: The fixture holds the clipboard open on this thread for the
+                    // whole publication and re-fills every format it wants afterwards.
                     unsafe { EmptyClipboard() } != 0,
                     "Could not empty fixture clipboard"
                 );
@@ -834,6 +933,8 @@ mod tests {
                     text.publish(CF_UNICODETEXT)?;
                 }
                 ensure!(
+                    // SAFETY: The call only reads the current clipboard owner handle and
+                    // compares it with the fixture's own window handle.
                     unsafe { GetClipboardOwner() } == owner,
                     "Fixture HWND did not own clipboard"
                 );
@@ -847,13 +948,19 @@ mod tests {
         fn assert_formats(&self, expect_files: bool, expect_text: bool) -> Result<()> {
             let clipboard = Clipboard::open(ptr::null_mut())?;
             ensure!(
+                // SAFETY: The call only inspects the clipboard's format list and needs no
+                // open clipboard.
                 (unsafe { IsClipboardFormatAvailable(CF_HDROP) } != 0) == expect_files,
                 "Unexpected CF_HDROP availability"
             );
             ensure!(
+                // SAFETY: The call only inspects the clipboard's format list and needs no
+                // open clipboard.
                 (unsafe { IsClipboardFormatAvailable(CF_UNICODETEXT) } != 0) == expect_text,
                 "Unexpected text availability"
             );
+            // SAFETY: The call only inspects the clipboard's format list, and
+            // `preferred_format` returns a format id registered with Windows.
             let effect_present = unsafe { IsClipboardFormatAvailable(preferred_format()?) } != 0;
             ensure!(
                 effect_present == expect_files,
@@ -866,6 +973,8 @@ mod tests {
                 );
             }
             ensure!(
+                // SAFETY: The call only reads the clipboard's serial number; it takes no
+                // pointer and needs no open clipboard.
                 u64::from(unsafe { GetClipboardSequenceNumber() }) == self.last_sequence.get(),
                 "Clipboard changed outside the fixture"
             );
@@ -873,14 +982,21 @@ mod tests {
         }
         fn text(&self) -> Result<String> {
             let _clipboard = Clipboard::open(ptr::null_mut())?;
+            // SAFETY: The fixture holds the clipboard open on this thread for the whole
+            // call, so the returned moveable global block stays valid until it is locked
+            // and read below.
             let memory = unsafe { GetClipboardData(CF_UNICODETEXT) };
             ensure!(!memory.is_null(), "Fixture text is missing");
+            // SAFETY: `memory` is the non-null moveable global block returned by
+            // `GetClipboardData`, and `GlobalSize` only reports the size of that block.
             let length = unsafe { GlobalSize(memory) };
             ensure!(
                 (2..=4096).contains(&length),
                 "Fixture text has an invalid size"
             );
             let (_lock, bytes) = Locked::new(memory)?;
+            // SAFETY: `bytes` is the locked global block whose `GlobalSize` is `length`,
+            // and the `_lock` guard keeps it locked and alive while the slice is decoded.
             let bytes = unsafe { std::slice::from_raw_parts(bytes, length) };
             let units = bytes
                 .as_chunks::<2>()
@@ -902,32 +1018,41 @@ mod tests {
             if expected != 0 {
                 let deadline = Instant::now() + Duration::from_secs(2);
                 loop {
-                    let cleaned = OWNER
-                        .try_with(|slot| {
-                            let slot = slot.borrow();
-                            let Some(owner) = slot.as_ref() else {
-                                return true;
-                            };
-                            if unsafe { GetClipboardOwner() } != owner.0
+                    let cleaned =
+                        OWNER
+                            .try_with(|slot| {
+                                let slot = slot.borrow();
+                                let Some(owner) = slot.as_ref() else {
+                                    return true;
+                                };
+                                // SAFETY: The call only reads the current clipboard owner handle and
+                                // compares it with the fixture's own window handle.
+                                if unsafe { GetClipboardOwner() } != owner.0
+                                // SAFETY: The call only reads the clipboard's serial number, which confirms
+                                // that the fixture still owns the publication it made.
                                 || !sequence_matches(Some(expected), unsafe {
                                     GetClipboardSequenceNumber()
-                                })
-                            {
-                                return true;
-                            }
-                            let Ok(_clipboard) = Clipboard::open(owner.0) else {
-                                return false;
-                            };
-                            if unsafe { GetClipboardOwner() } == owner.0
+                                }) {
+                                    return true;
+                                }
+                                let Ok(_clipboard) = Clipboard::open(owner.0) else {
+                                    return false;
+                                };
+                                // SAFETY: The call only reads the current clipboard owner handle and
+                                // compares it with the fixture's own window handle.
+                                if unsafe { GetClipboardOwner() } == owner.0
+                                // SAFETY: The call only reads the clipboard's serial number, which confirms
+                                // that the fixture still owns the publication it made.
                                 && sequence_matches(Some(expected), unsafe {
                                     GetClipboardSequenceNumber()
-                                })
-                            {
-                                unsafe { EmptyClipboard() };
-                            }
-                            true
-                        })
-                        .unwrap_or(true);
+                                }) {
+                                    // SAFETY: The fixture holds the clipboard open on this thread and only
+                                    // empties it while it still owns the exact publication it made.
+                                    unsafe { EmptyClipboard() };
+                                }
+                                true
+                            })
+                            .unwrap_or(true);
                     if cleaned || Instant::now() >= deadline {
                         break;
                     }
@@ -1002,6 +1127,8 @@ mod tests {
         assert!(!native_retry(|| write_if_current(&paths, copied)));
         native_retry(|| fixture.assert_formats(false, true));
         assert_eq!(native_retry(|| fixture.text()), "A newer local copy");
+        // SAFETY: The call only reads the clipboard's serial number; it takes no
+        // pointer and needs no open clipboard.
         assert_eq!(u64::from(unsafe { GetClipboardSequenceNumber() }), newer);
 
         // Matching acknowledgements replace all formats together; no stale
