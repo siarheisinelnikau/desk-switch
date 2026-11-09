@@ -71,9 +71,14 @@ impl Harness {
     }
 
     fn provider(&self) -> Provider {
-        let id = "12".repeat(16);
+        let provider = self.unregistered_provider("12".repeat(16));
+        let handle = job_id(&provider.remote.id, &provider.remote.peer);
+        register_remote_offer(&self.core, &handle, &provider.remote).unwrap();
+        provider
+    }
+
+    fn unregistered_provider(&self, id: String) -> Provider {
         let peer = self.peer_key();
-        let handle = job_id(&id, &peer);
         let remote = Arc::new(RemoteState {
             id,
             workspace: self.core.trust.lock().unwrap().workspace_id.clone(),
@@ -88,11 +93,6 @@ impl Harness {
             retired: Mutex::new(None),
             fetch: Mutex::new(None),
         });
-        {
-            let mut state = self.core.lazy.lock().unwrap();
-            state.remote = Some(handle.clone());
-            state.remotes.insert(handle, remote.clone());
-        }
         Provider {
             core: Arc::downgrade(&self.core),
             remote,
@@ -262,15 +262,10 @@ fn a_full_completion_queue_leaves_the_result_retryable_and_queues_it_once() {
     assert!(harness.commands.try_recv().is_err());
 }
 
-#[tokio::test(flavor = "current_thread")]
-async fn dropping_the_last_fetch_removes_its_native_cache() {
-    let mut harness = Harness::new(4);
-    let provider = harness.provider();
-    let session = provider.begin(intent()).unwrap();
-    let fetch = harness.take_begin();
+fn prepare_native_cache(harness: &Harness, fetch: &Fetch) -> Vec<PathBuf> {
     let manifest = Manifest {
         version: protocol::MANIFEST_VERSION,
-        id: "34".repeat(16),
+        id: fetch.wire.clone(),
         name: "Files".into(),
         roots: vec!["Files".into()],
         entries: vec![protocol::Entry {
@@ -281,13 +276,61 @@ async fn dropping_the_last_fetch_removes_its_native_cache() {
     };
     let cache = harness.core.dir.join("file-transfer/native-cache");
     let stage = cache.join(format!(".partial-{}", manifest.id));
-    let receive = storage::Receive::open(&cache, manifest, "peer", "workspace").unwrap();
+    let remote = fetch.remote.upgrade().unwrap();
+    let mut receive =
+        storage::Receive::open(&cache, manifest, &remote.peer, &remote.workspace).unwrap();
+    let mut paths = receive.finish().unwrap();
+    paths.push(stage);
     fetch.state.lock().unwrap().verified = Some(Arc::new(Mutex::new(receive)));
-    assert!(stage.exists());
+    assert!(paths.iter().all(|path| path.is_dir()));
+    paths
+}
+
+#[test]
+fn dropping_the_last_fetch_removes_its_native_cache() {
+    let mut harness = Harness::new(4);
+    let provider = harness.provider();
+    let session = provider.begin(intent()).unwrap();
+    let fetch = harness.take_begin();
+    let paths = prepare_native_cache(&harness, &fetch);
+
     drop(session);
     *provider.remote.fetch.lock().unwrap() = None;
     drop(fetch);
-    assert!(!stage.exists());
+
+    assert!(paths.iter().all(|path| !path.exists()));
+}
+
+#[test]
+fn registering_an_offer_evicts_the_retired_fetch_and_its_cache() {
+    let mut harness = Harness::new(4);
+    let provider = harness.provider();
+    let session = provider.begin(intent()).unwrap();
+    let fetch = harness.take_begin();
+    let paths = prepare_native_cache(&harness, &fetch);
+
+    retired_remote(&harness.core, &provider.remote.peer, &provider.remote.id);
+    *provider.remote.retired.lock().unwrap() = Some(Instant::now() - OFFER_GRACE);
+    let retired = Arc::downgrade(&provider.remote);
+    drop((session, fetch, provider));
+    assert_eq!(retired.strong_count(), 1);
+
+    let next = harness.unregistered_provider("56".repeat(16));
+    let handle = job_id(&next.remote.id, &next.remote.peer);
+    let core = harness.core.clone();
+    let (registered, result) = std::sync::mpsc::channel();
+    let worker = std::thread::spawn(move || {
+        let _ = registered.send(register_remote_offer(&core, &handle, &next.remote));
+    });
+    result
+        .recv_timeout(Duration::from_secs(5))
+        .expect("The next offer should register without deadlocking on cache cleanup")
+        .unwrap();
+    worker.join().unwrap();
+
+    assert!(retired.upgrade().is_none());
+    assert_eq!(test_remote_count(&harness.core), 1);
+    assert!(paths.iter().all(|path| !path.exists()));
 }
 
 #[tokio::test(flavor = "current_thread")]

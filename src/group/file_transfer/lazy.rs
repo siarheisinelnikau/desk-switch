@@ -1008,48 +1008,18 @@ pub(super) async fn incoming_offer(
         pipe.send(&Packet::Queued).await?;
         return Ok(());
     }
-    let offer = {
-        let mut state = core.lazy.lock().unwrap();
-        ensure!(
-            !state.remotes.contains_key(&handle),
-            "The copied offer is already being registered"
-        );
-        if let Some(previous) = state
-            .remote
-            .take()
-            .and_then(|old| state.remotes.get(&old).cloned())
-        {
-            previous.active.store(false, Ordering::Release);
-            *previous.retired.lock().unwrap() = Some(Instant::now());
-        }
-        state.remotes.retain(|_, value| {
-            value.active.load(Ordering::Acquire)
-                || value
-                    .retired
-                    .lock()
-                    .unwrap()
-                    .is_none_or(|retired| retired.elapsed() < OFFER_GRACE)
-                || Arc::strong_count(value) > 1
-        });
-        ensure!(
-            state.remotes.len() < MAX_JOBS,
-            "Too many copied file providers are still in use"
-        );
-        let remote = Arc::new(RemoteState {
-            id,
-            workspace: trust.workspace_id.clone(),
-            peer,
-            stamp,
-            operation,
-            description,
-            active: AtomicBool::new(true),
-            retired: Mutex::new(None),
-            fetch: Mutex::new(None),
-        });
-        state.remote = Some(handle.clone());
-        state.remotes.insert(handle.clone(), remote.clone());
-        remote
-    };
+    let offer = Arc::new(RemoteState {
+        id,
+        workspace: trust.workspace_id,
+        peer,
+        stamp,
+        operation,
+        description,
+        active: AtomicBool::new(true),
+        retired: Mutex::new(None),
+        fetch: Mutex::new(None),
+    });
+    register_remote_offer(&core, &handle, &offer)?;
     let provider = Arc::new(Provider {
         core: Arc::downgrade(&core),
         remote: offer.clone(),
@@ -1062,6 +1032,46 @@ pub(super) async fn incoming_offer(
         provider,
     }));
     pipe.send(&Packet::Queued).await?;
+    Ok(())
+}
+
+fn register_remote_offer(core: &Core, handle: &str, offer: &Arc<RemoteState>) -> Result<()> {
+    let expired;
+    {
+        let mut state = core.lazy.lock().unwrap();
+        ensure!(
+            !state.remotes.contains_key(handle),
+            "The copied offer is already being registered"
+        );
+        if let Some(previous) = state
+            .remote
+            .take()
+            .and_then(|old| state.remotes.get(&old).cloned())
+        {
+            previous.active.store(false, Ordering::Release);
+            *previous.retired.lock().unwrap() = Some(Instant::now());
+        }
+        expired = state
+            .remotes
+            .extract_if(.., |_, remote| {
+                !remote.active.load(Ordering::Acquire)
+                    && remote
+                        .retired
+                        .lock()
+                        .unwrap()
+                        .is_some_and(|retired| retired.elapsed() >= OFFER_GRACE)
+                    && Arc::strong_count(remote) == 1
+            })
+            .collect::<Vec<_>>();
+        ensure!(
+            state.remotes.len() < MAX_JOBS,
+            "Too many copied file providers are still in use"
+        );
+        state.remote = Some(handle.into());
+        state.remotes.insert(handle.into(), offer.clone());
+    }
+    // An evicted offer can own the last Fetch, whose cache cleanup locks lazy.
+    drop(expired);
     Ok(())
 }
 

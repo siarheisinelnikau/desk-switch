@@ -66,6 +66,19 @@ fn validate_image(image: &HardState) -> Result<Workspace> {
     )
 }
 
+fn restore_workspace(engine: &Engine) -> Result<Workspace> {
+    let (index, term, data) = engine.committed();
+    let mut state: Workspace = serde_json::from_slice(data)?;
+    // A proposal embeds the previous authority, and an election barrier can
+    // commit the legacy snapshot as-is. Restore the actual committed stamp.
+    state.authority = (index > 0).then(|| Authority {
+        workspace_id: engine.hard_state().workspace_id.clone(),
+        term,
+        index,
+    });
+    Ok(state)
+}
+
 fn validate_rpc_data(engine: &Engine, rpc: &crate::group::consensus::Rpc) -> Result<()> {
     use crate::group::consensus::Message;
     ensure!(
@@ -300,7 +313,7 @@ struct Control {
     connected_once: bool,
     state_dirty: bool,
     auto_dirty: bool,
-    last_directory: Option<BTreeMap<String, SocketAddr>>,
+    directory_snapshot: BTreeMap<String, SocketAddr>,
     last_reconnect: BTreeMap<String, String>,
     #[cfg(test)]
     fail_commit_persist: bool,
@@ -599,13 +612,22 @@ impl Control {
                 )
             })
             .collect();
-        if self.last_directory.as_ref() == Some(&locations) {
-            return;
+        let changed = self.directory_snapshot != locations;
+        if changed {
+            self.directory_snapshot = locations;
         }
-        self.last_directory = Some(locations.clone());
-        for (key, link) in &*self.links {
-            if self.canonical.members.contains_key(key) {
-                let _ = link.commands.try_send(Packet::Directory(locations.clone()));
+        for (key, link) in &mut self.links.active {
+            if changed {
+                link.directory_queued = false;
+            }
+            // Retry on the next event or tick when a session's queue is full.
+            // Reserving first avoids cloning a map that cannot be queued yet.
+            if !link.directory_queued
+                && self.directory_snapshot.contains_key(key)
+                && let Ok(permit) = link.commands.try_reserve()
+            {
+                permit.send(Packet::Directory(self.directory_snapshot.clone()));
+                link.directory_queued = true;
             }
         }
     }
@@ -822,7 +844,6 @@ impl Control {
         self.last_reconnect.remove(&key);
         self.state_dirty = true;
         self.auto_dirty = true;
-        self.last_directory = None;
         self.observed.insert(key.clone(), member.clone());
         let _ = send(
             &self.links,
@@ -1308,13 +1329,7 @@ pub(super) async fn run(
     };
     let canonical = engine
         .as_ref()
-        .map(|engine| {
-            serde_json::from_slice::<Workspace>(
-                engine
-                    .committed_data()
-                    .unwrap_or(engine.hard_state().snapshot.as_slice()),
-            )
-        })
+        .map(restore_workspace)
         .transpose()?
         .unwrap_or_else(|| state.clone());
     let mut control = Control {
@@ -1341,7 +1356,7 @@ pub(super) async fn run(
         connected_once: false,
         state_dirty: true,
         auto_dirty: true,
-        last_directory: None,
+        directory_snapshot: Default::default(),
         last_reconnect: BTreeMap::new(),
         #[cfg(test)]
         fail_commit_persist: false,
@@ -1462,7 +1477,162 @@ pub(super) async fn run(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::group::consensus::{Entry, Message, Rpc};
+    use crate::group::{
+        consensus::{Entry, Message, Rpc},
+        net::tests::synthetic_session,
+    };
+
+    fn test_control(state: Workspace) -> Control {
+        let own = state.hub.clone();
+        let local = state.members[&own].clone();
+        let (events, _) = mpsc::channel();
+        let (incoming, _) = queue::channel(8);
+        Control {
+            own: own.clone(),
+            dir: PathBuf::new(),
+            identity: config::Identity {
+                private: [0; 32],
+                public: [0; 32],
+            },
+            local: local.clone(),
+            canonical: state.clone(),
+            visible: state,
+            observed: [(own, local)].into(),
+            locations: Default::default(),
+            engine: None,
+            saved: None,
+            admission: None,
+            links: Default::default(),
+            internal: Internal {
+                sender: incoming,
+                dialing: Default::default(),
+            },
+            notify: Notify {
+                events,
+                snapshot: Default::default(),
+                clipboard: Default::default(),
+                ctx: egui::Context::default(),
+            },
+            receipts: Default::default(),
+            actions: Default::default(),
+            additions: Default::default(),
+            joining: None,
+            last_coordination: None,
+            clock: Instant::now(),
+            connected_once: true,
+            state_dirty: true,
+            auto_dirty: true,
+            directory_snapshot: Default::default(),
+            last_reconnect: Default::default(),
+            fail_commit_persist: false,
+        }
+    }
+
+    #[test]
+    fn directory_retries_only_blocked_sessions_with_current_addresses() {
+        let mut control = test_control(model::tests::fixture(4));
+        let peers = control
+            .canonical
+            .members
+            .keys()
+            .filter(|key| *key != &control.own)
+            .cloned()
+            .collect::<Vec<_>>();
+        let blocked = &peers[0];
+        let healthy = &peers[1];
+        let offline = &peers[2];
+        let (blocked_link, mut blocked_queue) = synthetic_session(3);
+        blocked_link.commands.try_send(Packet::Ping).unwrap();
+        assert!(
+            control
+                .links
+                .install(blocked.clone(), blocked_link)
+                .unwrap()
+        );
+        let (healthy_link, mut healthy_queue) = synthetic_session(1);
+        assert!(
+            control
+                .links
+                .install(healthy.clone(), healthy_link)
+                .unwrap()
+        );
+        let directory = |queue: &mut queue::Receiver<Packet>| {
+            let Packet::Directory(locations) = queue.try_recv().unwrap() else {
+                panic!("Expected a workspace address directory");
+            };
+            locations
+        };
+
+        control.directory();
+        let mut expected = directory(&mut healthy_queue);
+        assert_eq!(expected.len(), 3);
+        assert!(!expected.contains_key(offline));
+        control.directory();
+        assert!(healthy_queue.try_recv().is_err());
+
+        // Supersede the first map while the other link is still blocked.
+        let new_address = "192.0.2.2:45880".parse().unwrap();
+        control.locations.insert(healthy.clone(), new_address);
+        expected.insert(healthy.clone(), new_address);
+        control.directory();
+        assert_eq!(directory(&mut healthy_queue), expected);
+        assert!(matches!(blocked_queue.try_recv().unwrap(), Packet::Ping));
+
+        control.directory();
+        assert_eq!(directory(&mut blocked_queue), expected);
+        assert!(healthy_queue.try_recv().is_err());
+
+        // The authenticated replacement has its own queue, even at the
+        // same address. Neither the other peer nor the retired link retries.
+        let (replacement, mut replacement_queue) = synthetic_session(2);
+        assert!(control.links.install(blocked.clone(), replacement).unwrap());
+        control.directory();
+        assert_eq!(directory(&mut replacement_queue), expected);
+        assert!(blocked_queue.try_recv().is_err());
+        assert!(healthy_queue.try_recv().is_err());
+    }
+
+    #[test]
+    fn restart_recovers_the_committed_authority_without_electing_a_coordinator() {
+        let legacy = model::tests::fixture(3);
+        let own = legacy.hub.clone();
+        let genesis = HardState::bootstrap(
+            own.clone(),
+            legacy.members.keys().cloned().collect(),
+            serde_json::to_vec(&legacy).unwrap(),
+        )
+        .unwrap();
+        let uncommitted = Engine::new(own.clone(), genesis.clone(), 0).unwrap();
+        assert_eq!(restore_workspace(&uncommitted).unwrap(), legacy);
+
+        let mut expected = legacy;
+        expected.authority = Some(Authority {
+            workspace_id: own.clone(),
+            term: 1,
+            index: 1,
+        });
+        for compacted in [false, true] {
+            let mut hard = genesis.clone();
+            hard.term = 2;
+            hard.commit_index = 1;
+            if compacted {
+                hard.snapshot_index = 1;
+                hard.snapshot_term = 1;
+            } else {
+                hard.entries.push(Entry {
+                    index: 1,
+                    term: 1,
+                    barrier: true,
+                    data: Vec::new(),
+                    configuration: None,
+                });
+            }
+            let restarted = Engine::new(own.clone(), hard, 0).unwrap();
+            assert_eq!(restore_workspace(&restarted).unwrap(), expected);
+            assert!(restarted.leader().is_none());
+            assert!(!restarted.writable());
+        }
+    }
 
     #[test]
     fn approved_queued_observation_waits_for_prior_membership_without_gaining_authority() {
@@ -1508,48 +1678,9 @@ mod tests {
         assert_eq!(engine.committed().0, 2);
         assert!(engine.hard_state().configuration.joint.is_some());
         assert!(engine.busy(), "The prior admission has not finalized");
-        let local = admitted.members[&own].clone();
-        let (events, _) = mpsc::channel();
-        let (incoming, _) = queue::channel(8);
-        let mut control = Control {
-            own: own.clone(),
-            dir: PathBuf::new(),
-            identity: config::Identity {
-                private: [0; 32],
-                public: [0; 32],
-            },
-            local: local.clone(),
-            canonical: admitted.clone(),
-            visible: admitted,
-            observed: [(own, local)].into(),
-            locations: Default::default(),
-            engine: Some(engine),
-            saved: None,
-            admission: None,
-            links: Default::default(),
-            internal: Internal {
-                sender: incoming,
-                dialing: Default::default(),
-            },
-            notify: Notify {
-                events,
-                snapshot: Default::default(),
-                clipboard: Default::default(),
-                ctx: egui::Context::default(),
-            },
-            receipts: Default::default(),
-            actions: Default::default(),
-            additions: [all.members[&keys[2]].clone()].into(),
-            joining: None,
-            last_coordination: None,
-            clock: Instant::now(),
-            connected_once: true,
-            state_dirty: true,
-            auto_dirty: true,
-            last_directory: None,
-            last_reconnect: Default::default(),
-            fail_commit_persist: false,
-        };
+        let mut control = test_control(admitted);
+        control.engine = Some(engine);
+        control.additions.push_back(all.members[&keys[2]].clone());
         let mut observation = all.members[&keys[2]].clone();
         observation.node.name = "Approved pending computer".into();
         control
