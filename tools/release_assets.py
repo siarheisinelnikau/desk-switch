@@ -5,13 +5,16 @@ import re
 def asset_names(version):
     if not re.fullmatch(r"(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)", version):
         raise ValueError("Expected a stable semantic release version")
+    version_parts = tuple(map(int, version.split(".")))
+    # Preserve the names embedded in earlier signed manifests.
+    windows_suffix = "-windows-x86-64" if version_parts < (0, 8, 1) else ""
     names = {
-        "windows-x86_64": f"desk-switch-v{version}-windows-x86-64.exe",
+        "windows-x86_64": f"desk-switch-v{version}{windows_suffix}.exe",
         "linux-x86_64-deb": f"desk-switch-v{version}-linux-x86-64.deb",
     }
     # Preserve the signed historical matrices. macOS returns in 0.6.2 after
     # the Windows/Ubuntu-only releases between 0.5.0 and that version.
-    if version == "0.5.0" or tuple(map(int, version.split("."))) >= (0, 6, 2):
+    if version == "0.5.0" or version_parts >= (0, 6, 2):
         names.update({
             "macos-arm64-app": f"desk-switch-v{version}-macos-arm64.zip",
             "macos-x86_64-app": f"desk-switch-v{version}-macos-x86-64.zip",
