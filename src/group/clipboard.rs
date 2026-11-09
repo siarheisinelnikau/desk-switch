@@ -162,11 +162,10 @@ fn native_sequence() -> Option<u64> {
     autoreleasepool(|_| {
         // NSPasteboard can be used on the clipboard worker, just as arboard
         // does. Match its nullable lookup for non-GUI/launchd environments.
-        let pasteboard: Option<Retained<NSPasteboard>> = unsafe {
+        let pasteboard: Option<Retained<NSPasteboard>> =
             // SAFETY: the message takes no arguments and returns a retained
             // pasteboard, which the optional keeps owned.
-            msg_send![NSPasteboard::class(), generalPasteboard]
-        };
+            unsafe { msg_send![NSPasteboard::class(), generalPasteboard] };
         pasteboard.and_then(|pasteboard| u64::try_from(pasteboard.changeCount()).ok())
     })
 }
