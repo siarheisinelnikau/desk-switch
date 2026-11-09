@@ -40,6 +40,8 @@ pub struct Update {
     pub ready: bool,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub prepared: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub independent_install: bool,
     pub checking: bool,
     pub installing: bool,
     pub failed: bool,

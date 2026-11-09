@@ -38,6 +38,7 @@ impl Desktop {
                 ready: self.update_ready,
                 prepared: self.prepared_update.is_some()
                     || (self.update_ready && self.candidate_update.is_none()),
+                independent_install: true,
                 checking: self.update_job.is_some(),
                 installing: self.install_pending
                     || self.install_job.is_some()
@@ -152,7 +153,7 @@ impl Desktop {
         Ok(())
     }
     pub(super) fn check_remote_updates(&mut self, ctx: &egui::Context) {
-        self.peer_update_status = None;
+        self.clear_remote_update_result(&self.peer_key.clone());
         if let Err(error) = self.send_management(Message::CheckUpdates { id: request_id() }, ctx) {
             self.notice = Some((error.to_string(), true));
         }
@@ -302,33 +303,6 @@ impl Desktop {
                     "The other PC did not acknowledge the request. Reconnect and try again.".into(),
                     true,
                 ));
-            } else {
-                ctx.request_repaint_after(remaining);
-            }
-        }
-        if let Some((version, since)) = &self.peer_restart {
-            let confirmed = self
-                .pair
-                .remote
-                .as_ref()
-                .and_then(|node| node.version.as_ref())
-                .is_some_and(|installed| installed.app == *version);
-            let remaining = Duration::from_secs(120).saturating_sub(since.elapsed());
-            if confirmed {
-                self.peer_update_status = Some((
-                    format!("The other PC is now running version {version}."),
-                    false,
-                ));
-                self.peer_restart = None;
-                self.group.update_target = None;
-            } else if remaining.is_zero() {
-                self.peer_update_status = Some((
-                    "The other PC has not reconnected after installation. Check it and reconnect."
-                        .into(),
-                    true,
-                ));
-                self.peer_restart = None;
-                self.group.update_target = None;
             } else {
                 ctx.request_repaint_after(remaining);
             }

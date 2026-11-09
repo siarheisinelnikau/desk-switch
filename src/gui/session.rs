@@ -423,16 +423,7 @@ impl Desktop {
                     self.prefs.workspace.peer_name = name;
                     self.prefs.workspace.last_address = address.to_string();
                     self.pair.connection_restored(address);
-                    if let Some(message) = self
-                        .paired_update
-                        .as_ref()
-                        .and_then(workspace::update::Coordinator::retry)
-                    {
-                        self.apply_update_effects(
-                            vec![workspace::update::Effect::Send(message)],
-                            ctx,
-                        );
-                    }
+                    self.retry_updates_for(&self.peer_key);
                     let _ = self.prefs.save(&self.dir);
                 }
                 Event::State(remote) => {
@@ -443,8 +434,12 @@ impl Desktop {
                     self.pair.remote = Some(*remote);
                     self.apply_input_monitor_requirement();
                 }
-                Event::Update(message) => self.receive_update(message, ctx),
-                Event::UpdateSent(message) => self.sent_update(&message, ctx),
+                Event::Update(message) => {
+                    self.receive_update_from(&self.peer_key.clone(), message, ctx)
+                }
+                Event::UpdateSent(message) => {
+                    self.sent_update_to(&self.peer_key.clone(), &message, ctx)
+                }
                 Event::Management(message) => self.receive_management(message, ctx),
                 Event::Forgotten => self.apply_forget(),
                 Event::Closed(error) => {
@@ -689,6 +684,7 @@ impl Desktop {
         self.stop_pair();
         self.pair.last_remote = None;
         self.paired_update = None;
+        self.remote_updates.remove(&self.peer_key);
         let result: Result<()> = (|| {
             if self.dir.join("peer").exists() {
                 std::fs::remove_file(self.dir.join("peer"))?;

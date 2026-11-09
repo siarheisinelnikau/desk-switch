@@ -871,5 +871,8 @@
   "When updating several computers, prepare them first. Install on the other computers before restarting this one.": "При обновлении нескольких ПК сначала подготовьте их. Установите обновление на других ПК, затем перезапустите этот.",
   "Full diagnostics include computer names, network addresses, settings and recent logs.": "Полная диагностика включает имена ПК, сетевые адреса, настройки и последние записи журнала.",
   "Sharing paused on this computer.": "Общий доступ на этом компьютере приостановлен.",
-  "Sharing resumed on this computer.": "Общий доступ на этом компьютере возобновлён."
+  "Sharing resumed on this computer.": "Общий доступ на этом компьютере возобновлён.",
+  "Update required": "Требуется обновление",
+  "Update both computers to compatible versions before connecting.": "Обновите оба компьютера до совместимых версий перед подключением.",
+  "Prepare updates to download them without restarting. Each computer installs independently.": "Подготовьте обновления, чтобы скачать их без перезапуска. Каждый компьютер обновляется отдельно."
 }
