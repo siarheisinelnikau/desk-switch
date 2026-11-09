@@ -113,7 +113,7 @@ Use **Ctrl+X** followed by **Ctrl+V** for a move. Desk Switch preserves original
 
 The progress window shows **Receiving files**, verification and any confirmed source cleanup separately. **Files transferred** reports the completed transfer between computers; the file manager controls writing into its final destination. Desk Switch reports **Copied** or **Moved** only when the required native confirmation and cleanup are complete. A newer local clipboard copy is preserved; reconnecting does not republish an older offer. Shared clipboard is off by default. Disabling it stops new offers and publication, and received content is not forwarded repeatedly.
 
-On **GNOME Wayland**, enable the bundled **Desk Switch Tray** companion once in the GNOME **Extensions** app. After installing the Debian package, log out and back in if GNOME has not discovered the extension. After an upgrade, toggle the extension off and on to load its current file-paste support. The companion supplies both the clipboard bridge and the requested tray click behavior. Without it, Desk Switch reports that sharing is unavailable on that session. Windows and supported X11 sessions use their native file clipboard backends. **Native file paste into Finder is unavailable on macOS**; text/images and explicit **Send files…** remain available, including sending files to a Mac.
+On **GNOME Wayland**, enable the bundled **Desk Switch Tray** companion once in the GNOME **Extensions** app. Log out and back in if GNOME has not discovered the extension or if the Debian package updated it. The companion supplies both the clipboard bridge and the tray click behavior. Without it, Desk Switch reports that sharing is unavailable on that session. Windows and supported X11 sessions use their native file clipboard backends. **Native file paste into Finder is unavailable on macOS**; text/images and explicit **Send files…** remain available, including sending files to a Mac.
 
 ## Files and folders
 
@@ -145,7 +145,7 @@ There is **one shared physical monitor** for the workspace. Its rectangle follow
 
 Offline displays and displays without a unique native geometry remain listed as unavailable. They do not receive edge handoffs; other mapped displays can still be arranged. Changes in geometry, layout or input generation invalidate stale handoffs. If an optional pointer placement fails, the current input session remains usable and the error is shown. Ordinary same-computer transitions stay under the OS's control.
 
-On **Ubuntu GNOME Wayland**, geometry comes from Mutter and must match the portal's EIS regions. Enable **Desk Switch Tray** for read-only initial pointer observation. After an upgrade from an older companion, toggle it off and on in **Extensions**, or sign out and back in, to load the new version. A missing or unsupported mapping disables that edge; relative input, manual switching and F12 remain available. No additional screen-capture permission or DDC polling is requested for arrangement.
+On **Ubuntu GNOME Wayland**, geometry comes from Mutter and must match the portal's EIS regions. Enable **Desk Switch Tray** for read-only initial pointer observation. After an upgrade from an older companion, sign out and back in to load the new version. A missing or unsupported mapping disables that edge; relative input, manual switching and F12 remain available. No additional screen-capture permission or DDC polling is requested for arrangement.
 
 ## Optional shared monitor
 
@@ -169,7 +169,7 @@ Use **Quit application** from quick controls or the native tray menu to release 
 
 On **Ubuntu GNOME**, enable **Desk Switch Tray** once in GNOME **Extensions** for left-click popup and right-click native-menu behavior. Log out and back in if the newly installed extension is not listed yet. Other desktops need an AppIndicator/StatusNotifier host and may apply their own click policy.
 
-After a companion update, toggle **Desk Switch Tray** off and on in **Extensions**, or sign out and back in, to load the new code. The application window uses X11/XWayland when available so closing it can hide it in the tray and quick controls can be positioned beside the indicator. This does not change native Wayland keyboard/mouse capture. A desktop without XWayland cannot provide these window-hiding and placement operations through the current native Wayland window backend.
+After a companion update, sign out of Ubuntu and back in to load the new extension code. The application window uses X11/XWayland when available so closing it can hide it in the tray and quick controls can be positioned beside the indicator. This does not change native Wayland keyboard/mouse capture. A desktop without XWayland cannot provide these window-hiding and placement operations through the current native Wayland window backend.
 
 Login startup is enabled after the first launch and can be disabled in Settings for any selected computer. Startup uses that computer's saved profile and auto-connect choice.
 
@@ -189,7 +189,7 @@ Recent service logs and diagnostics are synchronized over authenticated, encrypt
 
 Two files in the state directory help when the application stops before the report can be copied. `panic-report.txt` holds the last panic with its message, location and backtrace. `diagnostics.log` holds the recent service messages and is only written when it is requested with the environment variable `DESK_SWITCH_DIAGNOSTICS_LOG=1`; it is rotated at two megabytes and keeps one previous file. It can contain computer names, file paths and network addresses, so review it before sharing. The state directory is printed by the `state-dir` command.
 
-When upgrading from **0.8.x to 0.9.1**, upgrade every member before resuming sharing. Native device protocol is **9** and workspace protocol is **3**. Settings and saved membership carry forward. Use **Settings → Updates** locally on a computer that cannot reconnect because it still uses the older workspace protocol. Adjacent stable patch releases in the same minor series can share devices when their protocols match.
+When upgrading from **0.8.x to 0.9.x**, upgrade every member before resuming sharing. Native device protocol is **9** and workspace protocol is **3**. Settings and saved membership carry forward. Use **Settings → Updates** locally on a computer that cannot reconnect because it still uses the older workspace protocol. Adjacent stable patch releases in the same minor series can share devices when their protocols match.
 
 When migrating an older workspace that has yet to establish its canonical membership, bring the **original coordinating computer online on the new version with a trusted quorum** once. It may be upgraded first or last. After this migration, any surviving majority can coordinate. Settings, identities and display arrangements are preserved.
 
