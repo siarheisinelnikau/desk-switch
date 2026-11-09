@@ -297,38 +297,8 @@ fn validate_job_id(id: &str) -> Result<()> {
     protocol::valid_id(export)?;
     crate::group::model::valid_key(peer)
 }
-fn listener(port: u16) -> Result<std::net::TcpListener> {
-    let socket = socket2::Socket::new(
-        socket2::Domain::IPV6,
-        socket2::Type::STREAM,
-        Some(socket2::Protocol::TCP),
-    )
-    .and_then(|socket| {
-        socket.set_only_v6(false)?;
-        #[cfg(unix)]
-        socket.set_reuse_address(true)?;
-        socket.bind(&SocketAddr::from(([0, 0, 0, 0, 0, 0, 0, 0], port)).into())?;
-        Ok(socket)
-    })
-    .or_else(|error| {
-        if !crate::listen::ipv6_unavailable(&error) {
-            return Err(error);
-        }
-        let socket = socket2::Socket::new(
-            socket2::Domain::IPV4,
-            socket2::Type::STREAM,
-            Some(socket2::Protocol::TCP),
-        )?;
-        // Windows must not share a native service port: two profiles binding
-        // the same file-transfer port would split authenticated connections.
-        #[cfg(unix)]
-        socket.set_reuse_address(true)?;
-        socket.bind(&SocketAddr::from(([0, 0, 0, 0], port)).into())?;
-        Ok::<_, std::io::Error>(socket)
-    })?;
-    socket.listen(8)?;
-    socket.set_nonblocking(true)?;
-    Ok(socket.into())
+fn listener(port: u16) -> std::io::Result<std::net::TcpListener> {
+    crate::listen::wildcard_tcp(port, 8)
 }
 impl Service {
     pub fn start(dir: PathBuf, ctx: egui::Context) -> Result<Self> {

@@ -1,12 +1,20 @@
-//! Native data listeners accept both address families without changing concrete
+//! Service listeners accept both address families without changing concrete
 //! interface binds or the authenticated protocols layered on the TCP stream.
 use socket2::{Domain, Protocol, Socket, Type};
 use std::{
     io,
-    net::{Ipv4Addr, Ipv6Addr, SocketAddr},
+    net::{Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener},
 };
 
 pub fn tcp(address: SocketAddr) -> io::Result<tokio::net::TcpListener> {
+    tokio::net::TcpListener::from_std(tcp_std(address, 16)?)
+}
+
+pub(crate) fn wildcard_tcp(port: u16, backlog: i32) -> io::Result<TcpListener> {
+    tcp_std(SocketAddr::from((Ipv6Addr::UNSPECIFIED, port)), backlog)
+}
+
+fn tcp_std(address: SocketAddr, backlog: i32) -> io::Result<TcpListener> {
     let socket = if address.ip().is_unspecified() {
         bind_socket(
             SocketAddr::from((Ipv6Addr::UNSPECIFIED, address.port())),
@@ -25,8 +33,9 @@ pub fn tcp(address: SocketAddr) -> io::Result<tokio::net::TcpListener> {
     } else {
         bind_socket(address, false)?
     };
+    socket.listen(backlog)?;
     socket.set_nonblocking(true)?;
-    tokio::net::TcpListener::from_std(socket.into())
+    Ok(socket.into())
 }
 
 fn bind_socket(address: SocketAddr, dual_stack: bool) -> io::Result<Socket> {
@@ -43,11 +52,10 @@ fn bind_socket(address: SocketAddr, dual_stack: bool) -> io::Result<Socket> {
     #[cfg(unix)]
     socket.set_reuse_address(true)?;
     socket.bind(&address.into())?;
-    socket.listen(16)?;
     Ok(socket)
 }
 
-pub(crate) fn ipv6_unavailable(error: &io::Error) -> bool {
+fn ipv6_unavailable(error: &io::Error) -> bool {
     if matches!(
         error.kind(),
         io::ErrorKind::Unsupported | io::ErrorKind::AddrNotAvailable
@@ -172,5 +180,72 @@ mod tests {
         let local = listener.local_addr().unwrap();
         let error = tcp(SocketAddr::from((Ipv6Addr::UNSPECIFIED, local.port()))).unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::AddrInUse);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn wildcard_listener_refuses_to_fall_back_from_an_occupied_ipv6_port() {
+        let holder =
+            Socket::new(Domain::IPV6, Type::STREAM, Some(Protocol::TCP)).and_then(|socket| {
+                socket.set_only_v6(true)?;
+                socket.bind(&SocketAddr::from((Ipv6Addr::UNSPECIFIED, 0)).into())?;
+                socket.listen(8)?;
+                Ok(socket)
+            });
+        let holder = match holder {
+            Ok(socket) => socket,
+            Err(error) if ipv6_unavailable(&error) => return,
+            Err(error) => panic!("Could not occupy an IPv6-only port: {error}"),
+        };
+        let port = holder.local_addr().unwrap().as_socket().unwrap().port();
+        let ipv4 = TcpListener::bind((Ipv4Addr::UNSPECIFIED, port))
+            .expect("The IPv4 side of the test port must be available");
+        drop(ipv4);
+        let error = wildcard_tcp(port, 8).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::AddrInUse);
+    }
+
+    #[test]
+    fn workspace_control_services_reject_an_occupied_service_port() {
+        let holder = wildcard_tcp(0, 8).unwrap();
+        let port = holder.local_addr().unwrap().port();
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let profile = std::env::temp_dir().join(format!(
+            "desk-switch-control-listener-{}-{nonce}",
+            std::process::id()
+        ));
+        let identity = crate::config::create_identity(&profile).unwrap();
+        let mut member = crate::group::model::tests::fixture(2)
+            .members
+            .into_values()
+            .next()
+            .unwrap();
+        member.node.key = crate::config::hex(&identity.public);
+        let ctx = eframe::egui::Context::default();
+        let paired = crate::workspace::net::Service::start(
+            profile.clone(),
+            member.node.clone(),
+            port,
+            ctx.clone(),
+        );
+        let coordinated =
+            crate::group::net::Service::start(profile.join("workspace"), member, port, ctx);
+        let failures = [
+            ("paired control", paired.err()),
+            ("workspace coordination", coordinated.err()),
+        ];
+        std::fs::remove_file(profile.join("identity")).unwrap();
+        std::fs::remove_dir(profile).unwrap();
+        for (service, failure) in failures {
+            let error = failure.unwrap_or_else(|| panic!("{service} fell back to IPv4"));
+            assert_eq!(
+                error.downcast_ref::<io::Error>().map(io::Error::kind),
+                Some(io::ErrorKind::AddrInUse),
+                "{service} failed for a different reason: {error:#}"
+            );
+        }
     }
 }

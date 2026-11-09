@@ -4,13 +4,13 @@ use crate::{
     Config, InstallOptions,
     download::check_cancel,
     github::Release,
-    verify::{hash, verify_executable, verify_pe_subsystem},
+    verify::{hash, hash_reader, verify_executable, verify_pe_subsystem},
 };
 use serde::{Deserialize, Serialize};
 use std::{
     fs,
     io::Write,
-    os::windows::{ffi::OsStrExt, process::CommandExt},
+    os::windows::{ffi::OsStrExt, fs::OpenOptionsExt, process::CommandExt},
     path::{Path, PathBuf},
     process::Command,
     ptr,
@@ -22,7 +22,7 @@ use windows_sys::Win32::{
     Foundation::{
         CloseHandle, ERROR_INVALID_PARAMETER, GetLastError, HANDLE, WAIT_OBJECT_0, WAIT_TIMEOUT,
     },
-    Storage::FileSystem::ReplaceFileW,
+    Storage::FileSystem::{FILE_SHARE_READ, ReplaceFileW},
     System::Threading::{
         CREATE_NO_WINDOW, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE,
         QueryFullProcessImageNameW, WaitForSingleObject,
@@ -50,6 +50,8 @@ pub struct Prepared {
     directory: PathBuf,
     handed_off: bool,
     options: InstallOptions,
+    helper_digest: String,
+    helper_size: u64,
 }
 
 impl Prepared {
@@ -165,7 +167,7 @@ pub(crate) fn prepare_cancellable(
             original_sha: hash(&target)?,
             target,
             parent_pid: std::process::id(),
-            new_sha: expected,
+            new_sha: expected.clone(),
             version: release.version.to_string(),
             restart_args: Some(options.restart_args.clone()),
             rollback_args: Some(options.rollback_args.clone()),
@@ -181,6 +183,8 @@ pub(crate) fn prepare_cancellable(
             directory: directory.clone(),
             handed_off: false,
             options: options.clone(),
+            helper_digest: expected,
+            helper_size: release.executable.size,
         })
     })();
     if result.is_err() {
@@ -193,11 +197,25 @@ pub fn handoff(prepared: &mut Prepared) -> Result<(), String> {
     if prepared.handed_off {
         return Err("The update has already been handed off.".into());
     }
-    Command::new(prepared.directory.join(&prepared.options.helper_name))
+    let path = prepared.directory.join(&prepared.options.helper_name);
+    // Keep the verified file open until CreateProcess has loaded the image.
+    // Allow the loader to read it while blocking writes and replacements.
+    let helper = fs::OpenOptions::new()
+        .read(true)
+        .share_mode(FILE_SHARE_READ)
+        .open(&path)
+        .map_err(|e| format!("Could not open the staged update helper: {e}"))?;
+    if helper.metadata().map_err(|e| e.to_string())?.len() != prepared.helper_size
+        || hash_reader(&helper)? != prepared.helper_digest
+    {
+        return Err("The staged update helper failed SHA-256 verification.".into());
+    }
+    Command::new(path)
         .arg("--apply-update")
         .creation_flags(CREATE_NO_WINDOW)
         .spawn()
         .map_err(|e| format!("Could not start the update helper: {e}"))?;
+    drop(helper);
     prepared.handed_off = true;
     Ok(())
 }
@@ -253,6 +271,8 @@ pub fn apply_legacy_update(
         directory: directory.clone(),
         handed_off: false,
         options: config.install.clone(),
+        helper_digest: expected.clone(),
+        helper_size: size,
     };
     let destination = directory.join(&config.install.helper_name);
     fs::copy(&staged, &destination).map_err(|e| e.to_string())?;
@@ -862,6 +882,27 @@ fn smoke_replacement(config: &Config, query_denied: bool, fail_health: bool) -> 
 #[cfg(test)]
 mod stage_directory_tests {
     use super::*;
+
+    #[test]
+    fn handoff_rejects_a_changed_helper_before_launch() {
+        let options = InstallOptions::default();
+        let directory = new_stage(&std::env::temp_dir(), &options).unwrap();
+        let helper = directory.join(&options.helper_name);
+        fs::write(&helper, b"verified update").unwrap();
+        let mut prepared = Prepared {
+            directory,
+            handed_off: false,
+            options,
+            helper_digest: hash(&helper).unwrap(),
+            helper_size: fs::metadata(&helper).unwrap().len(),
+        };
+        fs::write(&helper, b"tampered update").unwrap();
+        assert_eq!(
+            handoff(&mut prepared).unwrap_err(),
+            "The staged update helper failed SHA-256 verification."
+        );
+        assert!(!prepared.handed_off);
+    }
 
     #[test]
     fn preparations_in_the_same_clock_tick_get_independent_folders() {
