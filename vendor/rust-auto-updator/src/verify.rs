@@ -32,11 +32,14 @@ pub fn single_asset_checksum(text: &str, executable_name: &str) -> Result<String
 }
 
 pub fn hash(path: &Path) -> Result<String, String> {
-    let mut file = fs::File::open(path).map_err(|e| e.to_string())?;
+    hash_reader(fs::File::open(path).map_err(|e| e.to_string())?)
+}
+
+pub(crate) fn hash_reader(mut reader: impl Read) -> Result<String, String> {
     let mut hash = Sha256::new();
     let mut bytes = [0u8; 64 * 1024];
     loop {
-        let n = file.read(&mut bytes).map_err(|e| e.to_string())?;
+        let n = reader.read(&mut bytes).map_err(|e| e.to_string())?;
         if n == 0 {
             break;
         }

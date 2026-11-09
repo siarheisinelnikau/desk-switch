@@ -174,6 +174,7 @@ pub fn run_at(start_hidden: bool, dir: PathBuf) -> Result<()> {
             return Err(error).context(ALREADY_OPEN);
         }
     };
+    crate::diagnostics_log::enable_if_requested(&dir);
     let icon = egui::IconData {
         rgba: tray::icon_rgba(64),
         width: 64,
