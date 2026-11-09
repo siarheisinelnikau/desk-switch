@@ -871,5 +871,8 @@
   "When updating several computers, prepare them first. Install on the other computers before restarting this one.": "Pour mettre à jour plusieurs ordinateurs, préparez-les d’abord. Installez la mise à jour sur les autres ordinateurs avant de redémarrer celui-ci.",
   "Full diagnostics include computer names, network addresses, settings and recent logs.": "Le diagnostic complet contient les noms des ordinateurs, les adresses réseau, les réglages et les journaux récents.",
   "Sharing paused on this computer.": "Partage en pause sur cet ordinateur.",
-  "Sharing resumed on this computer.": "Partage repris sur cet ordinateur."
+  "Sharing resumed on this computer.": "Partage repris sur cet ordinateur.",
+  "Update required": "Mise à jour requise",
+  "Update both computers to compatible versions before connecting.": "Mettez les deux ordinateurs à jour vers des versions compatibles avant de les connecter.",
+  "Prepare updates to download them without restarting. Each computer installs independently.": "Préparez les mises à jour pour les télécharger sans redémarrer. Chaque ordinateur les installe indépendamment."
 }

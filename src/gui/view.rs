@@ -2370,9 +2370,9 @@ impl Desktop {
             .or(self.pair.last_remote.as_ref())
             .cloned();
         let connected = self.pair.remote.is_some();
-        let busy =
-            self.paired_update.is_some() || self.install_job.is_some() || self.install_pending;
-        let peer_busy = busy || self.peer_restart.is_some() || self.management_pending.is_some();
+        let busy = self.update_action_busy();
+        let peer_busy =
+            self.update_target_busy(&self.peer_key) || self.management_pending.is_some();
         let peer_name = self.settings_peer_name();
         let mut check = false;
         let mut install_local = false;
@@ -2382,7 +2382,7 @@ impl Desktop {
                 subheading(ui, "Обновления");
                 check = ui
                     .add_enabled(
-                        !busy && self.management_pending.is_none(),
+                        !busy || connected && !peer_busy,
                         egui::Button::new(crate::i18n::tr("Проверить обновления")),
                     )
                     .clicked();
@@ -2406,10 +2406,10 @@ impl Desktop {
                     .as_ref()
                     .map(|state| state.update.clone())
                     .unwrap_or_default();
-                if let Some((status, failed)) = &self.peer_update_status {
-                    update.status = status.clone();
-                    update.failed = *failed;
-                    update.installing |= self.peer_restart.is_some();
+                if let Some(operation) = self.remote_updates.get(&remote.key) {
+                    let (status, failed) = operation.status();
+                    update.status = status;
+                    update.failed = failed;
                 } else if !connected {
                     update.status =
                         "The other PC is disconnected. Reconnect it to manage updates.".into();
@@ -2465,8 +2465,11 @@ impl Desktop {
             );
         });
         if check {
-            self.check_updates(ui.ctx());
+            if !busy {
+                self.check_updates(ui.ctx());
+            }
             if connected
+                && !peer_busy
                 && remote
                     .as_ref()
                     .is_some_and(|node| node.management.is_some())
@@ -2478,7 +2481,7 @@ impl Desktop {
             self.install_update(ui.ctx());
         }
         if install_remote {
-            self.start_remote_update(ui.ctx());
+            self.start_remote_update();
         }
     }
 }

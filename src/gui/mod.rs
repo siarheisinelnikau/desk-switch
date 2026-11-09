@@ -130,8 +130,7 @@ pub struct Desktop {
     cable_remote_done: bool,
     settings_remote: bool,
     management_pending: Option<management::Pending>,
-    peer_restart: Option<(String, Instant)>,
-    peer_update_status: Option<(String, bool)>,
+    remote_updates: std::collections::BTreeMap<String, paired_update::RemoteUpdate>,
     presented: bool,
     discovery: Option<crate::discovery::Discovery>,
     discovered: std::collections::BTreeMap<String, crate::discovery::Peer>,
@@ -325,8 +324,7 @@ impl Desktop {
             cable_remote_done: false,
             settings_remote: false,
             management_pending: None,
-            peer_restart: None,
-            peer_update_status: None,
+            remote_updates: Default::default(),
             presented: false,
             discovery: None,
             discovered: std::collections::BTreeMap::new(),
@@ -847,7 +845,7 @@ impl Desktop {
                             "Installed version is newer than the latest signed release ({version})."
                         )
                     };
-                    self.fail_paired_download(
+                    self.fail_paired_update(
                         "The requested signed update is not available on this PC.".into(),
                         ctx,
                     );
@@ -855,7 +853,7 @@ impl Desktop {
                 Ok(crate::updater::Outcome::Unpublished) => {
                     self.update_failed = false;
                     self.update_status = "Канал настроен. Релизы ещё не опубликованы.".into();
-                    self.fail_paired_download("No signed release is available.".into(), ctx);
+                    self.fail_paired_update("No signed release is available.".into(), ctx);
                 }
                 Ok(crate::updater::Outcome::Available(candidate)) => {
                     let version = candidate.version().to_owned();
@@ -896,7 +894,7 @@ impl Desktop {
                 }
                 Err(error) => {
                     self.update_failed = true;
-                    self.fail_paired_download(format!("{error:#}"), ctx);
+                    self.fail_paired_update(format!("{error:#}"), ctx);
                     self.update_status = update_failure_status(preparing, &error);
                 }
             }
@@ -946,6 +944,7 @@ impl Desktop {
             }
         }
         self.tick_paired_update(ctx);
+        self.tick_remote_updates(ctx);
         self.tick_management(ctx);
         self.tick_cable(ctx);
         if let Some(service) = &self.pair.service {
@@ -1192,7 +1191,7 @@ impl Desktop {
             || self.quitting
         {
             self.download_action = None;
-            self.fail_paired_download(
+            self.fail_paired_update(
                 "Another update operation is already in progress.".into(),
                 ctx,
             );
@@ -1218,7 +1217,7 @@ impl Desktop {
             Err(error) => {
                 self.download_action = None;
                 self.update_failed = true;
-                self.fail_paired_download(error.to_string(), ctx);
+                self.fail_paired_update(error.to_string(), ctx);
                 self.update_status = update_failure_status(true, &error);
             }
         }

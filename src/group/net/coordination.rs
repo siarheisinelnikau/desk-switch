@@ -682,6 +682,28 @@ impl Control {
         .map_err(local_failure)
     }
     fn connection_error(&mut self, key: String, error: anyhow::Error, outgoing: bool) {
+        if let Some(mismatch) = error.downcast_ref::<WorkspaceProtocolMismatch>() {
+            if !outgoing && !self.trusted().contains(&mismatch.key) {
+                return;
+            }
+            let reason = mismatch.to_string();
+            let previous = self
+                .trusted()
+                .contains(&mismatch.key)
+                .then(|| {
+                    self.last_reconnect
+                        .insert(mismatch.key.clone(), reason.clone())
+                })
+                .flatten();
+            if key.is_empty() || previous.as_deref() != Some(&reason) {
+                self.notify.event(Event::IncompatibleWorkspace {
+                    key: mismatch.key.clone(),
+                    address: mismatch.address,
+                    version: mismatch.version.clone(),
+                });
+            }
+            return;
+        }
         if key.is_empty() {
             if outgoing {
                 self.user_error(&self.own, error);
@@ -926,6 +948,7 @@ impl Control {
                     "Invalid saved computer address"
                 );
                 if !expected.is_empty() && !self.links.contains_key(&expected) {
+                    self.last_reconnect.remove(&expected);
                     // Keep an explicit endpoint even when an earlier cached
                     // dial currently holds this peer's single-flight permit.
                     // The next retry still authenticates the saved identity.
@@ -1003,7 +1026,7 @@ impl Control {
         )?;
         if let Some((target, message)) = update {
             if target == self.own {
-                self.notify.event(Event::UpdateSent(message));
+                self.notify.event(Event::UpdateSent { target, message });
             } else {
                 self.receipts.remember(target, message);
             }
@@ -1139,7 +1162,10 @@ impl Control {
                 );
                 message.validate()?;
                 if self.receipts.confirm(key, &message) {
-                    self.notify.event(Event::UpdateSent(message));
+                    self.notify.event(Event::UpdateSent {
+                        target: key.to_owned(),
+                        message,
+                    });
                 }
             }
             Packet::Clipboard {

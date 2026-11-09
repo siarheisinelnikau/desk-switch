@@ -871,5 +871,8 @@
   "When updating several computers, prepare them first. Install on the other computers before restarting this one.": "When updating several computers, prepare them first. Install on the other computers before restarting this one.",
   "Full diagnostics include computer names, network addresses, settings and recent logs.": "Full diagnostics include computer names, network addresses, settings and recent logs.",
   "Sharing paused on this computer.": "Sharing paused on this computer.",
-  "Sharing resumed on this computer.": "Sharing resumed on this computer."
+  "Sharing resumed on this computer.": "Sharing resumed on this computer.",
+  "Update required": "Update required",
+  "Update both computers to compatible versions before connecting.": "Update both computers to compatible versions before connecting.",
+  "Prepare updates to download them without restarting. Each computer installs independently.": "Prepare updates to download them without restarting. Each computer installs independently."
 }
