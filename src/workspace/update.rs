@@ -4,12 +4,23 @@ use std::time::{Duration, Instant};
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub enum Message {
-    Prepare { id: u64, version: String },
+    Prepare {
+        id: u64,
+        version: String,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        install_when_ready: bool,
+    },
     Ready(u64),
     Commit(u64),
-    Installing { id: u64, authorization: bool },
+    Installing {
+        id: u64,
+        authorization: bool,
+    },
     Handoff(u64),
-    Failed { id: u64, message: String },
+    Failed {
+        id: u64,
+        message: String,
+    },
     Cancel(u64),
 }
 impl Message {
@@ -77,6 +88,7 @@ pub struct Coordinator {
     phase: Phase,
     authorization: bool,
     remote_authorization: bool,
+    install_when_ready: bool,
     pub handed_off: bool,
     progress: Instant,
     peer_lost: Option<Instant>,
@@ -93,17 +105,24 @@ impl Coordinator {
             phase: Phase::AwaitReady,
             authorization: local_linux,
             remote_authorization: remote_linux,
+            install_when_ready: false,
             handed_off: false,
             progress: Instant::now(),
             peer_lost: None,
         }
     }
-    pub fn peer_only(id: u64, version: String, remote_linux: bool) -> Self {
+    pub fn peer_only(
+        id: u64,
+        version: String,
+        remote_linux: bool,
+        install_when_ready: bool,
+    ) -> Self {
         let mut update = Self::outgoing(id, version, false, remote_linux);
         update.side = Side::Initiator {
             local_first: false,
             local_update: false,
         };
+        update.install_when_ready = install_when_ready;
         update
     }
     pub fn remote_only(&self) -> bool {
@@ -115,15 +134,30 @@ impl Coordinator {
             }
         )
     }
+    pub fn updates_both(&self) -> bool {
+        matches!(
+            self.side,
+            Side::Initiator {
+                local_update: true,
+                ..
+            }
+        )
+    }
     pub fn without_password(mut self) -> Self {
         self.authorization = false;
         self.remote_authorization = false;
         self
     }
-    pub fn incoming(id: u64, version: String, authorization: bool) -> Result<Self> {
+    pub fn incoming(
+        id: u64,
+        version: String,
+        authorization: bool,
+        install_when_ready: bool,
+    ) -> Result<Self> {
         Message::Prepare {
             id,
             version: version.clone(),
+            install_when_ready,
         }
         .validate()?;
         ensure!(
@@ -138,6 +172,7 @@ impl Coordinator {
             phase: Phase::Download,
             authorization,
             remote_authorization: false,
+            install_when_ready,
             handed_off: false,
             progress: Instant::now(),
             peer_lost: None,
@@ -148,6 +183,7 @@ impl Coordinator {
             Phase::AwaitReady => Message::Prepare {
                 id: self.id,
                 version: self.version.clone(),
+                install_when_ready: self.install_when_ready,
             },
             Phase::Ready => Message::Ready(self.id),
             Phase::InstallQueued | Phase::Installing if self.side == Side::Receiver => {
@@ -165,6 +201,9 @@ impl Coordinator {
         match self.phase {
             Phase::AwaitReady if self.remote_only() => {
                 "Preparing the signed update on the other PC…"
+            }
+            Phase::Download if self.install_when_ready => {
+                "Downloading and verifying the signed update…"
             }
             Phase::AwaitReady | Phase::Download => "Preparing the same signed update on both PCs…",
             Phase::Ready => "Update verified. Waiting for the other PC…",
@@ -218,6 +257,18 @@ impl Coordinator {
                     authorization: self.authorization,
                 })])
             }
+            (
+                Side::Initiator {
+                    local_update: false,
+                    ..
+                },
+                Phase::AwaitReady,
+                Message::Installing { authorization, .. },
+            ) => {
+                self.phase = Phase::AwaitRemote;
+                self.remote_authorization = authorization;
+                Ok(vec![])
+            }
             (Side::Initiator { .. }, Phase::AwaitRemoteStart, Message::Installing { .. }) => {
                 self.phase = Phase::Done;
                 Ok(vec![Effect::Quit])
@@ -230,17 +281,36 @@ impl Coordinator {
                 self.remote_authorization = authorization;
                 Ok(vec![])
             }
-            (Side::Initiator { .. }, Phase::AwaitRemote, Message::Handoff(_)) => {
-                if self.remote_only() {
-                    self.phase = Phase::Done;
-                    return Ok(vec![Effect::PeerRestart(self.version.clone())]);
-                }
+            (
+                Side::Initiator {
+                    local_update: false,
+                    ..
+                },
+                Phase::AwaitReady | Phase::AwaitRemote,
+                Message::Handoff(_),
+            ) => {
+                self.phase = Phase::Done;
+                Ok(vec![Effect::PeerRestart(self.version.clone())])
+            }
+            (
+                Side::Initiator {
+                    local_update: true, ..
+                },
+                Phase::AwaitRemote,
+                Message::Handoff(_),
+            ) => {
                 self.phase = Phase::Installing;
                 Ok(vec![Effect::Install])
             }
-            (Side::Receiver, Phase::Download | Phase::Ready, Message::Prepare { version, .. })
-                if version == self.version =>
-            {
+            (
+                Side::Receiver,
+                Phase::Download | Phase::Ready | Phase::InstallQueued | Phase::Installing,
+                Message::Prepare {
+                    version,
+                    install_when_ready,
+                    ..
+                },
+            ) if version == self.version && install_when_ready == self.install_when_ready => {
                 Ok(self.retry().map(Effect::Send).into_iter().collect())
             }
             (_, _, Message::Failed { message, .. }) => Ok(self.fail(message, false)),
@@ -267,9 +337,22 @@ impl Coordinator {
                 true,
             );
         }
-        self.phase = Phase::Ready;
         self.progress = Instant::now();
-        vec![Effect::Send(Message::Ready(self.id))]
+        if self.install_when_ready {
+            // The authenticated request already authorized this computer's
+            // installation. Its sender can restart or disconnect during download.
+            self.phase = Phase::Installing;
+            vec![
+                Effect::Send(Message::Installing {
+                    id: self.id,
+                    authorization: self.authorization,
+                }),
+                Effect::Install,
+            ]
+        } else {
+            self.phase = Phase::Ready;
+            vec![Effect::Send(Message::Ready(self.id))]
+        }
     }
     pub fn sent(&mut self, message: &Message) -> Vec<Effect> {
         if message.id() != self.id || self.side != Side::Receiver {
@@ -293,6 +376,10 @@ impl Coordinator {
         self.handed_off = true;
         self.progress = Instant::now();
         match self.side {
+            Side::Receiver if self.install_when_ready => {
+                self.phase = Phase::Done;
+                vec![Effect::Send(Message::Handoff(self.id)), Effect::Quit]
+            }
             Side::Receiver => {
                 self.phase = Phase::SendingHandoff;
                 vec![Effect::Send(Message::Handoff(self.id))]
@@ -373,7 +460,7 @@ mod tests {
     #[test]
     fn windows_waits_for_ubuntu_authorization_and_verified_installation() {
         let mut windows = Coordinator::outgoing(1, next_version(), false, true);
-        let mut ubuntu = Coordinator::incoming(1, next_version(), true).unwrap();
+        let mut ubuntu = Coordinator::incoming(1, next_version(), true, false).unwrap();
         assert_eq!(ubuntu.prepared("99.0.0"), [Effect::Send(Message::Ready(1))]);
         assert_eq!(
             windows.receive(Message::Ready(1)).unwrap(),
@@ -460,7 +547,7 @@ mod tests {
     }
     #[test]
     fn receiver_requires_the_exact_signed_release_and_explicit_commit() {
-        let mut peer = Coordinator::incoming(3, next_version(), false).unwrap();
+        let mut peer = Coordinator::incoming(3, next_version(), false, false).unwrap();
         assert!(peer.receive(Message::Commit(3)).is_err());
         assert!(
             peer.prepared("99.0.1")
@@ -468,7 +555,7 @@ mod tests {
                 .all(|e| *e != Effect::Install)
         );
         assert!(peer.done());
-        let mut peer = Coordinator::incoming(4, next_version(), false).unwrap();
+        let mut peer = Coordinator::incoming(4, next_version(), false, false).unwrap();
         peer.prepared("99.0.0");
         assert!(peer.receive(Message::Commit(3)).is_err());
         let notice = Message::Installing {
@@ -484,8 +571,9 @@ mod tests {
     #[test]
     fn updating_only_the_peer_never_installs_or_quits_the_initiator() {
         for linux in [false, true] {
-            let mut local = Coordinator::peer_only(20, next_version(), linux).without_password();
-            let mut peer = Coordinator::incoming(20, next_version(), false).unwrap();
+            let mut local =
+                Coordinator::peer_only(20, next_version(), linux, false).without_password();
+            let mut peer = Coordinator::incoming(20, next_version(), false, false).unwrap();
             assert!(local.remote_only());
             assert_eq!(
                 local.receive(Message::Ready(20)).unwrap(),
@@ -516,8 +604,60 @@ mod tests {
         }
     }
     #[test]
+    fn independent_remote_updates_install_and_restart_without_the_sender() {
+        let version = next_version();
+        for id in [51, 52] {
+            let mut sender = Coordinator::peer_only(id, version.clone(), false, true);
+            let Some(Message::Prepare {
+                id,
+                version: requested,
+                install_when_ready,
+            }) = sender.retry()
+            else {
+                panic!("Expected an independent update request");
+            };
+            let mut receiver =
+                Coordinator::incoming(id, requested, false, install_when_ready).unwrap();
+            let installing = Message::Installing {
+                id,
+                authorization: false,
+            };
+            assert_eq!(
+                receiver.prepared(&version),
+                vec![Effect::Send(installing.clone()), Effect::Install],
+            );
+            // The receiver needs neither a commit nor a delivery receipt from
+            // a sender that might be installing its own update.
+            let handoff = Message::Handoff(id);
+            assert_eq!(
+                receiver.installed(),
+                vec![Effect::Send(handoff.clone()), Effect::Quit]
+            );
+            assert!(receiver.done());
+
+            assert!(sender.receive(installing).unwrap().is_empty());
+            assert_eq!(
+                sender.receive(handoff).unwrap(),
+                vec![Effect::PeerRestart(version.clone())]
+            );
+        }
+    }
+
+    #[test]
+    fn older_prepare_still_requires_a_commit_and_its_original_wire_shape() {
+        let wire = r#"{"Prepare":{"id":17,"version":"99.0.0"}}"#;
+        let message: Message = serde_json::from_str(wire).unwrap();
+        assert_eq!(serde_json::to_string(&message).unwrap(), wire);
+        let mut receiver = Coordinator::incoming(17, next_version(), false, false).unwrap();
+        assert_eq!(
+            receiver.prepared(&next_version()),
+            vec![Effect::Send(Message::Ready(17))]
+        );
+    }
+
+    #[test]
     fn failed_peer_only_update_leaves_the_current_installation_running() {
-        let mut local = Coordinator::peer_only(21, next_version(), true).without_password();
+        let mut local = Coordinator::peer_only(21, next_version(), true, false).without_password();
         local.receive(Message::Ready(21)).unwrap();
         assert_eq!(
             local

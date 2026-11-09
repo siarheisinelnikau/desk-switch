@@ -217,6 +217,7 @@ impl Desktop {
         let now = Instant::now();
         if current_group_peer(self.group.workspace.as_ref(), &pinned)
             && self.paired_update.is_none()
+            && !self.update_target_busy(&pinned)
         {
             self.group.compat.suspended = true;
             self.group.compat.connected = false;
@@ -272,14 +273,7 @@ impl Desktop {
                     self.group.compat.retry_at = None;
                     self.group.compat.address = Some(address);
                     self.pair.status.clear();
-                    if self.group.update_target.as_deref() == Some(&pinned)
-                        && let Some(message) = self
-                            .paired_update
-                            .as_ref()
-                            .and_then(update::Coordinator::retry)
-                    {
-                        let _ = self.update_send_to(&pinned, message);
-                    }
+                    self.retry_updates_for(&pinned);
                 }
                 Event::Connected { .. } => {
                     // The legacy listener itself pins the root peer. Keep a
@@ -303,24 +297,9 @@ impl Desktop {
                     self.group.reply_target = None;
                 }
                 Event::Update(message) if self.group.compat.connected => {
-                    if self
-                        .group
-                        .update_target
-                        .as_ref()
-                        .is_none_or(|target| target == &pinned)
-                    {
-                        self.group.update_target = Some(pinned.clone());
-                        if let Some(remote) = &self.group.compat.remote {
-                            self.pair.remote = Some(remote.clone());
-                        }
-                        self.receive_update(message, ctx);
-                    }
+                    self.receive_update_from(&pinned, message, ctx);
                 }
-                Event::UpdateSent(message)
-                    if self.group.update_target.as_deref() == Some(&pinned) =>
-                {
-                    self.sent_update(&message, ctx)
-                }
+                Event::UpdateSent(message) => self.sent_update_to(&pinned, &message, ctx),
                 Event::Closed(error) => {
                     self.group.compat.disconnected(now);
                     if !error.is_empty() {

@@ -871,5 +871,8 @@
   "When updating several computers, prepare them first. Install on the other computers before restarting this one.": "Per aggiornare più computer, preparali prima. Installa sugli altri computer prima di riavviare questo.",
   "Full diagnostics include computer names, network addresses, settings and recent logs.": "La diagnostica completa include nomi dei computer, indirizzi di rete, impostazioni e log recenti.",
   "Sharing paused on this computer.": "Condivisione sospesa su questo computer.",
-  "Sharing resumed on this computer.": "Condivisione ripresa su questo computer."
+  "Sharing resumed on this computer.": "Condivisione ripresa su questo computer.",
+  "Update required": "Aggiornamento necessario",
+  "Update both computers to compatible versions before connecting.": "Aggiorna entrambi i computer a versioni compatibili prima di collegarli.",
+  "Prepare updates to download them without restarting. Each computer installs independently.": "Prepara gli aggiornamenti per scaricarli senza riavviare. Ogni computer li installa in modo indipendente."
 }

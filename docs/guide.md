@@ -179,7 +179,7 @@ Login startup is enabled after the first launch and can be disabled in Settings 
 
 Automatic checks run at startup and every six hours by default and fetch **signed release metadata only**. They do not download an installer or install anything. **Download and install** explicitly downloads, verifies and installs the update on the selected computer, then restarts it as required. The persistent automatic-check toggle disables background checks; manual checking remains available. Settings, identities, workspace membership and user data survive updates. Older device-protocol versions wait for a compatible update before input or media sharing resumes.
 
-Use **Prepare update** for each selected computer to download and verify its package while it keeps running. Once ready, choose **Install and restart** on the other computers, then restart this computer. Check that each required computer is online before starting.
+Use **Prepare update** to download and verify a package without restarting that computer. Each computer can check, prepare or install independently. A compatible remote computer can complete an accepted installation even if the computer that requested it restarts.
 
 Each computer independently downloads from the canonical repository and verifies a pinned Ed25519 signature covering the exact artifact URL, version, size and SHA-256. Signed metadata is embedded in the release description. From 0.6.2, its targets cover the Windows executable, Ubuntu Debian package and both Mac app archives, using the vendored [`rust-auto-updator` 0.4.1](https://github.com/siarheisinelnikau/rust-auto-updator) core.
 
@@ -189,7 +189,7 @@ Recent service logs and diagnostics are synchronized over authenticated, encrypt
 
 Two files in the state directory help when the application stops before the report can be copied. `panic-report.txt` holds the last panic with its message, location and backtrace. `diagnostics.log` holds the recent service messages and is only written when it is requested with the environment variable `DESK_SWITCH_DIAGNOSTICS_LOG=1`; it is rotated at two megabytes and keeps one previous file. It can contain computer names, file paths and network addresses, so review it before sharing. The state directory is printed by the `state-dir` command.
 
-When upgrading from **0.8.x to 0.9.0**, upgrade every member before resuming sharing. Native device protocol is **9** and workspace protocol is **3**. Settings and saved membership carry forward. Update other computers before upgrading the controlling PC, or use local updates on each computer. Starting with 0.9.0, adjacent stable patch releases in the same minor series can share devices when they use the same protocols.
+When upgrading from **0.8.x to 0.9.1**, upgrade every member before resuming sharing. Native device protocol is **9** and workspace protocol is **3**. Settings and saved membership carry forward. Use **Settings → Updates** locally on a computer that cannot reconnect because it still uses the older workspace protocol. Adjacent stable patch releases in the same minor series can share devices when their protocols match.
 
 When migrating an older workspace that has yet to establish its canonical membership, bring the **original coordinating computer online on the new version with a trusted quorum** once. It may be upgraded first or last. After this migration, any surviving majority can coordinate. Settings, identities and display arrangements are preserved.
 

@@ -145,7 +145,10 @@ pub enum Event {
         source: String,
         message: workspace::update::Message,
     },
-    UpdateSent(workspace::update::Message),
+    UpdateSent {
+        target: String,
+        message: workspace::update::Message,
+    },
     Clipboard {
         source: String,
         mime: String,
@@ -155,6 +158,11 @@ pub enum Event {
     Reconnecting {
         key: String,
         reason: String,
+    },
+    IncompatibleWorkspace {
+        key: String,
+        address: SocketAddr,
+        version: String,
     },
     Coordination {
         leader: Option<String>,
@@ -640,6 +648,32 @@ async fn read_packet(
     Ok(serde_json::from_slice(&bytes)?)
 }
 
+#[derive(Debug)]
+struct WorkspaceProtocolMismatch {
+    key: String,
+    address: SocketAddr,
+    version: String,
+}
+
+impl std::fmt::Display for WorkspaceProtocolMismatch {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "Incompatible workspace protocol from Desk Switch {}",
+            self.version
+        )
+    }
+}
+impl std::error::Error for WorkspaceProtocolMismatch {}
+
+fn workspace_protocol(candidate: &Candidate) -> Option<u16> {
+    // Version 0.9.0 introduced protocol 3 without advertising it in Noise.
+    // Earlier releases cannot decode the first protocol 3 workspace frame.
+    candidate
+        .workspace_protocol
+        .or_else(|| (candidate.version.app == "0.9.0").then_some(3))
+}
+
 async fn setup(
     mut candidate: Candidate,
     local: Member,
@@ -650,6 +684,14 @@ async fn setup(
     consent_owner: Option<String>,
 ) -> Result<()> {
     let peer = config::hex(&candidate.key);
+    let mismatch = || WorkspaceProtocolMismatch {
+        key: peer.clone(),
+        address: candidate.address,
+        version: candidate.version.app.clone(),
+    };
+    if workspace_protocol(&candidate) != Some(model::PROTOCOL) {
+        return Err(mismatch().into());
+    }
     let trusted = state.members.contains_key(&peer);
     let outgoing = candidate.outgoing;
     let noise = Arc::new(Mutex::new(candidate.noise));
@@ -672,10 +714,9 @@ async fn setup(
     else {
         bail!("Missing workspace handshake");
     };
-    ensure!(
-        protocol == model::PROTOCOL,
-        "Incompatible workspace handshake"
-    );
+    if protocol != model::PROTOCOL {
+        return Err(mismatch().into());
+    }
     let requested = if outgoing { intent } else { remote_intent };
     let mesh = trusted && workspace.as_deref() == Some(state.workspace_id());
     ensure!(
@@ -1289,6 +1330,77 @@ mod tests {
             },
             receive,
         )
+    }
+
+    #[tokio::test]
+    async fn remote_first_upgrade_sends_no_workspace_frame_to_protocol_two() {
+        let root = std::env::temp_dir().join(format!(
+            "desk-switch-workspace-protocol-{}",
+            std::process::id()
+        ));
+        let new_identity = config::create_identity(&root.join("new")).unwrap();
+        let old_identity = config::create_identity(&root.join("old")).unwrap();
+        for new_outgoing in [false, true] {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let (client, accepted) = tokio::join!(TcpStream::connect(address), listener.accept());
+            let (new, old) = if new_outgoing {
+                (client.unwrap(), accepted.unwrap().0)
+            } else {
+                (accepted.unwrap().0, client.unwrap())
+            };
+            let (new, old) = tokio::join!(
+                workspace::net::authenticate(
+                    new,
+                    &new_identity,
+                    "Updated computer",
+                    new_outgoing,
+                    None,
+                    model::PORT
+                ),
+                workspace::net::authenticate(
+                    old,
+                    &old_identity,
+                    "Older computer",
+                    !new_outgoing,
+                    None,
+                    model::PORT
+                ),
+            );
+            let mut new = new.unwrap();
+            let mut old = old.unwrap();
+            // Reproduce the authenticated metadata from v0.8.1, which had no
+            // workspace protocol field and expected a Member in its first frame.
+            new.workspace_protocol = None;
+            new.version.app = "0.8.1".into();
+            let state = model::tests::fixture(2);
+            let local = state.members[&state.hub].clone();
+            let (sender, _incoming) = queue::channel(1);
+            let error = setup(
+                new,
+                local,
+                state,
+                Intent::Mesh,
+                Internal {
+                    sender,
+                    dialing: Default::default(),
+                },
+                None,
+                None,
+            )
+            .await
+            .unwrap_err();
+            assert!(error.downcast_ref::<WorkspaceProtocolMismatch>().is_some());
+            let mut byte = [0];
+            assert_eq!(
+                timeout(AUTH, old.stream.read(&mut byte))
+                    .await
+                    .unwrap()
+                    .unwrap(),
+                0
+            );
+        }
+        remove_test_root(&root);
     }
 
     #[test]
@@ -2152,11 +2264,11 @@ mod tests {
             until(&mut computers, &mut forwarded, |_, events| {
                 events.iter().any(|(index, event)| {
                     *index == sender
-                        && matches!(event,Event::UpdateSent(received) if received==&message)
+                        && matches!(event,Event::UpdateSent{target: peer, message: received} if peer==&keys[target] && received==&message)
                 })
             });
             assert!(!forwarded.iter().any(|(index, event)| *index != sender
-                && matches!(event,Event::UpdateSent(received) if received==&message)));
+                && matches!(event,Event::UpdateSent{target: peer, message: received} if peer==&keys[target] && received==&message)));
         }
         use sha2::{Digest, Sha256};
         let bytes = b"Shared clipboard across four authenticated PCs".to_vec();
