@@ -92,6 +92,10 @@ struct HandleInfo {
     index_low: u32,
 }
 #[link(name = "kernel32")]
+// SAFETY: The declarations below match the documented `kernel32.dll` exports
+// with the `WINAPI` (`extern "system"`) calling convention and the exact
+// argument and return types those exports use, so the linker binds the real
+// functions.
 unsafe extern "system" {
     fn CreateFileW(
         path: *const u16,
@@ -119,6 +123,9 @@ fn wide(path: &Path) -> Vec<u16> {
 fn attributes(path: &Path) -> Result<(File, Identity)> {
     let name = wide(path);
     // Metadata-only access plus OPEN_REPARSE_POINT never hydrates a placeholder.
+    // SAFETY: `name` is a NUL-terminated UTF-16 path that outlives the call, the
+    // flags request metadata-only access with OPEN_REPARSE_POINT so no placeholder
+    // is hydrated, and a valid result is a handle this function owns.
     let handle = unsafe {
         CreateFileW(
             name.as_ptr(),
@@ -134,12 +141,18 @@ fn attributes(path: &Path) -> Result<(File, Identity)> {
         handle as isize != -1,
         "Could not inspect the native clipboard cache"
     );
+    // SAFETY: `handle` is the unique handle returned by the successful
+    // `CreateFileW` above, and the `File` wrapper takes that ownership and closes
+    // it exactly once when it is dropped.
     let file = unsafe { File::from_raw_handle(handle) };
     Ok((file.try_clone()?, identity(&file)?))
 }
 fn identity(file: &File) -> Result<Identity> {
     let mut info = HandleInfo::default();
     ensure!(
+        // SAFETY: `file` owns a live file handle and `info` is a live, writable
+        // `repr(C)` structure with the `BY_HANDLE_FILE_INFORMATION` layout the call
+        // fills in.
         unsafe { GetFileInformationByHandle(file.as_raw_handle(), &mut info) } != 0,
         "Could not identify a native clipboard file"
     );
@@ -154,6 +167,9 @@ fn native_consumer(id: u32, operation: &str) -> Option<NativeConsumer> {
     if id == 0 || id == std::process::id() {
         return None;
     }
+    // SAFETY: `id` is the consumer's process id and the call requests only
+    // PROCESS_QUERY_LIMITED_INFORMATION with no handle inheritance, so the
+    // returned handle is used only to read the process times and is then closed.
     let handle = unsafe { OpenProcess(0x1000, 0, id) };
     if handle.is_null() {
         return None;
@@ -162,7 +178,12 @@ fn native_consumer(id: u32, operation: &str) -> Option<NativeConsumer> {
     let mut exit = FileTime::default();
     let mut kernel = FileTime::default();
     let mut user = FileTime::default();
+    // SAFETY: `handle` is the live process handle opened above and the four
+    // `FileTime` locals are live, writable structures with the FILETIME layout
+    // the call fills in.
     let valid = unsafe { GetProcessTimes(handle, &mut created, &mut exit, &mut kernel, &mut user) };
+    // SAFETY: `handle` was opened by `OpenProcess` in this function, is stored
+    // nowhere else, and is closed exactly once here.
     unsafe { CloseHandle(handle) };
     (valid != 0 && created.value() != 0).then(|| NativeConsumer {
         process_id: id,
@@ -429,6 +450,9 @@ impl Cleanup {
         }
         if self.registered {
             let name = wide(&self.path);
+            // SAFETY: The connection was already disconnected and its operations
+            // finished before this cleanup ran, the root was registered by this provider,
+            // and `name` is a NUL-terminated UTF-16 path that outlives the call.
             if unsafe { self.api.unregister_sync_root(PCWSTR(name.as_ptr())) }.is_err() {
                 return;
             }
@@ -578,6 +602,10 @@ impl Root {
             HardLink: CF_HARDLINK_POLICY_NONE,
             ..Default::default()
         };
+        // SAFETY: `name` is a NUL-terminated UTF-16 path to the directory this
+        // function created, and `registration` and `policies` are live structures
+        // whose embedded pointers refer to `provider`, `version` and the state token,
+        // all of which outlive the call.
         unsafe {
             api.register_sync_root(
                 PCWSTR(name.as_ptr()),
@@ -592,6 +620,10 @@ impl Root {
             let cleanup = root.cleanup.lock().unwrap();
             (&*cleanup.as_ref().unwrap().context) as *const Arc<State> as *const c_void
         };
+        // SAFETY: `callbacks` is a live registration table terminated by its
+        // `CF_CALLBACK_TYPE_NONE` entry, `pointer` addresses the boxed `Arc<State>`
+        // whose address stays stable and which outlives the connection, and `name` is
+        // a NUL-terminated UTF-16 path.
         let key = unsafe {
             api.connect_sync_root(
                 PCWSTR(name.as_ptr()),
@@ -648,6 +680,10 @@ impl Root {
                 DescriptorKind::File { .. } => 0x20,
             } | NOT_INDEXED;
             let parent_name = wide(&parent);
+            // SAFETY: `parent_name` is a NUL-terminated UTF-16 path to a directory
+            // inside the registered sync root, and `placeholder` is a live structure whose
+            // embedded pointers refer to `name` and `identity_blob`, both of which outlive
+            // the call.
             unsafe {
                 self.state.api.create_placeholders(
                     PCWSTR(parent_name.as_ptr()),
@@ -800,10 +836,19 @@ impl Request {
         }
     }
 }
+// SAFETY: `value` must be a non-null pointer to a NUL-terminated UTF-16
+// string that stays valid for the whole call; the function only reads it and
+// copies at most 32_768 units into an owned `OsString`.
 unsafe fn bounded_text(value: PCWSTR) -> Result<OsString> {
     ensure!(!value.is_null(), "Missing native clipboard path");
     for length in 0..32_768 {
+        // SAFETY: `value` is non-null and points at the NUL-terminated UTF-16
+        // string the Cloud Files filter supplied; the loop stops at the first NUL, so
+        // this read stays inside that string.
         if unsafe { *value.0.add(length) } == 0 {
+            // SAFETY: `length` is the index of the NUL terminator, so the string holds
+            // exactly `length` UTF-16 units inside the filter's allocation, and
+            // `OsString::from_wide` copies them before this borrow ends.
             return Ok(OsString::from_wide(unsafe {
                 std::slice::from_raw_parts(value.0, length)
             }));
@@ -811,19 +856,31 @@ unsafe fn bounded_text(value: PCWSTR) -> Result<OsString> {
     }
     bail!("The native clipboard path is too long")
 }
+// SAFETY: `info` must be the non-null `CF_CALLBACK_INFO` the Cloud Files
+// filter supplied for this callback, its `CallbackContext` must still point at
+// the `Arc<State>` this provider registered, and that state must stay alive for
+// the whole call.
 unsafe fn snapshot(info: *const CF_CALLBACK_INFO) -> Result<(Arc<Root>, Request)> {
     ensure!(!info.is_null(), "Missing Cloud Files callback information");
     // RequestKey is version dependent; reject older layouts rather than reading
     // beyond their allocation or matching an ambiguous native operation.
     ensure!(
+        // SAFETY: `info` is non-null and points at the live `CF_CALLBACK_INFO` the
+        // filter supplied, so reading its `StructSize` field is in bounds.
         unsafe { (*info).StructSize } as usize >= size_of::<CF_CALLBACK_INFO>(),
         "The Cloud Files callback layout is unsupported"
     );
+    // SAFETY: `info` is non-null and points at the live `CF_CALLBACK_INFO` the
+    // filter supplied, which outlives this borrow of it.
     let info = unsafe { &*info };
     ensure!(
         !info.CallbackContext.is_null(),
         "Missing native file provider"
     );
+    // SAFETY: `info.CallbackContext` is non-null and is the exact pointer this
+    // provider passed to `CfConnectSyncRoot`, which addresses the boxed
+    // `Arc<State>` that stays alive until the connection is disconnected; the
+    // clone below takes an owned reference before the borrow ends.
     let state = unsafe { &*info.CallbackContext.cast::<Arc<State>>() }.clone();
     let root = state
         .owner
@@ -847,6 +904,9 @@ unsafe fn snapshot(info: *const CF_CALLBACK_INFO) -> Result<(Arc<Root>, Request)
         "Missing native cache identity"
     );
     ensure!(
+        // SAFETY: The identity length was checked to equal `state.token.len()`
+        // above and the pointer is non-null, so the buffer holds exactly that many
+        // bytes.
         unsafe {
             std::slice::from_raw_parts(info.SyncRootIdentity.cast::<u8>(), state.token.len())
         } == state.token,
@@ -857,6 +917,8 @@ unsafe fn snapshot(info: *const CF_CALLBACK_INFO) -> Result<(Arc<Root>, Request)
         "Missing native file identity"
     );
     let index = decode_identity(
+        // SAFETY: The identity length was checked to be 24 and the pointer is
+        // non-null, so the buffer holds exactly those 24 bytes.
         unsafe { std::slice::from_raw_parts(info.FileIdentity.cast::<u8>(), 24) },
         &state.token,
         state.offer.description.entries.len(),
@@ -879,6 +941,9 @@ unsafe fn snapshot(info: *const CF_CALLBACK_INFO) -> Result<(Arc<Root>, Request)
     }
     let mut process = 0;
     if !info.ProcessInfo.is_null() {
+        // SAFETY: `info.ProcessInfo` is non-null and points at the live
+        // `CF_PROCESS_INFO` the filter supplied; the `StructSize` check below reads
+        // `ProcessId` only when that field is inside the structure.
         let process_info = unsafe { &*info.ProcessInfo };
         if process_info.StructSize as usize
             >= offset_of!(CF_PROCESS_INFO, ProcessId) + size_of::<u32>()
@@ -892,6 +957,8 @@ unsafe fn snapshot(info: *const CF_CALLBACK_INFO) -> Result<(Arc<Root>, Request)
     } else {
         native_consumer(process, &crate::config::hex(&state.token))
     };
+    // SAFETY: `info.VolumeDosName` is the volume name the filter supplied; it is
+    // a NUL-terminated UTF-16 string that stays valid for this callback.
     let volume = PathBuf::from(unsafe { bounded_text(info.VolumeDosName) }?);
     Ok((
         root,
@@ -907,6 +974,10 @@ unsafe fn snapshot(info: *const CF_CALLBACK_INFO) -> Result<(Arc<Root>, Request)
         },
     ))
 }
+// SAFETY: `raw` must be the non-null `CF_CALLBACK_PARAMETERS` the Cloud
+// Files filter supplied for this callback and `ParamSize` must cover the
+// variant `T` the caller reads; the returned reference borrows that native
+// structure, so the caller may only use it inside the callback.
 unsafe fn parameters<'a, T>(
     raw: *const CF_CALLBACK_PARAMETERS,
 ) -> Result<&'a CF_CALLBACK_PARAMETERS> {
@@ -914,9 +985,14 @@ unsafe fn parameters<'a, T>(
     // CF_CALLBACK_PARAMETERS documents ParamSize as ULONG plus the specific
     // variant, rather than the native union's padded x64 offset.
     ensure!(
+        // SAFETY: `raw` is non-null and points at the live `CF_CALLBACK_PARAMETERS`
+        // the filter supplied, so reading its `ParamSize` field is in bounds.
         unsafe { (*raw).ParamSize } as usize >= size_of::<u32>() + size_of::<T>(),
         "The Cloud Files request layout is unsupported"
     );
+    // SAFETY: `raw` is non-null and points at the live `CF_CALLBACK_PARAMETERS`
+    // the filter supplied, and the borrow the caller receives is used only inside
+    // this callback.
     Ok(unsafe { &*raw })
 }
 fn callback(action: impl FnOnce() -> Result<()>) {
@@ -936,6 +1012,10 @@ fn io_callback(
     }
     // Reject unsupported callback versions and tampered identities promptly.
     // Failing this native request grants neither file access nor a Move receipt.
+    // SAFETY: `info` is the callback's own `CF_CALLBACK_INFO` pointer; the
+    // closure below rejects a null pointer or a short structure before
+    // dereferencing it, and the context it reads is the `Arc<State>` this provider
+    // registered, which outlives the connection.
     let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
         if info.is_null() || ((*info).StructSize as usize) < size_of::<CF_CALLBACK_INFO>() {
             return;
@@ -1340,6 +1420,10 @@ impl State {
                 },
             },
         };
+        // SAFETY: `info` carries this request's connection, transfer and request
+        // keys and `args` is a live `CF_OPERATION_PARAMETERS` whose `ParamSize`
+        // matches the `AckData` arm it selects, so the call reads exactly the fields
+        // it sets.
         unsafe { self.api.execute(&info, &mut args) }
     }
     fn fail_data(&self, request: &Request, status: NTSTATUS) -> Result<()> {
@@ -1356,6 +1440,10 @@ impl State {
                 },
             },
         };
+        // SAFETY: `info` carries this request's connection, transfer and request
+        // keys and `args` is a live `CF_OPERATION_PARAMETERS` whose `ParamSize`
+        // matches the `TransferData` arm it selects, so the call reads exactly the
+        // fields it sets.
         unsafe { self.api.execute(&info, &mut args) }
     }
     fn ack_action(
@@ -1388,6 +1476,10 @@ impl State {
                 },
             }
         };
+        // SAFETY: `info` carries this request's connection, transfer and request
+        // keys and `args` is a live `CF_OPERATION_PARAMETERS` whose `ParamSize`
+        // matches the `AckRename` or `AckDelete` arm it selects, so the call reads
+        // exactly the fields it sets.
         unsafe { self.api.execute(&info, &mut args) }
     }
     fn transfer(&self, request: &Request, offset: u64, data: &[u8]) -> Result<()> {
@@ -1405,6 +1497,10 @@ impl State {
                 },
             },
         };
+        // SAFETY: `info` carries this request's connection, transfer and request
+        // keys and `args` selects the `TransferData` arm whose `Buffer` points at the
+        // live `data` slice of exactly `data.len()` bytes, so the call reads only the
+        // bytes it is given.
         unsafe { self.api.execute(&info, &mut args) }
     }
     fn retrieve(&self, request: &Request, offset: u64, data: &mut [u8]) -> Result<()> {
@@ -1421,8 +1517,15 @@ impl State {
                 },
             },
         };
+        // SAFETY: `info` carries this request's connection, transfer and request
+        // keys and `args` selects the `RetrieveData` arm whose `Buffer` points at the
+        // live, writable `data` slice of exactly `data.len()` bytes, so the call writes
+        // at most that many bytes into it.
         unsafe { self.api.execute(&info, &mut args) }?;
         ensure!(
+            // SAFETY: `args` is the live parameter block the `RetrieveData` call above
+            // filled in, and that arm stores `ReturnedLength`, so the field read here is
+            // the one the call wrote.
             unsafe { args.Anonymous.RetrieveData.ReturnedLength } == data.len() as i64,
             "The native file cache returned an incomplete range"
         );
@@ -1650,12 +1753,23 @@ fn hydrate(work: &Work, request: &Request) -> Result<()> {
     state.ack_data(request, start, length, STATUS_OK)?;
     Ok(())
 }
+// SAFETY: The Cloud Files filter calls this with the `CF_CALLBACK_INFO` and
+// `CF_CALLBACK_PARAMETERS` it supplied for this operation, both valid for the
+// duration of the call, and the body routes every failure through
+// `io_callback`, which catches panics so none unwind across the native
+// boundary.
 unsafe extern "system" fn fetch_callback(
     info: *const CF_CALLBACK_INFO,
     raw: *const CF_CALLBACK_PARAMETERS,
 ) {
     io_callback(info, CF_OPERATION_TYPE_TRANSFER_DATA, || {
+        // SAFETY: `info` is the callback's own `CF_CALLBACK_INFO` pointer and its
+        // context is the `Arc<State>` this provider registered, which stays alive for
+        // as long as the filter can call back.
         let (root, mut request) = unsafe { snapshot(info) }?;
+        // SAFETY: `raw` is the callback's own parameter pointer and its
+        // `ParamSize` is checked against the `FetchData` variant before the union arm
+        // is read.
         let args = unsafe {
             parameters::<CF_CALLBACK_PARAMETERS_0_1>(raw)?
                 .Anonymous
@@ -1697,12 +1811,23 @@ unsafe extern "system" fn fetch_callback(
         Ok(())
     });
 }
+// SAFETY: The Cloud Files filter calls this with the `CF_CALLBACK_INFO` and
+// `CF_CALLBACK_PARAMETERS` it supplied for this operation, both valid for the
+// duration of the call, and the body routes every failure through
+// `io_callback`, which catches panics so none unwind across the native
+// boundary.
 unsafe extern "system" fn validate_callback(
     info: *const CF_CALLBACK_INFO,
     raw: *const CF_CALLBACK_PARAMETERS,
 ) {
     io_callback(info, CF_OPERATION_TYPE_ACK_DATA, || {
+        // SAFETY: `info` is the callback's own `CF_CALLBACK_INFO` pointer and its
+        // context is the `Arc<State>` this provider registered, which stays alive for
+        // as long as the filter can call back.
         let (root, request) = unsafe { snapshot(info) }?;
+        // SAFETY: `raw` is the callback's own parameter pointer and its
+        // `ParamSize` is checked against the `ValidateData` variant before the union
+        // arm is read.
         let args = unsafe {
             parameters::<CF_CALLBACK_PARAMETERS_0_2>(raw)?
                 .Anonymous
@@ -1744,18 +1869,30 @@ unsafe extern "system" fn validate_callback(
         state.ack_data(&request, offset, length, status)
     });
 }
+// SAFETY: The Cloud Files filter calls this with the `CF_CALLBACK_INFO` and
+// `CF_CALLBACK_PARAMETERS` it supplied for this operation, both valid for the
+// duration of the call, and the body runs inside `callback`, which catches
+// panics so none unwind across the native boundary.
 unsafe extern "system" fn cancel_callback(
     info: *const CF_CALLBACK_INFO,
     raw: *const CF_CALLBACK_PARAMETERS,
 ) {
     callback(|| {
+        // SAFETY: `info` is the callback's own `CF_CALLBACK_INFO` pointer and its
+        // context is the `Arc<State>` this provider registered, which stays alive for
+        // as long as the filter can call back.
         let (root, request) = unsafe { snapshot(info) }?;
         ensure!(
             !raw.is_null()
+                // SAFETY: `raw` is non-null here and points at the live
+                // `CF_CALLBACK_PARAMETERS` the filter supplied, so reading its `ParamSize`
+                // field is in bounds.
                 && unsafe { (*raw).ParamSize } as usize
                     >= size_of::<CF_CALLBACK_PARAMETERS_0_0_0_0>() + 2 * size_of::<u32>(),
             "The Cloud Files cancellation layout is unsupported"
         );
+        // SAFETY: `raw` is non-null and its `ParamSize` was checked above to cover
+        // the cancellation variant, so the `Cancel` union arm can be read.
         let args = unsafe { (*raw).Anonymous.Cancel.Anonymous.FetchData };
         let cancelled_session = {
             let mut requests = root.state.requests.lock().unwrap();
@@ -1794,11 +1931,18 @@ unsafe extern "system" fn cancel_callback(
         Ok(())
     });
 }
+// SAFETY: The Cloud Files filter calls this with the `CF_CALLBACK_INFO` it
+// supplied for this operation, valid for the duration of the call, and the
+// body runs inside `callback`, which catches panics so none unwind across the
+// native boundary.
 unsafe extern "system" fn open_callback(
     info: *const CF_CALLBACK_INFO,
     _raw: *const CF_CALLBACK_PARAMETERS,
 ) {
     callback(|| {
+        // SAFETY: `info` is the callback's own `CF_CALLBACK_INFO` pointer and its
+        // context is the `Arc<State>` this provider registered, which stays alive for
+        // as long as the filter can call back.
         let (root, request) = unsafe { snapshot(info) }?;
         if request.self_process || root.state.tearing_down.load(Ordering::Acquire) {
             return Ok(());
@@ -1823,11 +1967,18 @@ unsafe extern "system" fn open_callback(
         Ok(())
     });
 }
+// SAFETY: The Cloud Files filter calls this with the `CF_CALLBACK_INFO` it
+// supplied for this operation, valid for the duration of the call, and the
+// body runs inside `callback`, which catches panics so none unwind across the
+// native boundary.
 unsafe extern "system" fn close_callback(
     info: *const CF_CALLBACK_INFO,
     _raw: *const CF_CALLBACK_PARAMETERS,
 ) {
     callback(|| {
+        // SAFETY: `info` is the callback's own `CF_CALLBACK_INFO` pointer and its
+        // context is the `Arc<State>` this provider registered, which stays alive for
+        // as long as the filter can call back.
         let (root, request) = unsafe { snapshot(info) }?;
         if request.self_process {
             return Ok(());
@@ -2127,6 +2278,10 @@ fn prepare_move(work: &Work, request: &Request, target: Option<PathBuf>) -> Resu
                         current.file == expected.file && current.volume == expected.volume,
                         "The native Move file identity changed"
                     );
+                    // SAFETY: `file` owns the live placeholder handle returned by
+                    // `attributes`, so it stays valid for the call, and the null overlapped
+                    // pointer selects the synchronous form, so no completion state has to outlive
+                    // the call.
                     unsafe {
                         state.api.hydrate_placeholder(
                             HANDLE(file.as_raw_handle()),
@@ -2201,12 +2356,23 @@ fn start_move(root: Arc<Root>, request: Request, target: Option<PathBuf>) -> Res
     });
     Ok(())
 }
+// SAFETY: The Cloud Files filter calls this with the `CF_CALLBACK_INFO` and
+// `CF_CALLBACK_PARAMETERS` it supplied for this operation, both valid for the
+// duration of the call, and the body routes every failure through
+// `io_callback`, which catches panics so none unwind across the native
+// boundary.
 unsafe extern "system" fn rename_callback(
     info: *const CF_CALLBACK_INFO,
     raw: *const CF_CALLBACK_PARAMETERS,
 ) {
     io_callback(info, CF_OPERATION_TYPE_ACK_RENAME, || {
+        // SAFETY: `info` is the callback's own `CF_CALLBACK_INFO` pointer and its
+        // context is the `Arc<State>` this provider registered, which stays alive for
+        // as long as the filter can call back.
         let (root, request) = unsafe { snapshot(info) }?;
+        // SAFETY: `raw` is the callback's own parameter pointer and its
+        // `ParamSize` is checked against the `Rename` variant before the union arm
+        // is read.
         let args = unsafe {
             parameters::<CF_CALLBACK_PARAMETERS_0_10>(raw)?
                 .Anonymous
@@ -2224,6 +2390,9 @@ unsafe extern "system" fn rename_callback(
                 .state
                 .ack_action(&request, CF_OPERATION_TYPE_ACK_RENAME, STATUS_FAILED);
         }
+        // SAFETY: `args.TargetPath` is the NUL-terminated UTF-16 target path the
+        // filter supplied with this rename notification, and it stays valid for the
+        // duration of the callback.
         let target = unsafe { bounded_text(args.TargetPath) }
             .and_then(|target| move_target(&request.volume, &target, &root.path));
         match target {
@@ -2234,12 +2403,23 @@ unsafe extern "system" fn rename_callback(
         }
     });
 }
+// SAFETY: The Cloud Files filter calls this with the `CF_CALLBACK_INFO` and
+// `CF_CALLBACK_PARAMETERS` it supplied for this operation, both valid for the
+// duration of the call, and the body routes every failure through
+// `io_callback`, which catches panics so none unwind across the native
+// boundary.
 unsafe extern "system" fn delete_callback(
     info: *const CF_CALLBACK_INFO,
     raw: *const CF_CALLBACK_PARAMETERS,
 ) {
     io_callback(info, CF_OPERATION_TYPE_ACK_DELETE, || {
+        // SAFETY: `info` is the callback's own `CF_CALLBACK_INFO` pointer and its
+        // context is the `Arc<State>` this provider registered, which stays alive for
+        // as long as the filter can call back.
         let (root, request) = unsafe { snapshot(info) }?;
+        // SAFETY: `raw` is the callback's own parameter pointer and its
+        // `ParamSize` is checked against the `Delete` variant before the union arm
+        // is read.
         let args = unsafe {
             parameters::<CF_CALLBACK_PARAMETERS_0_8>(raw)?
                 .Anonymous
@@ -2354,22 +2534,42 @@ fn complete_move(root: Arc<Root>, request: Request, rename: bool) -> Result<()> 
     });
     Ok(())
 }
+// SAFETY: The Cloud Files filter calls this with the `CF_CALLBACK_INFO` and
+// `CF_CALLBACK_PARAMETERS` it supplied for this operation, both valid for the
+// duration of the call, and the body runs inside `callback`, which catches
+// panics so none unwind across the native boundary.
 unsafe extern "system" fn rename_complete_callback(
     info: *const CF_CALLBACK_INFO,
     raw: *const CF_CALLBACK_PARAMETERS,
 ) {
     callback(|| {
+        // SAFETY: `info` is the callback's own `CF_CALLBACK_INFO` pointer and its
+        // context is the `Arc<State>` this provider registered, which stays alive for
+        // as long as the filter can call back.
         let (root, request) = unsafe { snapshot(info) }?;
+        // SAFETY: `raw` is the callback's own parameter pointer and its
+        // `ParamSize` is checked against the `Rename` completion variant before the
+        // parameter block is read.
         let _ = unsafe { parameters::<CF_CALLBACK_PARAMETERS_0_11>(raw)? };
         complete_move(root, request, true)
     });
 }
+// SAFETY: The Cloud Files filter calls this with the `CF_CALLBACK_INFO` and
+// `CF_CALLBACK_PARAMETERS` it supplied for this operation, both valid for the
+// duration of the call, and the body runs inside `callback`, which catches
+// panics so none unwind across the native boundary.
 unsafe extern "system" fn delete_complete_callback(
     info: *const CF_CALLBACK_INFO,
     raw: *const CF_CALLBACK_PARAMETERS,
 ) {
     callback(|| {
+        // SAFETY: `info` is the callback's own `CF_CALLBACK_INFO` pointer and its
+        // context is the `Arc<State>` this provider registered, which stays alive for
+        // as long as the filter can call back.
         let (root, request) = unsafe { snapshot(info) }?;
+        // SAFETY: `raw` is the callback's own parameter pointer and its
+        // `ParamSize` is checked against the `Delete` completion variant before the
+        // parameter block is read.
         let _ = unsafe { parameters::<CF_CALLBACK_PARAMETERS_0_9>(raw)? };
         complete_move(root, request, false)
     });

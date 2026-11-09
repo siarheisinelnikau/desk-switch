@@ -33,6 +33,10 @@ const MARKER: &str = ".desk-switch-explorer-ci-owner";
 struct ExplorerApartment;
 impl ExplorerApartment {
     fn enter() -> Option<Self> {
+        // SAFETY: This proof worker thread has not initialized COM before, so
+        // this call starts its single-threaded apartment; every successful
+        // CoInitializeEx must be balanced by one CoUninitialize on the same
+        // thread, and the returned guard is dropped there.
         unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) }
             .ok()
             .ok()?;
@@ -41,6 +45,9 @@ impl ExplorerApartment {
 }
 impl Drop for ExplorerApartment {
     fn drop(&mut self) {
+        // SAFETY: This guard exists only after a successful CoInitializeEx on
+        // this thread, and it is dropped exactly once here, so the apartment
+        // initialization count stays balanced.
         unsafe { CoUninitialize() };
     }
 }
@@ -158,6 +165,11 @@ impl OwnedBrowser {
             folder_of(&self.browser).is_some_and(|path| same_path(&path, &self.fixture.folder)),
             "The test Explorer window no longer displays its owned folder"
         );
+        // SAFETY: `self.browser` is the live `IWebBrowser2` pointer owned by
+        // this struct; it was created by `CoCreateInstance` in the apartment
+        // this thread entered and is only used from that thread, so the vtable
+        // call targets a live object. `Quit` asks that window to close and
+        // transfers no ownership.
         unsafe { self.browser.Quit() }.context("Could not close the owned Explorer window")?;
         let deadline = Instant::now() + Duration::from_secs(3);
         while window_matches(&window) {
@@ -189,11 +201,22 @@ fn same_path(left: &Path, right: &Path) -> bool {
 fn window_matches(window: &Window) -> bool {
     let handle = window.hwnd as HWND;
     let mut process = 0;
+    // SAFETY: `handle` is the Explorer window handle recorded from the owned
+    // browser, and `IsWindow` only tests that the handle still refers to a
+    // window; it neither closes nor transfers the handle.
     (unsafe { IsWindow(handle) }) != 0
+        // SAFETY: `process` is a live `u32` local that outlives the call and
+        // receives the owning process id; `handle` is a borrowed window handle
+        // that is not closed here.
         && unsafe { GetWindowThreadProcessId(handle, &mut process) } != 0
         && process == window.process
 }
 fn explorer_process(process: u32) -> Result<()> {
+    // SAFETY: `process` is the id of the Explorer process that owns the
+    // browser window this test created, and the call requests only
+    // `PROCESS_QUERY_LIMITED_INFORMATION`; a non-null handle is owned by this
+    // function and closed exactly once by `CloseHandle` below, while a null
+    // handle takes the early return that owns nothing.
     let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, process) };
     ensure!(
         !handle.is_null(),
@@ -201,7 +224,12 @@ fn explorer_process(process: u32) -> Result<()> {
     );
     let mut name = vec![0u16; MAX_PATH];
     let mut count = name.len() as u32;
+    // SAFETY: `name` holds exactly `count` UTF-16 units, which is the capacity
+    // the call is told it may write, and `handle` is the live process handle
+    // opened above; the call writes only into `name` and only reads `handle`.
     let result = unsafe { QueryFullProcessImageNameW(handle, 0, name.as_mut_ptr(), &mut count) };
+    // SAFETY: `handle` is the unique process handle returned by `OpenProcess`
+    // above; it is not stored anywhere else and is closed exactly once here.
     unsafe { CloseHandle(handle) };
     ensure!(
         result != 0,
@@ -217,15 +245,32 @@ fn explorer_process(process: u32) -> Result<()> {
 }
 fn folder_of(browser: &IWebBrowser2) -> Option<PathBuf> {
     let service: IServiceProvider = browser.cast().ok()?;
+    // SAFETY: `service` is the live IServiceProvider interface pointer of the
+    // owned Explorer browser, so the query targets a valid object; the returned
+    // IShellBrowser pointer is owned by the `browser` binding and is released
+    // when that binding goes out of scope.
     let browser: IShellBrowser = unsafe { service.QueryService(&SID_STopLevelBrowser) }.ok()?;
+    // SAFETY: `browser` is a live IShellBrowser pointer owned by this scope, so
+    // the call targets a valid object; the returned IShellView pointer is owned
+    // by the `view` binding and is released at the end of this scope.
     let view = unsafe { browser.QueryActiveShellView() }.ok()?;
     let view: IFolderView = view.cast().ok()?;
+    // SAFETY: `view` is the live IFolderView pointer of the Explorer's active
+    // shell view, so the call targets a valid object; the returned
+    // IPersistFolder2 pointer is owned by the `folder` binding.
     let folder: IPersistFolder2 = unsafe { view.GetFolder() }.ok()?;
+    // SAFETY: `folder` is a live IPersistFolder2 pointer, and GetCurFolder
+    // transfers an ITEMIDLIST allocated with CoTaskMemAlloc to this code; the
+    // `Pidl` guard frees it exactly once with the matching allocator.
     let item = Pidl(unsafe { folder.GetCurFolder() }.ok()?);
     if item.0.is_null() {
         return None;
     }
     let mut buffer = vec![0u16; MAX_PATH];
+    // SAFETY: `buffer` holds MAX_PATH UTF-16 units and the call is told that
+    // capacity, so it writes at most that many units into it; `item.0` is the
+    // ITEMIDLIST owned by the `item` guard, which stays alive for the call and
+    // is only read here, never freed.
     if !unsafe { SHGetPathFromIDListEx(item.0, &mut buffer, GPFIDL_DEFAULT) }.as_bool() {
         return None;
     }
@@ -240,9 +285,18 @@ fn run_capture(fixture: Fixture, control: Arc<Mutex<Control>>) -> Result<serde_j
         ExplorerApartment::enter().context("The hosted Explorer COM apartment is unavailable")?;
     let _cancel =
         Cancellation::enter().context("The hosted Explorer COM calls cannot be bounded")?;
+    // SAFETY: The call takes no pointer arguments and returns the id of the
+    // calling thread, which is this worker thread that owns the Explorer COM
+    // apartment; the value is only used to target `CoCancelCall` at that
+    // apartment.
     control.lock().unwrap().thread = unsafe { GetCurrentThreadId() };
     fixture.validate()?;
     let browser: IWebBrowser2 =
+        // SAFETY: `ExplorerApartment::enter` above put this thread into a
+        // single-threaded apartment before this call, so the returned
+        // ShellBrowserWindow interface pointer is bound to that apartment; it
+        // is owned by the `browser` binding, used only from this thread, and
+        // released before the apartment guard drops.
         unsafe { CoCreateInstance(&ShellBrowserWindow, None, CLSCTX_LOCAL_SERVER) }.context(
             "The hosted runner has no available interactive Explorer ShellBrowserWindow",
         )?;
@@ -258,7 +312,14 @@ fn run_capture(fixture: Fixture, control: Arc<Mutex<Control>>) -> Result<serde_j
     let folder_text = folder_text.strip_prefix(r"\\?\").unwrap_or(&folder_text);
     let url = format!("file:///{}", folder_text.replace('\\', "/"));
     let target = BSTR::from(url.as_str());
+    // SAFETY: `owned.browser` is the live IWebBrowser2 pointer owned by the
+    // `owned` binding, created in this thread's apartment; the call only shows
+    // the window and transfers no ownership.
     let _ = unsafe { owned.browser.SetVisible(VARIANT_BOOL(-1)) };
+    // SAFETY: `owned.browser` is the live IWebBrowser2 pointer owned by the
+    // `owned` binding and used from the apartment that created it; `target` is a
+    // live BSTR that owns the NUL-terminated URL and outlives the call, and the
+    // remaining arguments are None, so no other pointer is dereferenced.
     unsafe { owned.browser.Navigate(&target, None, None, None, None) }
         .context("Explorer could not navigate to the private test folder")?;
     let deadline = Instant::now() + Duration::from_secs(20);
@@ -275,12 +336,19 @@ fn run_capture(fixture: Fixture, control: Arc<Mutex<Control>>) -> Result<serde_j
         );
         thread::sleep(Duration::from_millis(25));
     }
+    // SAFETY: `owned.browser` is the live IWebBrowser2 pointer owned by the
+    // `owned` binding; the call only reads the Explorer window handle, which
+    // stays owned by Explorer and is not closed by this test.
     let hwnd = unsafe { owned.browser.HWND() }
         .context("Explorer has no window")?
         .0 as usize;
     ensure!(hwnd != 0, "Explorer did not create a window");
     let mut process = 0;
     ensure!(
+        // SAFETY: `process` is a live `u32` local that outlives the call and receives
+        // the owning process id; `hwnd` is the Explorer window handle the owned
+        // browser reported, carried unchanged through `usize`, so the cast back to
+        // the Win32 handle type recovers the same handle value.
         unsafe { GetWindowThreadProcessId(hwnd as HWND, &mut process) } != 0 && process != 0,
         "Explorer window has no process identity"
     );
@@ -292,10 +360,23 @@ fn run_capture(fixture: Fixture, control: Arc<Mutex<Control>>) -> Result<serde_j
     };
     owned.known = Some(window.clone());
     control.lock().unwrap().owned = Some(window);
+    // SAFETY: `&owned.browser` is a live IWebBrowser2 interface pointer owned by
+    // the `owned` binding and valid for the duration of the call; the reserved
+    // argument is None, so the call only grants foreground rights to that
+    // window and takes no ownership.
     let _ = unsafe { CoAllowSetForegroundWindow(&owned.browser, None) };
+    // SAFETY: `owned.browser` is the live IWebBrowser2 pointer owned by the
+    // `owned` binding, created in this thread's apartment; the call only shows
+    // the window and transfers no ownership.
     unsafe { owned.browser.SetVisible(VARIANT_BOOL(-1)) }
         .context("Could not display the owned Explorer window")?;
+    // SAFETY: `hwnd` is the Explorer window handle the owned browser reported,
+    // carried unchanged through `usize`; the call only requests an asynchronous
+    // restore of that window and neither closes nor transfers the handle.
     unsafe { ShowWindowAsync(hwnd as HWND, SW_RESTORE) };
+    // SAFETY: `hwnd` is the Explorer window handle the owned browser reported,
+    // carried unchanged through `usize`; the call only asks that window to take
+    // the foreground and neither closes nor transfers the handle.
     let _ = unsafe { SetForegroundWindow(hwnd as HWND) };
     let foreground_deadline = Instant::now() + Duration::from_secs(3);
     while foreground_for(process) != Some(hwnd) {
@@ -405,6 +486,11 @@ fn isolated_ci_explorer_destination_capture() -> Result<()> {
         Err(_) => {
             let active = control.lock().unwrap();
             if active.thread != 0 {
+                // SAFETY: `active.thread` is the id of the worker thread that entered the
+                // Explorer COM apartment and issued the pending Shell calls, recorded there
+                // with `GetCurrentThreadId`, and the `Cancellation` guard enabled call
+                // cancellation for that apartment; a zero timeout only requests
+                // cancellation without waiting for the server.
                 let _ = unsafe { CoCancelCall(active.thread, 0) };
             }
             // The only window eligible for timeout cleanup was created by our
@@ -415,6 +501,10 @@ fn isolated_ci_explorer_destination_capture() -> Result<()> {
                 && window.folder == fixture.folder
                 && window_matches(window)
             {
+                // SAFETY: `window.hwnd` is the Explorer window handle that this test's own
+                // COM factory created and that `window_matches` just confirmed still belongs
+                // to the owned Explorer process; the call only posts a close request to that
+                // window and neither closes nor transfers the handle.
                 let _ = unsafe { PostMessageW(window.hwnd as HWND, WM_CLOSE, 0, 0) };
             }
             bail!(

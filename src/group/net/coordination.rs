@@ -219,6 +219,8 @@ fn durable_write(dir: &Path, name: &str, contents: &str) -> Result<()> {
             // Same-directory atomic replace, with the move completed on disk
             // before any vote/log acknowledgement leaves this process.
             ensure!(
+                // SAFETY: both paths are NUL-terminated UTF-16 buffers that outlive the
+                // call, and the flags request a replace inside the same directory.
                 unsafe { move_file_ex_w(source.as_ptr(), destination.as_ptr(), 0x1 | 0x8) } != 0,
                 "Saving workspace voting state: {}",
                 std::io::Error::last_os_error()

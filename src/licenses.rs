@@ -28,4 +28,8 @@ pub const NOTICES: &str = concat!(
     "\n\nref-cast/ref-cast-impl 1.0.27 — https://github.com/dtolnay/ref-cast\n",
     "Distributed under the MIT option of the project license.\n\n",
     include_str!("../assets/third-party/file-transfer/ref-cast-LICENSE-MIT"),
+    "\n\n================================================================================\n",
+    "COMPLETE RESOLVED THIRD-PARTY PACKAGE NOTICES\n",
+    "================================================================================\n\n",
+    include_str!("../THIRD-PARTY-NOTICES.md"),
 );

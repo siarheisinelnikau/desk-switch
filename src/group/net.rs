@@ -815,6 +815,21 @@ fn dial(
     });
 }
 
+/// Writes one packet with a bounded wait, so a stalled peer cannot keep the
+/// session open forever. The limit is a parameter because a keep-alive ping
+/// uses a shorter budget than a real packet.
+async fn write_bounded(
+    writer: &mut (impl tokio::io::AsyncWrite + Unpin),
+    noise: &Arc<Mutex<snow::TransportState>>,
+    packet: &Packet,
+    limit: Duration,
+) -> Result<()> {
+    match timeout(limit, write_packet(writer, noise, packet)).await {
+        Ok(result) => result,
+        Err(error) => Err(anyhow::Error::from(error)),
+    }
+}
+
 fn start_session(candidate: Candidate, internal: Internal) -> Session {
     let generation = candidate.connection;
     let (send, mut outgoing) = queue::channel(128);
@@ -846,20 +861,20 @@ fn start_session(candidate: Candidate, internal: Internal) -> Session {
                 result = &mut reader => break result.map_err(anyhow::Error::from).and_then(|result|result),
                 packet = outgoing.recv() => {
                     let Some(packet) = packet else { break Ok(()); };
-                    if let Err(error) = timeout(Duration::from_secs(30), write_packet(&mut write, &noise, &packet)).await.map_err(anyhow::Error::from).and_then(|result|result) { break Err(error); }
+                    if let Err(error) = write_bounded(&mut write, &noise, &packet, Duration::from_secs(30)).await { break Err(error); }
                 }
                 changed=clips.changed()=>{
                     if changed.is_err(){break Ok(());}
                     let latest=clips.borrow_and_update().clone();
-                    if let Some(latest)=latest && let Err(error)=timeout(Duration::from_secs(30),write_packet(&mut write,&noise,&latest)).await.map_err(anyhow::Error::from).and_then(|result|result){break Err(error);}
+                    if let Some(latest)=latest && let Err(error)=write_bounded(&mut write,&noise,&latest,Duration::from_secs(30)).await{break Err(error);}
                 }
                 changed=snapshots.changed()=>{
                     if changed.is_err(){break Ok(());}
                     let latest=snapshots.borrow_and_update().clone();
-                    if let Some(latest)=latest && let Err(error)=timeout(Duration::from_secs(30),write_packet(&mut write,&noise,&latest)).await.map_err(anyhow::Error::from).and_then(|result|result){break Err(error);}
+                    if let Some(latest)=latest && let Err(error)=write_bounded(&mut write,&noise,&latest,Duration::from_secs(30)).await{break Err(error);}
                 }
                 _ = tokio::time::sleep(Duration::from_secs(2)) => {
-                    if let Err(error) = timeout(AUTH, write_packet(&mut write, &noise, &Packet::Ping)).await.map_err(anyhow::Error::from).and_then(|result|result) { break Err(error); }
+                    if let Err(error) = write_bounded(&mut write, &noise, &Packet::Ping, AUTH).await { break Err(error); }
                 }
             }
         };

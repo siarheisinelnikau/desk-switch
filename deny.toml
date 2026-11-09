@@ -1,0 +1,77 @@
+# cargo-deny configuration for Desk Switch.
+#
+# The licenses below cover every SPDX expression in the resolved dependency
+# graph. Expressions that offer alternatives (for example "MIT OR Apache-2.0")
+# are accepted as long as one permitted option is listed, which is the usual
+# reading of a dual-licensed dependency.
+[graph]
+targets = [
+    "x86_64-unknown-linux-gnu",
+    "x86_64-pc-windows-msvc",
+    "x86_64-apple-darwin",
+    "aarch64-apple-darwin",
+]
+all-features = false
+
+[advisories]
+# A real vulnerability always fails this check. The advisories below are only
+# reported as "unmaintained" crates:
+#   RUSTSEC-2025-0141            bincode - the wire format; bincode 2 is a
+#                                 breaking change for the peer protocol.
+#   RUSTSEC-2026-0370/0371/0372  the zbus 5 / zvariant family - the derive
+#                                 macros moved into zbus 6, whose API migration
+#                                 can only be verified on Linux.
+ignore = [
+    { id = "RUSTSEC-2025-0141", reason = "bincode 2 is a breaking wire-format change" },
+    { id = "RUSTSEC-2026-0370", reason = "zbus 5 / zvariant family; migrate with Linux testing" },
+    { id = "RUSTSEC-2026-0371", reason = "zbus 5 / zvariant family; migrate with Linux testing" },
+    { id = "RUSTSEC-2026-0372", reason = "zbus 5 / zvariant family; migrate with Linux testing" },
+]
+
+[licenses]
+allow = [
+    "0BSD",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-1-Clause",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "BSL-1.0",
+    "CC0-1.0",
+    "CDLA-Permissive-2.0",
+    "ISC",
+    "LGPL-2.1-or-later",
+    "MIT",
+    "MPL-2.0",
+    "OFL-1.1",
+    "Unicode-3.0",
+    "Unlicense",
+    "Ubuntu-font-1.0",
+    "Zlib",
+]
+confidence-threshold = 0.8
+exceptions = []
+
+[licenses.private]
+# The vendored crates in this repository are not published to a registry.
+ignore = true
+
+[bans]
+multiple-versions = "warn"
+wildcards = "allow"
+highlight = "all"
+allow = []
+deny = []
+skip = []
+skip-tree = []
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []
+
+[sources.allow-org]
+github = []
+gitlab = []
+bitbucket = []

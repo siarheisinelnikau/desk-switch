@@ -43,6 +43,67 @@ pub fn current_code() -> &'static str {
     LANGUAGES[ACTIVE.load(Ordering::Relaxed)].0
 }
 
+/// Maps an operating-system locale to a supported UI language.
+///
+/// The locale may be a bare language (`fr`), a language and region with either
+/// separator (`fr_FR`, `fr-FR`), a POSIX locale with a charset (`fr_FR.UTF-8`)
+/// or a modifier (`sr_RS@latin`). Anything unknown falls back to English.
+fn locale_language(locale: &str) -> &'static str {
+    let first = locale.split(':').next().unwrap_or("").trim();
+    let code = first
+        .split(['.', '@'])
+        .next()
+        .unwrap_or("")
+        .replace('-', "_");
+    let primary = code.split('_').next().unwrap_or("").to_ascii_lowercase();
+    match primary.as_str() {
+        "ru" => "ru",
+        "de" => "de",
+        "fr" => "fr",
+        "es" => "es",
+        "it" => "it",
+        _ => "en",
+    }
+}
+
+/// The language to use when no preference has been stored yet.
+pub fn system_language() -> &'static str {
+    locale_language(&os_locale())
+}
+
+#[cfg(windows)]
+fn os_locale() -> String {
+    // SAFETY: GetUserDefaultUILanguage takes no arguments, returns a plain
+    // language identifier and transfers no ownership.
+    let id = unsafe { windows_sys::Win32::Globalization::GetUserDefaultUILanguage() };
+    if id == 0 {
+        return String::new();
+    }
+    // A LANGID packs the primary language in the low ten bits.
+    match id & 0x3ff {
+        0x19 => "ru-RU",
+        0x07 => "de-DE",
+        0x0c => "fr-FR",
+        0x0a => "es-ES",
+        0x10 => "it-IT",
+        _ => "en-US",
+    }
+    .to_string()
+}
+
+#[cfg(not(windows))]
+fn os_locale() -> String {
+    for key in ["LC_ALL", "LC_MESSAGES", "LANG", "LANGUAGE"] {
+        if let Ok(value) = std::env::var(key) {
+            let value = value.trim();
+            if !value.is_empty() && value != "C" && value != "POSIX" {
+                return value.to_string();
+            }
+        }
+    }
+    String::new()
+}
+
 pub fn tr_language(code: &str, text: &str) -> String {
     translate(
         LANGUAGES
@@ -231,6 +292,36 @@ mod tests {
                     panic!("{language} still uses the English text for {key:?}");
                 }
             }
+        }
+    }
+
+    #[test]
+    fn the_system_locale_selects_a_supported_language_or_english() {
+        for (locale, expected) in [
+            ("ru", "ru"),
+            ("ru_RU", "ru"),
+            ("ru-RU", "ru"),
+            ("ru_RU.UTF-8", "ru"),
+            ("de_DE.UTF-8", "de"),
+            ("de-DE", "de"),
+            ("fr", "fr"),
+            ("fr_CA", "fr"),
+            ("es_ES.UTF-8", "es"),
+            ("it_IT", "it"),
+            ("en_US.UTF-8", "en"),
+            ("pt_BR", "en"),
+            ("C", "en"),
+            ("", "en"),
+            ("C.UTF-8", "en"),
+        ] {
+            assert_eq!(locale_language(locale), expected, "locale {locale}");
+        }
+        // LANGUAGE may list several locales; the first one decides.
+        assert_eq!(locale_language("de_DE:en_US:ru_RU"), "de");
+        // Every produced code must exist in the catalog set.
+        for (code, _) in LANGUAGES {
+            assert!(CATALOGS.iter().all(|catalog| !catalog.is_empty()));
+            assert!(LANGUAGES.iter().any(|(key, _)| *key == code));
         }
     }
 

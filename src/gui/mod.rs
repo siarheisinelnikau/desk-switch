@@ -154,6 +154,8 @@ pub fn run(start_hidden: bool) -> Result<()> {
     run_at(start_hidden, config::state_dir()?)
 }
 
+const ALREADY_OPEN: &str = "Desk Switch уже открыт для этого профиля";
+
 pub fn run_at(start_hidden: bool, dir: PathBuf) -> Result<()> {
     anyhow::ensure!(dir.is_absolute(), "путь профиля должен быть абсолютным");
     let mut builder = std::fs::DirBuilder::new();
@@ -164,8 +166,14 @@ pub fn run_at(start_hidden: bool, dir: PathBuf) -> Result<()> {
         builder.mode(0o700);
     }
     builder.create(&dir)?;
-    let _lock =
-        config::lock(&dir, "desktop.lock").context("Desk Switch уже открыт для этого профиля")?;
+    let _lock = match config::lock(&dir, "desktop.lock") {
+        Ok(lock) => lock,
+        Err(error) => {
+            #[cfg(windows)]
+            show_already_open_notice(&dir);
+            return Err(error).context(ALREADY_OPEN);
+        }
+    };
     let icon = egui::IconData {
         rgba: tray::icon_rgba(64),
         width: 64,
@@ -204,6 +212,31 @@ pub fn run_at(start_hidden: bool, dir: PathBuf) -> Result<()> {
         }),
     )
     .map_err(|error| anyhow::anyhow!("открытие окна Desk Switch: {error}"))
+}
+
+#[cfg(windows)]
+fn show_already_open_notice(dir: &std::path::Path) {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{MB_ICONINFORMATION, MB_OK, MessageBoxW};
+
+    let language = Preferences::load(dir).unwrap_or_default().language;
+    let message = crate::i18n::tr_language(&language, ALREADY_OPEN)
+        .encode_utf16()
+        .chain(Some(0))
+        .collect::<Vec<_>>();
+    let title = "Desk Switch"
+        .encode_utf16()
+        .chain(Some(0))
+        .collect::<Vec<_>>();
+    // SAFETY: the message and title are NUL-terminated UTF-16 buffers that
+    // outlive the call, and the window handle may be null.
+    unsafe {
+        MessageBoxW(
+            std::ptr::null_mut(),
+            message.as_ptr(),
+            title.as_ptr(),
+            MB_ICONINFORMATION | MB_OK,
+        );
+    }
 }
 
 impl Desktop {
@@ -1100,6 +1133,11 @@ impl Desktop {
         };
         if let Some(error) = &failed_update {
             self.notice = Some((format!("Обновление не установлено: {error}"), true));
+        }
+        if let Some(report) = crate::crash::take_report(&self.dir)
+            && let Some(summary) = crate::crash::report_summary(&report)
+        {
+            self.notice = Some((format!("Desk Switch crashed last time: {summary}"), true));
         }
         if self.prefs.auto_update && failed_update.is_none() {
             if !std::env::current_exe().is_ok_and(|path| crate::updater::shared_managed(&path))
