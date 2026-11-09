@@ -69,31 +69,9 @@ pub struct Service {
 impl Service {
     pub fn start(dir: PathBuf, node: Node, port: u16, ctx: eframe::egui::Context) -> Result<Self> {
         let identity = config::load_identity(&dir)?;
-        let socket = socket2::Socket::new(
-            socket2::Domain::IPV6,
-            socket2::Type::STREAM,
-            Some(socket2::Protocol::TCP),
-        )
-        .and_then(|socket| {
-            socket.set_only_v6(false)?;
-            socket.set_reuse_address(true)?;
-            socket.bind(&SocketAddr::from(([0, 0, 0, 0, 0, 0, 0, 0], port)).into())?;
-            Ok(socket)
-        })
-        .or_else(|_| {
-            let socket = socket2::Socket::new(
-                socket2::Domain::IPV4,
-                socket2::Type::STREAM,
-                Some(socket2::Protocol::TCP),
-            )?;
-            socket.set_reuse_address(true)?;
-            socket.bind(&SocketAddr::from(([0, 0, 0, 0], port)).into())?;
-            Ok::<_, std::io::Error>(socket)
-        })
-        .context("Не удалось включить доступность в сети. Возможно, Desk Switch уже запущен.")?;
-        socket.listen(8)?;
-        socket.set_nonblocking(true)?;
-        let listener: std::net::TcpListener = socket.into();
+        let listener = crate::listen::wildcard_tcp(port, 8).context(
+            "Не удалось включить доступность в сети. Возможно, Desk Switch уже запущен.",
+        )?;
         Self::spawn(dir, node, listener, identity, ctx)
     }
 

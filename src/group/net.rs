@@ -334,35 +334,9 @@ struct ClipboardCommand {
     latest: Mutex<Option<Action>>,
     changed: tokio::sync::Notify,
 }
-fn listen(port: u16) -> Result<std::net::TcpListener> {
-    let socket = socket2::Socket::new(
-        socket2::Domain::IPV6,
-        socket2::Type::STREAM,
-        Some(socket2::Protocol::TCP),
-    )
-    .and_then(|socket| {
-        socket.set_only_v6(false)?;
-        socket.set_reuse_address(true)?;
-        socket.bind(&SocketAddr::from(([0, 0, 0, 0, 0, 0, 0, 0], port)).into())?;
-        Ok(socket)
-    })
-    .or_else(|_| {
-        let socket = socket2::Socket::new(
-            socket2::Domain::IPV4,
-            socket2::Type::STREAM,
-            Some(socket2::Protocol::TCP),
-        )?;
-        socket.set_reuse_address(true)?;
-        socket.bind(&SocketAddr::from(([0, 0, 0, 0], port)).into())?;
-        Ok::<_, std::io::Error>(socket)
-    })?;
-    socket.listen(16)?;
-    socket.set_nonblocking(true)?;
-    Ok(socket.into())
-}
 impl Service {
     pub fn start(dir: PathBuf, mut local: Member, port: u16, ctx: egui::Context) -> Result<Self> {
-        let listener = listen(port)?;
+        let listener = crate::listen::wildcard_tcp(port, 16)?;
         let port = listener.local_addr()?.port();
         local.address.set_port(port);
         let mut state = load(&dir, local)?;
@@ -888,6 +862,7 @@ fn start_session(candidate: Candidate, internal: Internal) -> Session {
         commands: send,
         clipboard,
         snapshot,
+        directory_queued: false,
     }
 }
 
@@ -896,6 +871,7 @@ struct Session {
     commands: queue::Sender<Packet>,
     clipboard: tokio::sync::watch::Sender<Option<Arc<Packet>>>,
     snapshot: tokio::sync::watch::Sender<Option<Arc<Packet>>>,
+    directory_queued: bool,
 }
 type Sessions = BTreeMap<String, Session>;
 
@@ -1249,7 +1225,7 @@ mod tests {
         }
     }
 
-    fn synthetic_session(generation: u8) -> (Session, queue::Receiver<Packet>) {
+    pub(super) fn synthetic_session(generation: u8) -> (Session, queue::Receiver<Packet>) {
         let (commands, receive) = queue::channel(1);
         let (clipboard, _clips) = tokio::sync::watch::channel(None);
         let (snapshot, _snapshots) = tokio::sync::watch::channel(None);
@@ -1259,6 +1235,7 @@ mod tests {
                 commands,
                 clipboard,
                 snapshot,
+                directory_queued: false,
             },
             receive,
         )
@@ -1613,6 +1590,7 @@ mod tests {
                 commands,
                 clipboard,
                 snapshot,
+                directory_queued: false,
             },
         );
         broadcast(&sessions, &state);
