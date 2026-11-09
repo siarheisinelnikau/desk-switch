@@ -40,7 +40,7 @@ Permissions are granted through macOS itself and cannot be bypassed. On macOS 15
 ## Link your computers
 
 1. Start Desk Switch on the computers you want to link. The workspace advertises itself on the local network while the application is running.
-2. Click **+ Add a computer** in the header. In **Nearby computers**, choose a discovered computer and click **Connect**. Approve the connection with **Allow** on the invited computer. Compare the displayed security code when confirming a new identity; keys are created and exchanged automatically. The dialog shows the pending approval, completion or a connection error.
+2. Click **+ Add a computer** in the header. In **Nearby computers**, choose a discovered computer and click **Connect**. Compare the displayed security code on both computers, then choose **Codes match** on each. A declined or expired invitation can be retried. The dialog shows the pending approval, completion or a connection error.
 3. Repeat for each additional computer. Every member sees the complete workspace, connection status and device roles. Use **Switch here** on a computer's card to select it, or **Settings** to manage it.
 
 One trusted computer coordinates workspace changes. If it disconnects, sleeps or restarts, the remaining members can elect another coordinator automatically. A **majority of the saved trusted membership** must be connected: two of three, three of four, or three of five. A **two-computer workspace needs both computers** for shared changes; it cannot continue global edits with one missing. During a loss of quorum, shared controls wait and show reconnection/waiting status. F11 emergency input return and local update checking remain available.
@@ -56,6 +56,12 @@ If discovery is unavailable, open **+ Add a computer → Manual IP**. Enter a nu
 IPv4 and **routable IPv6** addresses (global or ULA) are supported by the control, input, audio and microphone listeners. A routed network or VPN and appropriate firewall access are required across subnets; Desk Switch does not provide NAT traversal. IPv6 link-local interface scope numbers are local to each computer, and Desk Switch does not translate them between members. Use IPv4 or a routable IPv6 address for a workspace spanning computers with different interface scopes.
 
 Direct device connections use **45876/TCP** for input and **45877/TCP** for system audio. File transfers use **45881/TCP** by default; allow it on every participating member so sending, receiving, cancellation and resume can connect. A custom control address uses the following TCP port for file connections. Microphone fanout uses one TCP listener on the source for each receiver, allocated from **49000** by the member's sorted identity index: for a workspace of N computers, allow **49000 through 49000 + N − 1** on the microphone source. Legacy pairing/management uses **45878/TCP**; **45879/TCP** is the earlier two-computer microphone port, not the new fanout range. Allow Desk Switch on your private LAN if the operating system requests firewall permission. The application does not change firewall rules.
+
+### Remove or replace a computer
+
+Select a computer in **Settings → Remove computer…** and confirm. The current coordinator handles the removal after a majority of both the previous and remaining members agree. If you need to remove the current coordinator, close Desk Switch on it and wait for the remaining majority to elect a new coordinator. An excluded computer must be approved again to join.
+
+If a majority cannot be recovered, open **Settings → Start a new workspace…** on a computer you still have. After confirming, reopen Desk Switch. It starts with a new identity, keeps local app preferences and backs up the previous workspace records in its state directory. Add each computer again and compare the codes. Use this recovery action on any remaining computer that is still bound to the previous workspace.
 
 ## Devices across the workspace
 
@@ -113,7 +119,7 @@ On **GNOME Wayland**, enable the bundled **Desk Switch Tray** companion once in 
 
 Click **Send files…** on the recipient's computer card. In **Transfers**, use **Add files…** or **Add folders…**, check the recipient, then **Send**. Previously approved workspace members receive transfers automatically under **Downloads / Desk Switch**, in a unique bundle folder. Existing files are preserved. The clipboard setting is not needed for a direct send.
 
-The compact progress window works while the main application is in the tray. It shows the source, recipient, current file, byte progress and verification. **Pause transfer** pauses the shared transfer; **Resume transfer** continues when the other computer is reachable, checking completed data before reuse. **Cancel transfer** stops that transfer, including other pastes using the same incoming files. Closing the progress window cancels its cancellable transfers; minimizing it lets them continue. Confirmed source cleanup cannot be cancelled or rolled back from this window.
+The compact progress window works while the main application is in the tray. It shows the source, recipient, current file, byte progress and verification. **Pause transfer** pauses the shared transfer; **Resume transfer** continues when the other computer is reachable, checking completed data before reuse. **Cancel transfer** stops that transfer, including other pastes using the same incoming files. Closing or minimizing the progress window lets transfers continue. Open **Transfers** to see progress or explicitly cancel a transfer. Confirmed source cleanup cannot be cancelled or rolled back from this window.
 
 **Transfers** in the main window keeps the history. A **Transfers · n** shortcut appears in quick controls when transfers or local recovery need attention. Explicit sends receive files in **Downloads / Desk Switch**; **Open folder** opens completed received copies. Clipboard pastes go to the destination chosen in the file manager. Receiving a file does not open or execute it.
 
@@ -155,7 +161,7 @@ DDC/CI depends on the monitor and firmware. Some LG monitors can show a recurrin
 
 ## Window, tray and startup
 
-**X** hides the main window in the tray and keeps sharing active. **Left-click** the tray icon to open compact controls beside the pointer: switch destination, enable or disable sound/microphone/keyboard/mouse, and adjust each computer's system or relative volume and mute. **Right-click** opens the native tray menu. **Open Desk Switch** opens the full window; Escape or loss of focus closes the popup. On Wayland, the compositor controls popup placement.
+**X** hides the main window in the tray and keeps sharing active. **Left-click** the tray icon to open compact controls beside the pointer: switch destination, enable or disable sound/microphone/keyboard/mouse, and adjust each computer's system or relative volume and mute. **Pause microphone and clipboard on this computer** stops this computer's microphone forwarding and clipboard synchronization even while shared settings are unavailable. This local choice persists across reconnects and restarts. **Right-click** opens the native tray menu. **Open Desk Switch** opens the full window; Escape or loss of focus closes the popup. On Wayland, the compositor controls popup placement.
 
 Use **Quit application** from quick controls or the native tray menu to release input, stop services and exit; an unresponsive child is terminated after six seconds. If no working tray is available, X exits instead of leaving an inaccessible background process. Losing the tray brings a hidden window back.
 
@@ -173,15 +179,17 @@ Login startup is enabled after the first launch and can be disabled in Settings 
 
 Automatic checks run at startup and every six hours by default and fetch **signed release metadata only**. They do not download an installer or install anything. **Download and install** explicitly downloads, verifies and installs the update on the selected computer, then restarts it as required. The persistent automatic-check toggle disables background checks; manual checking remains available. Settings, identities, workspace membership and user data survive updates. Older device-protocol versions wait for a compatible update before input or media sharing resumes.
 
+Use **Prepare update** for each selected computer to download and verify its package while it keeps running. Once ready, choose **Install and restart** on the other computers, then restart this computer. Check that each required computer is online before starting.
+
 Each computer independently downloads from the canonical repository and verifies a pinned Ed25519 signature covering the exact artifact URL, version, size and SHA-256. Signed metadata is embedded in the release description. From 0.6.2, its targets cover the Windows executable, Ubuntu Debian package and both Mac app archives, using the vendored [`rust-auto-updator` 0.4.1](https://github.com/siarheisinelnikau/rust-auto-updator) core.
 
 An installed Ubuntu package updates without an application password prompt. Its fixed system helper accepts only a newer Desk Switch amd64 package whose exact bytes match the pinned project signature; it cannot install another package or an arbitrary file. Initial `.deb` installation still uses Ubuntu's normal administrator authorization. No generic system authorization policy is weakened.
 
-Recent service logs and diagnostics are synchronized over authenticated, encrypted workspace connections. Open **Settings → Advanced → Diagnostics → Copy diagnostics** to collect member state and recent service messages. Offline reports remain labelled as such. Snapshots are bounded and do not reconfigure device services.
+Recent service logs and diagnostics are synchronized over authenticated, encrypted workspace connections. Open **Settings → Advanced → Diagnostics → Copy diagnostics** to collect platform, version and health information without names, addresses, device identifiers or paths. **Copy full diagnostics** includes settings and recent service messages. Offline reports remain labelled as such. Snapshots are bounded and do not reconfigure device services.
 
 Two files in the state directory help when the application stops before the report can be copied. `panic-report.txt` holds the last panic with its message, location and backtrace. `diagnostics.log` holds the recent service messages and is only written when it is requested with the environment variable `DESK_SWITCH_DIAGNOSTICS_LOG=1`; it is rotated at two megabytes and keeps one previous file. It can contain computer names, file paths and network addresses, so review it before sharing. The state directory is printed by the `state-dir` command.
 
-When upgrading to **0.8.1**, install it on every member before resuming sharing. Native device protocol is **9** and workspace protocol is **2**. Mixed versions temporarily disconnect from sharing. To update other computers remotely from one PC, finish those updates before upgrading that controlling PC. Each computer can also check and install its update locally.
+When upgrading from **0.8.x to 0.9.0**, upgrade every member before resuming sharing. Native device protocol is **9** and workspace protocol is **3**. Settings and saved membership carry forward. Update other computers before upgrading the controlling PC, or use local updates on each computer. Starting with 0.9.0, adjacent stable patch releases in the same minor series can share devices when they use the same protocols.
 
 When migrating an older workspace that has yet to establish its canonical membership, bring the **original coordinating computer online on the new version with a trusted quorum** once. It may be upgraded first or last. After this migration, any surviving majority can coordinate. Settings, identities and display arrangements are preserved.
 

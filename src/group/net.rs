@@ -3,10 +3,7 @@
 use super::model::{self, Member, MemberPreferences, Settings, Workspace};
 use crate::{
     config,
-    workspace::{
-        self, Node,
-        net::{Candidate, Request},
-    },
+    workspace::{self, Node, net::Candidate},
 };
 use anyhow::{Context, Result, bail, ensure};
 use eframe::egui;
@@ -46,6 +43,7 @@ mod clipboard_bytes {
     }
 }
 
+pub(crate) const CONSENT_TIMEOUT: Duration = Duration::from_secs(90);
 const MAX_PACKET: usize = 16 * 1024 * 1024;
 const CHUNK: usize = 60 * 1024;
 const AUTH: Duration = Duration::from_secs(5);
@@ -95,6 +93,9 @@ pub enum Action {
     },
     ReturnInput,
     EdgePause(bool),
+    RemoveMember {
+        key: String,
+    },
     MonitorResult {
         id: u64,
         error: Option<String>,
@@ -102,6 +103,10 @@ pub enum Action {
     Invite {
         address: SocketAddr,
         key: String,
+    },
+    ApproveInvite {
+        id: [u8; 32],
+        accept: bool,
     },
     Manage {
         target: String,
@@ -119,9 +124,18 @@ pub enum Action {
     },
 }
 
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct Request {
+    pub id: [u8; 32],
+    pub name: String,
+    pub code: String,
+}
+
 #[derive(Debug)]
 pub enum Event {
     Request(Request),
+    RequestExpired([u8; 32]),
+    Removed,
     State(Box<Workspace>),
     Management {
         source: String,
@@ -163,12 +177,17 @@ enum Packet {
     Hello {
         protocol: u16,
         intent: Intent,
+        workspace: Option<String>,
+    },
+    Introduction {
         member: Box<Member>,
         hub: String,
         count: usize,
         workspace_id: String,
     },
     Decision(bool),
+    PairingPrompt(Request),
+    PairingExpired([u8; 32]),
     Bootstrap(Box<super::consensus::HardState>),
     Consensus(super::consensus::Rpc),
     Observation(Box<Member>),
@@ -204,7 +223,6 @@ enum Packet {
 
 enum Command {
     Action(Box<Action>),
-    Approve(String, bool),
     Disconnect,
     #[cfg(test)]
     Raw(String, Box<Packet>),
@@ -213,6 +231,7 @@ enum Command {
 }
 enum Incoming {
     Consent {
+        owner: Option<String>,
         request: Request,
         accept: oneshot::Sender<bool>,
     },
@@ -404,8 +423,8 @@ impl Service {
         *self.status_commands.latest.lock().unwrap() = Some((Box::new(node), native, ready));
         self.status_commands.changed.notify_one();
     }
-    pub fn approve(&self, key: String, accept: bool) {
-        let _ = self.commands.try_send(Command::Approve(key, accept));
+    pub fn approve(&self, id: [u8; 32], accept: bool) -> Result<()> {
+        self.action(Action::ApproveInvite { id, accept })
     }
     pub fn poll(&self) -> Vec<Event> {
         let mut events = self.events.try_iter().take(128).collect::<Vec<_>>();
@@ -628,45 +647,37 @@ async fn setup(
     intent: Intent,
     internal: Internal,
     dial: Option<DialPermit>,
+    consent_owner: Option<String>,
 ) -> Result<()> {
     let peer = config::hex(&candidate.key);
     let trusted = state.members.contains_key(&peer);
     let outgoing = candidate.outgoing;
     let noise = Arc::new(Mutex::new(candidate.noise));
-    write_packet(
+    write_timed(
         &mut candidate.stream,
         &noise,
         &Packet::Hello {
             protocol: model::PROTOCOL,
             intent,
-            member: Box::new(local.clone()),
-            hub: state.hub.clone(),
-            count: state.members.len(),
-            workspace_id: state.workspace_id().to_owned(),
+            workspace: trusted.then(|| state.workspace_id().to_owned()),
         },
+        AUTH,
     )
     .await?;
     let Packet::Hello {
         protocol,
         intent: remote_intent,
-        mut member,
-        hub: remote_hub,
-        count,
-        workspace_id,
+        workspace,
     } = timeout(AUTH, read_packet(&mut candidate.stream, &noise)).await??
     else {
-        bail!("Missing workspace handshake")
+        bail!("Missing workspace handshake");
     };
     ensure!(
-        protocol == model::PROTOCOL && member.node.key == peer,
+        protocol == model::PROTOCOL,
         "Incompatible workspace handshake"
     );
-    member.address = canonical_address(candidate.address);
-    member.online = true;
-    member.validate(&remote_hub)?;
-    model::valid_key(&workspace_id)?;
     let requested = if outgoing { intent } else { remote_intent };
-    let mesh = trusted && workspace_id == state.workspace_id();
+    let mesh = trusted && workspace.as_deref() == Some(state.workspace_id());
     ensure!(
         !matches!(requested, Intent::Mesh) || mesh,
         "The saved computer belongs to a different workspace; invite it explicitly"
@@ -675,53 +686,88 @@ async fn setup(
         (outgoing, requested),
         (true, Intent::Invite) | (false, Intent::Join)
     );
-    if !mesh && controller {
-        ensure!(
-            state.hub == local.node.key,
-            "Add computers through the workspace controller"
-        );
-    } else if !mesh {
-        ensure!(remote_hub == peer, "Connect to the workspace controller");
-        ensure!(
-            state.members.len() <= 1 || state.hub == peer,
-            "Leave the existing workspace before joining another"
-        );
-    }
-    if !mesh && controller && matches!(requested, Intent::Invite) {
-        ensure!(
-            count <= 1 || remote_hub == local.node.key,
-            "The invited computer already belongs to another workspace"
-        );
-    }
-    let accepted = if trusted || outgoing {
-        true
-    } else {
+    if !mesh {
+        if controller {
+            ensure!(
+                state.hub == local.node.key,
+                "Add computers through the workspace controller"
+            );
+        } else {
+            ensure!(
+                state.members.len() <= 1 || state.hub == peer,
+                "Leave the existing workspace before joining another"
+            );
+        }
         let (accept, approved) = oneshot::channel();
         internal
             .send(Incoming::Consent {
+                owner: consent_owner,
                 request: Request {
-                    key: peer.clone(),
+                    id: candidate.connection,
                     name: candidate.name.clone(),
                     code: candidate.code.clone(),
                 },
                 accept,
             })
             .await?;
-        timeout(Duration::from_secs(90), approved).await??
-    };
-    write_packet(&mut candidate.stream, &noise, &Packet::Decision(accepted)).await?;
-    ensure!(
-        accepted
-            && matches!(
-                timeout(
-                    Duration::from_secs(90),
-                    read_packet(&mut candidate.stream, &noise)
-                )
-                .await??,
+        let accepted = timeout(CONSENT_TIMEOUT, approved).await??;
+        write_timed(
+            &mut candidate.stream,
+            &noise,
+            &Packet::Decision(accepted),
+            AUTH,
+        )
+        .await?;
+        ensure!(accepted, "Workspace invitation declined");
+        ensure!(
+            matches!(
+                timeout(CONSENT_TIMEOUT, read_packet(&mut candidate.stream, &noise)).await??,
                 Packet::Decision(true)
             ),
-        "Workspace invitation declined"
-    );
+            "Workspace invitation declined"
+        );
+    }
+    let introduction = Packet::Introduction {
+        member: Box::new(local),
+        hub: state.hub.clone(),
+        count: state.members.len(),
+        workspace_id: state.workspace_id().to_owned(),
+    };
+    let (mut reader, mut writer) = candidate.stream.split();
+    let (_, response) = timeout(AUTH, async {
+        tokio::try_join!(
+            write_packet(&mut writer, &noise, &introduction),
+            read_packet(&mut reader, &noise),
+        )
+    })
+    .await??;
+    let Packet::Introduction {
+        mut member,
+        hub: remote_hub,
+        count,
+        workspace_id,
+    } = response
+    else {
+        bail!("Missing approved workspace introduction");
+    };
+    ensure!(member.node.key == peer, "Computer identity mismatch");
+    member.address = canonical_address(candidate.address);
+    member.online = true;
+    member.validate(&remote_hub)?;
+    model::valid_key(&workspace_id)?;
+    if mesh {
+        ensure!(
+            workspace_id == state.workspace_id(),
+            "Workspace identity changed"
+        );
+    } else if !controller {
+        ensure!(remote_hub == peer, "Connect to the workspace controller");
+    } else if matches!(requested, Intent::Invite) {
+        ensure!(
+            count <= 1 || remote_hub == state.hub,
+            "The invited computer already belongs to another workspace"
+        );
+    }
     candidate.noise = Arc::try_unwrap(noise)
         .map_err(|_| anyhow::anyhow!("Handshake still in use"))?
         .into_inner()
@@ -743,11 +789,12 @@ fn dial(
     identity: &config::Identity,
     local: &Member,
     state: &Workspace,
-    address: SocketAddr,
-    expected: String,
+    target: (SocketAddr, String),
     intent: Intent,
     internal: Internal,
+    consent_owner: Option<String>,
 ) {
+    let (address, expected) = target;
     let Some(permit) = internal.reserve_dial(&expected, address) else {
         return;
     };
@@ -779,6 +826,7 @@ fn dial(
                 intent,
                 internal.clone(),
                 Some(permit),
+                consent_owner,
             )
             .await
         }
@@ -792,7 +840,7 @@ fn dial(
 /// Writes one packet with a bounded wait, so a stalled peer cannot keep the
 /// session open forever. The limit is a parameter because a keep-alive ping
 /// uses a shorter budget than a real packet.
-async fn write_bounded(
+async fn write_timed(
     writer: &mut (impl tokio::io::AsyncWrite + Unpin),
     noise: &Arc<Mutex<snow::TransportState>>,
     packet: &Packet,
@@ -835,20 +883,20 @@ fn start_session(candidate: Candidate, internal: Internal) -> Session {
                 result = &mut reader => break result.map_err(anyhow::Error::from).and_then(|result|result),
                 packet = outgoing.recv() => {
                     let Some(packet) = packet else { break Ok(()); };
-                    if let Err(error) = write_bounded(&mut write, &noise, &packet, Duration::from_secs(30)).await { break Err(error); }
+                    if let Err(error) = write_timed(&mut write, &noise, &packet, Duration::from_secs(30)).await { break Err(error); }
                 }
                 changed=clips.changed()=>{
                     if changed.is_err(){break Ok(());}
                     let latest=clips.borrow_and_update().clone();
-                    if let Some(latest)=latest && let Err(error)=write_bounded(&mut write,&noise,&latest,Duration::from_secs(30)).await{break Err(error);}
+                    if let Some(latest)=latest && let Err(error)=write_timed(&mut write,&noise,&latest,Duration::from_secs(30)).await{break Err(error);}
                 }
                 changed=snapshots.changed()=>{
                     if changed.is_err(){break Ok(());}
                     let latest=snapshots.borrow_and_update().clone();
-                    if let Some(latest)=latest && let Err(error)=write_bounded(&mut write,&noise,&latest,Duration::from_secs(30)).await{break Err(error);}
+                    if let Some(latest)=latest && let Err(error)=write_timed(&mut write,&noise,&latest,Duration::from_secs(30)).await{break Err(error);}
                 }
                 _ = tokio::time::sleep(Duration::from_secs(2)) => {
-                    if let Err(error) = write_bounded(&mut write, &noise, &Packet::Ping, AUTH).await { break Err(error); }
+                    if let Err(error) = write_timed(&mut write, &noise, &Packet::Ping, AUTH).await { break Err(error); }
                 }
             }
         };
@@ -1072,6 +1120,7 @@ fn apply(
         Action::ActivateEdge { key, position } => state.activate(source, &key, Some(position))?,
         Action::ReturnInput => state.return_input()?,
         Action::EdgePause(paused) => state.pause_edges(paused)?,
+        Action::RemoveMember { key } => state.remove_member(&key)?,
         Action::MonitorResult { id, error } => state.monitor_result(source, id, error)?,
         Action::Invite { address, key } => {
             if !key.is_empty() {
@@ -1081,12 +1130,13 @@ fn apply(
                 identity,
                 &state.members[own],
                 state,
-                address,
-                key,
+                (address, key),
                 Intent::Invite,
                 internal.clone(),
+                (source != own).then(|| source.to_owned()),
             );
         }
+        Action::ApproveInvite { .. } => bail!("Unexpected invitation response"),
         Action::Manage { target, message } => {
             message.validate()?;
             ensure!(
@@ -1879,7 +1929,7 @@ mod tests {
         for (index, computer) in computers.iter_mut().enumerate() {
             for event in computer.service.poll() {
                 match event {
-                    Event::Request(request) => computer.service.approve(request.key, true),
+                    Event::Request(request) => computer.service.approve(request.id, true).unwrap(),
                     Event::State(state) => computer.state = Some(*state),
                     other => forwarded.push((index, other)),
                 }
@@ -1989,7 +2039,14 @@ mod tests {
         });
         for index in 1..4 {
             let address = computers[index].state.as_ref().unwrap().members[&keys[index]].address;
-            computers[0]
+            // Once two members are established, initiate the next invite
+            // from a follower and confirm its forwarded pairing code there.
+            let inviter = usize::from(index == 2);
+            until(&mut computers, &mut forwarded, |_, events| {
+                failover_coordination(events, inviter)
+                    .is_some_and(|(leader, writable, _, _)| leader.is_some() && writable)
+            });
+            computers[inviter]
                 .service
                 .action(Action::Invite {
                     address,

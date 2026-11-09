@@ -125,9 +125,12 @@ fn authenticated_folder_transfer_resumes_after_both_processes_restart() {
     let sender = spawn_actor(&fixture, "sender-first", alice_port, bob_port, &b);
     wait(|| receiver.0.try_wait().unwrap().is_some());
     assert!(receiver.0.wait().unwrap().success());
+    assert_eq!(
+        fs::read_to_string(fixture.path("receiver-crash.prefix")).unwrap(),
+        (3 * CHUNK).to_string(),
+    );
     wait(|| {
-        read_view(&fixture.path("sender-first.view"))
-            .is_some_and(|v| v.phase == Phase::Paused && v.bytes >= 3 * CHUNK as u64)
+        read_view(&fixture.path("sender-first.view")).is_some_and(|v| v.phase == Phase::Paused)
     });
     drop(sender);
     drop(receiver);
@@ -177,9 +180,12 @@ fn cancelling_while_the_receiver_is_offline_survives_restart_and_cleans_its_part
     let sender = spawn_actor(&fixture, "sender-first", alice_port, bob_port, &b);
     wait(|| receiver.0.try_wait().unwrap().is_some());
     assert!(receiver.0.wait().unwrap().success());
+    assert_eq!(
+        fs::read_to_string(fixture.path("receiver-crash.prefix")).unwrap(),
+        (3 * CHUNK).to_string(),
+    );
     wait(|| {
-        read_view(&fixture.path("sender-first.view"))
-            .is_some_and(|v| v.phase == Phase::Paused && v.bytes >= 3 * CHUNK as u64)
+        read_view(&fixture.path("sender-first.view")).is_some_and(|v| v.phase == Phase::Paused)
     });
     let view = read_view(&fixture.path("sender-first.view")).unwrap();
     let export = view.id.split('.').next().unwrap();
@@ -410,6 +416,7 @@ async fn crash_receiver(root: &Path, port: u16, peer: &str, workspace: &str) -> 
                     pipe.send(&Packet::Ack { index: i, offset }).await?;
                     chunks += 1;
                     if chunks == 3 {
+                        fs::write(root.join("receiver-crash.prefix"), offset.to_string())?;
                         return Ok(());
                     }
                 }
