@@ -112,7 +112,7 @@ function icon(id, busName, x) {
         menu: {opens: 0, closes: 0, isOpen: false,
             close() { this.closes++; this.isOpen = false; }},
         get_transformed_extents: () => ({get_x: () => x, get_y: () => 0, get_width: () => 24, get_height: () => 24}),
-        contains: other => other?.parent === actor,
+        get_parent: () => null,
     });
     return actor;
 }
@@ -127,27 +127,28 @@ vm.runInNewContext(source, sandbox, {filename: 'Desk Switch GNOME extension.js'}
 const extension = new sandbox.Subject();
 extension.enable();
 assert.equal(idle.size, 1);
-for (const [id, callback] of idle) { idle.delete(id); callback(); }
-assert.equal(extension._icons.size, 2);
 const event = (type, button = 1, x = 110) => ({type: () => type, get_button: () => button, get_coords: () => [x, 12], get_time: () => 1234});
 target = own;
 assert.equal(extension._handleEvent(event(1, 3)), Clutter.EVENT_PROPAGATE);
 assert.equal(extension._handleEvent(event(2, 3)), Clutter.EVENT_PROPAGATE);
 assert.equal(own.menu.closes, 0);
-assert.equal(extension._handleEvent(event(1)), Clutter.EVENT_STOP);
+assert.equal(extension._handleEvent(event(1)), Clutter.EVENT_STOP,
+    'the first click must bypass the host menu even before the initial panel scan');
 assert.equal(extension._handleEvent(event(2)), Clutter.EVENT_STOP);
 await Promise.resolve();
 assert.equal(own.menu.opens, 0, 'primary activation must bypass AppIndicator.open and its host menu');
 assert.equal(own.menu.isOpen, false);
 assert.deepEqual(calls, [[110, 12]]);
 assert.equal(own.menu.closes, 1);
+for (const [id, callback] of idle) { idle.delete(id); callback(); }
+assert.equal(extension._icons.size, 2);
 target = other;
 assert.equal(extension._handleEvent(event(1, 1, 140)), Clutter.EVENT_PROPAGATE);
 assert.equal(extension._handleEvent(event(2, 1, 140)), Clutter.EVENT_PROPAGATE);
 target = own;
 extension._handleEvent(event(1)); target = null; extension._handleEvent(event(2));
 assert.equal(calls.length, 1, 'a cancelled press must not activate');
-target = {parent: own};
+target = {get_parent: () => own};
 extension._handleEvent(event(1)); extension._handleEvent(event(2));
 await Promise.resolve();
 assert.equal(calls.length, 2, 'a child actor belongs to its indicator');
@@ -155,6 +156,29 @@ delete own._indicator._proxy.g_object_path;
 extension._activate(own._indicator, 110.4, 12.2);
 assert.equal(calls.length, 3, 'older proxies use the fixed ksni object path');
 assert.deepEqual(calls[2], [110, 12]);
+await Promise.resolve();
+
+// GNOME can replace the indicator while the companion is running. Handle its
+// first click from the picked actor while discovery is still pending.
+const replacement = icon('desk-switch', ':1.4', 100);
+Main.panel.statusArea.own = replacement;
+boxes[2].emit('child-added', replacement);
+assert.equal(idle.size, 1);
+target = {get_parent: () => ({get_parent: () => replacement})};
+assert.equal(extension._handleEvent(event(1)), Clutter.EVENT_STOP);
+assert.equal(extension._handleEvent(event(2)), Clutter.EVENT_STOP);
+assert.deepEqual(calls.slice(3), [[110, 12]], 'the new indicator activates once');
+assert.equal(extension._handleEvent(event(1, 3)), Clutter.EVENT_PROPAGATE);
+assert.equal(extension._handleEvent(event(2, 3)), Clutter.EVENT_PROPAGATE);
+assert.equal(replacement.menu.closes, 1, 'the secondary click belongs to the host');
+assert.equal(extension._handleEvent(event(1)), Clutter.EVENT_STOP);
+replacement.emit('destroy');
+delete Main.panel.statusArea.own;
+target = null;
+assert.equal(extension._handleEvent(event(2)), Clutter.EVENT_PROPAGATE);
+assert.equal(calls.length, 4, 'destroying a pressed indicator cancels activation');
+Main.panel.statusArea.own = own;
+for (const [id, callback] of idle) { idle.delete(id); callback(); }
 await Promise.resolve();
 
 class Invocation {

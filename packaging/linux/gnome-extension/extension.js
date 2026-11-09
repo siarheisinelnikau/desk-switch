@@ -97,16 +97,16 @@ export default class DeskSwitchTray extends Extension {
 
     _iconAt(x, y) {
         const target = global.stage.get_actor_at_pos(Clutter.PickMode.REACTIVE, x, y);
-        if (!target)
-            return null;
-        for (const icon of this._icons.keys()) {
-            if (icon.visible && icon._indicator.id === INDICATOR_ID &&
-                (target === icon || icon.contains(target))) {
-                const rect = icon.get_transformed_extents();
-                if (x >= rect.get_x() && x < rect.get_x() + rect.get_width() &&
-                    y >= rect.get_y() && y < rect.get_y() + rect.get_height())
-                    return icon;
-            }
+        // The Shell can already route clicks to a new icon before our idle scan.
+        for (let actor = target; actor; actor = actor.get_parent()) {
+            const indicator = actor._indicator;
+            if (!actor.visible || !indicator?._proxy || indicator.id !== INDICATOR_ID ||
+                !indicator.busName)
+                continue;
+            const rect = actor.get_transformed_extents();
+            if (x >= rect.get_x() && x < rect.get_x() + rect.get_width() &&
+                y >= rect.get_y() && y < rect.get_y() + rect.get_height())
+                return actor;
         }
         return null;
     }
@@ -123,6 +123,7 @@ export default class DeskSwitchTray extends Extension {
             this._pressedIcon = icon;
             if (!icon)
                 return Clutter.EVENT_PROPAGATE;
+            this._watchIcon(icon);
             icon.menu.close();
         } else {
             const pressed = this._pressedIcon;
