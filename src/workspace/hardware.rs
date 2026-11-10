@@ -89,12 +89,8 @@ impl Probe {
                                 && !d.id.chars().any(char::is_control)
                         });
                         for device in list.iter_mut() {
-                            device.name = device
-                                .name
-                                .chars()
-                                .filter(|c| !c.is_control())
-                                .take(256)
-                                .collect();
+                            device.name.retain(|c| !c.is_control());
+                            device.name.truncate(device.name.floor_char_boundary(256));
                         }
                         list.sort_by(|a, b| a.id.cmp(&b.id));
                         list.dedup_by(|a, b| a.id == b.id);

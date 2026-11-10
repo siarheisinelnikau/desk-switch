@@ -251,9 +251,10 @@ pub(super) enum DeviceIcon {
     Mouse,
     Headphones,
     Microphone,
+    Display,
 }
 impl DeviceIcon {
-    pub(super) const ALL: [Self; 4] = [
+    pub(super) const SHARED: [Self; 4] = [
         Self::Keyboard,
         Self::Mouse,
         Self::Headphones,
@@ -268,7 +269,24 @@ impl DeviceIcon {
             Self::Mouse => "Mouse",
             Self::Headphones => "Headphones / speakers",
             Self::Microphone => "Microphone",
+            Self::Display => "Display",
         }
+    }
+    fn attached_names(self, inventory: &crate::workspace::devices::Inventory) -> Vec<&str> {
+        let devices = match self {
+            Self::Keyboard => &inventory.keyboards,
+            Self::Mouse => &inventory.mice,
+            Self::Headphones => &inventory.speakers,
+            Self::Microphone => &inventory.microphones,
+            Self::Display => {
+                return inventory
+                    .displays
+                    .iter()
+                    .map(|display| display.name.as_str())
+                    .collect();
+            }
+        };
+        devices.iter().map(|device| device.name.as_str()).collect()
     }
 }
 
@@ -337,6 +355,16 @@ fn paint_device(
             ] {
                 painter.line_segment([point(from.0, from.1), point(to.0, to.1)], stroke(1.5));
             }
+        }
+        DeviceIcon::Display => {
+            painter.rect_stroke(
+                egui::Rect::from_center_size(point(0.0, -4.0), Vec2::new(32.0, 22.0) * scale),
+                3,
+                stroke(1.5),
+                egui::StrokeKind::Inside,
+            );
+            painter.line_segment([point(0.0, 7.0), point(0.0, 13.0)], stroke(1.5));
+            painter.line_segment([point(-8.0, 13.0), point(8.0, 13.0)], stroke(1.5));
         }
     }
 }
@@ -462,9 +490,12 @@ pub(super) struct SharedMonitorVisual {
 pub(super) struct WorkspaceVisual {
     pub(super) devices: [Option<DeviceSource>; 4],
     pub(super) monitor: Option<SharedMonitorVisual>,
+    pub(super) input_target: Option<String>,
 }
 impl WorkspaceVisual {
     pub(super) fn from_workspace(state: &crate::group::model::Workspace) -> Self {
+        use crate::lifecycle::InputStatus::{Here, Peer};
+
         let plan = state.plan();
         let sources = state
             .members
@@ -490,6 +521,18 @@ impl WorkspaceVisual {
             })
         };
         let input = plan.input.as_deref().and_then(|key| source(key, false));
+        let input_target = plan.input.as_ref().and_then(|source| {
+            if state.members[source].node.input != Some(Peer) {
+                return Some(source.clone());
+            }
+            // The requested target can change before the native handoff or
+            // return has finished. Only show a receiver confirmed by both PCs.
+            let mut receivers = state.members.iter().filter(|(key, member)| {
+                *key != source && member.compatible() && member.node.input == Some(Here)
+            });
+            let (key, _) = receivers.next()?;
+            receivers.next().is_none().then(|| key.clone())
+        });
         let audio = plan.audio.as_deref().and_then(|key| {
             let member = &state.members[key];
             let level = member
@@ -551,6 +594,7 @@ impl WorkspaceVisual {
                 microphone,
             ],
             monitor,
+            input_target,
         }
     }
 
@@ -566,7 +610,7 @@ impl WorkspaceVisual {
             self.devices[index]
                 .as_ref()
                 .filter(|source| match index {
-                    0 | 1 => state.active_input.as_deref().unwrap_or(&source.key) == key,
+                    0 | 1 => self.input_target.as_deref() == Some(key),
                     // Every compatible computer sends to the selected output.
                     2 => true,
                     _ => source.key == key || member.node.hardware.microphone_receive,
@@ -581,6 +625,66 @@ impl WorkspaceVisual {
                 })
         })
     }
+}
+
+fn attached_device_names(
+    member: &crate::group::model::Member,
+) -> Option<Vec<(DeviceIcon, Vec<&str>)>> {
+    member.online.then(|| {
+        DeviceIcon::SHARED
+            .into_iter()
+            .chain([DeviceIcon::Display])
+            .map(|icon| (icon, icon.attached_names(&member.node.devices)))
+            .filter(|(_, names)| !names.is_empty())
+            .collect()
+    })
+}
+
+pub(super) fn attached_devices(ui: &mut egui::Ui, member: &crate::group::model::Member) {
+    let tr = crate::i18n::tr;
+    ui.horizontal_wrapped(|ui| {
+        ui.spacing_mut().item_spacing.x = 6.0;
+        ui.weak(tr("Attached"));
+        let Some(devices) = attached_device_names(member) else {
+            ui.weak(tr("Unavailable"));
+            return;
+        };
+        if devices.is_empty() {
+            ui.weak(tr("No devices detected"));
+        }
+        for (icon, names) in devices {
+            let count = names.len();
+            let width = if count > 1 { 49.0 } else { 29.0 };
+            let (rect, response) =
+                ui.allocate_exact_size(Vec2::new(width, 24.0), egui::Sense::hover());
+            let center = egui::pos2(rect.left() + 14.5, rect.center().y);
+            paint_device(ui.painter(), icon, center, 0.68, ui.visuals().text_color());
+            if count > 1 {
+                ui.painter().text(
+                    egui::pos2(rect.left() + 28.0, rect.center().y),
+                    egui::Align2::LEFT_CENTER,
+                    format!("×{count}"),
+                    egui::TextStyle::Small.resolve(ui.style()),
+                    ui.visuals().weak_text_color(),
+                );
+            }
+            response.on_hover_ui(|ui| {
+                ui.set_max_width(360.0);
+                ui.strong(tr(icon.label()));
+                for name in names
+                    .iter()
+                    .copied()
+                    .filter(|name| !name.is_empty())
+                    .take(8)
+                {
+                    ui.label(name);
+                }
+                if count > 8 {
+                    ui.weak("…");
+                }
+            });
+        }
+    });
 }
 
 pub(super) fn device_icon(
@@ -2619,6 +2723,171 @@ mod workspace_visual_tests {
 
     fn key(index: usize) -> String {
         format!("{index:064x}")
+    }
+
+    #[test]
+    fn input_icons_follow_the_confirmed_receiver_and_return_to_the_source() {
+        use crate::lifecycle::InputStatus::{Here, Peer};
+
+        let mut workspace = fixture(3);
+        let source = key(1);
+        let receiver = key(2);
+        let assert_target = |workspace: &crate::group::model::Workspace, target: Option<&str>| {
+            let visual = WorkspaceVisual::from_workspace(workspace);
+            for key in workspace.members.keys() {
+                let devices = visual.member_devices(workspace, key);
+                for icon in [DeviceIcon::Keyboard, DeviceIcon::Mouse] {
+                    let enabled = if icon == DeviceIcon::Keyboard {
+                        workspace.settings.keyboard_enabled
+                    } else {
+                        workspace.settings.mouse_enabled
+                    };
+                    assert_eq!(
+                        devices[icon.index()]
+                            .as_ref()
+                            .map(|device| device.key.as_str()),
+                        (enabled && target == Some(key.as_str())).then_some(source.as_str()),
+                    );
+                }
+            }
+        };
+
+        workspace.members.get_mut(&source).unwrap().node.input = Some(Here);
+        workspace.members.get_mut(&receiver).unwrap().node.input = Some(Peer);
+        assert_target(&workspace, Some(&source));
+        workspace.activate(&source, &receiver, None).unwrap();
+        assert_target(&workspace, Some(&source));
+
+        workspace.members.get_mut(&source).unwrap().node.input = Some(Peer);
+        assert_target(&workspace, None);
+        workspace.members.get_mut(&receiver).unwrap().node.input = Some(Here);
+        assert_target(&workspace, Some(&receiver));
+        workspace.members.get_mut(&key(3)).unwrap().node.input = Some(Here);
+        assert_target(&workspace, None);
+        workspace.members.get_mut(&key(3)).unwrap().node.input = Some(Peer);
+
+        workspace.settings.keyboard_enabled = false;
+        assert_target(&workspace, Some(&receiver));
+        workspace.return_input().unwrap();
+        assert_target(&workspace, Some(&receiver));
+        workspace.members.get_mut(&receiver).unwrap().online = false;
+        assert_target(&workspace, None);
+        workspace.members.get_mut(&source).unwrap().node.input = Some(Here);
+        assert_target(&workspace, Some(&source));
+    }
+
+    #[test]
+    fn attached_devices_follow_each_computers_inventory_independently_of_routes() {
+        use crate::{
+            audio::AudioDevice,
+            group::model::Workspace,
+            workspace::{Node, devices, hardware},
+        };
+
+        let mut workspace = fixture(2);
+        let windows = key(1);
+        let ubuntu = key(2);
+        let mut old = workspace.members[&windows].node.clone();
+        let mut new = workspace.members[&ubuntu].node.clone();
+        let headset = AudioDevice {
+            id: "usb-headset".into(),
+            name: "USB headset".into(),
+            default: false,
+        };
+        let microphone = AudioDevice {
+            id: "usb-microphone".into(),
+            name: "USB microphone".into(),
+            default: false,
+        };
+        old.devices.speakers.push(headset.clone());
+        old.devices.microphones.push(microphone.clone());
+        old.devices.displays.push(devices::Display {
+            id: "usb-display".into(),
+            name: "External display".into(),
+            fingerprint: String::new(),
+            native: None,
+        });
+        workspace.settings.audio = Selection::Computer(windows.clone());
+        workspace.settings.microphone_enabled = true;
+        let binding = devices::Binding {
+            computer: windows.clone(),
+            device: microphone.id.clone(),
+        };
+        workspace.settings.microphone_binding = Some(binding.clone());
+        let observe = |state: &mut Workspace, mut node: Node| {
+            let key = node.key.clone();
+            node.hardware = hardware::hardware(
+                &node.devices,
+                &state.members[&key].preferences.devices,
+                true,
+            );
+            state.update_node(&key, node, None, 0).unwrap();
+        };
+        let attached = |state: &Workspace, key: &str, icon, name| {
+            attached_device_names(&state.members[key])
+                .unwrap()
+                .iter()
+                .any(|(kind, names)| *kind == icon && names.contains(&name))
+        };
+        observe(&mut workspace, old.clone());
+        assert_eq!(workspace.plan().microphone, Some(binding.clone()));
+        assert!(attached(
+            &workspace,
+            &windows,
+            DeviceIcon::Keyboard,
+            "keyboard"
+        ));
+
+        new.devices.keyboards.append(&mut old.devices.keyboards);
+        observe(&mut workspace, old.clone());
+        assert!(!attached(
+            &workspace,
+            &windows,
+            DeviceIcon::Keyboard,
+            "keyboard"
+        ));
+        assert!(!attached(
+            &workspace,
+            &ubuntu,
+            DeviceIcon::Keyboard,
+            "keyboard"
+        ));
+        observe(&mut workspace, new.clone());
+        assert!(attached(
+            &workspace,
+            &ubuntu,
+            DeviceIcon::Keyboard,
+            "keyboard"
+        ));
+        assert!(attached(&workspace, &windows, DeviceIcon::Mouse, "mouse"));
+        assert!(workspace.plan().input.is_none());
+
+        new.devices.mice.append(&mut old.devices.mice);
+        new.devices.displays.append(&mut old.devices.displays);
+        new.devices
+            .speakers
+            .push(old.devices.speakers.pop().unwrap());
+        new.devices
+            .microphones
+            .push(old.devices.microphones.pop().unwrap());
+        observe(&mut workspace, old);
+        observe(&mut workspace, new);
+        for (icon, name) in [
+            (DeviceIcon::Keyboard, "keyboard"),
+            (DeviceIcon::Mouse, "mouse"),
+            (DeviceIcon::Headphones, headset.name.as_str()),
+            (DeviceIcon::Microphone, microphone.name.as_str()),
+            (DeviceIcon::Display, "External display"),
+        ] {
+            assert!(attached(&workspace, &ubuntu, icon, name));
+            assert!(!attached(&workspace, &windows, icon, name));
+        }
+        assert_eq!(workspace.plan().input.as_deref(), Some(ubuntu.as_str()));
+        assert_eq!(workspace.plan().audio.as_deref(), Some(windows.as_str()));
+        assert!(workspace.plan().microphone.is_none());
+        assert_eq!(workspace.settings.microphone_binding, Some(binding));
+        workspace.members.get_mut(&ubuntu).unwrap().online = false;
+        assert!(attached_device_names(&workspace.members[&ubuntu]).is_none());
     }
 
     #[test]

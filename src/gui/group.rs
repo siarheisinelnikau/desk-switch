@@ -252,6 +252,8 @@ impl Desktop {
                     Action::EdgePause(paused) => state.edge_paused = paused,
                     _ => {}
                 }
+                #[cfg(debug_assertions)]
+                super::preview::sync_input_status(state);
             }
             self.ctx.request_repaint_of(egui::ViewportId::ROOT);
             return;
@@ -794,6 +796,8 @@ impl Desktop {
     }
 
     pub(super) fn group_overview(&mut self, ui: &mut egui::Ui) {
+        use super::view::DeviceIcon;
+
         ui.label(tr(
             "Share your devices across all connected computers. Change settings from any computer.",
         ));
@@ -849,12 +853,29 @@ impl Desktop {
                     let index = row_index * columns + column;
                     let key = &member.node.key;
                     let accent: Color32 = super::view::peer_color(index);
+                    let devices = visual.member_devices(&state, key);
+                    let input_label = match (
+                        devices[DeviceIcon::Keyboard.index()].is_some(),
+                        devices[DeviceIcon::Mouse.index()].is_some(),
+                    ) {
+                        (true, true) => Some("Keyboard & mouse active here"),
+                        (true, false) => Some("Keyboard active here"),
+                        (false, true) => Some("Mouse active here"),
+                        (false, false) => None,
+                    };
                     ui.allocate_ui_with_layout(
                         egui::vec2(width, 0.0),
                         egui::Layout::top_down(egui::Align::Min),
                         |ui| {
-                            egui::Frame::group(ui.style())
+                            let frame = egui::Frame::group(ui.style());
+                            let stroke = if input_label.is_some() {
+                                egui::Stroke::new(1.0, accent)
+                            } else {
+                                frame.stroke
+                            };
+                            frame
                                 .fill(ui.visuals().window_fill())
+                                .stroke(stroke)
                                 .corner_radius(12)
                                 .inner_margin(16)
                                 .show(ui, |ui| {
@@ -895,10 +916,11 @@ impl Desktop {
                                             "Offline"
                                         })
                                     ));
-                                    let devices = visual.member_devices(&state, key);
+                                    super::view::attached_devices(ui, member);
                                     ui.horizontal(|ui| {
                                         ui.spacing_mut().item_spacing.x = 6.0;
-                                        for icon in super::view::DeviceIcon::ALL {
+                                        ui.weak(tr("Shared"));
+                                        for icon in DeviceIcon::SHARED {
                                             super::view::device_icon(
                                                 ui,
                                                 icon,
@@ -908,8 +930,8 @@ impl Desktop {
                                         }
                                     });
                                     let mut roles = Vec::new();
-                                    if plan.input.as_ref() == Some(key) {
-                                        roles.push(tr("Keyboard & mouse"));
+                                    if let Some(label) = input_label {
+                                        roles.push(tr(label));
                                     }
                                     if plan.audio.as_ref() == Some(key) {
                                         roles.push(tr("Shared output"));
@@ -921,10 +943,15 @@ impl Desktop {
                                     {
                                         roles.push(tr("Microphone"));
                                     }
-                                    ui.label(if roles.is_empty() {
+                                    let role = RichText::new(if roles.is_empty() {
                                         tr("Available for sharing")
                                     } else {
                                         roles.join(" · ")
+                                    });
+                                    ui.label(if input_label.is_some() {
+                                        role.color(accent).strong()
+                                    } else {
+                                        role
                                     });
                                     if incompatible.is_some()
                                         || member.online && !member.compatible()
@@ -1620,13 +1647,14 @@ impl Desktop {
                     ui.label(tr(label));
                     egui::ComboBox::from_id_salt(id)
                         .width(ui.available_width())
-                        .selected_text(
-                            value
-                                .as_ref()
-                                .and_then(|id| devices.iter().find(|device| &device.id == id))
+                        .selected_text(match value.as_deref() {
+                            Some(id) => devices
+                                .iter()
+                                .find(|device| device.id == id)
                                 .map(|device| device.name.clone())
-                                .unwrap_or_else(|| tr("Automatic")),
-                        )
+                                .unwrap_or_else(|| tr("Unavailable")),
+                            None => tr("Automatic"),
+                        })
                         .show_ui(ui, |ui| {
                             ui.selectable_value(value, None, tr("Automatic"));
                             for device in devices {
