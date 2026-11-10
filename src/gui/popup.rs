@@ -432,8 +432,9 @@ impl Desktop {
                     .count(),
                 crate::i18n::tr("computers connected")
             );
-            snapshot.target = workspace
-                .active_input
+            snapshot.target = snapshot
+                .visual
+                .input_target
                 .as_ref()
                 .and_then(|key| workspace.members.get(key))
                 .map(|member| member.node.name.clone())

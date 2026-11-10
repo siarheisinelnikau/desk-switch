@@ -9,6 +9,23 @@ use anyhow::Result;
 use eframe::egui;
 use std::path::PathBuf;
 
+pub(super) fn sync_input_status(state: &mut crate::group::model::Workspace) {
+    let source = state.plan().input;
+    let target = state
+        .active_input
+        .as_ref()
+        .filter(|key| !state.switch_pending() && state.members[*key].compatible())
+        .or(source.as_ref());
+    for (key, member) in &mut state.members {
+        member.node.input =
+            (source.is_some() && member.compatible()).then_some(if target == Some(key) {
+                InputStatus::Here
+            } else {
+                InputStatus::Peer
+            });
+    }
+}
+
 struct PreviewApp {
     desktop: Desktop,
     frames: std::sync::Arc<std::sync::atomic::AtomicU64>,
@@ -758,6 +775,10 @@ impl Desktop {
                 node.diagnostics.platform = platform.into();
                 node.hardware.keyboard = index == 0;
                 node.hardware.mouse = index == 0;
+                if index != 0 {
+                    node.devices.keyboards.clear();
+                    node.devices.mice.clear();
+                }
                 node.hardware.audio_score = if index == 0 { 99 } else { 20 };
                 node.hardware.audio_name = if index == 0 {
                     "USB Headphones"
@@ -916,6 +937,7 @@ impl Desktop {
                     state.confirmed_monitor = None;
                 }
             }
+            sync_input_status(&mut state);
             self.group.workspace = Some(state);
             self.group.preview = true;
             self.group.selected = self.public_key.clone();
