@@ -1318,6 +1318,16 @@ impl eframe::App for Desktop {
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _: &mut eframe::Frame) {
+        // Eframe can invoke the parent UI while a deferred child is visible.
+        // Keep its dispatcher alive without rebuilding a hidden workspace or
+        // scheduling that workspace's next animation frame.
+        if self.hidden
+            || ui
+                .ctx()
+                .input(|input| input.viewport().minimized == Some(true))
+        {
+            return;
+        }
         self.render(ui);
         self.paired_update_dialog(ui.ctx());
         self.cable_dialog(ui.ctx());
@@ -1333,6 +1343,13 @@ impl software::App for Desktop {
         self.transfer_progress(ctx);
     }
     fn ui(&mut self, ui: &mut egui::Ui) {
+        if self.hidden
+            || ui
+                .ctx()
+                .input(|input| input.viewport().minimized == Some(true))
+        {
+            return;
+        }
         self.render(ui);
         self.paired_update_dialog(ui.ctx());
         self.cable_dialog(ui.ctx());
