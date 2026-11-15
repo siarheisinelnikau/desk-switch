@@ -176,7 +176,7 @@ fn cancelled(cancel: &AtomicBool) -> Result<()> {
     Ok(())
 }
 
-fn no_links(metadata: &Metadata) -> Result<()> {
+pub(crate) fn no_links(metadata: &Metadata) -> Result<()> {
     ensure!(
         !metadata.file_type().is_symlink(),
         "Symbolic links cannot be transferred"
@@ -237,7 +237,7 @@ fn private_directory(dir: &Dir) -> Result<()> {
     Ok(())
 }
 
-fn directory(parent: &Dir, name: &OsStr, create: bool) -> Result<Dir> {
+pub(crate) fn directory(parent: &Dir, name: &OsStr, create: bool) -> Result<Dir> {
     if create {
         match parent.create_dir_with(name, &private_builder()) {
             Ok(()) => sync_dir(parent)?,
@@ -252,7 +252,7 @@ fn directory(parent: &Dir, name: &OsStr, create: bool) -> Result<Dir> {
 
 /// Open every component independently with no-follow semantics. In particular,
 /// a symlink in an ancestor cannot redirect a later source read or stage write.
-fn absolute_directory(path: &Path, create: bool) -> Result<Dir> {
+pub(crate) fn absolute_directory(path: &Path, create: bool) -> Result<Dir> {
     absolute_directory_with(path, create, false)
 }
 
@@ -352,7 +352,12 @@ fn absolute_directory_with(path: &Path, create: bool, source: bool) -> Result<Di
     Ok(current)
 }
 
-fn open_file(parent: &Dir, name: impl AsRef<Path>, write: bool, create: bool) -> Result<File> {
+pub(crate) fn open_file(
+    parent: &Dir,
+    name: impl AsRef<Path>,
+    write: bool,
+    create: bool,
+) -> Result<File> {
     #[cfg(test)]
     CONTENT_OPENS.with(|count| count.set(count.get() + 1));
     let mut options = OpenOptions::new();
@@ -374,7 +379,7 @@ fn open_file(parent: &Dir, name: impl AsRef<Path>, write: bool, create: bool) ->
     Ok(file)
 }
 
-fn sync_dir(dir: &Dir) -> Result<()> {
+pub(crate) fn sync_dir(dir: &Dir) -> Result<()> {
     #[cfg(unix)]
     {
         use cap_std::fs::OpenOptionsExt;
@@ -402,7 +407,7 @@ fn write_new(parent: &Dir, name: &str, bytes: &[u8]) -> Result<()> {
     sync_dir(parent)
 }
 
-fn write_json(parent: &Dir, name: &str, value: &impl Serialize) -> Result<()> {
+pub(crate) fn write_json(parent: &Dir, name: &str, value: &impl Serialize) -> Result<()> {
     let bytes = serde_json::to_vec(value)?;
     ensure!(
         bytes.len() <= MAX_MANIFEST,
@@ -444,7 +449,7 @@ fn write_json(parent: &Dir, name: &str, value: &impl Serialize) -> Result<()> {
     Err(last.unwrap_or_else(|| anyhow::anyhow!("Could not create transfer metadata")))
 }
 
-fn read_json<T: DeserializeOwned>(parent: &Dir, name: &str, limit: usize) -> Result<T> {
+pub(crate) fn read_json<T: DeserializeOwned>(parent: &Dir, name: &str, limit: usize) -> Result<T> {
     let file = open_file(parent, name, false, false)?;
     ensure!(
         regular(&file, true)?.len() <= limit as u64,
@@ -456,7 +461,7 @@ fn read_json<T: DeserializeOwned>(parent: &Dir, name: &str, limit: usize) -> Res
     serde_json::from_slice(&bytes).context("Transfer metadata is damaged")
 }
 
-fn exists(parent: &Dir, name: &str) -> Result<bool> {
+pub(crate) fn exists(parent: &Dir, name: &str) -> Result<bool> {
     match parent.symlink_metadata(name) {
         Ok(_) => Ok(true),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
@@ -541,7 +546,7 @@ impl FileIdentity {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-struct SourceMetadata {
+pub(crate) struct SourceMetadata {
     identity: FileIdentity,
     directory: bool,
     length: u64,
@@ -552,7 +557,7 @@ struct SourceMetadata {
 }
 
 impl SourceMetadata {
-    fn of(metadata: &Metadata) -> Result<Self> {
+    pub(crate) fn of(metadata: &Metadata) -> Result<Self> {
         no_links(metadata)?;
         ensure!(
             metadata.is_dir() || metadata.is_file(),
@@ -572,7 +577,7 @@ impl SourceMetadata {
         })
     }
 
-    fn check(&self, metadata: &Metadata) -> Result<()> {
+    pub(crate) fn check(&self, metadata: &Metadata) -> Result<()> {
         ensure!(
             self == &Self::of(metadata)?,
             "A copied file or folder changed; copy the selection again"

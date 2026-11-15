@@ -1430,6 +1430,16 @@ fn single_component(name: &OsStr) -> Result<()> {
     Ok(())
 }
 
+/// Shared no-clobber primitive for sync stages and recoverable versions.
+pub(crate) fn move_no_replace(from: &Dir, source: &OsStr, to: &Dir, target: &OsStr) -> Result<()> {
+    let metadata = from
+        .symlink_metadata(source)
+        .context("Reading the confined rename source")?;
+    let expected = Identity::of(&metadata).context("Identifying the confined rename source")?;
+    rename_no_replace(from, source, to, target, &expected)
+        .context("Completing the confined no-replace rename")
+}
+
 #[cfg(target_os = "linux")]
 fn rename_no_replace(
     from: &Dir,
@@ -1581,9 +1591,9 @@ fn rename_no_replace(
         Err(
             // SAFETY: the call takes a status code and returns a plain error number
             // without touching memory.
-            std::io::Error::from_raw_os_error(unsafe { RtlNtStatusToDosError(status) } as i32)
-                .into(),
+            std::io::Error::from_raw_os_error(unsafe { RtlNtStatusToDosError(status) } as i32),
         )
+        .with_context(|| format!("Native confined rename failed with status {status:#x}"))
     }
 }
 

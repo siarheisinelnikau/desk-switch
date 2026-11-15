@@ -44,6 +44,15 @@ fn palette(ui: &egui::Ui) -> Palette {
     Palette::new(ui.visuals().dark_mode)
 }
 
+pub(super) fn motion(ctx: &egui::Context, reduced: bool) {
+    ctx.data_mut(|data| data.insert_temp(egui::Id::new("reduced-motion"), reduced));
+    for theme in [egui::Theme::Light, egui::Theme::Dark] {
+        let mut style = (*ctx.style_of(theme)).clone();
+        style.animation_time = if reduced { 0.0 } else { 0.16 };
+        ctx.set_style_of(theme, style);
+    }
+}
+
 pub fn style(ctx: &egui::Context, preference: &str) {
     ctx.send_viewport_cmd(egui::ViewportCommand::SetTheme(match preference {
         "light" => egui::SystemTheme::Light,
@@ -137,7 +146,7 @@ fn note(ui: &mut egui::Ui, text: &str) {
     ));
 }
 
-fn primary(ui: &mut egui::Ui, text: &str) -> egui::Response {
+pub(super) fn primary(ui: &mut egui::Ui, text: &str) -> egui::Response {
     ui.add(
         egui::Button::new(crate::i18n::ui_text(
             RichText::new(crate::i18n::tr(text)).color(Color32::WHITE),
@@ -802,6 +811,7 @@ impl Desktop {
             self.group_add_dialog(&ctx);
             self.group_layout_dialog(&ctx);
             self.transfer_window(&ctx);
+            self.resource_window(&ctx);
         }
     }
 
@@ -888,6 +898,7 @@ impl Desktop {
                             )
                         });
                         if settings.clicked() {
+                            self.resource_panel.close();
                             self.group.add_open = false;
                             self.transfers.close();
                             self.page = Page::Application;

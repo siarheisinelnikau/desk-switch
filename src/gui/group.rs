@@ -297,6 +297,9 @@ impl Desktop {
         });
     }
     pub(super) fn tick_group(&mut self, ctx: &egui::Context) {
+        if self.quitting {
+            self.resources.take();
+        }
         if self.group.preview || self.group.removed {
             return;
         }
@@ -400,6 +403,7 @@ impl Desktop {
                     self.group.removed = true;
                     self.group.service.take();
                     self.group.file_transfer.take();
+                    self.resources.take();
                     self.group.clipboard.take();
                     self.group.data.stop();
                     self.stop_pair();
@@ -1332,6 +1336,13 @@ impl Desktop {
             .show(ui, |ui| {
                 ui.set_width(ui.available_width());
                 ui.strong(tr("Application"));
+                if local
+                    && ui
+                        .checkbox(&mut self.prefs.reduced_motion, tr("Reduce motion"))
+                        .changed()
+                {
+                    self.appearance_changed(ctx);
+                }
                 egui::ComboBox::from_id_salt("group-theme")
                     .selected_text(tr(&application.theme))
                     .show_ui(ui, |ui| {

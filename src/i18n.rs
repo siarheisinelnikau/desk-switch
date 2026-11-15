@@ -139,7 +139,11 @@ fn translate(language: usize, text: &str) -> String {
             return format!("{target}: {rest}");
         }
     }
-    text.into()
+    CATALOGS
+        .get(1)
+        .and_then(|english| english.get(text))
+        .cloned()
+        .unwrap_or_else(|| text.into())
 }
 
 fn parts(template: &str) -> Vec<(&str, bool)> {

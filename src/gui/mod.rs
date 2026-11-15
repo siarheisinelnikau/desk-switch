@@ -15,6 +15,7 @@ mod paired_update;
 mod popup;
 #[cfg(debug_assertions)]
 mod preview;
+mod resources;
 mod session;
 #[cfg(windows)]
 mod software;
@@ -99,6 +100,8 @@ pub struct Desktop {
     tray_snapshot: tray::State,
     quick: popup::Popup,
     transfers: transfer::Transfers,
+    resources: Option<crate::group::resources::Service>,
+    resource_panel: resources::Panel,
     file_progress: file_progress::Progress,
     monitor_setup_open: bool,
     actions: Receiver<Action>,
@@ -254,6 +257,7 @@ impl Desktop {
         };
         crate::i18n::set_language(&prefs.language);
         view::style(&ctx, &prefs.theme);
+        view::motion(&ctx, prefs.reduced_motion);
         let (document, settings_error) = match config::read_settings(&dir) {
             Ok(document) => (document, None),
             Err(error) => (config::FileSettings::default(), Some(format!("{error:#}"))),
@@ -293,6 +297,8 @@ impl Desktop {
             tray_snapshot: tray::State::default(),
             quick,
             transfers: Default::default(),
+            resources: None,
+            resource_panel: Default::default(),
             file_progress: Default::default(),
             monitor_setup_open: false,
             actions,
@@ -710,6 +716,7 @@ impl Desktop {
 
     fn tick(&mut self, ctx: &egui::Context) {
         self.transfers.tick(ctx);
+        self.resource_panel.tick(ctx);
         #[cfg(debug_assertions)]
         if self.preview.is_some() {
             self.preview_tick(ctx);
@@ -1112,6 +1119,7 @@ impl Desktop {
     fn appearance_changed(&mut self, ctx: &egui::Context) {
         crate::i18n::set_language(&self.prefs.language);
         view::style(ctx, &self.prefs.theme);
+        view::motion(ctx, self.prefs.reduced_motion);
         if let Some(tray) = &mut self.tray {
             tray.update(self.tray_snapshot);
         }

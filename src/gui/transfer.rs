@@ -37,6 +37,8 @@ pub(super) struct Transfers {
 }
 
 enum Command {
+    Folders,
+    Usb,
     Send { target: String, paths: Vec<PathBuf> },
     Pause(String),
     Cancel(String),
@@ -177,6 +179,12 @@ impl Transfers {
                     scroll = scroll.vertical_scroll_offset(0.0);
                 }
                 scroll.show(ui, |ui| {
+                        ui.horizontal_wrapped(|ui| {
+                            ui.selectable_label(true, tr("Send files")).on_hover_text(tr("Transfers"));
+                            if ui.button(tr("Folder sync")).clicked() { commands.push(Command::Folders); }
+                            if ui.button(tr("USB devices")).clicked() { commands.push(Command::Usb); }
+                        });
+                        ui.separator();
                         ui.strong(tr("Send files and folders"));
                         ui.horizontal_wrapped(|ui| {
                             ui.label(tr("To:"));
@@ -662,6 +670,7 @@ impl Desktop {
     }
 
     pub(super) fn start_file_transfers(&mut self, ctx: &egui::Context) {
+        self.start_resources(ctx);
         if self.group.file_transfer.is_none() {
             match crate::group::file_transfer::Service::start(self.dir.clone(), ctx.clone()) {
                 Ok(service) => {
@@ -677,11 +686,8 @@ impl Desktop {
     }
 
     pub(super) fn update_file_transfers(&self, workspace: &Workspace) {
-        let Some(service) = &self.group.file_transfer else {
-            return;
-        };
         let trusted = workspace.authority.is_some() && !self.quitting;
-        service.update(crate::group::file_transfer::TrustSnapshot {
+        let trust = crate::group::file_transfer::TrustSnapshot {
             workspace_id: workspace
                 .authority
                 .as_ref()
@@ -705,13 +711,25 @@ impl Desktop {
             clipboard_enabled: trusted
                 && workspace.settings.clipboard_enabled
                 && !self.prefs.pause_local_sharing,
-        });
-        if let Some(clipboard) = &self.group.clipboard {
+        };
+        if let Some(service) = &self.group.file_transfer {
+            service.update(trust.clone());
+        }
+        if let Some(resources) = &self.resources {
+            resources.update(if self.prefs.pause_local_sharing {
+                Default::default()
+            } else {
+                trust
+            });
+        }
+        if let (Some(clipboard), Some(service)) = (&self.group.clipboard, &self.group.file_transfer)
+        {
             service.clipboard(clipboard);
         }
     }
 
     pub(super) fn open_transfers(&mut self, target: Option<&str>) {
+        self.resource_panel.close();
         self.transfers.open(target);
         self.group.add_open = false;
         self.group.layout_editor.close();
@@ -740,9 +758,9 @@ impl Desktop {
             .filter(|transfer| active(transfer))
             .count();
         let label = if count == 0 {
-            tr("Transfers")
+            tr("Files & USB")
         } else {
-            crate::i18n::tr(format!("Transfers · {count}"))
+            crate::i18n::tr(format!("Files & USB · {count}"))
         };
         if ui
             .add_enabled(
@@ -813,6 +831,14 @@ impl Desktop {
                 .show(ctx, workspace, &self.public_key, &capabilities, &snapshot);
         for command in commands {
             let result = match command {
+                Command::Folders => {
+                    self.open_resources(false);
+                    Ok(())
+                }
+                Command::Usb => {
+                    self.open_resources(true);
+                    Ok(())
+                }
                 Command::Pause(id) => self
                     .group
                     .file_transfer
