@@ -44,12 +44,16 @@ pub(super) fn interested(ctx: &egui::Context, viewport: egui::ViewportId) -> boo
 }
 
 #[cfg(windows)]
-pub(super) fn record(ctx: &egui::Context, event: winit::event::DeviceEvent, time: f64) {
+pub(super) fn record(
+    ctx: &egui::Context,
+    event: winit::event::DeviceEvent,
+    time: f64,
+) -> std::time::Duration {
     use winit::{
         event::{DeviceEvent, ElementState},
         platform::scancode::PhysicalKeyExtScancode,
     };
-    ctx.data_mut(|data| {
+    let wake = ctx.data_mut(|data| {
         let state = data.get_temp_mut_or_default::<Activity>(id());
         match event {
             DeviceEvent::Key(key) => {
@@ -76,9 +80,21 @@ pub(super) fn record(ctx: &egui::Context, event: winit::event::DeviceEvent, time
             DeviceEvent::MouseWheel { .. } => state.wheel = time,
             _ => {}
         }
+        let key = id().with("last-input-wake");
+        let last = data.get_temp::<f64>(key).unwrap_or(-1000.0);
+        let wake = time - last >= 0.06;
+        if wake {
+            data.insert_temp(key, time);
+        }
+        wake
     });
-    // The visible animation consumes this state at its next frame. Raw mouse
-    // reports never request extra redraws or flood the GUI command queue.
+    // The host schedules every interested visible viewport, including the tray
+    // popup. A trailing repaint preserves releases inside the coalescing window.
+    if wake {
+        std::time::Duration::ZERO
+    } else {
+        std::time::Duration::from_millis(60)
+    }
 }
 
 impl Activity {

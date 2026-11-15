@@ -5,3 +5,4 @@ pub mod file_transfer;
 pub mod layout;
 pub mod model;
 pub mod net;
+pub mod resources;

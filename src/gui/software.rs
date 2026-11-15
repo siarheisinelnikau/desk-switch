@@ -725,7 +725,16 @@ impl ApplicationHandler<Wake> for Host {
 
     fn device_event(&mut self, _: &ActiveEventLoop, _: DeviceId, event: DeviceEvent) {
         if self.device_listening {
-            super::activity::record(&self.ctx, event, self.started.elapsed().as_secs_f64());
+            let delay =
+                super::activity::record(&self.ctx, event, self.started.elapsed().as_secs_f64());
+            for (id, view) in &self.views {
+                if view.desired_visible
+                    && view.input_feedback
+                    && view.window.is_minimized() != Some(true)
+                {
+                    self.ctx.request_repaint_after_for(delay, *id);
+                }
+            }
         }
     }
 

@@ -3,7 +3,7 @@
 mod lazy;
 pub mod protocol;
 mod source_trash;
-mod storage;
+pub(crate) mod storage;
 #[cfg(all(test, windows))]
 pub(crate) mod hosted_source_move {
     pub(crate) use super::source_trash::with_hosted_native_trash;

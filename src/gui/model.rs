@@ -8,6 +8,7 @@ use std::path::{Path, PathBuf};
 pub struct Preferences {
     pub language: String,
     pub theme: String,
+    pub reduced_motion: bool,
     pub discovery: bool,
     pub autostart: bool,
     pub auto_connect: bool,
@@ -33,6 +34,7 @@ impl Default for Preferences {
         Self {
             language: crate::i18n::system_language().into(),
             theme: "dark".into(),
+            reduced_motion: false,
             discovery: false,
             autostart: true,
             auto_connect: true,
@@ -268,6 +270,17 @@ mod tests {
         assert_eq!(prefs.language, "en");
         assert_eq!(prefs.volume, 25);
         assert!(prefs.muted);
+        assert!(!prefs.reduced_motion);
+        let saved = Preferences {
+            reduced_motion: true,
+            ..prefs
+        };
+        let restored: Preferences = toml::from_str(&toml::to_string(&saved).unwrap()).unwrap();
+        assert!(restored.reduced_motion);
+        assert_eq!(
+            (restored.language.as_str(), restored.theme.as_str()),
+            ("en", "dark")
+        );
     }
 
     #[test]

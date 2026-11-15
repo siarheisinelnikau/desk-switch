@@ -198,6 +198,20 @@ pub(super) fn show(
     };
     let id = ui.make_persistent_id("workspace-route-motion");
     let now = ui.input(|i| i.time);
+    let reduced = ui.ctx().data(|data| {
+        data.get_temp::<bool>(egui::Id::new("reduced-motion"))
+            .unwrap_or(false)
+    });
+    let transition = ui.ctx().data_mut(|data| {
+        let key = id.with("finite-transition");
+        let previous = data.get_temp::<(Scene, f64)>(key);
+        let until = match previous {
+            Some((previous, until)) if &previous == scene => until,
+            _ => now + 0.42,
+        };
+        data.insert_temp(key, (scene.clone(), until));
+        until
+    });
     let mut selected = None;
     egui::Frame::new()
         .fill(surface)
@@ -236,17 +250,22 @@ pub(super) fn show(
                 return;
             }
             let painter = ui.painter_at(rect);
-            let animating = !ui.input(|i| i.viewport().minimized.unwrap_or(false))
-                && scene
-                    .ports
-                    .iter()
-                    .any(|port| port.source.is_some() && !port.muted && !port.error);
+            let activity = if reduced {
+                super::activity::Activity::default()
+            } else {
+                super::activity::read(ui)
+            };
+            let recent_input = now - activity.moved < 0.85
+                || now - activity.wheel < 0.6
+                || activity.released.iter().any(|t| now - t < 0.6);
+            let animating = !reduced
+                && !ui.input(|i| i.viewport().minimized.unwrap_or(false))
+                && (now < transition || recent_input);
             if animating {
                 ui.ctx()
                     .request_repaint_after(std::time::Duration::from_millis(60));
             }
             let phase = animating.then_some((now % 120.0) as f32);
-            let activity = super::activity::read(ui);
             let mouse_wave = mouse_wave(ui, &activity, now);
             let device_y = rect.bottom() - if compact { 33.0 } else { 69.0 };
             let slot_width = rect.width() / 5.0;
