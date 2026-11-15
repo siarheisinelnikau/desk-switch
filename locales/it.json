@@ -881,5 +881,17 @@
   "Sharing resumed on this computer.": "Condivisione ripresa su questo computer.",
   "Update required": "Aggiornamento necessario",
   "Update both computers to compatible versions before connecting.": "Aggiorna entrambi i computer a versioni compatibili prima di collegarli.",
-  "Prepare updates to download them without restarting. Each computer installs independently.": "Prepara gli aggiornamenti per scaricarli senza riavviare. Ogni computer li installa in modo indipendente."
+  "Prepare updates to download them without restarting. Each computer installs independently.": "Prepara gli aggiornamenti per scaricarli senza riavviare. Ogni computer li installa in modo indipendente.",
+  "Choose a computer. Your shared devices follow.": "Scegli un computer. I tuoi dispositivi condivisi lo seguono.",
+  "Click a computer to switch": "Fai clic su un computer per passare",
+  "Computers": "Computer",
+  "Device host": "Host dei dispositivi",
+  "In control": "Controllo attivo",
+  "Next computer": "Computer successivo",
+  "Not connected": "Non connesso",
+  "Replay connections": "Riproduci connessioni",
+  "Return control": "Riprendi il controllo",
+  "Sharing & volume": "Condivisione e volume",
+  "connected": "connessi",
+  "Device host / shared devices / receiving computers": "Host / dispositivi condivisi / computer riceventi"
 }

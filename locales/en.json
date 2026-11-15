@@ -881,5 +881,17 @@
   "Sharing resumed on this computer.": "Sharing resumed on this computer.",
   "Update required": "Update required",
   "Update both computers to compatible versions before connecting.": "Update both computers to compatible versions before connecting.",
-  "Prepare updates to download them without restarting. Each computer installs independently.": "Prepare updates to download them without restarting. Each computer installs independently."
+  "Prepare updates to download them without restarting. Each computer installs independently.": "Prepare updates to download them without restarting. Each computer installs independently.",
+  "Choose a computer. Your shared devices follow.": "Choose a computer. Your shared devices follow.",
+  "Click a computer to switch": "Click a computer to switch",
+  "Computers": "Computers",
+  "Device host": "Device host",
+  "In control": "In control",
+  "Next computer": "Next computer",
+  "Not connected": "Not connected",
+  "Replay connections": "Replay connections",
+  "Return control": "Return control",
+  "Sharing & volume": "Sharing & volume",
+  "connected": "connected",
+  "Device host / shared devices / receiving computers": "Device host / shared devices / receiving computers"
 }

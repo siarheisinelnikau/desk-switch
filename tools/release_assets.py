@@ -12,9 +12,9 @@ def asset_names(version):
         "windows-x86_64": f"desk-switch-v{version}{windows_suffix}.exe",
         "linux-x86_64-deb": f"desk-switch-v{version}-linux-x86-64.deb",
     }
-    # Preserve the signed historical matrices. macOS returns in 0.6.2 after
-    # the Windows/Ubuntu-only releases between 0.5.0 and that version.
-    if version == "0.5.0" or version_parts >= (0, 6, 2):
+    # Keep historical signed matrices intact. Releases from 0.10.0 ship only
+    # Windows and Ubuntu until macOS can be verified on physical hardware.
+    if version == "0.5.0" or (0, 6, 2) <= version_parts < (0, 10, 0):
         names.update({
             "macos-arm64-app": f"desk-switch-v{version}-macos-arm64.zip",
             "macos-x86_64-app": f"desk-switch-v{version}-macos-x86-64.zip",

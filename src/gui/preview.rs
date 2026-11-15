@@ -5,7 +5,7 @@ use crate::{
     lifecycle::InputStatus,
     workspace::{Hardware, Node, Plan, Shared, net::Request},
 };
-use anyhow::Result;
+use anyhow::{Context, Result};
 use eframe::egui;
 use std::path::PathBuf;
 
@@ -162,7 +162,7 @@ fn render_probe(
                 time::{Duration, Instant},
             };
             let mut samples = Vec::new();
-            let states: &[&str] = if file_progress { &["visible-idle", "minimized", "hidden", "restored-idle"] } else { &["visible-idle", "hidden", "restored-idle"] };
+            let states: &[&str] = if file_progress { &["visible-idle", "minimized", "hidden", "restored-idle"] } else { &["visible-motion", "switched-motion", "popup-motion", "main-hidden-popup-motion", "hidden", "restored-motion"] };
             for &state in states {
                 if file_progress {
                     let progress = super::file_progress::id();
@@ -173,16 +173,25 @@ fn render_probe(
                         ctx.send_viewport_cmd_to(progress, egui::ViewportCommand::Visible(true));
                         ctx.send_viewport_cmd_to(progress, egui::ViewportCommand::Minimized(state == "minimized"));
                     }
-                } else if state != "visible-idle" {
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Visible(state != "hidden"));
+                } else {
+                    let action = match state {
+                        "switched-motion" => Some(Action::Quick(super::popup::Command::Target([0x33; 32]))),
+                        "popup-motion" => Some(Action::QuickOpen { x: 1200, y: 400 }),
+                        "main-hidden-popup-motion" => Some(Action::Hide),
+                        "hidden" => Some(Action::QuickClose),
+                        "restored-motion" => Some(Action::Show),
+                        _ => None,
+                    };
+                    if let Some(action) = action { super::tray::dispatch(&send, &ctx, action); }
                 }
                 // Resize, font uploads and finite scroll-bar animations can outlive
                 // the first frame. Measure only after two seconds without UI work.
+                let motion_expected = !file_progress && state != "hidden";
                 let warm = Instant::now();
                 let mut quiet = Instant::now();
                 let frame_count = || frames.load(Ordering::Relaxed) + super::popup::FRAMES.load(Ordering::Relaxed) + super::file_progress::FRAMES.load(Ordering::Relaxed);
                 let mut previous = frame_count();
-                while warm.elapsed() < Duration::from_secs(if file_progress { 6 } else { 8 })
+                while warm.elapsed() < Duration::from_secs(if motion_expected { 2 } else if file_progress { 6 } else { 8 })
                     && quiet.elapsed() < Duration::from_secs(2)
                 {
                     std::thread::sleep(Duration::from_millis(100));
@@ -197,20 +206,29 @@ fn render_probe(
                 let popup_start = super::popup::FRAMES.load(Ordering::Relaxed);
                 let progress_start = super::file_progress::FRAMES.load(Ordering::Relaxed);
                 let input_start: u64 = causes.lock().unwrap().iter().filter(|(key, _)| key.starts_with("input:")).map(|(_, count)| count).sum();
+                #[cfg(windows)]
+                let activity = super::software::activity();
+                let cpu_start = cpu_seconds();
                 let since = Instant::now();
                 std::thread::sleep(Duration::from_secs(6));
+                #[cfg(windows)]
+                let activity_delta = Some(std::array::from_fn::<_, 2, _>(|i| super::software::activity()[i] - activity[i]));
+                #[cfg(not(windows))]
+                let activity_delta: Option<[u64; 2]> = None;
                 samples.push(serde_json::json!({
                     "state": state, "seconds": since.elapsed().as_secs_f64(),
-                    "settled": settled, "warm_seconds": warm.elapsed().as_secs_f64() - since.elapsed().as_secs_f64(),
+                    "settled": settled, "motion_expected": motion_expected, "warm_seconds": warm.elapsed().as_secs_f64() - since.elapsed().as_secs_f64(),
                     "ui_frames": frames.load(Ordering::Relaxed) - start,
                     "popup_ui_frames": super::popup::FRAMES.load(Ordering::Relaxed) - popup_start,
                     "file_progress_ui_frames": super::file_progress::FRAMES.load(Ordering::Relaxed) - progress_start,
                     "file_progress_minimized": file_progress.then(|| ctx.input(|input| input.raw.viewports.get(&super::file_progress::id()).and_then(|viewport| viewport.minimized))),
                     "input_events": causes.lock().unwrap().iter().filter(|(key, _)| key.starts_with("input:")).map(|(_, count)| count).sum::<u64>() - input_start,
+                    "rasterized_and_presented": activity_delta,
+                    "cpu_one_core_percent": cpu_start.zip(cpu_seconds()).map(|(a,b)| (b-a)*100.0/since.elapsed().as_secs_f64()),
                 }));
             }
             let result = serde_json::to_string_pretty(&serde_json::json!({
-                "backend": backend, "fixture": true, "isolated_offscreen": true, "samples": samples,
+                "backend": backend, "fixture": true, "main_offscreen": true, "samples": samples,
                 "file_progress_viewport": file_progress,
                 "total_ui_frames": frames.load(Ordering::Relaxed),
                 "repaint_causes": *causes.lock().unwrap(),
@@ -220,10 +238,42 @@ fn render_probe(
             if let Err(error) = result {
                 eprintln!("Render probe failed: {error:#}");
             }
-            let _ = send.send(Action::Quit);
-            ctx.request_repaint();
+            super::tray::dispatch(&send, &ctx, Action::Quit);
         })?;
     Ok(())
+}
+
+#[cfg(windows)]
+fn cpu_seconds() -> Option<f64> {
+    use windows_sys::Win32::{
+        Foundation::FILETIME,
+        System::Threading::{GetCurrentProcess, GetProcessTimes},
+    };
+    let mut created = FILETIME {
+        dwLowDateTime: 0,
+        dwHighDateTime: 0,
+    };
+    let mut exited = created;
+    let mut kernel = created;
+    let mut user = created;
+    // SAFETY: the pseudo-handle belongs to this process and all output pointers
+    // reference initialized, writable FILETIME values for the duration of the call.
+    let ok = unsafe {
+        GetProcessTimes(
+            GetCurrentProcess(),
+            &mut created,
+            &mut exited,
+            &mut kernel,
+            &mut user,
+        )
+    };
+    let ticks =
+        |time: FILETIME| (u64::from(time.dwHighDateTime) << 32) | u64::from(time.dwLowDateTime);
+    (ok != 0).then(|| (ticks(kernel) + ticks(user)) as f64 / 10_000_000.0)
+}
+#[cfg(not(windows))]
+fn cpu_seconds() -> Option<f64> {
+    None
 }
 
 pub fn run(case: &str, dir: PathBuf) -> Result<()> {
@@ -256,7 +306,7 @@ pub fn run(case: &str, dir: PathBuf) -> Result<()> {
     let mut options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("Desk Switch")
-            .with_active(false)
+            .with_active(!capturing && std::env::var_os("DESK_SWITCH_RENDER_PROBE").is_none())
             .with_inner_size(if case.starts_with("shared-four-file-progress") {
                 [
                     480.0,
@@ -269,10 +319,8 @@ pub fn run(case: &str, dir: PathBuf) -> Result<()> {
             } else if case.ends_with("quick-controls") {
                 let size = super::popup::preferred_size();
                 [size.x, size.y]
-            } else if capturing || std::env::var_os("EFRAME_SCREENSHOT_TO").is_some() {
-                [1080.0, 1000.0]
             } else {
-                [1080.0, 760.0]
+                [1080.0, 880.0]
             })
             .with_min_inner_size(if case.starts_with("shared-four-file-progress") {
                 [400.0, 240.0]
@@ -291,6 +339,17 @@ pub fn run(case: &str, dir: PathBuf) -> Result<()> {
     };
     if std::env::var_os("DESK_SWITCH_RENDER_PROBE").is_some() {
         options.viewport = options.viewport.with_position([-15_000.0, -15_000.0]);
+    }
+    if let Ok(size) = std::env::var("DESK_SWITCH_PREVIEW_SIZE") {
+        let (width, height) = size
+            .split_once('x')
+            .context("preview size must be WIDTHxHEIGHT")?;
+        let (width, height) = (width.parse::<f32>()?, height.parse::<f32>()?);
+        anyhow::ensure!(
+            (320.0..=2560.0).contains(&width) && (240.0..=1600.0).contains(&height),
+            "preview size is out of bounds"
+        );
+        options.viewport = options.viewport.with_inner_size([width, height]);
     }
     let case = case.to_owned();
     run_native_preview(options, move |ctx, backend| {
@@ -897,6 +956,14 @@ impl Desktop {
                 display_entry: None,
             };
             state.bind_microphone();
+            if case == "shared-four-offline" {
+                state.members.get_mut(&"33".repeat(32)).unwrap().online = false;
+            }
+            if case == "shared-four-muted" {
+                state.settings.microphone_level.muted = true;
+                state.settings.audio_enabled = false;
+                state.settings.keyboard_enabled = false;
+            }
             if case.starts_with("shared-four-layout") {
                 use crate::group::layout::{self, Point};
                 state.settings.edge = true;

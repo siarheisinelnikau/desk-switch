@@ -119,7 +119,7 @@ class ReleaseAssetsTests(unittest.TestCase):
                 })
 
     def test_single_windows_executable_uses_the_short_versioned_name(self):
-        for version in ["0.8.1", "0.10.0", "1.0.0"]:
+        for version in ["0.8.1", "0.9.0", "0.9.3"]:
             with self.subTest(version=version):
                 self.assertEqual(asset_names(version), {
                     "windows-x86_64": f"desk-switch-v{version}.exe",
@@ -128,11 +128,19 @@ class ReleaseAssetsTests(unittest.TestCase):
                     "macos-x86_64-app": f"desk-switch-v{version}-macos-x86-64.zip",
                 })
 
+    def test_releases_from_010_ship_only_windows_and_ubuntu(self):
+        for version in ["0.10.0", "0.10.1", "1.0.0"]:
+            with self.subTest(version=version):
+                self.assertEqual(asset_names(version), {
+                    "windows-x86_64": f"desk-switch-v{version}.exe",
+                    "linux-x86_64-deb": f"desk-switch-v{version}-linux-x86-64.deb",
+                })
+
     def test_historical_two_platform_releases_reject_mac_archives_before_signing(self):
         root = self.directory
         (root / "src").mkdir()
         (root / "src/compatibility.rs").write_text("pub const PROTOCOL: u16 = 7;")
-        for version in ["0.5.1", "0.6.0", "0.6.1"]:
+        for version in ["0.5.1", "0.6.0", "0.6.1", "0.10.0"]:
             (root / "Cargo.toml").write_text(f'[package]\nversion = "{version}"\n')
             with self.subTest(version=version), patch.object(prepare_release, "ROOT", root), patch("sys.argv", ["prepare_release.py", "--windows", "missing.exe", "--deb", "missing.deb", "--tag", f"v{version}", "--macos-arm64", "unexpected.zip"]), patch.object(prepare_release.subprocess, "check_output", side_effect=AssertionError("Signing key must not be accessed")), self.assertRaisesRegex(ValueError, "This release does not include macOS"):
                 prepare_release.main()
@@ -242,7 +250,7 @@ class ReleaseAssetsTests(unittest.TestCase):
         root = self.directory
         (root / "src").mkdir()
         (root / "src/compatibility.rs").write_text("pub const PROTOCOL: u16 = 7;")
-        for version in ["0.5.0", "0.6.2", "1.0.0"]:
+        for version in ["0.5.0", "0.6.2", "0.9.3"]:
             (root / "Cargo.toml").write_text(f'[package]\nversion = "{version}"\n')
             with self.subTest(version=version), patch.object(prepare_release, "ROOT", root), patch("sys.argv", ["prepare_release.py", "--windows", "missing.exe", "--deb", "missing.deb", "--tag", f"v{version}"]), patch.object(prepare_release.subprocess, "check_output", side_effect=AssertionError("Signing key must not be accessed")), self.assertRaisesRegex(ValueError, "Missing required macos-arm64-app"):
                 prepare_release.main()
@@ -257,7 +265,7 @@ class ReleaseAssetsTests(unittest.TestCase):
             prepare_release.main()
 
     def test_new_candidates_require_all_four_assets_without_renaming_mac_archives(self):
-        for version in ["0.5.0", "0.6.2", "1.0.0"]:
+        for version in ["0.5.0", "0.6.2", "0.9.3"]:
             names = asset_names(version)
             candidate = {"tag_name": f"v{version}", "prerelease": True, "draft": False,
                          "body": "Notes", "assets": [{"id": index, "name": name, "state": "uploaded", "size": 10, "digest": "sha256:" + "11" * 32} for index, name in enumerate(names.values(), 1)]}

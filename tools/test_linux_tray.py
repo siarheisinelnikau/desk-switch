@@ -110,12 +110,18 @@ def main():
             with (args.out / 'render.log').open('w') as log:
                 process = subprocess.Popen([str(args.binary.resolve()), 'gui-preview', 'shared-four', '--state-dir', str(state / 'render')],
                                            env=dict(env, DESK_SWITCH_RENDER_PROBE=str(probe)), stdout=log, stderr=log)
-                wait_for(lambda: process.poll() is not None, 'The rendering probe exceeded its deadline', 45)
+                wait_for(lambda: process.poll() is not None, 'The rendering probe exceeded its deadline', 65)
                 assert process.returncode == 0, (args.out / 'render.log').read_text()
             rendering = json.loads(probe.read_text())
             assert 'llvmpipe' in rendering['backend'].lower(), rendering['backend']
             for sample in rendering['samples']:
-                assert sample['settled'] and sample['ui_frames'] == sample['popup_ui_frames'] == sample['input_events'] == 0, sample
+                assert sample['input_events'] == 0, sample
+                if sample['motion_expected']:
+                    assert sample['ui_frames'] + sample['popup_ui_frames'] > 0, sample
+                    if sample['state'] == 'main-hidden-popup-motion':
+                        assert sample['ui_frames'] == 0, sample
+                else:
+                    assert sample['settled'] and sample['ui_frames'] == sample['popup_ui_frames'] == 0, sample
             registered.clear()
             with (args.out / 'lifecycle.log').open('w') as log:
                 process = subprocess.Popen([str(args.binary.resolve()), 'gui-preview', 'shared-four', '--state-dir', str(state / 'lifecycle')],
@@ -155,7 +161,7 @@ def main():
                 'backend': rendering['backend'], 'native_window_system': 'X11', 'root_id': root,
                 'close_restore_cycles': 2, 'popup_cycles_while_main_hidden': 2, 'quit_while_hidden': True,
                 'scope': 'Actual application fixture on Xvfb/private D-Bus; no physical GNOME mouse routing or real user devices.'}, indent=2) + '\n')
-        print('PASS: real X11 close/hide/restore, direct SNI popup activation, native menu export, hidden quit and settled rendering. Physical GNOME clicks remain untested.')
+        print('PASS: real X11 close/hide/restore, direct SNI popup activation, native menu export, hidden quit, visible animation and quiet hidden rendering. Physical GNOME clicks remain untested.')
     finally:
         if process is not None:
             stop(process)

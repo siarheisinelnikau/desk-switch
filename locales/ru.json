@@ -881,5 +881,17 @@
   "Sharing resumed on this computer.": "Общий доступ на этом компьютере возобновлён.",
   "Update required": "Требуется обновление",
   "Update both computers to compatible versions before connecting.": "Обновите оба компьютера до совместимых версий перед подключением.",
-  "Prepare updates to download them without restarting. Each computer installs independently.": "Подготовьте обновления, чтобы скачать их без перезапуска. Каждый компьютер обновляется отдельно."
+  "Prepare updates to download them without restarting. Each computer installs independently.": "Подготовьте обновления, чтобы скачать их без перезапуска. Каждый компьютер обновляется отдельно.",
+  "Choose a computer. Your shared devices follow.": "Выберите компьютер. Общие устройства переключатся вместе с ним.",
+  "Click a computer to switch": "Нажмите на компьютер для переключения",
+  "Computers": "Компьютеры",
+  "Device host": "Хост устройств",
+  "In control": "Управление здесь",
+  "Next computer": "Следующий компьютер",
+  "Not connected": "Не подключено",
+  "Replay connections": "Повторить анимацию связей",
+  "Return control": "Вернуть управление",
+  "Sharing & volume": "Общий доступ и громкость",
+  "connected": "подключено",
+  "Device host / shared devices / receiving computers": "Хост / общие устройства / компьютеры-получатели"
 }

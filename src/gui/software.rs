@@ -10,13 +10,27 @@ use std::{
 };
 use winit::{
     application::ApplicationHandler,
-    event::WindowEvent,
-    event_loop::{ActiveEventLoop, ControlFlow, EventLoop, OwnedDisplayHandle},
+    event::{DeviceEvent, DeviceId, WindowEvent},
+    event_loop::{ActiveEventLoop, ControlFlow, DeviceEvents, EventLoop, OwnedDisplayHandle},
     window::{Window, WindowId},
 };
 
 #[cfg(test)]
 mod smoke;
+
+#[cfg(debug_assertions)]
+static RASTERIZED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+#[cfg(debug_assertions)]
+static PRESENTED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+#[cfg(debug_assertions)]
+pub(super) fn activity() -> [u64; 2] {
+    use std::sync::atomic::Ordering;
+    [
+        RASTERIZED.load(Ordering::Relaxed),
+        PRESENTED.load(Ordering::Relaxed),
+    ]
+}
 
 pub struct CreationContext {
     pub egui_ctx: Context,
@@ -44,6 +58,7 @@ struct View {
     builder: ViewportBuilder,
     callback: Option<Arc<egui::DeferredViewportUiCallback>>,
     desired_visible: bool,
+    input_feedback: bool,
     ui_while_hidden: bool,
     next: Option<Instant>,
     last_ui: Option<Instant>,
@@ -91,6 +106,7 @@ struct Host {
     error: Option<String>,
     trace: Option<std::path::PathBuf>,
     retired_views: Vec<serde_json::Value>,
+    device_listening: bool,
     #[cfg(test)]
     probe: Option<smoke::Probe>,
 }
@@ -155,6 +171,7 @@ impl Host {
                 builder,
                 callback,
                 desired_visible,
+                input_feedback: false,
                 ui_while_hidden: true,
                 next: Some(Instant::now()),
                 last_ui: None,
@@ -343,6 +360,7 @@ impl Host {
         let mut context_passes = 0;
         let mut logic_passes = 0;
         let mut ui_passes = 0;
+        super::activity::begin_frame(&self.ctx, id);
         let output = self.ctx.run_ui(raw, |ui| {
             context_passes += 1;
             if id == ViewportId::ROOT {
@@ -359,6 +377,7 @@ impl Host {
         });
         let view = self.views.get_mut(&id).unwrap();
         view.stats.context_passes += context_passes;
+        view.input_feedback = super::activity::interested(&self.ctx, id);
         view.stats.logic_passes += logic_passes;
         view.stats.ui_passes += ui_passes;
         view.input
@@ -439,6 +458,8 @@ impl Host {
             view.pixels_per_point = output.pixels_per_point;
             view.texture_epoch = self.texture_epoch;
             view.stats.rasterized += 1;
+            #[cfg(debug_assertions)]
+            RASTERIZED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             if !view.desired_visible {
                 view.stats.hidden_paints += 1;
             }
@@ -590,12 +611,15 @@ fn present(view: &mut View) -> Result<(), String> {
         buffer
             .present()
             .map_err(|e| format!("Could not present the GDI bitmap: {e}"))?;
+        #[cfg(debug_assertions)]
+        PRESENTED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
     Ok(())
 }
 
 impl ApplicationHandler<Wake> for Host {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
+        event_loop.listen_device_events(DeviceEvents::Never);
         if self.app.is_some() {
             return;
         }
@@ -699,6 +723,12 @@ impl ApplicationHandler<Wake> for Host {
         }
     }
 
+    fn device_event(&mut self, _: &ActiveEventLoop, _: DeviceId, event: DeviceEvent) {
+        if self.device_listening {
+            super::activity::record(&self.ctx, event, self.started.elapsed().as_secs_f64());
+        }
+    }
+
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
         #[cfg(test)]
         if let Some(mut probe) = self.probe.take() {
@@ -724,6 +754,20 @@ impl ApplicationHandler<Wake> for Host {
             }
             if event_loop.exiting() {
                 return;
+            }
+        }
+        let visible = self.views.values().any(|v| {
+            v.desired_visible && v.input_feedback && v.window.is_minimized() != Some(true)
+        });
+        if visible != self.device_listening {
+            self.device_listening = visible;
+            event_loop.listen_device_events(if visible {
+                DeviceEvents::Always
+            } else {
+                DeviceEvents::Never
+            });
+            if !visible {
+                super::activity::clear(&self.ctx);
             }
         }
         let next = self.views.values().filter_map(|v| v.next).min();
@@ -796,6 +840,7 @@ fn run_host(
         error: None,
         trace,
         retired_views: Vec::new(),
+        device_listening: false,
         #[cfg(test)]
         probe,
     };

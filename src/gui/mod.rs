@@ -1,3 +1,4 @@
+mod activity;
 mod file_progress;
 mod group;
 mod group_compat;
@@ -17,6 +18,7 @@ mod preview;
 mod session;
 #[cfg(windows)]
 mod software;
+mod topology;
 mod transfer;
 mod tray;
 mod view;
@@ -188,7 +190,7 @@ pub fn run_at(start_hidden: bool, dir: PathBuf) -> Result<()> {
         viewport: egui::ViewportBuilder::default()
             .with_title("Desk Switch")
             .with_app_id("com.deskswitch.Desktop")
-            .with_inner_size([1080.0, 760.0])
+            .with_inner_size([1080.0, 880.0])
             .with_min_inner_size([880.0, 650.0])
             .with_icon(icon),
         ..Default::default()
