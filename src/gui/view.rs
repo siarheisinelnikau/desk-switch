@@ -1,7 +1,7 @@
 use super::{Desktop, Page};
 use eframe::egui::{self, Align, Color32, FontId, RichText, Stroke, Vec2};
 
-const ACCENT: Color32 = Color32::from_rgb(82, 99, 224);
+const ACCENT: Color32 = Color32::from_rgb(57, 155, 196);
 
 struct Palette {
     bg: Color32,
@@ -17,13 +17,13 @@ impl Palette {
     fn new(dark: bool) -> Self {
         if dark {
             Self {
-                bg: Color32::from_rgb(17, 22, 32),
-                card: Color32::from_rgb(25, 32, 46),
+                bg: Color32::from_rgb(13, 18, 25),
+                card: Color32::from_rgb(21, 29, 39),
                 ink: Color32::from_rgb(231, 236, 246),
-                muted: Color32::from_rgb(159, 173, 195),
-                line: Color32::from_rgb(52, 65, 87),
+                muted: Color32::from_rgb(149, 166, 185),
+                line: Color32::from_rgb(43, 58, 73),
                 green: Color32::from_rgb(76, 211, 163),
-                selection: Color32::from_rgb(41, 55, 83),
+                selection: Color32::from_rgb(26, 58, 73),
                 error: Color32::from_rgb(249, 149, 128),
             }
         } else {
@@ -34,7 +34,7 @@ impl Palette {
                 muted: Color32::from_rgb(115, 125, 145),
                 line: Color32::from_rgb(225, 230, 239),
                 green: Color32::from_rgb(35, 139, 109),
-                selection: Color32::from_rgb(233, 247, 241),
+                selection: Color32::from_rgb(223, 242, 249),
                 error: Color32::from_rgb(162, 69, 53),
             }
         }
@@ -290,7 +290,7 @@ impl DeviceIcon {
     }
 }
 
-fn paint_device(
+pub(super) fn paint_device(
     painter: &egui::Painter,
     icon: DeviceIcon,
     center: egui::Pos2,
@@ -464,32 +464,28 @@ pub(super) fn peer_color(index: usize) -> Color32 {
     ][index % 4]
 }
 
+pub(super) fn contrast_color(color: Color32, dark: bool) -> Color32 {
+    if dark {
+        color
+    } else {
+        Color32::from_rgb(
+            (f32::from(color.r()) * 0.55) as u8,
+            (f32::from(color.g()) * 0.55) as u8,
+            (f32::from(color.b()) * 0.55) as u8,
+        )
+    }
+}
+
 #[derive(Clone, PartialEq)]
 pub(super) struct DeviceSource {
-    key: String,
+    pub(super) key: String,
     pub(super) name: String,
     pub(super) color: Color32,
-    muted: bool,
-}
-#[derive(Clone, PartialEq)]
-struct MonitorParticipant {
-    source: DeviceSource,
-    input: Option<u16>,
-    online: bool,
-    selected: bool,
-}
-#[derive(Clone, PartialEq)]
-pub(super) struct SharedMonitorVisual {
-    current: Option<DeviceSource>,
-    requested: Option<DeviceSource>,
-    pending: bool,
-    error: Option<String>,
-    participants: Vec<MonitorParticipant>,
+    pub(super) muted: bool,
 }
 #[derive(Clone, Default, PartialEq)]
 pub(super) struct WorkspaceVisual {
     pub(super) devices: [Option<DeviceSource>; 4],
-    pub(super) monitor: Option<SharedMonitorVisual>,
     pub(super) input_target: Option<String>,
 }
 impl WorkspaceVisual {
@@ -548,40 +544,6 @@ impl WorkspaceVisual {
                     || state.settings.microphone_level.volume == 0,
             )
         });
-        let monitor = state.settings.monitor_enabled.then(|| {
-            let command = state.monitor_command.as_ref();
-            SharedMonitorVisual {
-                current: state
-                    .confirmed_monitor
-                    .as_deref()
-                    .and_then(|key| source(key, false)),
-                requested: command.and_then(|command| source(&command.destination, false)),
-                pending: command.is_some_and(|command| {
-                    command.result.is_none() && command.interrupted.is_none()
-                }),
-                error: command.and_then(|command| {
-                    command
-                        .result
-                        .as_ref()
-                        .and_then(|result| result.error.clone())
-                        .or_else(|| command.interrupted.clone())
-                }),
-                participants: state
-                    .members
-                    .values()
-                    .filter(|member| member.node.monitor.enabled)
-                    .filter_map(|member| {
-                        source(&member.node.key, false).map(|source| MonitorParticipant {
-                            selected: state.confirmed_monitor.as_deref()
-                                == Some(member.node.key.as_str()),
-                            source,
-                            input: member.node.monitor.input,
-                            online: member.online,
-                        })
-                    })
-                    .collect(),
-            }
-        });
         Self {
             devices: [
                 state
@@ -593,7 +555,6 @@ impl WorkspaceVisual {
                 audio,
                 microphone,
             ],
-            monitor,
             input_target,
         }
     }
@@ -742,142 +703,6 @@ pub(super) fn device_checkbox(
         ui.add_enabled(enabled, egui::Checkbox::new(value, crate::i18n::tr(label)))
     })
     .inner
-}
-
-pub(super) fn shared_monitor(ui: &mut egui::Ui, visual: &SharedMonitorVisual, compact: bool) {
-    let colors = palette(ui);
-    let current = visual.current.as_ref();
-    let color = current
-        .map(|source| source.color)
-        .unwrap_or(colors.muted.gamma_multiply(0.55));
-    let status = if visual.error.is_some() {
-        Some(crate::i18n::tr("Monitor switch failed"))
-    } else if visual.pending {
-        Some(format!(
-            "{} · {}",
-            crate::i18n::tr("Switching…"),
-            visual
-                .requested
-                .as_ref()
-                .map(|source| source.name.as_str())
-                .unwrap_or("—")
-        ))
-    } else {
-        None
-    };
-    let name = current
-        .map(|source| source.name.clone())
-        .unwrap_or_else(|| crate::i18n::tr("Monitor input unknown"));
-    let layout = if !compact && ui.available_width() < 560.0 {
-        egui::Layout::top_down(Align::Min)
-    } else {
-        egui::Layout::left_to_right(Align::Center)
-    };
-    ui.allocate_ui_with_layout(Vec2::new(ui.available_width(), 0.0), layout, |ui| {
-        let (size, scale, width) = if compact {
-            (Vec2::new(104.0, 62.0), 0.42, 94.0)
-        } else {
-            (Vec2::new(216.0, 126.0), 0.82, 196.0)
-        };
-        let (rect, response) = ui.allocate_exact_size(size, egui::Sense::hover());
-        let center = egui::pos2(rect.center().x, rect.top() + 50.0 * scale);
-        monitor_scaled(ui.painter(), center, width, scale, color, colors.bg);
-        if !compact {
-            ui.place(
-                egui::Rect::from_center_size(center, Vec2::new(width - 18.0, 28.0)),
-                egui::Label::new(RichText::new(crate::i18n::tr("Shared monitor")).size(14.0))
-                    .truncate(),
-            );
-        }
-        response.on_hover_text(crate::i18n::tr(
-            "The monitor view updates when you switch with Desk Switch.",
-        ));
-        ui.vertical(|ui| {
-            if compact {
-                ui.strong(crate::i18n::tr("Shared monitor"));
-            }
-            ui.add(egui::Label::new(RichText::new(&name).color(color)).truncate())
-                .on_hover_text(&name);
-            if let Some(status) = &status {
-                ui.add(
-                    egui::Label::new(RichText::new(status).small().color(
-                        if visual.error.is_some() {
-                            colors.error
-                        } else {
-                            colors.muted
-                        },
-                    ))
-                    .truncate(),
-                )
-                .on_hover_text(
-                    visual
-                        .error
-                        .as_deref()
-                        .map(crate::i18n::tr)
-                        .unwrap_or_else(|| status.clone()),
-                );
-            }
-            if !compact {
-                ui.horizontal_wrapped(|ui| {
-                    for participant in &visual.participants {
-                        let (rect, response) =
-                            ui.allocate_exact_size(Vec2::new(92.0, 76.0), egui::Sense::hover());
-                        let tower_color = if participant.online {
-                            participant.source.color
-                        } else {
-                            colors.muted.gamma_multiply(0.55)
-                        };
-                        if participant.selected {
-                            ui.painter().rect_filled(
-                                rect.shrink(1.0),
-                                7,
-                                tower_color.gamma_multiply(0.08),
-                            );
-                        }
-                        tower_scaled(
-                            ui.painter(),
-                            egui::pos2(rect.center().x, rect.top() + 26.0),
-                            0.45,
-                            tower_color,
-                            colors.card,
-                        );
-                        ui.place(
-                            egui::Rect::from_min_size(
-                                rect.left_top() + Vec2::new(3.0, 52.0),
-                                Vec2::new(rect.width() - 6.0, 20.0),
-                            ),
-                            egui::Label::new(
-                                RichText::new(&participant.source.name)
-                                    .size(11.0)
-                                    .color(tower_color),
-                            )
-                            .truncate(),
-                        );
-                        let input = participant
-                            .input
-                            .map(|input| match input {
-                                15 => "DisplayPort".into(),
-                                16 => "DisplayPort 2".into(),
-                                17 => "HDMI 1".into(),
-                                18 => "HDMI 2".into(),
-                                _ => format!("0x{input:02x}"),
-                            })
-                            .unwrap_or_else(|| crate::i18n::tr("Monitor port is not configured"));
-                        response.on_hover_text(format!(
-                            "{} · {} · {}",
-                            participant.source.name,
-                            input,
-                            crate::i18n::tr(if participant.online {
-                                "Connected"
-                            } else {
-                                "Offline"
-                            })
-                        ));
-                    }
-                });
-            }
-        });
-    });
 }
 
 fn device_picker(

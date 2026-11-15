@@ -11,7 +11,7 @@ use crate::{
     workspace::{self, Node, Selection},
 };
 use anyhow::{Context, Result};
-use eframe::egui::{self, Color32, RichText};
+use eframe::egui::{self, RichText};
 use std::{collections::BTreeMap, net::SocketAddr};
 
 fn tr(text: &str) -> String {
@@ -796,12 +796,18 @@ impl Desktop {
     }
 
     pub(super) fn group_overview(&mut self, ui: &mut egui::Ui) {
-        use super::view::DeviceIcon;
-
-        ui.label(tr(
-            "Share your devices across all connected computers. Change settings from any computer.",
-        ));
-        ui.add_space(12.0);
+        ui.horizontal(|ui| {
+            ui.label(
+                RichText::new(tr("Your computers. One workspace."))
+                    .size(24.0)
+                    .strong(),
+            );
+        });
+        ui.label(
+            RichText::new(tr("Choose a computer. Your shared devices follow."))
+                .color(ui.visuals().weak_text_color()),
+        );
+        ui.add_space(8.0);
         self.group.connection_status(ui);
         let now = std::time::Instant::now();
         self.group.requests.retain(|(deadline, _)| *deadline > now);
@@ -834,199 +840,97 @@ impl Desktop {
         let plan = state.plan();
         let members = state.members.values().collect::<Vec<_>>();
         let visual = super::view::WorkspaceVisual::from_workspace(&state);
-        if let Some(monitor) = &visual.monitor {
-            egui::Frame::group(ui.style())
-                .inner_margin(12)
-                .show(ui, |ui| {
-                    ui.set_width(ui.available_width());
-                    super::view::shared_monitor(ui, monitor, false);
-                });
-            ui.add_space(8.0);
+        let scene = super::topology::Scene::from_workspace(&state, &self.public_key);
+        if let Some(key) = super::topology::show(
+            ui,
+            &scene,
+            false,
+            self.group.writable() && !state.switch_pending(),
+        ) {
+            self.group_action(Action::Activate { key });
         }
-        ui.weak(tr("Device colour shows which PC it comes from"));
-        let columns = if ui.available_width() >= 600.0 { 2 } else { 1 };
-        let width = (ui.available_width() - 12.0 * (columns - 1) as f32) / columns as f32;
+        ui.add_space(8.0);
+        let columns = if ui.available_width() >= 700.0 { 4 } else { 2 };
+        let width = (ui.available_width() - 10.0 * (columns - 1) as f32) / columns as f32;
         for (row_index, row) in members.chunks(columns).enumerate() {
             ui.horizontal_top(|ui| {
-                ui.spacing_mut().item_spacing.x = 12.0;
-                for (column, member) in row.iter().enumerate() {
-                    let index = row_index * columns + column;
-                    let key = &member.node.key;
-                    let accent: Color32 = super::view::peer_color(index);
-                    let devices = visual.member_devices(&state, key);
-                    let input_label = match (
-                        devices[DeviceIcon::Keyboard.index()].is_some(),
-                        devices[DeviceIcon::Mouse.index()].is_some(),
-                    ) {
-                        (true, true) => Some("Keyboard & mouse active here"),
-                        (true, false) => Some("Keyboard active here"),
-                        (false, true) => Some("Mouse active here"),
-                        (false, false) => None,
-                    };
+                ui.spacing_mut().item_spacing.x = 10.0;
+                for (col, member) in row.iter().enumerate() {
                     ui.allocate_ui_with_layout(
                         egui::vec2(width, 0.0),
                         egui::Layout::top_down(egui::Align::Min),
                         |ui| {
-                            let frame = egui::Frame::group(ui.style());
-                            let stroke = if input_label.is_some() {
-                                egui::Stroke::new(1.0, accent)
-                            } else {
-                                frame.stroke
-                            };
-                            frame
+                            egui::Frame::new()
+                                .inner_margin(10)
+                                .corner_radius(10)
                                 .fill(ui.visuals().window_fill())
-                                .stroke(stroke)
-                                .corner_radius(12)
-                                .inner_margin(16)
                                 .show(ui, |ui| {
-                                    ui.set_width(width - 34.0);
-                                    ui.set_min_height(106.0);
-                                    ui.spacing_mut().item_spacing.y = 6.0;
-                                    ui.horizontal_wrapped(|ui| {
-                                        ui.colored_label(
-                                            accent,
-                                            RichText::new(&member.node.name).size(18.0).strong(),
-                                        );
-                                        if key == &self.public_key {
-                                            ui.weak(tr("This PC"));
-                                        }
-                                    });
-                                    let platform = match member.node.diagnostics.platform.as_str() {
-                                        "windows" => "Windows",
-                                        "linux" => "Ubuntu",
-                                        "macos" => "macOS",
-                                        _ => "Computer",
-                                    };
-                                    let incompatible = self.group.incompatible_workspaces.get(key);
-                                    ui.weak(format!(
-                                        "{platform} · {} · {}",
-                                        incompatible
-                                            .map(String::as_str)
-                                            .or_else(|| member
-                                                .node
-                                                .version
-                                                .as_ref()
-                                                .map(|version| version.app.as_str()))
-                                            .unwrap_or("—"),
-                                        tr(if incompatible.is_some() {
-                                            "Update required"
-                                        } else if member.online {
-                                            "Connected"
-                                        } else {
-                                            "Offline"
-                                        })
-                                    ));
+                                    ui.set_width(width - 20.0);
+                                    ui.add(
+                                        egui::Label::new(
+                                            RichText::new(&member.node.name).strong().color(
+                                                super::view::contrast_color(
+                                                    super::view::peer_color(
+                                                        row_index * columns + col,
+                                                    ),
+                                                    ui.visuals().dark_mode,
+                                                ),
+                                            ),
+                                        )
+                                        .truncate(),
+                                    );
                                     super::view::attached_devices(ui, member);
-                                    ui.horizontal(|ui| {
-                                        ui.spacing_mut().item_spacing.x = 6.0;
-                                        ui.weak(tr("Shared"));
-                                        for icon in DeviceIcon::SHARED {
-                                            super::view::device_icon(
-                                                ui,
-                                                icon,
-                                                devices[icon.index()].as_ref(),
-                                                0.8,
-                                            );
-                                        }
-                                    });
-                                    let mut roles = Vec::new();
-                                    if let Some(label) = input_label {
-                                        roles.push(tr(label));
-                                    }
-                                    if plan.audio.as_ref() == Some(key) {
-                                        roles.push(tr("Shared output"));
-                                    }
-                                    if plan
-                                        .microphone
-                                        .as_ref()
-                                        .is_some_and(|binding| &binding.computer == key)
-                                    {
-                                        roles.push(tr("Microphone"));
-                                    }
-                                    let role = RichText::new(if roles.is_empty() {
-                                        tr("Available for sharing")
-                                    } else {
-                                        roles.join(" · ")
-                                    });
-                                    ui.label(if input_label.is_some() {
-                                        role.color(accent).strong()
-                                    } else {
-                                        role
-                                    });
-                                    if incompatible.is_some()
+                                    if self
+                                        .group
+                                        .incompatible_workspaces
+                                        .contains_key(&member.node.key)
                                         || member.online && !member.compatible()
                                     {
-                                        ui.horizontal_wrapped(|ui| {
-                                            ui.weak(tr("Update required to share devices."));
-                                            if ui.link(tr("Updates")).clicked() {
-                                                self.group.selected = key.clone();
-                                                self.page = Page::Application;
-                                            }
-                                        });
-                                    } else if !member.online {
-                                        ui.weak(tr(
-                                            "Open Desk Switch on this computer to reconnect.",
-                                        ));
-                                    } else if member.node.input_error.is_some() {
-                                        ui.horizontal_wrapped(|ui| {
-                                            ui.weak(tr("Keyboard and mouse need attention."));
-                                            if ui.link(tr("Diagnostics")).clicked() {
-                                                self.page = Page::Diagnostics;
-                                            }
-                                        });
+                                        ui.colored_label(
+                                            ui.visuals().warn_fg_color,
+                                            tr("Update required"),
+                                        );
+                                    } else if member.node.input_error.is_some()
+                                        && ui
+                                            .link(tr("Keyboard and mouse need attention."))
+                                            .clicked()
+                                    {
+                                        self.group.selected = member.node.key.clone();
+                                        self.page = Page::Diagnostics;
                                     }
                                     ui.horizontal_wrapped(|ui| {
-                                        let active = state.active_input.as_ref() == Some(key);
-                                        let failed = active && member.node.monitor_error.is_some();
-                                        let video_needed = state.settings.monitor_enabled
-                                            && member.node.monitor.enabled
-                                            && state.active_monitor.as_ref() != Some(key);
-                                        if ui
-                                            .add_enabled(
-                                                member.compatible()
-                                                    && self.group.writable()
-                                                    && (!active || failed || video_needed)
-                                                    && !state.switch_pending(),
-                                                egui::Button::new(tr(if failed {
-                                                    "Retry switch"
-                                                } else if active && state.switch_pending() {
-                                                    "Switching…"
-                                                } else if active && !video_needed {
-                                                    "Input target"
-                                                } else {
-                                                    "Switch here"
-                                                })),
-                                            )
-                                            .clicked()
-                                        {
-                                            self.group_action(Action::Activate {
-                                                key: key.clone(),
-                                            });
-                                        }
-                                        if ui.button(tr("Settings")).clicked() {
+                                        if ui.small_button(tr("Settings")).clicked() {
                                             self.transfers.close();
                                             self.group.add_open = false;
-                                            self.group.selected = key.clone();
+                                            self.group.selected = member.node.key.clone();
                                             self.page = Page::Application;
                                         }
-                                        self.transfer_card_action(ui, key, member.compatible());
+                                        self.transfer_card_action(
+                                            ui,
+                                            &member.node.key,
+                                            member.compatible(),
+                                        );
                                     });
-                                    if let Some(error) = &member.node.monitor_error {
+                                    if member.node.monitor_error.is_some() {
+                                        if ui.small_button(tr("Retry switch")).clicked() {
+                                            self.group_action(Action::Activate {
+                                                key: member.node.key.clone(),
+                                            });
+                                        }
                                         ui.colored_label(
                                             ui.visuals().error_fg_color,
                                             tr("Monitor switch failed"),
-                                        )
-                                        .on_hover_text(error);
+                                        );
                                     }
-                                })
+                                });
                         },
                     );
                 }
             });
         }
         ui.add_space(4.0);
-        egui::Frame::group(ui.style())
-            .inner_margin(16)
+        egui::CollapsingHeader::new(tr("Sharing & volume"))
+            .id_salt("workspace-sharing-controls")
             .show(ui, |ui| {
                 ui.spacing_mut().item_spacing.y = 8.0;
                 ui.strong(tr("Shared devices"));

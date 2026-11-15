@@ -3,8 +3,8 @@ use crate::workspace::{AudioLevel, Plan};
 use eframe::egui::{self, Color32, Pos2, RichText, Vec2};
 use std::sync::{Arc, Mutex, mpsc::Sender};
 
-const WIDTH: f32 = 344.0;
-const HEIGHT: f32 = 512.0;
+const WIDTH: f32 = 420.0;
+const HEIGHT: f32 = 710.0;
 pub(super) fn preferred_size() -> Vec2 {
     egui::vec2(WIDTH, HEIGHT)
 }
@@ -33,6 +33,7 @@ pub enum Command {
 
 #[derive(Clone, Default, PartialEq)]
 struct Snapshot {
+    scene: super::topology::Scene,
     visual: super::view::WorkspaceVisual,
     targets: Vec<([u8; 32], String, bool)>,
     connected: bool,
@@ -394,6 +395,7 @@ impl Desktop {
         }
         if let Some(workspace) = &self.group.workspace {
             let plan = workspace.plan();
+            snapshot.scene = super::topology::Scene::from_workspace(workspace, &self.public_key);
             snapshot.visual = super::view::WorkspaceVisual::from_workspace(workspace);
             snapshot.transfers = self
                 .transfer_snapshot()
@@ -499,6 +501,10 @@ impl Desktop {
         let send = self.quick.send.clone();
         let root = ctx.clone();
         #[cfg(debug_assertions)]
+        let probing = std::env::var_os("DESK_SWITCH_RENDER_PROBE").is_some();
+        #[cfg(not(debug_assertions))]
+        let probing = false;
+        #[cfg(debug_assertions)]
         if self.preview_popup {
             return;
         }
@@ -507,12 +513,16 @@ impl Desktop {
             egui::ViewportBuilder::default()
                 .with_title("Desk Switch quick controls")
                 .with_inner_size(placement.size())
-                .with_position(placement.min)
+                .with_position(if probing {
+                    egui::pos2(-14_000.0, -14_000.0)
+                } else {
+                    placement.min
+                })
                 .with_decorations(false)
                 .with_resizable(false)
                 .with_taskbar(false)
                 .with_always_on_top()
-                .with_active(true),
+                .with_active(!probing),
             move |ui, _| {
                 let (snapshot, close) = {
                     let mut state = state.lock().unwrap();
@@ -522,7 +532,7 @@ impl Desktop {
                     }
                     let close = ui.ctx().input(|i| {
                         i.viewport().close_requested() || i.key_pressed(egui::Key::Escape)
-                    }) || (state.seen_focus && focused == Some(false));
+                    }) || (!probing && state.seen_focus && focused == Some(false));
                     (state.snapshot.clone(), close)
                 };
                 if close {
@@ -614,9 +624,10 @@ fn body(
         ui.painter().circle_filled(rect.center(), 3.0, color);
         ui.add(egui::Label::new(&snapshot.peer).truncate());
     });
-    if let Some(monitor) = &snapshot.visual.monitor {
-        super::view::shared_monitor(ui, monitor, true);
-        ui.separator();
+    if let Some(key) = super::topology::show(ui, &snapshot.scene, true, snapshot.can_switch)
+        && let Ok(key) = crate::config::key(&key)
+    {
+        send(Action::Quick(Command::Target(key)));
     }
     if !snapshot.target.is_empty() {
         ui.add(
@@ -628,7 +639,7 @@ fn body(
             .truncate(),
         );
     }
-    if !snapshot.targets.is_empty() {
+    if !snapshot.targets.is_empty() && snapshot.scene == super::topology::Scene::default() {
         egui::ComboBox::from_id_salt("quick-input-target")
             .width(ui.available_width())
             .selected_text(tr("Switch to computer…"))
@@ -642,11 +653,15 @@ fn body(
     }
     let switch = ui.add_enabled(
         snapshot.can_switch,
-        egui::Button::new(tr(if snapshot.targets.is_empty() {
-            "Switch to the other PC"
-        } else {
-            "Switch to next computer"
-        }))
+        egui::Button::new(
+            RichText::new(tr(if snapshot.targets.is_empty() {
+                "Switch to the other PC"
+            } else {
+                "Switch to next computer"
+            }))
+            .color(Color32::WHITE),
+        )
+        .fill(Color32::from_rgb(37, 111, 142))
         .min_size(Vec2::new(ui.available_width(), 34.0)),
     );
     if switch.clicked() {
@@ -750,51 +765,46 @@ fn body(
     }
     ui.separator();
     for row in &snapshot.levels {
-        ui.horizontal(|ui| {
-            ui.add_sized(
-                [120.0, 18.0],
-                egui::Label::new(
-                    RichText::new(&row.name)
-                        .strong()
-                        .color(row.color.unwrap_or(ui.visuals().text_color())),
-                )
-                .truncate(),
-            )
-            .on_hover_text(&row.name);
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                let caption = tr(if row.system {
-                    "System volume"
-                } else {
-                    "Relative volume"
-                });
-                ui.add(
-                    egui::Label::new(
-                        RichText::new(&caption)
-                            .small()
-                            .color(ui.visuals().weak_text_color()),
-                    )
-                    .truncate(),
-                )
-                .on_hover_text(caption);
-            });
-        });
         let mut level = row.value;
         let changed = ui
             .horizontal(|ui| {
                 if !snapshot.can_edit {
                     ui.disable();
                 }
+                let caption = tr(if row.system {
+                    "System volume"
+                } else {
+                    "Relative volume"
+                });
+                ui.add_sized(
+                    [100.0, 30.0],
+                    egui::Label::new(
+                        RichText::new(&row.name).color(
+                            row.color
+                                .map(|color| {
+                                    super::view::contrast_color(color, ui.visuals().dark_mode)
+                                })
+                                .unwrap_or(ui.visuals().text_color()),
+                        ),
+                    )
+                    .truncate(),
+                )
+                .on_hover_text(format!("{} · {}", row.name, caption));
                 let slider = ui
                     .scope(|ui| {
-                        let font = egui::TextStyle::Body.resolve(ui.style());
-                        let mute_width = ui.fonts_mut(|fonts| {
-                            fonts
-                                .layout_no_wrap(tr("Mute"), font, Color32::WHITE)
-                                .size()
-                                .x
-                        });
+                        let mute_width = ui
+                            .painter()
+                            .layout_no_wrap(
+                                tr("Mute"),
+                                egui::TextStyle::Body.resolve(ui.style()),
+                                ui.visuals().text_color(),
+                            )
+                            .size()
+                            .x
+                            + ui.spacing().icon_width
+                            + ui.spacing().icon_spacing;
                         ui.spacing_mut().slider_width =
-                            (ui.available_width() - mute_width - 106.0).clamp(96.0, 175.0);
+                            (ui.available_width() - mute_width - 88.0).clamp(48.0, 180.0);
                         ui.add(egui::Slider::new(&mut level.volume, 0..=100).suffix(" %"))
                     })
                     .inner

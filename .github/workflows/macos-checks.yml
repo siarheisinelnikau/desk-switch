@@ -2,23 +2,6 @@ name: macOS experimental checks
 
 on:
   workflow_dispatch:
-  push:
-    branches: [codex/validate-0.7]
-  pull_request:
-    # Any Rust change can break the macOS build, so the experimental macOS
-    # matrix runs for every pull request that touches sources or dependencies.
-    # A Windows-only or Ubuntu-only checkout cannot detect these regressions.
-    paths:
-      - "src/**"
-      - "build.rs"
-      - "Cargo.toml"
-      - "Cargo.lock"
-      - "vendor/**"
-      - "packaging/**"
-      - "tools/package_macos.py"
-      - ".github/workflows/macos-checks.yml"
-  schedule:
-    - cron: "37 4 * * 1"
 
 permissions:
   contents: read

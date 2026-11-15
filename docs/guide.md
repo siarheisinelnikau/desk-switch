@@ -1,29 +1,29 @@
 # Desk Switch guide
 
-Your computers. One workspace. Share a keyboard, mouse, headphones or speakers, microphone and an optional clipboard across **two, three, four or more computers**. Control the workspace and each computer's settings from any member, send files directly, and arrange screens around your desk. Releases support Windows, Ubuntu and experimental Apple Silicon/Intel macOS bundles. A shared monitor can follow the selected computer through DDC/CI.
+Your computers. One workspace. Share a keyboard, mouse, headphones or speakers, microphone and an optional clipboard across **two, three, four or more computers**. Control the workspace and each computer's settings from any member, send files directly, and arrange screens around your desk. The 0.10 release line supports Windows and Ubuntu; earlier macOS bundles remain experimental. A shared monitor can follow the selected computer through DDC/CI.
 
 ![A four-computer workspace with shared input, sound, microphone and clipboard controls](workspace-four-computers.png)
 
 ## Install
 
-Install the **same version on every computer** from [Releases](https://github.com/siarheisinelnikau/desk-switch/releases). Version **0.8.1** has four native downloads:
+Install **0.10.0 on every Windows and Ubuntu computer** from [Releases](https://github.com/siarheisinelnikau/desk-switch/releases). The 0.10 and 0.9 release lines do not connect to each other. This release has two native downloads:
 
 | Platform | Download |
 | --- | --- |
-| Ubuntu 24.04/26.04, x86-64 | [desk-switch-v0.8.1-linux-x86-64.deb](https://github.com/siarheisinelnikau/desk-switch/releases/download/v0.8.1/desk-switch-v0.8.1-linux-x86-64.deb) |
-| Windows, x86-64 | [desk-switch-v0.8.1.exe](https://github.com/siarheisinelnikau/desk-switch/releases/download/v0.8.1/desk-switch-v0.8.1.exe) |
-| macOS 13+, Apple Silicon (experimental) | [desk-switch-v0.8.1-macos-arm64.zip](https://github.com/siarheisinelnikau/desk-switch/releases/download/v0.8.1/desk-switch-v0.8.1-macos-arm64.zip) |
-| macOS 13+, Intel x86-64 (experimental) | [desk-switch-v0.8.1-macos-x86-64.zip](https://github.com/siarheisinelnikau/desk-switch/releases/download/v0.8.1/desk-switch-v0.8.1-macos-x86-64.zip) |
+| Windows x86-64 | [desk-switch-v0.10.0.exe](https://github.com/siarheisinelnikau/desk-switch/releases/download/v0.10.0/desk-switch-v0.10.0.exe) |
+| Ubuntu 24.04/26.04 x86-64 | [desk-switch-v0.10.0-linux-x86-64.deb](https://github.com/siarheisinelnikau/desk-switch/releases/download/v0.10.0/desk-switch-v0.10.0-linux-x86-64.deb) |
 
 ```sh
-sudo apt install ./desk-switch-v0.8.1-linux-x86-64.deb
+sudo apt install ./desk-switch-v0.10.0-linux-x86-64.deb
 ```
 
 Open **Desk Switch** from Ubuntu's application menu or run the Windows executable. New profiles use **English** and **Dark**. Existing language and theme choices are preserved. Russian, German, French, Spanish and Italian are also available; changes apply immediately to the window and tray.
 
-## macOS (experimental)
+## Historical macOS releases (experimental)
 
-**Version 0.6.2 restores experimental Apple Silicon and Intel macOS app bundles and their signed in-app update targets.** Versions 0.6.0 and 0.6.1 remain Windows/Ubuntu-only. Both Mac architectures must pass native compile, test and package checks before publication. **macOS functionality has not been tested on physical hardware.** Those checks do not verify real input devices, audio routing, permissions, monitor firmware or UI performance on a Mac. macOS 13 or newer is required.
+**No macOS build or update is published for 0.10.0 because the implementation has not been verified on physical hardware. The instructions below apply to earlier releases only.**
+
+**Version 0.6.2 restored experimental Apple Silicon and Intel macOS app bundles and their signed in-app update targets.** Versions 0.6.0 and 0.6.1 remain Windows/Ubuntu-only. Both Mac architectures must pass native compile, test and package checks before publication. **macOS functionality has not been tested on physical hardware.** Those checks do not verify real input devices, audio routing, permissions, monitor firmware or UI performance on a Mac. macOS 13 or newer is required.
 
 Unzip the archive for your Mac's architecture and move the complete **Desk Switch.app** to **Applications** or **~/Applications** before opening it. The bundles and their embedded native helpers are ad-hoc signed, but are **not Developer ID signed or notarized**. Follow macOS's normal Open/Privacy & Security flow if Gatekeeper blocks the first launch. In-app updates verify the project's pinned Ed25519 signature and replace the complete application bundle, preserve the separate settings directory, and retain a rollback copy until the new GUI confirms startup. **~/Applications** supports updates without administrator credentials; a read-only or protected installation directory produces a clear error instead of requesting elevation.
 
