@@ -95,8 +95,11 @@ export default class DeskSwitchTray extends Extension {
         this._icons.set(icon, destroy);
     }
 
-    _iconAt(x, y) {
-        const target = global.stage.get_actor_at_pos(Clutter.PickMode.REACTIVE, x, y);
+    _iconAt(x, y, event) {
+        // GNOME 50 can deliver a gesture's event actor before a fresh stage
+        // pick sees the panel child. Prefer the actor from this actual event.
+        const target = global.stage.get_event_actor?.(event) ??
+            global.stage.get_actor_at_pos(Clutter.PickMode.REACTIVE, x, y);
         // The Shell can already route clicks to a new icon before our idle scan.
         for (let actor = target; actor; actor = actor.get_parent()) {
             const indicator = actor._indicator;
@@ -118,7 +121,7 @@ export default class DeskSwitchTray extends Extension {
             event.get_button() !== Clutter.BUTTON_PRIMARY)
             return Clutter.EVENT_PROPAGATE;
         const [x, y] = event.get_coords();
-        const icon = this._iconAt(x, y);
+        const icon = this._iconAt(x, y, event);
         if (type === Clutter.EventType.BUTTON_PRESS) {
             this._pressedIcon = icon;
             if (!icon)
@@ -157,7 +160,7 @@ export default class DeskSwitchTray extends Extension {
     }
 
     VersionAsync(_parameters, invocation) {
-        invocation.return_value(new GLib.Variant('(u)', [2]));
+        invocation.return_value(new GLib.Variant('(u)', [3]));
     }
 
     _processId(name) {

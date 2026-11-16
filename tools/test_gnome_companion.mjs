@@ -11,6 +11,8 @@ class Signals {
     emit(name, ...args) { for (const handler of this.handlers.values()) if (handler.name === name) handler.callback(this, ...args); }
 }
 const stage = new Signals();
+let eventTarget;
+stage.get_event_actor = () => eventTarget;
 let target = null;
 stage.get_actor_at_pos = () => target;
 const selection = new Signals();
@@ -455,7 +457,7 @@ assert.equal(acceptedReservation.result.signature, '(bu)');
 assert.equal(acceptedReservation.result.data[0], true); assert.equal(writes, beforeNewer + 1);
 assert.equal(new TextDecoder().decode(png), 'copy\nfile:///tmp/verified%20download');
 const fileBridgeVersion = new Invocation(); conditionalExtension.VersionAsync([], fileBridgeVersion);
-assert.deepEqual(Array.from(fileBridgeVersion.result.data), [2], 'ABI 2 advertises deferred file copy/move and transfer-window activation');
+assert.deepEqual(Array.from(fileBridgeVersion.result.data), [3], 'ABI 3 advertises the current tray routing and retains file clipboard ABI 2');
 const moveReservation = new Invocation();
 await conditionalExtension.WriteFilesWithOperationIfCurrentAsync([conditionalExtension._clipboardSerial, 1, stagedUris], moveReservation);
 assert.equal(moveReservation.result.data[0], true);
@@ -490,3 +492,20 @@ conditionalExtension.disable(); await cancelledConditional;
 assert(afterDisable.error); assert.equal(writes, afterDuringCopy);
 assert.equal(exports, 0); assert.equal(owned, 0); assert.equal(idle.size, 0);
 console.log('PASS: conditional file clipboard publication rejects changed revisions, including identical text recopies, with no native write; accepted writes and GUI authorization remain covered.');
+
+// GNOME 50's event actor can already identify our indicator while a separate
+// stage pick points at another actor. Route the completed click from the event.
+const eventExtension = new sandbox.Subject();
+eventExtension.enable();
+target = other;
+eventTarget = {get_parent: () => own};
+const beforeEventActor = calls.length;
+assert.equal(eventExtension._handleEvent(event(1)), Clutter.EVENT_STOP);
+assert.equal(eventExtension._handleEvent(event(2)), Clutter.EVENT_STOP);
+assert.equal(calls.length, beforeEventActor + 1);
+assert.equal(eventExtension._handleEvent(event(1, 3)), Clutter.EVENT_PROPAGATE);
+assert.equal(eventExtension._handleEvent(event(2, 3)), Clutter.EVENT_PROPAGATE);
+assert.equal(calls.length, beforeEventActor + 1);
+eventExtension.disable();
+eventTarget = undefined;
+console.log('PASS: GNOME event-actor routing activates only our completed primary click; the native secondary menu is preserved.');

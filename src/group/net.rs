@@ -100,6 +100,10 @@ pub enum Action {
         id: u64,
         error: Option<String>,
     },
+    MonitorPrepared {
+        id: u64,
+        error: Option<String>,
+    },
     Invite {
         address: SocketAddr,
         key: String,
@@ -1163,6 +1167,7 @@ fn apply(
         Action::EdgePause(paused) => state.pause_edges(paused)?,
         Action::RemoveMember { key } => state.remove_member(&key)?,
         Action::MonitorResult { id, error } => state.monitor_result(source, id, error)?,
+        Action::MonitorPrepared { id, error } => state.monitor_prepared(source, id, error)?,
         Action::Invite { address, key } => {
             if !key.is_empty() {
                 model::valid_key(&key)?;

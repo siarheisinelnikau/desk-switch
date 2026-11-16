@@ -3,15 +3,8 @@
 //! Input capture still uses the native Wayland portal/EIS backend.
 use winit::platform::x11::EventLoopBuilderExtX11;
 
-pub(super) fn options(mut options: eframe::NativeOptions) -> eframe::NativeOptions {
+pub(super) fn configure<T>(builder: &mut winit::event_loop::EventLoopBuilder<T>) {
     if std::env::var_os("DISPLAY").is_some_and(|display| !display.is_empty()) {
-        let previous = options.event_loop_builder.take();
-        options.event_loop_builder = Some(Box::new(move |builder| {
-            if let Some(previous) = previous {
-                previous(builder);
-            }
-            builder.with_x11();
-        }));
+        builder.with_x11();
     }
-    options
 }

@@ -1,4 +1,4 @@
-//! Reactive egui host: CPU rasterization, retained bitmaps, Windows GDI presentation.
+//! Reactive egui host: CPU rasterization and retained native-window bitmaps.
 use eframe::egui;
 use egui::{Context, ViewportBuilder, ViewportCommand, ViewportId};
 use egui_software_backend::{BufferMutRef, ColorFieldOrder, EguiSoftwareRender};
@@ -15,8 +15,14 @@ use winit::{
     window::{Window, WindowId},
 };
 
-#[cfg(test)]
+#[cfg(all(test, windows))]
 mod smoke;
+
+pub(super) const BACKEND: &str = if cfg!(windows) {
+    "CPU / Windows GDI"
+} else {
+    "CPU / softbuffer X11 or Wayland"
+};
 
 #[cfg(debug_assertions)]
 static RASTERIZED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -107,7 +113,7 @@ struct Host {
     trace: Option<std::path::PathBuf>,
     retired_views: Vec<serde_json::Value>,
     device_listening: bool,
-    #[cfg(test)]
+    #[cfg(all(test, windows))]
     probe: Option<smoke::Probe>,
 }
 
@@ -144,9 +150,9 @@ impl Host {
         set_window_icons(&window)?;
         builder.visible = Some(desired_visible);
         let display = softbuffer::Context::new(event_loop.owned_display_handle())
-            .map_err(|e| format!("Could not create the GDI context: {e}"))?;
+            .map_err(|e| format!("Could not create the native bitmap context: {e}"))?;
         let surface = softbuffer::Surface::new(&display, window.clone())
-            .map_err(|e| format!("Could not create the GDI surface: {e}"))?;
+            .map_err(|e| format!("Could not create the native bitmap surface: {e}"))?;
         let input = egui_winit::State::new(
             self.ctx.clone(),
             id,
@@ -528,7 +534,7 @@ impl Host {
             return;
         };
         let views: Vec<_> = self.views.values_mut().map(view_report).collect();
-        let report = serde_json::json!({"renderer":"CPU / Windows GDI", "version":crate::compatibility::VERSION,
+        let report = serde_json::json!({"renderer":BACKEND, "version":crate::compatibility::VERSION,
             "seconds":self.started.elapsed().as_secs_f64(), "views":views, "retired_views": self.retired_views});
         if let Ok(bytes) = serde_json::to_vec_pretty(&report) {
             let _ = std::fs::write(path, bytes);
@@ -554,6 +560,7 @@ fn refresh_interval(window: &Window) -> Duration {
     Duration::from_nanos(1_000_000_000_000 / u64::from(refresh))
 }
 
+#[cfg(windows)]
 fn set_window_icons(window: &Window) -> Result<(), String> {
     use windows_sys::Win32::UI::{
         HiDpi::GetSystemMetricsForDpi,
@@ -571,6 +578,15 @@ fn set_window_icons(window: &Window) -> Result<(), String> {
     window.set_window_icon(Some(icon(SM_CXSMICON)?));
     // winit's generic window icon assigns ICON_SMALL; the taskbar needs ICON_BIG.
     window.set_taskbar_icon(Some(icon(SM_CXICON)?));
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn set_window_icons(window: &Window) -> Result<(), String> {
+    window.set_window_icon(Some(
+        winit::window::Icon::from_rgba(icon_pixels(64), 64, 64)
+            .map_err(|error| error.to_string())?,
+    ));
     Ok(())
 }
 
@@ -655,6 +671,17 @@ impl ApplicationHandler<Wake> for Host {
         else {
             return;
         };
+        if matches!(event, WindowEvent::Destroyed) {
+            // Never query geometry or present to an X11 drawable after the
+            // compositor destroys it. A surviving root may recreate a child.
+            self.views.remove(&id);
+            if id == ViewportId::ROOT {
+                event_loop.exit();
+            } else {
+                self.ctx.request_repaint_of(ViewportId::ROOT);
+            }
+            return;
+        }
         let view = self.views.get_mut(&id).unwrap();
         if self.trace.is_some() {
             let category = match &event {
@@ -739,7 +766,7 @@ impl ApplicationHandler<Wake> for Host {
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
-        #[cfg(test)]
+        #[cfg(all(test, windows))]
         if let Some(mut probe) = self.probe.take() {
             probe.tick(self, event_loop);
             self.probe = Some(probe);
@@ -780,7 +807,7 @@ impl ApplicationHandler<Wake> for Host {
             }
         }
         let next = self.views.values().filter_map(|v| v.next).min();
-        #[cfg(test)]
+        #[cfg(all(test, windows))]
         let next = next
             .into_iter()
             .chain(self.probe.as_ref().map(smoke::Probe::next))
@@ -803,23 +830,25 @@ pub fn run(
     builder: ViewportBuilder,
     creator: impl FnOnce(&CreationContext) -> Result<Box<dyn App>, String> + 'static,
 ) -> Result<(), String> {
-    #[cfg(test)]
+    #[cfg(all(test, windows))]
     return run_host(builder, Box::new(creator), None);
-    #[cfg(not(test))]
+    #[cfg(not(all(test, windows)))]
     run_host(builder, Box::new(creator))
 }
 
 fn run_host(
     builder: ViewportBuilder,
     creator: Creator,
-    #[cfg(test)] probe: Option<smoke::Probe>,
+    #[cfg(all(test, windows))] probe: Option<smoke::Probe>,
 ) -> Result<(), String> {
     let mut event_loop_builder = EventLoop::<Wake>::with_user_event();
-    #[cfg(test)]
+    #[cfg(all(test, windows))]
     {
         use winit::platform::windows::EventLoopBuilderExtWindows;
         event_loop_builder.with_any_thread(true);
     }
+    #[cfg(target_os = "linux")]
+    super::linux_window::configure(&mut event_loop_builder);
     let event_loop = event_loop_builder.build().map_err(|e| e.to_string())?;
     let ctx = Context::default();
     ctx.set_embed_viewports(false);
@@ -834,7 +863,7 @@ fn run_host(
         }
     });
     let trace = std::env::var_os("DESK_SWITCH_RENDER_TRACE").map(Into::into);
-    #[cfg(test)]
+    #[cfg(all(test, windows))]
     let trace = trace.or_else(|| probe.as_ref().map(smoke::Probe::trace));
     let mut host = Host {
         ctx,
@@ -850,7 +879,7 @@ fn run_host(
         trace,
         retired_views: Vec::new(),
         device_listening: false,
-        #[cfg(test)]
+        #[cfg(all(test, windows))]
         probe,
     };
     event_loop.run_app(&mut host).map_err(|e| e.to_string())?;

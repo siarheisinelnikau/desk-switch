@@ -10,7 +10,7 @@ python tools/gen_third_party_notices.py
 
 To check the committed inventory without Cargo or network access, run `python tools/gen_third_party_notices.py --check`.
 
-The resolved graph contains **503 third-party Cargo packages**. The root package `desk-switch` is excluded from that count. Additional non-Cargo bundled components are listed separately.
+The resolved graph contains **506 third-party Cargo packages**. The root package `desk-switch` is excluded from that count. Additional non-Cargo bundled components are listed separately.
 
 ## Desk Switch License
 
@@ -721,6 +721,15 @@ The `cfg_aliases!` macro uses a lot of the code from [`tectonic_cfg_support::tar
 - **Homepage:** Not specified in Cargo metadata
 - **Authors:** RustCrypto Developers
 
+### ctor 0.10.1
+
+<!-- cargo-package: ctor 0.10.1 -->
+
+- **License (Cargo metadata):** `Apache-2.0 OR MIT`; see [MIT license terms](#appendix-a-mit-license) and [Apache-2.0 license terms](#appendix-b-apache-20-license)
+- **Repository:** https://github.com/mmastrac/rust-ctor
+- **Homepage:** Not specified in Cargo metadata
+- **Authors:** Matt Mastracci <matthew@mastracci.com>
+
 ### cursor-icon 1.2.0
 
 <!-- cargo-package: cursor-icon 1.2.0 -->
@@ -844,6 +853,15 @@ The `cfg_aliases!` macro uses a lot of the code from [`tectonic_cfg_support::tar
 - **License (Cargo metadata):** `Apache-2.0 AND MIT`; see [MIT license terms](#appendix-a-mit-license) and [Apache-2.0 license terms](#appendix-b-apache-20-license)
 - **Repository:** https://github.com/rust-windowing/winit
 - **Homepage:** Not specified in Cargo metadata
+
+### dtor 0.8.1
+
+<!-- cargo-package: dtor 0.8.1 -->
+
+- **License (Cargo metadata):** `Apache-2.0 OR MIT`; see [MIT license terms](#appendix-a-mit-license) and [Apache-2.0 license terms](#appendix-b-apache-20-license)
+- **Repository:** https://github.com/mmastrac/rust-ctor
+- **Homepage:** Not specified in Cargo metadata
+- **Authors:** Matt Mastracci <matthew@mastracci.com>
 
 ### ecolor 0.35.0
 
@@ -3324,6 +3342,15 @@ The `cfg_aliases!` macro uses a lot of the code from [`tectonic_cfg_support::tar
 - **Repository:** https://github.com/image-rs/image-tiff
 - **Homepage:** Not specified in Cargo metadata
 - **Authors:** The image-rs Developers
+
+### tiny-xlib 0.2.5
+
+<!-- cargo-package: tiny-xlib 0.2.5 -->
+
+- **License (Cargo metadata):** `MIT OR Apache-2.0 OR Zlib`; see [MIT license terms](#appendix-a-mit-license) and [Apache-2.0 license terms](#appendix-b-apache-20-license)
+- **Repository:** https://github.com/rust-windowing/tiny-xlib
+- **Homepage:** https://github.com/rust-windowing/tiny-xlib
+- **Authors:** John Nunley <dev@notgull.net>
 
 ### tinystr 0.8.5
 

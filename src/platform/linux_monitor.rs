@@ -186,6 +186,66 @@ fn read_input(bus: u32) -> Result<u16> {
 
 pub struct Ddc(pub String);
 
+pub fn prepare(id: &str) -> Result<()> {
+    let displays = displays()?;
+    let display = displays
+        .iter()
+        .find(|display| display.id == id)
+        .context("The destination display is unavailable")?;
+    let enabled = fs::read_to_string(
+        std::path::Path::new("/sys/class/drm")
+            .join(&display.connector)
+            .join("enabled"),
+    )?;
+    ensure!(
+        enabled.trim() == "enabled",
+        "The destination video output is disabled. Enable it in Displays before switching."
+    );
+    let connection = zbus::blocking::connection::Builder::session()?
+        .method_timeout(Duration::from_secs(2))
+        .build()?;
+    let bus = zbus::blocking::fdo::DBusProxy::new(&connection)?;
+    if bus.name_has_owner("org.gnome.Mutter.DisplayConfig".try_into()?)? {
+        prepare_gnome(&connection)?;
+    } else {
+        use x11rb::{
+            connection::{Connection, RequestConnection},
+            protocol::{
+                dpms::{ConnectionExt as _, DPMSMode},
+                xproto::{ConnectionExt as _, ScreenSaver},
+            },
+        };
+        let (x11, _) = x11rb::connect(None).context("Connecting to the destination X11 session")?;
+        x11.force_screen_saver(ScreenSaver::RESET)?.check()?;
+        if x11.extension_information("DPMS")?.is_some() && x11.dpms_capable()?.reply()?.capable {
+            let info = x11.dpms_info()?.reply()?;
+            if info.state && info.power_level != DPMSMode::ON {
+                x11.dpms_force_level(DPMSMode::ON)?.check()?;
+            }
+        }
+        x11.flush()?;
+    }
+    Ok(())
+}
+
+fn prepare_gnome(connection: &zbus::blocking::Connection) -> Result<()> {
+    let display = zbus::blocking::Proxy::new(
+        connection,
+        "org.gnome.Mutter.DisplayConfig",
+        "/org/gnome/Mutter/DisplayConfig",
+        "org.gnome.Mutter.DisplayConfig",
+    )?;
+    let mode: i32 = display.get_property("PowerSaveMode")?;
+    if mode > 0 {
+        display.set_property("PowerSaveMode", 0i32)?;
+        ensure!(
+            display.get_property::<i32>("PowerSaveMode")? == 0,
+            "GNOME did not wake the destination display"
+        );
+    }
+    Ok(())
+}
+
 impl Monitor for Ddc {
     fn read(&mut self) -> Result<u16> {
         read_input(selected_bus(&displays()?, &self.0)?)
@@ -345,6 +405,84 @@ pub fn read_monitor(id: &str) -> Result<super::MonitorInfo> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sleeping_gnome_signal_is_woken_before_monitor_selection_without_ddc_or_unlocking() {
+        const MARKER: &str = "DESK_SWITCH_WAKE_PRIVATE_BUS";
+        if std::env::var(MARKER).as_deref() != Ok("1") {
+            let output = Command::new("dbus-run-session").arg("--")
+                .arg(std::env::current_exe().unwrap()).args(["--exact",
+                    "platform::linux_monitor::tests::sleeping_gnome_signal_is_woken_before_monitor_selection_without_ddc_or_unlocking",
+                    "--nocapture"]).env(MARKER, "1")
+                .env("DESK_SWITCH_WAKE_PARENT_BUS", std::env::var("DBUS_SESSION_BUS_ADDRESS").unwrap_or_default())
+                .output().unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        assert_ne!(
+            std::env::var("DBUS_SESSION_BUS_ADDRESS").unwrap(),
+            std::env::var("DESK_SWITCH_WAKE_PARENT_BUS").unwrap()
+        );
+        use std::sync::{
+            Arc,
+            atomic::{AtomicI32, AtomicU32, Ordering::SeqCst},
+        };
+        struct Mutter {
+            mode: Arc<AtomicI32>,
+            wakes: Arc<AtomicU32>,
+        }
+        #[zbus::interface(name = "org.gnome.Mutter.DisplayConfig")]
+        impl Mutter {
+            #[zbus(property)]
+            fn power_save_mode(&self) -> i32 {
+                self.mode.load(SeqCst)
+            }
+            #[zbus(property)]
+            fn set_power_save_mode(&self, mode: i32) {
+                assert_eq!(
+                    mode, 0,
+                    "A handoff must never blank the destination display"
+                );
+                self.wakes.fetch_add(1, SeqCst);
+                self.mode.store(mode, SeqCst);
+            }
+        }
+        let mode = Arc::new(AtomicI32::new(3));
+        let wakes = Arc::new(AtomicU32::new(0));
+        let _server = zbus::blocking::connection::Builder::session()
+            .unwrap()
+            .name("org.gnome.Mutter.DisplayConfig")
+            .unwrap()
+            .serve_at(
+                "/org/gnome/Mutter/DisplayConfig",
+                Mutter {
+                    mode: mode.clone(),
+                    wakes: wakes.clone(),
+                },
+            )
+            .unwrap()
+            .build()
+            .unwrap();
+        let client = zbus::blocking::connection::Builder::session()
+            .unwrap()
+            .method_timeout(Duration::from_secs(2))
+            .build()
+            .unwrap();
+        prepare_gnome(&client).unwrap();
+        assert_eq!(mode.load(SeqCst), 0);
+        assert_eq!(wakes.load(SeqCst), 1);
+        prepare_gnome(&client).unwrap();
+        assert_eq!(
+            wakes.load(SeqCst),
+            1,
+            "An already active signal needs no power write"
+        );
+    }
 
     #[test]
     fn fixture_selects_the_matching_connector_and_refuses_a_shared_bus() {
