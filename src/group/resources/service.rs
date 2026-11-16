@@ -23,6 +23,8 @@ use std::{
 use tokio::sync::{Semaphore, mpsc, watch};
 
 const PORT: u16 = 45882;
+#[cfg(test)]
+mod tests;
 #[derive(Clone, Debug, Default)]
 pub struct Snapshot {
     pub folders: Vec<Folder>,
@@ -41,6 +43,7 @@ pub struct Snapshot {
     pub total: u64,
     pub current: String,
 }
+#[cfg_attr(test, derive(serde::Deserialize, serde::Serialize))]
 pub enum Command {
     AddFolder {
         name: String,
@@ -94,6 +97,7 @@ struct Network {
 }
 struct Core {
     dir: PathBuf,
+    port: u16,
     identity: config::Identity,
     ctx: egui::Context,
     trust: Mutex<TrustSnapshot>,
@@ -129,10 +133,13 @@ impl Service {
         Self::start_on(dir, ctx, crate::listen::wildcard_tcp(PORT, 16)?)
     }
     fn start_on(dir: PathBuf, ctx: egui::Context, listener: std::net::TcpListener) -> Result<Self> {
+        let port = listener.local_addr()?.port();
+        listener.set_nonblocking(true)?;
         let settings = Settings::load(&dir)?;
         let core = Arc::new(Core {
             identity: config::load_identity(&dir)?,
             dir,
+            port,
             ctx,
             trust: Mutex::new(TrustSnapshot::default()),
             settings: Mutex::new(settings),
@@ -364,7 +371,7 @@ impl Core {
             .get(peer)
             .context("Choose a paired computer")?
             .address;
-        address.set_port(PORT);
+        address.set_port(self.port);
         let connection = transport::connect(address, &self.identity, peer, &trust.workspace_id)?;
         *self.active_socket.lock().unwrap() = Some(connection.socket()?);
         let tracked = self.track(peer, &trust.workspace_id, connection.socket()?);
