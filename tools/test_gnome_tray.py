@@ -78,6 +78,7 @@ def main():
         env = dict(os.environ, HOME=str(home), XDG_RUNTIME_DIR=str(runtime),
             XDG_CONFIG_HOME=str(home / 'config'), XDG_CACHE_HOME=str(home / 'cache'),
             XDG_DATA_HOME=str(data), XDG_CURRENT_DESKTOP='GNOME', XDG_SESSION_TYPE='wayland',
+            GNOME_SHELL_SESSION_MODE='user',
             GSETTINGS_BACKEND='keyfile', LIBGL_ALWAYS_SOFTWARE='1')
         for name in ['DISPLAY', 'WAYLAND_DISPLAY', 'XAUTHORITY', 'DESK_SWITCH_CAPTURE_TO', 'DESK_SWITCH_RENDER_PROBE']:
             env.pop(name, None)
@@ -103,10 +104,12 @@ def main():
                 host = next((uuid for uuid in ['ubuntu-appindicators@ubuntu.com', 'appindicatorsupport@rgcjonas.gmail.com']
                     if uuid in available), None)
                 assert host, 'Install gnome-shell-extension-appindicator for this isolated test'
-                assert extension('EnableExtension', host) == (True,)
+                if extension('GetExtensionInfo', host)[0].get('state') != 1:
+                    assert extension('EnableExtension', host) == (True,)
                 wait_for(lambda: extension('GetExtensionInfo', host)[0].get('state') == 1,
                     'The AppIndicator extension did not finish enabling')
-                assert extension('EnableExtension', UUID) == (True,)
+                if extension('GetExtensionInfo', UUID)[0].get('state') != 1:
+                    assert extension('EnableExtension', UUID) == (True,)
                 wait_for(lambda: extension('GetExtensionInfo', UUID)[0].get('state') == 1,
                     'The tray companion did not finish enabling')
                 wait_for(lambda: call('org.freedesktop.DBus', '/org/freedesktop/DBus',
