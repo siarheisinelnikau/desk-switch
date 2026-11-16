@@ -1099,39 +1099,77 @@ mod tests {
         assert!(scene.ports[4].muted);
     }
 
+    fn repaint_delay(
+        ctx: &egui::Context,
+        scene: &Scene,
+        time: f64,
+        minimized: bool,
+    ) -> std::time::Duration {
+        let mut input = egui::RawInput {
+            time: Some(time),
+            screen_rect: Some(Rect::from_min_size(Pos2::ZERO, egui::vec2(1000.0, 900.0))),
+            ..Default::default()
+        };
+        input
+            .viewports
+            .get_mut(&egui::ViewportId::ROOT)
+            .unwrap()
+            .minimized = Some(minimized);
+        ctx.run_ui(input, |ui| {
+            show(ui, scene, false, true);
+        })
+        .viewport_output[&egui::ViewportId::ROOT]
+            .repaint_delay
+    }
+
+    fn settled_repaint_delay(
+        ctx: &egui::Context,
+        scene: &Scene,
+        time: f64,
+        minimized: bool,
+    ) -> std::time::Duration {
+        // Drain egui's initial layout/repaint requests independently of the
+        // workspace transition, without advancing the synthetic input clock.
+        for _ in 0..8 {
+            repaint_delay(ctx, scene, time, minimized);
+        }
+        repaint_delay(ctx, scene, time, minimized)
+    }
+
     #[test]
-    fn visible_motion_keeps_running_and_a_minimized_scene_stops_scheduling_frames() {
+    fn workspace_transitions_finish_and_only_scene_changes_restart_them() {
         let ctx = egui::Context::default();
         let scene = Scene::from_workspace(&crate::group::model::tests::fixture(2), "");
-        let draw = |time, minimized| {
-            let mut input = egui::RawInput {
-                time: Some(time),
-                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, egui::vec2(1000.0, 900.0))),
-                ..Default::default()
-            };
-            input
-                .viewports
-                .get_mut(&egui::ViewportId::ROOT)
-                .unwrap()
-                .minimized = Some(minimized);
-            ctx.run_ui(input, |ui| {
-                show(ui, &scene, false, true);
-            })
-        };
-        for time in [0.0, 4.0, 60.0] {
-            let active = draw(time, false);
-            assert!(
-                active.viewport_output[&egui::ViewportId::ROOT].repaint_delay
-                    < std::time::Duration::MAX
+        assert!(settled_repaint_delay(&ctx, &scene, 0.0, false) < std::time::Duration::MAX);
+        for time in [0.1, 0.2, 0.36] {
+            assert!(repaint_delay(&ctx, &scene, time, false) < std::time::Duration::MAX);
+        }
+        for time in [0.6, 4.0, 60.0] {
+            assert_eq!(
+                settled_repaint_delay(&ctx, &scene, time, false),
+                std::time::Duration::MAX
             );
         }
-        for _ in 0..8 {
-            draw(61.0, true);
-        }
-        let hidden = draw(61.0, true);
+        let mut changed = scene.clone();
+        changed.ports[0].muted = !changed.ports[0].muted;
+        assert!(repaint_delay(&ctx, &changed, 60.1, false) < std::time::Duration::MAX);
+        assert!(repaint_delay(&ctx, &changed, 60.3, false) < std::time::Duration::MAX);
         assert_eq!(
-            hidden.viewport_output[&egui::ViewportId::ROOT].repaint_delay,
+            settled_repaint_delay(&ctx, &changed, 61.0, false),
             std::time::Duration::MAX
         );
+    }
+
+    #[test]
+    fn minimized_and_reduced_motion_scenes_do_not_schedule_animation_frames() {
+        let scene = Scene::from_workspace(&crate::group::model::tests::fixture(2), "");
+        for (minimized, reduced) in [(true, false), (false, true), (true, true)] {
+            let ctx = egui::Context::default();
+            super::super::view::motion(&ctx, reduced);
+            assert_eq!(
+                settled_repaint_delay(&ctx, &scene, 0.1, minimized),
+                std::time::Duration::MAX
+            );
+        }
     }
 }
