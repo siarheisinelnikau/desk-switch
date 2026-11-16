@@ -750,10 +750,11 @@ impl ApplicationHandler<Wake> for Host {
         }
     }
 
-    fn device_event(&mut self, _: &ActiveEventLoop, _: DeviceId, event: DeviceEvent) {
+    fn device_event(&mut self, _: &ActiveEventLoop, _: DeviceId, _event: DeviceEvent) {
+        #[cfg(windows)]
         if self.device_listening {
             let delay =
-                super::activity::record(&self.ctx, event, self.started.elapsed().as_secs_f64());
+                super::activity::record(&self.ctx, _event, self.started.elapsed().as_secs_f64());
             for (id, view) in &self.views {
                 if view.desired_visible
                     && view.input_feedback
