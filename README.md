@@ -36,8 +36,4 @@ On Ubuntu GNOME, enable **Desk Switch Tray** in **Extensions**.
 
 </details>
 
-## Inspiration
-
-A good friend shared this idea and showed me [Hotseat](https://github.com/muspelheim/hotseat), his project for switching monitor inputs on macOS. I built Desk Switch for my Ubuntu and Windows computers, extending the idea to keyboards, mice, speakers, headphones and microphones. Thank you, my friend, for the idea and inspiration.
-
 The 0.10 release line ships Windows and Ubuntu installers only. macOS source remains experimental and has not been verified on physical hardware; no macOS build or update is published for this version. Earlier macOS releases remain available in the release history.
