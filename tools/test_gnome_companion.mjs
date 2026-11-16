@@ -150,7 +150,10 @@ assert.equal(extension._handleEvent(event(2, 1, 140)), Clutter.EVENT_PROPAGATE);
 target = own;
 extension._handleEvent(event(1)); target = null; extension._handleEvent(event(2));
 assert.equal(calls.length, 1, 'a cancelled press must not activate');
-target = {get_parent: () => own};
+target = {visible: true, _indicator: own._indicator,
+    get_transformed_extents: own.get_transformed_extents, get_parent: () => own};
+assert.equal(extension._iconAt(110, 12), own,
+    'the real AppIndicator IconActor shares _indicator but only its parent button owns the native menu');
 extension._handleEvent(event(1)); extension._handleEvent(event(2));
 await Promise.resolve();
 assert.equal(calls.length, 2, 'a child actor belongs to its indicator');

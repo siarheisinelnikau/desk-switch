@@ -104,7 +104,10 @@ export default class DeskSwitchTray extends Extension {
         // The Shell can already route clicks to a new icon before our idle scan.
         for (let actor = target; actor; actor = actor.get_parent()) {
             const indicator = actor._indicator;
-            if (!actor.visible || !indicator?._proxy || indicator.id !== INDICATOR_ID ||
+            // AppIndicator's inner IconActor also exposes _indicator, but has
+            // no menu. Continue to the real panel button that owns the menu.
+            if (!actor.visible || typeof actor.menu?.close !== 'function' ||
+                !indicator?._proxy || indicator.id !== INDICATOR_ID ||
                 !indicator.busName)
                 continue;
             const rect = actor.get_transformed_extents();
