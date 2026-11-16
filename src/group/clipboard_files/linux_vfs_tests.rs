@@ -256,6 +256,30 @@ fn consumer() -> Consumer {
     // `/proc`.
     Consumer::resolve(std::process::id(), unsafe { libc::geteuid() }).unwrap()
 }
+
+#[test]
+fn background_indexing_cannot_count_as_native_paste_intent() {
+    for path in [
+        "/usr/libexec/localsearch-extractor-3",
+        "/usr/libexec/localsearch-3",
+        "/usr/libexec/tracker-extract-3",
+        "/usr/libexec/tracker-miner-fs-3",
+        "/usr/bin/gnome-video-thumbnailer",
+        "/usr/lib/tumbler-1/tumblerd",
+    ] {
+        assert!(background_content_reader(Path::new(path)), "{path}");
+    }
+    for path in [
+        "/usr/bin/nautilus",
+        "/usr/bin/gio",
+        "/usr/bin/cp",
+        "/usr/bin/cat",
+        "/tmp/localsearch-results/report-viewer",
+        "/usr/bin/tracker-search",
+    ] {
+        assert!(!background_content_reader(Path::new(path)), "{path}");
+    }
+}
 fn handle(state: &State, index: usize, owner: Consumer) -> (u64, Arc<OpenHandle>) {
     let number = state.open(INodeNo(index as u64 + 2), owner).unwrap();
     let handle = lock(&state.opened).get(&number).cloned().unwrap();

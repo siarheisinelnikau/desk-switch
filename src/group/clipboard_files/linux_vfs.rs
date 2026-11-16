@@ -190,6 +190,19 @@ impl Consumer {
     }
 }
 
+fn background_content_reader(executable: &Path) -> bool {
+    let Some(name) = executable.file_name().and_then(OsStr::to_str) else {
+        return false;
+    };
+    name == "tracker-extract"
+        || name.starts_with("tracker-extract-")
+        || name.starts_with("tracker-miner-fs")
+        || name == "localsearch"
+        || name.starts_with("localsearch-")
+        || name == "tumblerd"
+        || name.ends_with("-thumbnailer")
+}
+
 #[derive(Default)]
 struct Coverage {
     ranges: BTreeMap<u64, u64>,
@@ -1028,6 +1041,19 @@ impl Filesystem for NativeFilesystem {
         // A zero-byte read and EOF are metadata boundaries, not transfer intent.
         if size == 0 || offset >= node.attributes.size {
             reply.data(&[]);
+            return;
+        }
+        // GNOME's indexer can discover the mounted URI before the user pastes.
+        // Such content sniffing must never acquire a remote transfer session.
+        // Check the actual reader as a clipboard manager may pass an open FD.
+        let executable = fs::read_link(format!("/proc/{}/exe", request.pid())).ok();
+        #[cfg(test)]
+        eprintln!(
+            "Native file payload reader: pid {}, executable {executable:?}",
+            request.pid()
+        );
+        if executable.as_deref().is_some_and(background_content_reader) {
+            reply.error(Errno::EACCES);
             return;
         }
         if self.0.offer.operation == Operation::Move {
