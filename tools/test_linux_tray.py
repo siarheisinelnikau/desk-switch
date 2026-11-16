@@ -119,6 +119,8 @@ def main():
                 assert sample['settled'], sample
                 assert sample['ui_frames'] == sample['popup_ui_frames'] == sample['file_progress_ui_frames'] == 0, sample
                 assert sample['rasterized_and_presented'] == [0, 0], sample
+                cpu = sample['cpu_one_core_percent']
+                assert isinstance(cpu, (int, float)) and 0 <= cpu < 5.0, sample
             registered.clear()
             with (args.out / 'lifecycle.log').open('w') as log:
                 process = subprocess.Popen([str(args.binary.resolve()), 'gui-preview', 'shared-four', '--state-dir', str(state / 'lifecycle')],
