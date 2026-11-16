@@ -78,7 +78,7 @@ def main():
         env = dict(os.environ, HOME=str(home), XDG_RUNTIME_DIR=str(runtime),
             XDG_CONFIG_HOME=str(home / 'config'), XDG_CACHE_HOME=str(home / 'cache'),
             XDG_DATA_HOME=str(data), XDG_CURRENT_DESKTOP='GNOME', XDG_SESSION_TYPE='wayland',
-            GSETTINGS_BACKEND='memory', LIBGL_ALWAYS_SOFTWARE='1', MUTTER_DEBUG_FORCE_KMS_MODE='headless')
+            GSETTINGS_BACKEND='memory', LIBGL_ALWAYS_SOFTWARE='1')
         for name in ['DISPLAY', 'WAYLAND_DISPLAY', 'XAUTHORITY', 'DESK_SWITCH_CAPTURE_TO', 'DESK_SWITCH_RENDER_PROBE']:
             env.pop(name, None)
         try:
@@ -137,7 +137,7 @@ def main():
                     wait_for(lambda: visible('Desk Switch quick controls'), 'Left-click did not open the popup while the main window was hidden')
                     assert not visible('Desk Switch'), 'Opening the popup also restored the main window'
                     assert app.poll() is None
-                    version = shell("imports.misc.config.PACKAGE_VERSION")
+                    version = subprocess.check_output(['gnome-shell', '--version'], env=env, text=True, timeout=3).strip()
                     (args.out / 'result.json').write_text(json.dumps({'gnome': version, 'virtual_click_cycles': 3,
                         'left_click_device_popup': True, 'right_click_native_menu': True, 'hidden_root_popup': True,
                         'scope': 'Actual GNOME/AppIndicator/packaged companion on a private headless compositor; synthetic application and virtual pointer only.'}, indent=2) + '\n')

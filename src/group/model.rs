@@ -219,6 +219,8 @@ pub struct MonitorCommand {
     #[serde(default)]
     pub prepared: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub previous_input: Option<Key>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub interrupted: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub result: Option<MonitorResult>,
@@ -719,6 +721,7 @@ impl Workspace {
                 input: self.monitor_input(destination)?,
                 deadline_ms: now_ms().saturating_add(25_000),
                 prepared: false,
+                previous_input: self.active_input.clone(),
                 interrupted: None,
                 result: None,
             })
@@ -775,6 +778,21 @@ impl Workspace {
                 .monitor_error = Some(error.clone());
             self.members.get_mut(destination).unwrap().input_ready = id;
             command.result = Some(MonitorResult { error: Some(error) });
+            self.active_input = command
+                .previous_input
+                .clone()
+                .filter(|key| self.members.get(key).is_some_and(Member::compatible));
+            self.active_input_entry = None;
+            self.active_display = None;
+            self.display_entry = None;
+            self.active_monitor = self.confirmed_monitor.clone();
+            if let Some(member) = self
+                .active_input
+                .as_ref()
+                .and_then(|key| self.members.get_mut(key))
+            {
+                member.input_ready = id;
+            }
         } else {
             command.prepared = true;
         }
@@ -1254,6 +1272,8 @@ pub(crate) mod tests {
         assert!(command.result.as_ref().unwrap().error.is_some());
         assert!(!state.switch_pending());
         assert_eq!(state.confirmed_monitor, Some(key(1)));
+        assert_eq!(state.active_input, Some(key(1)));
+        assert_eq!(state.members[&key(1)].input_ready, id);
         assert!(state.monitor_result(&key(1), id, None).is_err());
         state.monitor_prepared(&key(2), id, None).unwrap();
         assert!(!state.monitor_command.as_ref().unwrap().prepared);

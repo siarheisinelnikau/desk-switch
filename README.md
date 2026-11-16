@@ -23,11 +23,11 @@ A connected majority can replace an offline coordinator. Two computers need both
 
 Left-click the tray icon for a compact workspace diagram, direct computer switching, sharing controls and per-computer volume. Right-click opens the native menu. **X** hides the window in the tray; **Quit application** exits.
 
-Device animations stay active while visible and stop rendering when hidden. On Windows, the visible keyboard and mouse respond to local physical key presses, clicks, scrolling and movement direction. Input feedback is temporary and is never saved or sent over the network. Expand **Sharing & volume** in the main window for source choices and additional controls.
+Device connections animate briefly when routes change, then settle. Hidden windows stop rendering. On Windows, the visible keyboard and mouse respond to local physical key presses, clicks, scrolling and movement direction. Input feedback is temporary and is never saved or sent over the network. Expand **Sharing & volume** in the main window for source choices and additional controls.
 
 ![Desk Switch tray popup with sharing controls and per-computer volume](docs/workspace-quick-controls.png)
 
-On Ubuntu GNOME, enable **Desk Switch Tray** in **Extensions**.
+On Ubuntu GNOME, open **Application → Tray device popup → Enable or reload tray popup** once. The tray menu also has **Set up left-click popup…**. If GNOME has not discovered the installed companion yet, sign out and sign in once, then enable it here. Left-click opens the device popup; right-click keeps GNOME's native menu.
 
 <details>
 <summary>Settings</summary>
@@ -36,4 +36,4 @@ On Ubuntu GNOME, enable **Desk Switch Tray** in **Extensions**.
 
 </details>
 
-The 0.10 release line ships Windows and Ubuntu installers only. macOS source remains experimental and has not been verified on physical hardware; no macOS build or update is published for this version. Earlier macOS releases remain available in the release history.
+The 0.11 release line ships Windows and Ubuntu installers only. macOS source remains experimental and has not been verified on physical hardware; no macOS build or update is published for this version. Earlier macOS releases remain available in the release history.

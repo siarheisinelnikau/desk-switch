@@ -106,6 +106,7 @@ impl FailoverWorkspace {
         if pending_monitor {
             stored.monitor_command = Some(model::MonitorCommand {
                 prepared: false,
+                previous_input: Some(keys[1].clone()),
                 id: 9,
                 writer: keys[1].clone(),
                 destination: target,

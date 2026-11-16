@@ -21,7 +21,7 @@ mod smoke;
 pub(super) const BACKEND: &str = if cfg!(windows) {
     "CPU / Windows GDI"
 } else {
-    "CPU / softbuffer X11 or Wayland"
+    "CPU / softbuffer X11"
 };
 
 #[cfg(debug_assertions)]
@@ -849,7 +849,7 @@ fn run_host(
         event_loop_builder.with_any_thread(true);
     }
     #[cfg(target_os = "linux")]
-    super::linux_window::configure(&mut event_loop_builder);
+    super::linux_window::configure(&mut event_loop_builder)?;
     let event_loop = event_loop_builder.build().map_err(|e| e.to_string())?;
     let ctx = Context::default();
     ctx.set_embed_viewports(false);

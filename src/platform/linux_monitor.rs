@@ -229,12 +229,14 @@ pub fn prepare(id: &str) -> Result<()> {
 }
 
 fn prepare_gnome(connection: &zbus::blocking::Connection) -> Result<()> {
-    let display = zbus::blocking::Proxy::new(
-        connection,
-        "org.gnome.Mutter.DisplayConfig",
-        "/org/gnome/Mutter/DisplayConfig",
-        "org.gnome.Mutter.DisplayConfig",
-    )?;
+    let display: zbus::blocking::Proxy<'_> = zbus::blocking::proxy::Builder::new(connection)
+        .destination("org.gnome.Mutter.DisplayConfig")?
+        .path("/org/gnome/Mutter/DisplayConfig")?
+        .interface("org.gnome.Mutter.DisplayConfig")?
+        // A cached pre-wake value can falsely reject a successful wake before
+        // PropertiesChanged reaches this connection. Confirm against the server.
+        .cache_properties(zbus::proxy::CacheProperties::No)
+        .build()?;
     let mode: i32 = display.get_property("PowerSaveMode")?;
     if mode > 0 {
         display.set_property("PowerSaveMode", 0i32)?;

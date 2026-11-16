@@ -66,7 +66,7 @@ def main():
         (work / "debian/control").write_text("Source: desk-switch\n\nPackage: desk-switch\nArchitecture: amd64\nDescription: Share input and audio between PCs\n")
         shlibs = subprocess.check_output(["dpkg-shlibdeps", "-O", "-e", str(binary)], cwd=work, text=True)
         native = next(line.split("=", 1)[1] for line in shlibs.splitlines() if line.startswith("shlibs:Depends="))
-        dependencies = native + ", pkexec, polkitd, openssl, acl, udev, python3, ca-certificates, ddcutil, pipewire-bin, pipewire-pulse, pulseaudio-utils, libdbus-1-3, zenity, fuse3, libx11-6, libx11-xcb1, libxcursor1, libxrandr2, libxi6, libxinerama1, libxkbcommon0, libxkbcommon-x11-0, libwayland-client0, libegl1, libgl1"
+        dependencies = native + ", pkexec, polkitd, openssl, acl, udev, python3, ca-certificates, ddcutil, pipewire-bin, pipewire-pulse, pulseaudio-utils, libdbus-1-3, zenity, fuse3, xwayland, libx11-6, libx11-xcb1, libxcursor1, libxrandr2, libxi6, libxinerama1, libxkbcommon0, libxkbcommon-x11-0, libwayland-client0"
         control = stage / "DEBIAN"
         control.mkdir()
         shutil.copyfile(ROOT / "packaging/linux/postinst", control / "postinst")
