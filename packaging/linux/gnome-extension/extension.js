@@ -15,6 +15,7 @@ const FILE_CLIPBOARD_LIMIT = 1024 * 1024;
 const FILE_CLIPBOARD_ROOTS = 10000;
 const CLIPBOARD_INTERFACE = `<node><interface name="${CLIPBOARD_NAME}">
     <method name="Version"><arg type="u" direction="out"/></method>
+    <method name="TrayVersion"><arg type="u" direction="out"/></method>
     <method name="Read">
         <arg type="u" direction="in"/>
         <arg type="u" direction="out"/><arg type="s" direction="out"/><arg type="ay" direction="out"/>
@@ -160,7 +161,11 @@ export default class DeskSwitchTray extends Extension {
     }
 
     VersionAsync(_parameters, invocation) {
-        invocation.return_value(new GLib.Variant('(u)', [3]));
+        invocation.return_value(new GLib.Variant('(u)', [2]));
+    }
+
+    TrayVersionAsync(_parameters, invocation) {
+        invocation.return_value(new GLib.Variant('(u)', [1]));
     }
 
     _processId(name) {

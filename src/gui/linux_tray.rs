@@ -138,8 +138,8 @@ fn check_on(connection: &zbus::blocking::Connection, enable: bool) -> Result<boo
         "/io/github/siarheisinelnikau/DeskSwitch/Clipboard",
         "io.github.siarheisinelnikau.DeskSwitch.Clipboard",
     )?;
-    match bridge.call::<_, _, u32>("Version", &()) {
-        Ok(version) => Ok(version >= 3),
+    match bridge.call::<_, _, u32>("TrayVersion", &()) {
+        Ok(version) => Ok(version >= 1),
         Err(_) if !enable => Ok(false),
         Err(error) => Err(error).context("GNOME has not loaded the tray companion. Sign out and sign in, then enable the tray popup here"),
     }
@@ -202,12 +202,12 @@ mod tests {
         struct Bridge(Arc<AtomicU32>);
         #[zbus::interface(name = "io.github.siarheisinelnikau.DeskSwitch.Clipboard")]
         impl Bridge {
-            fn version(&self) -> u32 {
+            fn tray_version(&self) -> u32 {
                 self.0.load(SeqCst)
             }
         }
         let calls = Arc::new(Mutex::new(Vec::new()));
-        let version = Arc::new(AtomicU32::new(2));
+        let version = Arc::new(AtomicU32::new(0));
         let _server = zbus::blocking::connection::Builder::session()
             .unwrap()
             .name("org.gnome.Shell.Extensions")
@@ -233,7 +233,7 @@ mod tests {
             calls.lock().unwrap().is_empty(),
             "Startup must not enable or reload extensions"
         );
-        version.store(3, SeqCst);
+        version.store(1, SeqCst);
         assert!(check_on(&client, true).unwrap());
         assert_eq!(*calls.lock().unwrap(), ["reload", "enable"]);
         assert!(check_on(&client, false).unwrap());
