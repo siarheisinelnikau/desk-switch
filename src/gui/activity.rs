@@ -32,13 +32,13 @@ fn id() -> egui::Id {
     egui::Id::new("physical-device-activity")
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux"))]
 pub(super) fn begin_frame(ctx: &egui::Context, viewport: egui::ViewportId) {
     ctx.data_mut(|data| {
         data.remove::<bool>(id().with(viewport));
     });
 }
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux"))]
 pub(super) fn interested(ctx: &egui::Context, viewport: egui::ViewportId) -> bool {
     ctx.data(|data| data.get_temp::<bool>(id().with(viewport)).unwrap_or(false))
 }
@@ -110,7 +110,7 @@ impl Activity {
     }
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux"))]
 pub(super) fn clear(ctx: &egui::Context) {
     ctx.data_mut(|data| {
         data.remove::<Activity>(id());
