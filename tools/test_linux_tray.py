@@ -116,12 +116,8 @@ def main():
             assert 'llvmpipe' in rendering['backend'].lower(), rendering['backend']
             for sample in rendering['samples']:
                 assert sample['input_events'] == 0, sample
-                if sample['motion_expected']:
-                    assert sample['ui_frames'] + sample['popup_ui_frames'] > 0, sample
-                    if sample['state'] == 'main-hidden-popup-motion':
-                        assert sample['ui_frames'] == 0, sample
-                else:
-                    assert sample['settled'] and sample['ui_frames'] == sample['popup_ui_frames'] == 0, sample
+                assert sample['settled'], sample
+                assert sample['ui_frames'] == sample['popup_ui_frames'] == sample['file_progress_ui_frames'] == 0, sample
             registered.clear()
             with (args.out / 'lifecycle.log').open('w') as log:
                 process = subprocess.Popen([str(args.binary.resolve()), 'gui-preview', 'shared-four', '--state-dir', str(state / 'lifecycle')],
@@ -161,7 +157,7 @@ def main():
                 'backend': rendering['backend'], 'native_window_system': 'X11', 'root_id': root,
                 'close_restore_cycles': 2, 'popup_cycles_while_main_hidden': 2, 'quit_while_hidden': True,
                 'scope': 'Actual application fixture on Xvfb/private D-Bus; no physical GNOME mouse routing or real user devices.'}, indent=2) + '\n')
-        print('PASS: real X11 close/hide/restore, direct SNI popup activation, native menu export, hidden quit, visible animation and quiet hidden rendering. Physical GNOME clicks remain untested.')
+        print('PASS: real X11 close/hide/restore, direct SNI popup activation, native menu export, hidden quit and quiet settled visible/hidden rendering. Physical GNOME clicks remain untested.')
     finally:
         if process is not None:
             stop(process)

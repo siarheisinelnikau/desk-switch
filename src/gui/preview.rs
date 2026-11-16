@@ -162,8 +162,10 @@ fn render_probe(
                 time::{Duration, Instant},
             };
             let mut samples = Vec::new();
-            let states: &[&str] = if file_progress { &["visible-idle", "minimized", "hidden", "restored-idle"] } else { &["visible-motion", "switched-motion", "popup-motion", "main-hidden-popup-motion", "hidden", "restored-motion"] };
+            let states: &[&str] = if file_progress { &["visible-idle", "minimized", "hidden", "restored-idle"] } else { &["visible-idle", "switched-idle", "popup-idle", "main-hidden-popup-idle", "hidden", "restored-idle"] };
+            let frame_count = || frames.load(Ordering::Relaxed) + super::popup::FRAMES.load(Ordering::Relaxed) + super::file_progress::FRAMES.load(Ordering::Relaxed);
             for &state in states {
+                let transition_start = frame_count();
                 if file_progress {
                     let progress = super::file_progress::id();
                     if state == "hidden" {
@@ -175,23 +177,21 @@ fn render_probe(
                     }
                 } else {
                     let action = match state {
-                        "switched-motion" => Some(Action::Quick(super::popup::Command::Target([0x33; 32]))),
-                        "popup-motion" => Some(Action::QuickOpen { x: 1200, y: 400 }),
-                        "main-hidden-popup-motion" => Some(Action::Hide),
+                        "switched-idle" => Some(Action::Quick(super::popup::Command::Target([0x33; 32]))),
+                        "popup-idle" => Some(Action::QuickOpen { x: 1200, y: 400 }),
+                        "main-hidden-popup-idle" => Some(Action::Hide),
                         "hidden" => Some(Action::QuickClose),
-                        "restored-motion" => Some(Action::Show),
+                        "restored-idle" => Some(Action::Show),
                         _ => None,
                     };
                     if let Some(action) = action { super::tray::dispatch(&send, &ctx, action); }
                 }
                 // Resize, font uploads and finite scroll-bar animations can outlive
                 // the first frame. Measure only after two seconds without UI work.
-                let motion_expected = !file_progress && state != "hidden";
                 let warm = Instant::now();
                 let mut quiet = Instant::now();
-                let frame_count = || frames.load(Ordering::Relaxed) + super::popup::FRAMES.load(Ordering::Relaxed) + super::file_progress::FRAMES.load(Ordering::Relaxed);
                 let mut previous = frame_count();
-                while warm.elapsed() < Duration::from_secs(if motion_expected { 2 } else if file_progress { 6 } else { 8 })
+                while warm.elapsed() < Duration::from_secs(if file_progress { 6 } else { 5 })
                     && quiet.elapsed() < Duration::from_secs(2)
                 {
                     std::thread::sleep(Duration::from_millis(100));
@@ -202,6 +202,7 @@ fn render_probe(
                     }
                 }
                 let settled = quiet.elapsed() >= Duration::from_secs(2);
+                let transition_frames = frame_count() - transition_start;
                 let start = frames.load(Ordering::Relaxed);
                 let popup_start = super::popup::FRAMES.load(Ordering::Relaxed);
                 let progress_start = super::file_progress::FRAMES.load(Ordering::Relaxed);
@@ -210,14 +211,16 @@ fn render_probe(
                 let activity = super::software::activity();
                 let cpu_start = cpu_seconds();
                 let since = Instant::now();
-                std::thread::sleep(Duration::from_secs(6));
+                // Keep the six-state workspace proof bounded to one minute,
+                // including its settling budget. Progress has only four states.
+                std::thread::sleep(Duration::from_secs(if file_progress { 6 } else { 5 }));
                 #[cfg(windows)]
                 let activity_delta = Some(std::array::from_fn::<_, 2, _>(|i| super::software::activity()[i] - activity[i]));
                 #[cfg(not(windows))]
                 let activity_delta: Option<[u64; 2]> = None;
                 samples.push(serde_json::json!({
                     "state": state, "seconds": since.elapsed().as_secs_f64(),
-                    "settled": settled, "motion_expected": motion_expected, "warm_seconds": warm.elapsed().as_secs_f64() - since.elapsed().as_secs_f64(),
+                    "settled": settled, "transition_ui_frames": transition_frames, "warm_seconds": warm.elapsed().as_secs_f64() - since.elapsed().as_secs_f64(),
                     "ui_frames": frames.load(Ordering::Relaxed) - start,
                     "popup_ui_frames": super::popup::FRAMES.load(Ordering::Relaxed) - popup_start,
                     "file_progress_ui_frames": super::file_progress::FRAMES.load(Ordering::Relaxed) - progress_start,
