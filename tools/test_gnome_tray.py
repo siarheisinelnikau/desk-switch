@@ -154,7 +154,11 @@ def main():
                             'The virtual pointer did not reach the actual panel button')
                         shell("(async () => { const Clutter = (await import('gi://Clutter')).default; "
                             f"global.deskSwitchTestPointer.notify_button(GLib.get_monotonic_time(), {button}, Clutter.ButtonState.PRESSED); return true; }})()")
-                        mask = 1 << (button + 7)
+                        # Mutter's native seat maps Clutter button 3 to
+                        # BUTTON2_MASK in its pointer modifier state (its
+                        # meta-seat-impl.c maskmap swaps the middle/right bits).
+                        # The event button remains 3 and opens the native menu.
+                        mask = {1: 1 << 8, 3: 1 << 9}[button]
                         wait_for(lambda: shell(f'(global.get_pointer()[2] & {mask}) !== 0'), 'The virtual button press was not delivered')
                         shell("(async () => { const Clutter = (await import('gi://Clutter')).default; "
                             f"global.deskSwitchTestPointer.notify_button(GLib.get_monotonic_time(), {button}, Clutter.ButtonState.RELEASED); return true; }})()")
