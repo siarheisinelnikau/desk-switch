@@ -182,6 +182,10 @@ pub fn accept(
     workspace: &str,
     peers: &BTreeSet<String>,
 ) -> Result<(String, Connection)> {
+    // Windows accepts can inherit a nonblocking listener's mode. Our packet
+    // deadlines require blocking reads; an incomplete greeting must wait for
+    // its remaining bytes instead of aborting an otherwise valid connection.
+    stream.set_nonblocking(false)?;
     let mut greeting = Deadline {
         stream: &mut stream,
         until: Instant::now() + Duration::from_secs(5),
@@ -313,7 +317,13 @@ impl Reader {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::{io::Cursor, sync::mpsc};
+    use std::{
+        io::Cursor,
+        sync::{
+            atomic::{AtomicBool, Ordering},
+            mpsc,
+        },
+    };
     struct Memory {
         send: mpsc::Sender<Vec<u8>>,
         receive: mpsc::Receiver<Vec<u8>>,
@@ -448,24 +458,72 @@ mod tests {
         bytes.truncate(bytes.len() - 1);
         assert!(receive::<Vec<u8>>(&mut Cursor::new(bytes), &mut b).is_err());
     }
-    #[test]
-    fn loopback_channel_authenticates_only_pinned_members() {
+    fn loopback(allow_peer: bool, workspace: &str) -> (Result<()>, Result<()>) {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
         let address = listener.local_addr().unwrap();
         let alice = identity();
         let bob = identity();
         let a = config::hex(&alice.public);
         let b = config::hex(&bob.public);
-        let server = std::thread::spawn(move || {
-            let (socket, _) = listener.accept().unwrap();
-            let (_, mut connection) =
-                accept(socket, &bob, "aa11223344556677", &BTreeSet::from([a])).unwrap();
-            assert_eq!(connection.receive::<String>().unwrap(), "fixture");
-            connection.send(&"ack").unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        let cancel = stop.clone();
+        let server = std::thread::spawn(move || -> Result<()> {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let socket = loop {
+                ensure!(
+                    !cancel.load(Ordering::Acquire) && Instant::now() < deadline,
+                    "Loopback fixture stopped before accepting a client"
+                );
+                match listener.accept() {
+                    Ok((socket, _)) => break socket,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(error) => return Err(error.into()),
+                }
+            };
+            let peers = if allow_peer {
+                BTreeSet::from([a])
+            } else {
+                BTreeSet::new()
+            };
+            let (_, mut connection) = accept(socket, &bob, "aa11223344556677", &peers)?;
+            ensure!(
+                connection.receive::<String>()? == "fixture",
+                "Unexpected fixture request"
+            );
+            connection.send(&"ack")
         });
-        let mut connection = connect(address, &alice, &b, "aa11223344556677").unwrap();
-        connection.send(&"fixture").unwrap();
-        assert_eq!(connection.receive::<String>().unwrap(), "ack");
-        server.join().unwrap();
+        let client = (|| -> Result<()> {
+            let mut connection = connect(address, &alice, &b, workspace)?;
+            connection.send(&"fixture")?;
+            ensure!(
+                connection.receive::<String>()? == "ack",
+                "Unexpected fixture response"
+            );
+            Ok(())
+        })();
+        // Join on both success and failure. A failed connect must not leave an
+        // accept thread blocked forever or skip its authentication result.
+        stop.store(true, Ordering::Release);
+        (client, server.join().unwrap())
+    }
+    #[test]
+    fn loopback_channel_authenticates_only_pinned_members() {
+        let (client, server) = loopback(true, "aa11223344556677");
+        client.unwrap();
+        server.unwrap();
+    }
+    #[test]
+    fn loopback_greeting_rejects_an_untrusted_peer_and_another_workspace() {
+        for (allow_peer, workspace, expected) in [
+            (false, "aa11223344556677", "Untrusted resource peer"),
+            (true, "bb11223344556677", "Resource workspace mismatch"),
+        ] {
+            let (client, server) = loopback(allow_peer, workspace);
+            assert!(client.is_err());
+            assert_eq!(server.unwrap_err().to_string(), expected);
+        }
     }
 }
