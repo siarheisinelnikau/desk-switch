@@ -187,20 +187,7 @@ fn read_input(bus: u32) -> Result<u16> {
 pub struct Ddc(pub String);
 
 pub fn prepare(id: &str) -> Result<()> {
-    let displays = displays()?;
-    let display = displays
-        .iter()
-        .find(|display| display.id == id)
-        .context("The destination display is unavailable")?;
-    let enabled = fs::read_to_string(
-        std::path::Path::new("/sys/class/drm")
-            .join(&display.connector)
-            .join("enabled"),
-    )?;
-    ensure!(
-        enabled.trim() == "enabled",
-        "The destination video output is disabled. Enable it in Displays before switching."
-    );
+    ensure!(!id.is_empty(), "Select a destination monitor");
     let connection = zbus::blocking::connection::Builder::session()?
         .method_timeout(Duration::from_secs(2))
         .build()?;
@@ -225,7 +212,24 @@ pub fn prepare(id: &str) -> Result<()> {
         }
         x11.flush()?;
     }
+    // Some monitors drop hotplug/EDID on inactive ports. Do not wait for the
+    // destination to become connected before the source can select its input.
+    // Reject only a connected output that remains disabled after waking.
+    if let Some(display) = displays()?.into_iter().find(|display| display.id == id) {
+        let connector = std::path::Path::new("/sys/class/drm").join(&display.connector);
+        let status = fs::read_to_string(connector.join("status")).ok();
+        let enabled = fs::read_to_string(connector.join("enabled")).ok();
+        ensure!(
+            !disabled_connected_output(status.as_deref(), enabled.as_deref()),
+            "The destination video output is disabled. Enable it in Displays before switching."
+        );
+    }
     Ok(())
+}
+
+fn disabled_connected_output(status: Option<&str>, enabled: Option<&str>) -> bool {
+    status.is_some_and(|value| value.trim() == "connected")
+        && enabled.is_some_and(|value| value.trim() == "disabled")
 }
 
 fn prepare_gnome(connection: &zbus::blocking::Connection) -> Result<()> {
@@ -407,6 +411,23 @@ pub fn read_monitor(id: &str) -> Result<super::MonitorInfo> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_inactive_port_does_not_need_hotplug_before_the_source_selects_it() {
+        assert!(!disabled_connected_output(
+            Some("disconnected\n"),
+            Some("disabled\n")
+        ));
+        assert!(!disabled_connected_output(None, None));
+        assert!(!disabled_connected_output(
+            Some("connected\n"),
+            Some("enabled\n")
+        ));
+        assert!(disabled_connected_output(
+            Some("connected\n"),
+            Some("disabled\n")
+        ));
+    }
 
     #[test]
     fn sleeping_gnome_signal_is_woken_before_monitor_selection_without_ddc_or_unlocking() {

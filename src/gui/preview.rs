@@ -274,7 +274,18 @@ fn cpu_seconds() -> Option<f64> {
         |time: FILETIME| (u64::from(time.dwHighDateTime) << 32) | u64::from(time.dwLowDateTime);
     (ok != 0).then(|| (ticks(kernel) + ticks(user)) as f64 / 10_000_000.0)
 }
-#[cfg(not(windows))]
+#[cfg(target_os = "linux")]
+fn cpu_seconds() -> Option<f64> {
+    let mut time = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // SAFETY: the process CPU clock only writes the live, initialized timespec
+    // and does not inspect or change any device or power-management state.
+    let ok = unsafe { libc::clock_gettime(libc::CLOCK_PROCESS_CPUTIME_ID, &mut time) };
+    (ok == 0).then(|| time.tv_sec as f64 + time.tv_nsec as f64 / 1_000_000_000.0)
+}
+#[cfg(target_os = "macos")]
 fn cpu_seconds() -> Option<f64> {
     None
 }

@@ -113,7 +113,7 @@ def main():
 
                     wait_for(lambda: visible('Desk Switch'), 'The native main window is missing')
                     shell("(async () => { const Clutter = (await import('gi://Clutter')).default; "
-                        "global.deskSwitchTestPointer = global.backend.get_default_seat().create_virtual_device(Clutter.InputDeviceType.POINTER_DEVICE); return true; })()")
+                        "global.deskSwitchTestPointer = global.stage.context.get_backend().get_default_seat().create_virtual_device(Clutter.InputDeviceType.POINTER_DEVICE); return true; })()")
 
                     def click(button):
                         shell("(async () => { const Clutter = (await import('gi://Clutter')).default; "

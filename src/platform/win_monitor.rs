@@ -524,12 +524,9 @@ fn read(handle: HANDLE) -> Result<u16> {
 pub struct Ddc(pub String);
 
 pub fn prepare(id: &str) -> Result<()> {
-    ensure!(
-        screens()?
-            .iter()
-            .any(|screen| identity(screen).is_ok_and(|(found, _)| found == id)),
-        "The destination display is unavailable"
-    );
+    // An inactive DP connection can disappear from Windows until the monitor
+    // selects it. Waking must not depend on that not-yet-selected connection.
+    ensure!(!id.is_empty(), "Select a destination monitor");
     use windows_sys::Win32::System::Power::{ES_DISPLAY_REQUIRED, SetThreadExecutionState};
     // SAFETY: this one-shot activity notification has no pointers and does not
     // set ES_CONTINUOUS, so it leaves the user's power policy unchanged.
