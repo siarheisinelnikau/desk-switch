@@ -1185,6 +1185,65 @@ fn pending_monitor_command_survives_election_without_reissue_or_early_input_read
 }
 
 #[test]
+fn two_peers_prepare_hdmi_before_selection_and_keep_control_when_the_return_signal_fails() {
+    let mut group = FailoverWorkspace::start(2);
+    group.wait_ready(&[0, 1]);
+    let keys = group.keys.clone();
+    // Windows owns physical input and starts on DP; Ubuntu receives HDMI1.
+    for (index, input) in [(0, 0x11), (1, 0x0f)] {
+        let mut node = group.state(index).members[&keys[index]].node.clone();
+        node.monitor.id = format!("synthetic-display-{index}");
+        node.monitor.input = Some(input);
+        group.computers[index].service.publish(node, None, 9);
+    }
+    group.wait(|computers, _| computers.iter().all(|computer| {
+        let state = computer.state.as_ref().unwrap();
+        state.members[&keys[0]].node.monitor.input == Some(0x11)
+            && state.members[&keys[1]].node.monitor.input == Some(0x0f)
+    }));
+    group.computers[1].service.action(Action::Activate { key: keys[0].clone() }).unwrap();
+    group.wait(|computers, _| computers.iter().all(|computer| {
+        computer.state.as_ref().unwrap().monitor_command.as_ref()
+            .is_some_and(|command| command.destination == keys[0] && !command.prepared)
+    }));
+    let command = group.state(0).monitor_command.as_ref().unwrap().clone();
+    assert_eq!(command.writer, keys[1]);
+    assert_eq!(command.input, 0x11);
+    assert!(group.state(1).switch_pending());
+    group.computers[0].service.action(Action::MonitorPrepared { id: command.id, error: None }).unwrap();
+    group.wait(|computers, _| computers.iter().all(|computer| {
+        computer.state.as_ref().unwrap().monitor_command.as_ref().unwrap().prepared
+    }));
+    assert!(group.state(1).switch_pending(), "Preparation alone is not a completed DDC selection");
+    group.computers[1].service.action(Action::MonitorResult { id: command.id, error: None }).unwrap();
+    group.wait(|computers, _| computers.iter().all(|computer| {
+        let state = computer.state.as_ref().unwrap();
+        !state.switch_pending() && state.confirmed_monitor.as_ref() == Some(&keys[0])
+    }));
+    group.computers[0].service.action(Action::Activate { key: keys[1].clone() }).unwrap();
+    group.wait(|computers, _| computers.iter().all(|computer| {
+        computer.state.as_ref().unwrap().monitor_command.as_ref()
+            .is_some_and(|next| next.id > command.id && next.destination == keys[1])
+    }));
+    let returning = group.state(1).monitor_command.as_ref().unwrap().clone();
+    group.computers[1].service.action(Action::MonitorPrepared {
+        id: returning.id, error: Some("Synthetic DP output is unavailable".into()),
+    }).unwrap();
+    group.wait(|computers, _| computers.iter().all(|computer| {
+        let state = computer.state.as_ref().unwrap();
+        !state.switch_pending() && state.active_input.as_ref() == Some(&keys[0])
+            && state.confirmed_monitor.as_ref() == Some(&keys[0])
+    }));
+    for index in 0..2 {
+        let state = group.state(index);
+        assert!(!state.monitor_command.as_ref().unwrap().prepared);
+        assert_eq!(state.members[&keys[0]].input_ready, returning.id);
+        state.validate().unwrap();
+    }
+    group.finish();
+}
+
+#[test]
 fn five_member_majority_serializes_competing_edits_and_preserves_only_committed_winners() {
     let mut group = FailoverWorkspace::start(5);
     let alive = [1, 2, 4];

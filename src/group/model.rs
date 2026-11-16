@@ -721,7 +721,7 @@ impl Workspace {
                 input: self.monitor_input(destination)?,
                 deadline_ms: now_ms().saturating_add(25_000),
                 prepared: false,
-                previous_input: self.active_input.clone(),
+                previous_input: self.active_input.clone().or_else(|| self.plan().input),
                 interrupted: None,
                 result: None,
             })
