@@ -216,6 +216,8 @@ pub struct MonitorCommand {
     pub connection: String,
     pub input: u16,
     pub deadline_ms: u64,
+    #[serde(default)]
+    pub prepared: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub interrupted: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -716,6 +718,7 @@ impl Workspace {
                 connection: self.members[writer].node.monitor.id.clone(),
                 input: self.monitor_input(destination)?,
                 deadline_ms: now_ms().saturating_add(25_000),
+                prepared: false,
                 interrupted: None,
                 result: None,
             })
@@ -743,6 +746,41 @@ impl Workspace {
         self.input_request = activation;
         Ok(())
     }
+    pub fn monitor_prepared(
+        &mut self,
+        destination: &str,
+        id: u64,
+        error: Option<String>,
+    ) -> Result<()> {
+        if let Some(error) = &error {
+            monitor_message(error)?;
+        }
+        let command = self
+            .monitor_command
+            .as_mut()
+            .context("No monitor command is pending")?;
+        ensure!(
+            command.destination == destination && command.id == id,
+            "Unexpected monitor preparation acknowledgement"
+        );
+        if command.result.is_some() || command.interrupted.is_some() || command.prepared {
+            return Ok(());
+        }
+        if let Some(error) = error {
+            // The source has not written anything: keep the previously selected input.
+            self.members
+                .get_mut(destination)
+                .unwrap()
+                .node
+                .monitor_error = Some(error.clone());
+            self.members.get_mut(destination).unwrap().input_ready = id;
+            command.result = Some(MonitorResult { error: Some(error) });
+        } else {
+            command.prepared = true;
+        }
+        Ok(())
+    }
+
     pub fn monitor_result(&mut self, writer: &str, id: u64, error: Option<String>) -> Result<()> {
         if let Some(error) = &error {
             monitor_message(error)?;
@@ -768,6 +806,10 @@ impl Workspace {
         ensure!(
             command.writer == writer && command.id == id,
             "Unexpected monitor command result"
+        );
+        ensure!(
+            command.prepared || error.is_some() || command.interrupted.is_some(),
+            "The destination display has not been prepared"
         );
         let error = if let Some(interrupted) = &command.interrupted {
             Some(error.unwrap_or_else(|| interrupted.clone()))
@@ -1168,6 +1210,68 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn dp_to_hdmi_waits_for_the_destination_signal_and_accepts_only_its_acknowledgement() {
+        let mut state = fixture(2);
+        state.settings.monitor_enabled = true;
+        state.members.get_mut(&key(1)).unwrap().node.monitor.input = Some(0x0f);
+        state.members.get_mut(&key(2)).unwrap().node.monitor.input = Some(0x11);
+        state.confirmed_monitor = Some(key(1));
+        state.activate(&key(1), &key(2), None).unwrap();
+        let command = state.monitor_command.as_ref().unwrap().clone();
+        assert_eq!(
+            (command.writer.as_str(), command.input),
+            (key(1).as_str(), 0x11)
+        );
+        assert!(!command.prepared);
+        assert!(state.monitor_result(&key(1), command.id, None).is_err());
+        assert!(state.monitor_prepared(&key(1), command.id, None).is_err());
+        assert!(
+            state
+                .monitor_prepared(&key(2), command.id + 1, None)
+                .is_err()
+        );
+        assert_eq!(state.monitor_command.as_ref(), Some(&command));
+        state.monitor_prepared(&key(2), command.id, None).unwrap();
+        assert!(state.monitor_command.as_ref().unwrap().prepared);
+        assert!(state.switch_pending());
+        state.monitor_result(&key(1), command.id, None).unwrap();
+        assert_eq!(state.confirmed_monitor, Some(key(2)));
+        state.validate().unwrap();
+    }
+
+    #[test]
+    fn unavailable_destination_finishes_without_permission_to_write_or_losing_the_visible_input() {
+        let mut state = fixture(2);
+        state.settings.monitor_enabled = true;
+        state.confirmed_monitor = Some(key(1));
+        state.activate(&key(1), &key(2), None).unwrap();
+        let id = state.activation;
+        state
+            .monitor_prepared(&key(2), id, Some("HDMI output is disabled".into()))
+            .unwrap();
+        let command = state.monitor_command.as_ref().unwrap();
+        assert!(!command.prepared);
+        assert!(command.result.as_ref().unwrap().error.is_some());
+        assert!(!state.switch_pending());
+        assert_eq!(state.confirmed_monitor, Some(key(1)));
+        assert!(state.monitor_result(&key(1), id, None).is_err());
+        state.monitor_prepared(&key(2), id, None).unwrap();
+        assert!(!state.monitor_command.as_ref().unwrap().prepared);
+        state.validate().unwrap();
+    }
+
+    fn confirm_monitor(state: &mut Workspace, writer: &str, id: Option<u64>) {
+        let id = id.unwrap_or(state.activation);
+        if let Some(command) = state.monitor_command.as_ref().filter(|command| {
+            command.id == id && command.result.is_none() && command.interrupted.is_none()
+        }) {
+            let destination = command.destination.clone();
+            state.monitor_prepared(&destination, id, None).unwrap();
+        }
+        state.monitor_result(writer, id, None).unwrap();
+    }
+
+    #[test]
     fn shares_input_audio_and_microphone_with_more_than_two_computers() {
         for count in [3, 7, 65] {
             let mut workspace = fixture(count);
@@ -1302,7 +1406,7 @@ pub(crate) mod tests {
         node.input_error = Some("Native input is still reconnecting".into());
         state.update_node(&key(2), node, None, 2).unwrap();
         assert!(state.switch_pending());
-        state.monitor_result(&key(1), 2, None).unwrap();
+        confirm_monitor(&mut state, &key(1), Some(2));
         assert!(
             !state.switch_pending(),
             "Input authentication must not hold the monitor gate"
@@ -1330,9 +1434,7 @@ pub(crate) mod tests {
         state.expire_monitor();
         assert!(state.switch_pending());
         assert!(state.activate(&key(1), &key(1), None).is_err());
-        state
-            .monitor_result(&key(2), state.activation, None)
-            .unwrap();
+        confirm_monitor(&mut state, &key(2), None);
         assert!(!state.switch_pending());
         assert!(state.confirmed_monitor.is_none());
         state.activate(&key(1), &key(1), None).unwrap();
@@ -1359,9 +1461,7 @@ pub(crate) mod tests {
             .update_node(&key(2), node, None, state.activation)
             .unwrap();
         assert!(state.switch_pending());
-        state
-            .monitor_result(&key(1), state.activation, None)
-            .unwrap();
+        confirm_monitor(&mut state, &key(1), None);
         let monitor = state.active_monitor.clone();
         state.return_input().unwrap();
         assert_eq!(state.active_input, Some(key(1)));
@@ -1383,14 +1483,14 @@ pub(crate) mod tests {
         let mut state = fixture(3);
         state.settings.monitor_enabled = true;
         state.activate(&key(1), &key(2), None).unwrap();
-        state.monitor_result(&key(1), 1, None).unwrap();
+        confirm_monitor(&mut state, &key(1), Some(1));
         state.return_input().unwrap();
         let returned = state.clone();
-        state.monitor_result(&key(1), 1, None).unwrap();
+        confirm_monitor(&mut state, &key(1), Some(1));
         assert_eq!(state, returned);
         state.activate(&key(1), &key(3), None).unwrap();
         let pending = state.clone();
-        state.monitor_result(&key(1), 1, None).unwrap();
+        confirm_monitor(&mut state, &key(1), Some(1));
         assert_eq!(state, pending);
         assert!(
             state
@@ -1404,7 +1504,7 @@ pub(crate) mod tests {
             .monitor_result(&key(2), 3, Some("I/O error after issuance".into()))
             .unwrap();
         let failed = state.clone();
-        state.monitor_result(&key(1), 1, None).unwrap();
+        confirm_monitor(&mut state, &key(1), Some(1));
         assert_eq!(state, failed);
     }
 
@@ -1475,9 +1575,7 @@ pub(crate) mod tests {
         let source = key(1);
         let target = key(2);
         state.activate(&source, &target, None).unwrap();
-        state
-            .monitor_result(&source, state.activation, None)
-            .unwrap();
+        confirm_monitor(&mut state, &source, None);
         state.return_input().unwrap();
         assert_eq!(state.active_input.as_ref(), Some(&source));
         assert_eq!(state.confirmed_monitor.as_ref(), Some(&target));
@@ -1492,7 +1590,7 @@ pub(crate) mod tests {
         let pending = state.clone();
         assert!(state.activate(&source, &target, None).is_err());
         assert_eq!(state, pending);
-        state.monitor_result(&target, command.id, None).unwrap();
+        confirm_monitor(&mut state, &target, Some(command.id));
         assert_eq!(state.members[&target].input_ready, state.activation);
         let completed = state.activation;
         state.activate(&source, &target, None).unwrap();
@@ -1530,9 +1628,7 @@ pub(crate) mod tests {
         let source = key(1);
         let target = key(2);
         state.activate(&source, &target, None).unwrap();
-        state
-            .monitor_result(&source, state.activation, None)
-            .unwrap();
+        confirm_monitor(&mut state, &source, None);
         let monitor = state.active_monitor.clone();
         let confirmed = state.confirmed_monitor.clone();
         let command = state.monitor_command.clone();

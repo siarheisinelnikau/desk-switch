@@ -56,6 +56,20 @@ pub fn select_monitor(id: &str, input: u16) -> Result<()> {
     crate::video::select_once(monitor, input)
 }
 
+/// Wake the destination's video signal before the source changes the monitor input.
+/// This never sends a DDC command, changes display layouts, or unlocks the session.
+pub fn prepare_monitor(id: &str) -> Result<()> {
+    #[cfg(target_os = "linux")]
+    return linux_monitor::prepare(id);
+    #[cfg(windows)]
+    return win_monitor::prepare(id);
+    #[cfg(target_os = "macos")]
+    {
+        anyhow::ensure!(!id.is_empty(), "Select a destination monitor");
+        Ok(())
+    }
+}
+
 pub fn run_monitor_service(
     id: &str,
     host: u16,

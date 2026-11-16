@@ -71,6 +71,7 @@ pub(super) struct Group {
     pub update_target: Option<String>,
     pub monitor_read_reply: Option<(String, u64)>,
     pub(super) monitor_job: Option<super::worker::Worker>,
+    pub(super) monitor_prepare: Option<super::group_monitor::Preparation>,
     pub preview: bool,
     pub add_open: bool,
     add_mode: AddMode,
@@ -147,6 +148,7 @@ impl Group {
 
     pub(super) fn monitor_busy(&self) -> bool {
         self.monitor_job.is_some()
+            || self.monitor_prepare.is_some()
             || self.monitor_wait.is_some()
             || self
                 .workspace

@@ -28,6 +28,14 @@ pub(super) struct Attempt {
     pub connection: String,
     pub input: u16,
 }
+
+pub(super) struct Preparation {
+    hub: String,
+    id: u64,
+    job: Option<Worker>,
+    result: Option<Option<String>>,
+    retry: Instant,
+}
 impl Attempt {
     fn new(state: &Workspace, command: &MonitorCommand) -> Self {
         Self {
@@ -114,6 +122,7 @@ impl Desktop {
         }
     }
     pub(super) fn tick_group_monitor(&mut self, state: &Workspace, ctx: &egui::Context) {
+        self.prepare_group_monitor(state, ctx);
         let initial = self.group.monitor_observed.as_deref() != Some(state.workspace_id());
         self.group.monitor_observed = Some(state.workspace_id().to_owned());
         let command = state
@@ -222,8 +231,9 @@ impl Desktop {
                 );
             }
         }
-        if let Some(command) = command.filter(|command| command.result.is_none())
-            && state.authority.is_some()
+        if let Some(command) = command.filter(|command| {
+            command.result.is_none() && (command.prepared || command.interrupted.is_some())
+        }) && state.authority.is_some()
         {
             let attempt = Attempt::new(state, command);
             let handled = self.group.monitor_attempt.as_ref() == Some(&attempt);
@@ -304,6 +314,88 @@ impl Desktop {
                     egui::ViewportId::ROOT,
                 );
             }
+        }
+    }
+
+    fn prepare_group_monitor(&mut self, state: &Workspace, ctx: &egui::Context) {
+        if self.group.preview {
+            return;
+        }
+        let command = state.monitor_command.as_ref().filter(|command| {
+            command.destination == self.public_key
+                && !command.prepared
+                && command.result.is_none()
+                && command.interrupted.is_none()
+        });
+        let Some(command) = command else {
+            self.group.monitor_prepare = None;
+            return;
+        };
+        if self
+            .group
+            .monitor_prepare
+            .as_ref()
+            .is_none_or(|pending| pending.hub != state.workspace_id() || pending.id != command.id)
+        {
+            let mut preparation = Preparation {
+                hub: state.workspace_id().to_owned(),
+                id: command.id,
+                job: None,
+                result: None,
+                retry: Instant::now(),
+            };
+            let monitor = &state.members[&self.public_key].node.monitor;
+            match Worker::start(
+                Kind::Query,
+                &["display-wake".into(), monitor.id.clone()],
+                &self.dir,
+                ctx,
+            ) {
+                Ok(job) => preparation.job = Some(job),
+                Err(error) => {
+                    preparation.result = Some(Some(format!(
+                        "Preparing the destination display: {error:#}"
+                    )))
+                }
+            }
+            self.group.monitor_prepare = Some(preparation);
+        }
+        let preparation = self.group.monitor_prepare.as_mut().unwrap();
+        if let Some(job) = &mut preparation.job {
+            job.poll();
+            if job.settled() {
+                preparation.result = Some((job.exit_ok != Some(true)).then(|| {
+                    bounded(
+                        &format!(
+                            "Preparing the destination display: {}",
+                            job.logs
+                                .iter()
+                                .map(String::as_str)
+                                .collect::<Vec<_>>()
+                                .join(" | ")
+                        ),
+                        2048,
+                    )
+                }));
+                preparation.job = None;
+            } else {
+                ctx.request_repaint_after_for(job.next_poll(), egui::ViewportId::ROOT);
+            }
+        }
+        if let Some(error) = &preparation.result {
+            if Instant::now() >= preparation.retry {
+                if let Some(service) = &self.group.service {
+                    let _ = service.action(Action::MonitorPrepared {
+                        id: command.id,
+                        error: error.clone(),
+                    });
+                }
+                preparation.retry = Instant::now() + Duration::from_secs(2);
+            }
+            ctx.request_repaint_after_for(
+                preparation.retry.saturating_duration_since(Instant::now()),
+                egui::ViewportId::ROOT,
+            );
         }
     }
 }

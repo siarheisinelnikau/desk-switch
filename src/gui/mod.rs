@@ -8,6 +8,8 @@ mod group_monitor;
 #[cfg(target_os = "linux")]
 mod linux_activation;
 #[cfg(target_os = "linux")]
+mod linux_tray;
+#[cfg(target_os = "linux")]
 mod linux_window;
 mod management;
 mod model;
@@ -17,7 +19,7 @@ mod popup;
 mod preview;
 mod resources;
 mod session;
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux"))]
 mod software;
 mod topology;
 mod transfer;
@@ -50,7 +52,12 @@ pub enum Action {
     Sound,
     Quit,
     Hide,
-    QuickOpen { x: i32, y: i32 },
+    QuickOpen {
+        x: i32,
+        y: i32,
+    },
+    #[cfg(target_os = "linux")]
+    TraySetup,
     QuickClose,
     FileTransfers,
     Quick(popup::Command),
@@ -97,6 +104,8 @@ pub struct Desktop {
     device_notice: Option<(Kind, String)>,
     tray: Option<tray::Tray>,
     tray_error: Option<String>,
+    #[cfg(target_os = "linux")]
+    linux_tray: linux_tray::Integration,
     tray_snapshot: tray::State,
     quick: popup::Popup,
     transfers: transfer::Transfers,
@@ -198,7 +207,7 @@ pub fn run_at(start_hidden: bool, dir: PathBuf) -> Result<()> {
             .with_icon(icon),
         ..Default::default()
     };
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "linux"))]
     return software::run(options.viewport, move |cc| {
         Ok(Box::new(Desktop::new(
             cc.egui_ctx.clone(),
@@ -207,9 +216,7 @@ pub fn run_at(start_hidden: bool, dir: PathBuf) -> Result<()> {
         )))
     })
     .map_err(anyhow::Error::msg);
-    #[cfg(target_os = "linux")]
-    let options = linux_window::options(options);
-    #[cfg(not(windows))]
+    #[cfg(target_os = "macos")]
     eframe::run_native(
         "Desk Switch",
         options,
@@ -294,6 +301,8 @@ impl Desktop {
             device_notice: None,
             tray,
             tray_error,
+            #[cfg(target_os = "linux")]
+            linux_tray: Default::default(),
             tray_snapshot: tray::State::default(),
             quick,
             transfers: Default::default(),
@@ -627,6 +636,13 @@ impl Desktop {
             }
             Action::Sound => self.toggle_audio(),
             Action::QuickOpen { x, y } => self.quick.open(ctx, x, y),
+            #[cfg(target_os = "linux")]
+            Action::TraySetup => {
+                self.page = Page::Application;
+                self.action(Action::Show, ctx);
+                #[cfg(target_os = "linux")]
+                self.linux_tray.start(ctx, false);
+            }
             Action::QuickClose => self.quick.close(ctx),
             Action::FileTransfers => {
                 self.quick.close(ctx);
@@ -725,6 +741,8 @@ impl Desktop {
         if self.presented {
             crate::updater::acknowledge_shared_start(&self.dir);
         }
+        #[cfg(target_os = "linux")]
+        self.linux_tray.tick(ctx);
         if self.startup_pending {
             self.startup_pending = false;
             self.startup(ctx);
@@ -1343,7 +1361,7 @@ impl eframe::App for Desktop {
     }
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux"))]
 impl software::App for Desktop {
     fn logic(&mut self, ctx: &egui::Context) {
         self.tick(ctx);

@@ -138,6 +138,7 @@ fn run() -> Result<()> {
         ),
         ["probe", id] => platform::probe(Some(id))?,
         ["monitor-select", id, input] => platform::select_monitor(id, input.parse()?)?,
+        ["display-wake", id] => platform::prepare_monitor(id)?,
         ["monitor-read", id] => println!(
             "@desk-switch-data {}",
             serde_json::to_string(&platform::read_monitor(id)?)?

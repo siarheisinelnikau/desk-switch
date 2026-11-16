@@ -113,11 +113,12 @@ def main():
                 wait_for(lambda: process.poll() is not None, 'The rendering probe exceeded its deadline', 65)
                 assert process.returncode == 0, (args.out / 'render.log').read_text()
             rendering = json.loads(probe.read_text())
-            assert 'llvmpipe' in rendering['backend'].lower(), rendering['backend']
+            assert rendering['backend'].startswith('CPU / softbuffer'), rendering['backend']
             for sample in rendering['samples']:
                 assert sample['input_events'] == 0, sample
                 assert sample['settled'], sample
                 assert sample['ui_frames'] == sample['popup_ui_frames'] == sample['file_progress_ui_frames'] == 0, sample
+                assert sample['rasterized_and_presented'] == [0, 0], sample
             registered.clear()
             with (args.out / 'lifecycle.log').open('w') as log:
                 process = subprocess.Popen([str(args.binary.resolve()), 'gui-preview', 'shared-four', '--state-dir', str(state / 'lifecycle')],
@@ -135,6 +136,15 @@ def main():
                     call(name, '/MenuBar', 'com.canonical.dbusmenu', 'Event', '(isvu)',
                          (entries[label], 'clicked', GLib.Variant('i', 0), 0))
 
+                # Exercise the user's failing menu action while ROOT is visible,
+                # rather than proving only direct Activate on a hidden window.
+                menu('Quick controls')
+                popup = wait_for(lambda: window(process.pid, 'Desk Switch quick controls'), 'The menu action did not create quick controls')
+                wait_for(lambda: visible(popup), 'The menu popup is not mapped')
+                assert visible(root), 'Opening quick controls hid the main window'
+                call(name, '/StatusNotifierItem', 'org.kde.StatusNotifierItem', 'Activate', '(ii)', (110, 24))
+                wait_for(lambda: not visible(popup), 'The visible-root popup did not dismiss')
+
                 for _ in range(2):
                     subprocess.run(['wmctrl', '-ic', root], check=True, timeout=3)
                     wait_for(lambda: not visible(root), 'Close X did not hide the actual main window')
@@ -143,8 +153,11 @@ def main():
                     wait_for(lambda: visible(root), 'Open did not restore the same main window')
                 subprocess.run(['wmctrl', '-ic', root], check=True, timeout=3)
                 wait_for(lambda: not visible(root), 'The main window did not hide before popup testing')
-                for _ in range(2):
-                    call(name, '/StatusNotifierItem', 'org.kde.StatusNotifierItem', 'Activate', '(ii)', (110, 24))
+                for cycle in range(6):
+                    if cycle % 2:
+                        menu('Quick controls')
+                    else:
+                        call(name, '/StatusNotifierItem', 'org.kde.StatusNotifierItem', 'Activate', '(ii)', (110, 24))
                     popup = wait_for(lambda: window(process.pid, 'Desk Switch quick controls'), 'Activate did not open quick controls')
                     wait_for(lambda: visible(popup), 'Quick controls are not mapped')
                     assert not visible(root), 'Quick controls also restored the main window'
@@ -153,9 +166,17 @@ def main():
                 menu('Quit Desk Switch')
                 wait_for(lambda: process.poll() is not None, 'Quit did not exit while the main window was hidden')
                 assert process.returncode == 0, (args.out / 'lifecycle.log').read_text()
+            with (args.out / 'capture.log').open('w') as log:
+                process = subprocess.Popen([str(args.binary.resolve()), 'gui-preview', 'shared-four-quick-controls',
+                    '--state-dir', str(state / 'capture')], env=dict(env,
+                    DESK_SWITCH_CAPTURE_TO=str(args.out.resolve() / 'device-popup.png')), stdout=log, stderr=log)
+                wait_for(lambda: process.poll() is not None, 'The bounded popup capture did not exit', 10)
+                assert process.returncode == 0, (args.out / 'capture.log').read_text()
+                assert (args.out / 'device-popup.png').stat().st_size > 1000
             (args.out / 'lifecycle.json').write_text(json.dumps({
                 'backend': rendering['backend'], 'native_window_system': 'X11', 'root_id': root,
-                'close_restore_cycles': 2, 'popup_cycles_while_main_hidden': 2, 'quit_while_hidden': True,
+                'close_restore_cycles': 2, 'menu_popup_with_main_visible': True,
+                'popup_cycles_while_main_hidden': 6, 'quit_while_hidden': True,
                 'scope': 'Actual application fixture on Xvfb/private D-Bus; no physical GNOME mouse routing or real user devices.'}, indent=2) + '\n')
         print('PASS: real X11 close/hide/restore, direct SNI popup activation, native menu export, hidden quit and quiet settled visible/hidden rendering. Physical GNOME clicks remain untested.')
     finally:

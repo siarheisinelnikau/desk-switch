@@ -2172,6 +2172,8 @@ impl Desktop {
         ui.add_space(12.0);
         self.update_settings(ui);
         self.application_settings(ui);
+        #[cfg(target_os = "linux")]
+        self.linux_tray.show(ui);
         self.device_settings(ui);
         #[cfg(target_os = "linux")]
         card(ui, |ui| {

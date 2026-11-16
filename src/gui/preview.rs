@@ -207,16 +207,16 @@ fn render_probe(
                 let popup_start = super::popup::FRAMES.load(Ordering::Relaxed);
                 let progress_start = super::file_progress::FRAMES.load(Ordering::Relaxed);
                 let input_start: u64 = causes.lock().unwrap().iter().filter(|(key, _)| key.starts_with("input:")).map(|(_, count)| count).sum();
-                #[cfg(windows)]
+                #[cfg(any(windows, target_os = "linux"))]
                 let activity = super::software::activity();
                 let cpu_start = cpu_seconds();
                 let since = Instant::now();
                 // Keep the six-state workspace proof bounded to one minute,
                 // including its settling budget. Progress has only four states.
                 std::thread::sleep(Duration::from_secs(if file_progress { 6 } else { 5 }));
-                #[cfg(windows)]
+                #[cfg(any(windows, target_os = "linux"))]
                 let activity_delta = Some(std::array::from_fn::<_, 2, _>(|i| super::software::activity()[i] - activity[i]));
-                #[cfg(not(windows))]
+                #[cfg(target_os = "macos")]
                 let activity_delta: Option<[u64; 2]> = None;
                 samples.push(serde_json::json!({
                     "state": state, "seconds": since.elapsed().as_secs_f64(),
@@ -414,26 +414,24 @@ pub fn run(case: &str, dir: PathBuf) -> Result<()> {
     Ok(())
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux"))]
 fn run_native_preview(
     options: eframe::NativeOptions,
     create: impl FnOnce(egui::Context, String) -> Result<PreviewApp> + 'static,
 ) -> Result<()> {
     super::software::run(options.viewport, move |cc| {
-        create(cc.egui_ctx.clone(), "CPU / Windows GDI".into())
+        create(cc.egui_ctx.clone(), super::software::BACKEND.into())
             .map(|app| Box::new(app) as Box<dyn super::software::App>)
             .map_err(|error| error.to_string())
     })
     .map_err(anyhow::Error::msg)
 }
 
-#[cfg(not(windows))]
+#[cfg(target_os = "macos")]
 fn run_native_preview(
     options: eframe::NativeOptions,
     create: impl FnOnce(egui::Context, String) -> Result<PreviewApp> + 'static,
 ) -> Result<()> {
-    #[cfg(target_os = "linux")]
-    let options = super::linux_window::options(options);
     eframe::run_native(
         "Desk Switch",
         options,
@@ -460,7 +458,7 @@ fn run_native_preview(
     .map_err(|error| anyhow::anyhow!(error.to_string()))
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux"))]
 impl super::software::App for PreviewApp {
     fn logic(&mut self, ctx: &egui::Context) {
         super::software::App::logic(&mut self.desktop, ctx);

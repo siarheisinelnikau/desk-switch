@@ -523,6 +523,24 @@ fn read(handle: HANDLE) -> Result<u16> {
 
 pub struct Ddc(pub String);
 
+pub fn prepare(id: &str) -> Result<()> {
+    ensure!(
+        screens()?
+            .iter()
+            .any(|screen| identity(screen).is_ok_and(|(found, _)| found == id)),
+        "The destination display is unavailable"
+    );
+    use windows_sys::Win32::System::Power::{ES_DISPLAY_REQUIRED, SetThreadExecutionState};
+    // SAFETY: this one-shot activity notification has no pointers and does not
+    // set ES_CONTINUOUS, so it leaves the user's power policy unchanged.
+    let previous = unsafe { SetThreadExecutionState(ES_DISPLAY_REQUIRED) };
+    ensure!(
+        previous != 0,
+        "Windows could not wake the destination display"
+    );
+    Ok(())
+}
+
 impl Monitor for Ddc {
     fn read(&mut self) -> Result<u16> {
         read(select(&self.0)?.0.hPhysicalMonitor)
