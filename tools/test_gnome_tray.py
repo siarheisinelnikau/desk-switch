@@ -112,15 +112,34 @@ def main():
                             f'a.meta_window.get_title() === {json.dumps(title)} && a.visible)')
 
                     wait_for(lambda: visible('Desk Switch'), 'The native main window is missing')
+                    shell('Main.overview.hide(); true')
+                    wait_for(lambda: shell('!Main.layoutManager._startingUp && !Main.overview.visible && '
+                        'global.deskSwitchTestIcon.mapped && global.deskSwitchTestIcon.width > 0 && '
+                        'global.deskSwitchTestIcon.height > 0'), 'The panel button is not ready for physical hit testing')
                     shell("(async () => { const Clutter = (await import('gi://Clutter')).default; "
                         "global.deskSwitchTestPointer = global.stage.context.get_backend().get_default_seat().create_virtual_device(Clutter.InputDeviceType.POINTER_DEVICE); return true; })()")
 
                     def click(button):
+                        x, y = shell("(() => { let [x, y] = global.deskSwitchTestIcon.get_transformed_position(); "
+                            "return [x + global.deskSwitchTestIcon.width / 2, y + global.deskSwitchTestIcon.height / 2]; })()")
                         shell("(async () => { const Clutter = (await import('gi://Clutter')).default; "
-                            "let [x, y] = global.deskSwitchTestIcon.get_transformed_position(); "
-                            "global.deskSwitchTestPointer.notify_absolute_motion(GLib.get_monotonic_time(), x + global.deskSwitchTestIcon.width / 2, y + global.deskSwitchTestIcon.height / 2); "
-                            f"global.deskSwitchTestPointer.notify_button(GLib.get_monotonic_time(), {button}, Clutter.ButtonState.PRESSED); "
+                            f"global.deskSwitchTestPointer.notify_absolute_motion(GLib.get_monotonic_time(), {x}, {y}); return true; }})()")
+                        # Virtual seat requests are asynchronous. Sending motion,
+                        # press and release in one Eval can click before the new
+                        # device reaches the indicator, especially during login.
+                        wait_for(lambda: shell("(async () => { const Clutter = (await import('gi://Clutter')).default; "
+                            "let [x, y] = global.get_pointer(); "
+                            f"if (Math.abs(x - {x}) > 1 || Math.abs(y - {y}) > 1) return false; "
+                            "for (let actor = global.stage.get_actor_at_pos(Clutter.PickMode.REACTIVE, x, y); actor; actor = actor.get_parent()) "
+                            "if (actor === global.deskSwitchTestIcon) return true; return false; })()"),
+                            'The virtual pointer did not reach the actual panel button')
+                        shell("(async () => { const Clutter = (await import('gi://Clutter')).default; "
+                            f"global.deskSwitchTestPointer.notify_button(GLib.get_monotonic_time(), {button}, Clutter.ButtonState.PRESSED); return true; }})()")
+                        mask = 1 << (button + 7)
+                        wait_for(lambda: shell(f'(global.get_pointer()[2] & {mask}) !== 0'), 'The virtual button press was not delivered')
+                        shell("(async () => { const Clutter = (await import('gi://Clutter')).default; "
                             f"global.deskSwitchTestPointer.notify_button(GLib.get_monotonic_time(), {button}, Clutter.ButtonState.RELEASED); return true; }})()")
+                        wait_for(lambda: shell(f'(global.get_pointer()[2] & {mask}) === 0'), 'The virtual button release was not delivered')
 
                     for _ in range(3):
                         click(1)
@@ -143,6 +162,17 @@ def main():
                         'scope': 'Actual GNOME/AppIndicator/packaged companion on a private headless compositor; synthetic application and virtual pointer only.'}, indent=2) + '\n')
                     print('PASS: actual GNOME primary clicks open the device popup, secondary clicks open its native menu, and a hidden main window stays hidden.')
         finally:
+            if compositor is not None and compositor.poll() is None:
+                try:
+                    diagnostics = shell("({pointer: global.get_pointer(), overview: Main.overview.visible, "
+                        "icon: global.deskSwitchTestIcon ? {mapped: global.deskSwitchTestIcon.mapped, "
+                        "position: global.deskSwitchTestIcon.get_transformed_position(), "
+                        "size: [global.deskSwitchTestIcon.width, global.deskSwitchTestIcon.height], "
+                        "menu: global.deskSwitchTestIcon.menu.isOpen} : null, "
+                        "windows: global.get_window_actors().map(a => ({pid: a.meta_window.get_pid(), title: a.meta_window.get_title(), visible: a.visible}))})")
+                    (args.out / 'diagnostics.json').write_text(json.dumps(diagnostics, indent=2) + '\n')
+                except (GLib.Error, AssertionError):
+                    pass
             stop(app)
             stop(compositor)
     return 0
