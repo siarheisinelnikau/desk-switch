@@ -3,8 +3,14 @@
 //! Input capture still uses the native Wayland portal/EIS backend.
 use winit::platform::x11::EventLoopBuilderExtX11;
 
-pub(super) fn configure<T>(builder: &mut winit::event_loop::EventLoopBuilder<T>) {
-    if std::env::var_os("DISPLAY").is_some_and(|display| !display.is_empty()) {
-        builder.with_x11();
+pub(super) fn configure<T>(
+    builder: &mut winit::event_loop::EventLoopBuilder<T>,
+) -> Result<(), String> {
+    if !std::env::var_os("DISPLAY").is_some_and(|display| !display.is_empty()) {
+        return Err(
+            "The tray interface requires XWayland. Install xwayland and sign in again.".into(),
+        );
     }
+    builder.with_x11();
+    Ok(())
 }
