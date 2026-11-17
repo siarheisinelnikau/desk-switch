@@ -91,8 +91,7 @@ fn clip(icon: &glib::Object, applied: &Cell<Option<(u32, u16)>>) -> anyhow::Resu
     }
     // SAFETY: the callback holds our live GtkStatusIcon on its owning GTK/X11
     // thread. The result is an XID, not a borrowed native object pointer.
-    let plug: u32 =
-        unsafe { gtk::ffi::gtk_status_icon_get_x11_window_id(icon.as_ptr().cast()) }.try_into()?;
+    let plug: u32 = unsafe { gtk::ffi::gtk_status_icon_get_x11_window_id(icon.as_ptr().cast()) };
     let (x11, _) = x11rb::connect(None)?;
     let tree = x11.query_tree(plug)?.reply()?;
     if tree.parent == tree.root {

@@ -210,6 +210,7 @@ mod native {
     impl Tray {
         pub fn new(sender: Sender<Action>, ctx: egui::Context) -> Result<Self> {
             if let Some(legacy) = legacy::Tray::try_new(sender.clone(), ctx.clone()) {
+                eprintln!("Desk Switch tray backend: native XEmbed");
                 return Ok(Self {
                     handle: None,
                     legacy: Some(legacy),
@@ -217,6 +218,7 @@ mod native {
                 });
             }
             let available = Arc::new(AtomicBool::new(true));
+            eprintln!("Desk Switch tray backend: StatusNotifierItem");
             let handle = Item {
                 language: crate::i18n::current_code().into(),
                 sender,

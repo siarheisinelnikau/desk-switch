@@ -137,8 +137,26 @@ def main():
                 assert native_env.get('DISPLAY'), 'The private GNOME must provide its own XWayland display'
                 env.update({name: value for name, value in native_env.items() if value})
                 env['DESK_SWITCH_PREVIEW_LANGUAGE'] = 'en'
-                env['DESK_SWITCH_PREVIEW_TRAY_SETUP'] = '1'
                 env['DESK_SWITCH_PREVIEW_TRAY_BACKEND'] = args.backend
+                if args.backend == 'legacy':
+                    # Measure this exact native GTK/XEmbed path before the
+                    # click walkthrough. Only synthetic windows are created.
+                    probe_path = args.out.resolve() / 'render.json'
+                    with (args.out / 'render.log').open('w') as probe_log:
+                        app = subprocess.Popen([str(args.binary.resolve()), 'gui-preview', 'shared-four',
+                            '--state-dir', str(home / 'render-profile')],
+                            env=dict(env, DESK_SWITCH_RENDER_PROBE=str(probe_path)), stdout=probe_log, stderr=probe_log)
+                        wait_for(lambda: app.poll() is not None, 'The native tray rendering probe exceeded its deadline', 65)
+                        assert app.returncode == 0, (args.out / 'render.log').read_text()
+                    assert 'tray backend: native XEmbed' in (args.out / 'render.log').read_text(), 'The rendering probe used the wrong tray backend'
+                    rendering = json.loads(probe_path.read_text())
+                    assert rendering['backend'].startswith('CPU / softbuffer')
+                    for sample in rendering['samples']:
+                        assert sample['settled'] and sample['input_events'] == 0, sample
+                        assert sample['ui_frames'] == sample['popup_ui_frames'] == sample['file_progress_ui_frames'] == 0, sample
+                        assert sample['rasterized_and_presented'] == [0, 0], sample
+                        assert 0 <= sample['cpu_one_core_percent'] < 5, sample
+                env['DESK_SWITCH_PREVIEW_TRAY_SETUP'] = '1'
                 with (args.out / 'application.log').open('w') as app_log:
                     app = subprocess.Popen([str(args.binary.resolve()), 'gui-preview', 'shared-four',
                         '--state-dir', str(home / 'profile')], env=env, stdout=app_log, stderr=app_log)

@@ -90,7 +90,7 @@ impl Native {
             // GNOME does not offer a general background data-control protocol.
             // Never silently use an Xwayland clipboard with different content.
             Gnome::new().map(Self::Gnome).context(
-                "The GNOME tray integration is unavailable. Check Application > Tray device popup; a new desktop session may be required after installation",
+                "The GNOME clipboard integration is unavailable. A new desktop session may be required after installation",
             )
         } else {
             X11::new().map(Self::X11)
@@ -142,7 +142,7 @@ impl Gnome {
                 self.paths = None;
                 self.refresh = true;
                 return Err(error).context(
-                        "The GNOME tray integration is unavailable. Check Application > Tray device popup; a new desktop session may be required after installation",
+                        "The GNOME clipboard integration is unavailable. A new desktop session may be required after installation",
                     );
             }
         };
@@ -190,7 +190,7 @@ impl Gnome {
             )
         };
         let (accepted, serial): (bool, u32) = result.context(
-            "The GNOME tray integration is unavailable. Check Application > Tray device popup; a new desktop session may be required after installation",
+            "The GNOME clipboard integration is unavailable. A new desktop session may be required after installation",
         )?;
         ensure!(
             serial != 0,
