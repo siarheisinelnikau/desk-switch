@@ -182,7 +182,8 @@ def main():
                         windows = shell("(async () => { const Meta = (await import('gi://Meta')).default; return "
                             f"global.get_window_actors().filter(a => a.meta_window.get_pid() === {pid} && "
                             "[Meta.WindowType.POPUP_MENU, Meta.WindowType.DROPDOWN_MENU].includes(a.meta_window.get_window_type()))"
-                            ".map(a => ({description: a.meta_window.get_description(), rect: a.meta_window.get_frame_rect()})); })()")
+                            ".map(a => { const r = a.meta_window.get_frame_rect(); return {description: a.meta_window.get_description(), "
+                            "rect: {x: r.x, y: r.y, width: r.width, height: r.height}}; }); })()")
                         for window in windows:
                             # Compositor actors can survive an X11 unmap. Check
                             # the actual GTK window rather than a stale actor.
@@ -252,7 +253,11 @@ def main():
                         if args.backend == 'sni':
                             shell('global.deskSwitchTestIcon().menu.close(); true')
                         else:
-                            shell("(async () => { const Clutter = (await import('gi://Clutter')).default; global.deskSwitchTestKeyboard.notify_keyval(GLib.get_monotonic_time(), Clutter.KEY_Escape, Clutter.KeyState.PRESSED); global.deskSwitchTestKeyboard.notify_keyval(GLib.get_monotonic_time(), Clutter.KEY_Escape, Clutter.KeyState.RELEASED); return true; })()")
+                            # Use the native seat's evdev Escape code and let
+                            # each request reach the compositor separately.
+                            for state in ['PRESSED', 'RELEASED']:
+                                shell("(async () => { const Clutter = (await import('gi://Clutter')).default; "
+                                    f"global.deskSwitchTestKeyboard.notify_key(GLib.get_monotonic_time(), 1, Clutter.KeyState.{state}); return true; }})()")
                         wait_for(lambda: not menu_visible(), 'The native menu did not dismiss')
                     shell(f"global.get_window_actors().find(a => a.meta_window.get_pid() === {pid} && a.meta_window.get_title() === 'Desk Switch').meta_window.delete(global.get_current_time()); true")
                     wait_for(lambda: not visible('Desk Switch'), 'Close did not leave the main window hidden')
@@ -276,10 +281,10 @@ def main():
                         "size: [icon.width, icon.height], menu: icon.menu?.isOpen ?? false} : null, "
                         "focus: global.display.focus_window?.get_description(), "
                         "overviewAnimating: Main.overview.animationInProgress, "
-                        "windows: global.get_window_actors().map(a => ({pid: a.meta_window.get_pid(), "
+                        "windows: global.get_window_actors().map(a => { const r = a.meta_window.get_frame_rect(); return {pid: a.meta_window.get_pid(), "
                         "title: a.meta_window.get_title(), visible: a.visible, "
                         "description: a.meta_window.get_description(), type: a.meta_window.get_window_type(), "
-                        "rect: a.meta_window.get_frame_rect()}))}; })()")
+                        "rect: {x: r.x, y: r.y, width: r.width, height: r.height}}; })}; })()")
                     (args.out / 'diagnostics.json').write_text(json.dumps(diagnostics, indent=2) + '\n')
                     for window in diagnostics['windows']:
                         if app is not None and window['pid'] == app.pid:
