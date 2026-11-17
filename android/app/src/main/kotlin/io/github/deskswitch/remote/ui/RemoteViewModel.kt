@@ -1,7 +1,10 @@
 package io.github.deskswitch.remote.ui
 
+import android.content.Context
+import androidx.annotation.StringRes
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
+import io.github.deskswitch.remote.R
 import io.github.deskswitch.remote.domain.*
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
@@ -14,20 +17,33 @@ import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.atomic.AtomicReference
 
-data class ScreenState(
+internal sealed interface ScreenIssue {
+    data class Detail(val message: String) : ScreenIssue
+    data class Local(@StringRes val resource: Int, val errorCode: Int? = null) : ScreenIssue
+
+    fun localized(context: Context): String = when (this) {
+        is Detail -> message
+        is Local -> if (errorCode == null) context.getString(resource) else context.getString(resource, errorCode)
+    }
+}
+
+internal data class ScreenState(
     val saved: List<Computer> = emptyList(), val nearby: List<Computer> = emptyList(),
     val connecting: Computer? = null, val connected: Computer? = null,
-    val pairing: Pairing? = null, val error: String? = null, val discoveryError: String? = null,
+    val pairing: Pairing? = null, val error: ScreenIssue? = null, val discoveryError: ScreenIssue? = null,
     val controls: PointerSettings = PointerSettings(),
     val previewError: String? = null,
 )
-class RemoteViewModel(
+class RemoteViewModel internal constructor(
     private val store: RemoteStore,
     private val makeFactory: ((Computer) -> Unit) -> SessionFactory,
     private val controlsStore: PointerSettingsStore,
+    private val appearanceStore: AppearanceSettingsStore,
 ) : ViewModel() {
     private val mutable = MutableStateFlow(ScreenState(saved = store.computers(), controls = controlsStore.load().normalized()))
-    val state = mutable.asStateFlow()
+    internal val state = mutable.asStateFlow()
+    private val mutableAppearance = MutableStateFlow(appearanceStore.load())
+    internal val appearance = mutableAppearance.asStateFlow()
     private val mutableFrames = MutableStateFlow<ByteArray?>(null)
     val previewFrames = mutableFrames.asStateFlow()
     private val mutableInputErrors = MutableSharedFlow<String>(extraBufferCapacity = 1)
@@ -49,8 +65,13 @@ class RemoteViewModel(
         }
         mutable.value = mutable.value.copy(nearby = computers.sortedBy { it.name }, saved = saved, connected = connected)
     }
-    fun discoveryFailed(message: String?) = viewModelScope.launch {
-        mutable.value = mutable.value.copy(discoveryError = message)
+    internal fun discoveryFailed(issue: ScreenIssue?) = viewModelScope.launch {
+        mutable.value = mutable.value.copy(discoveryError = issue)
+    }
+    internal fun setAppearance(settings: AppearanceSettings) {
+        if (settings == mutableAppearance.value) return
+        appearanceStore.save(settings)
+        mutableAppearance.value = settings
     }
     fun controls(settings: PointerSettings) {
         val value = settings.normalized()
@@ -117,7 +138,8 @@ class RemoteViewModel(
                         mutableFrames.value = null
                         viewModelScope.launch {
                             session = null; previewRequest = null
-                            mutable.value = mutable.value.copy(connected = null, connecting = null, pairing = null, error = error, previewError = null)
+                            mutable.value = mutable.value.copy(connected = null, connecting = null, pairing = null,
+                                error = error?.let { ScreenIssue.Detail(it) }, previewError = null)
                         }
                     }
                 })
@@ -132,7 +154,12 @@ class RemoteViewModel(
                     } else connected.close()
                 }
             } catch (error: Exception) {
-                viewModelScope.launch { if (generation.get() == run) mutable.value = mutable.value.copy(connecting = null, pairing = null, error = error.message?.take(240) ?: "Could not connect. Check that phone control is enabled on the computer.") }
+                viewModelScope.launch {
+                    if (generation.get() != run) return@launch
+                    val issue = error.message?.take(240)?.takeIf(String::isNotBlank)?.let { ScreenIssue.Detail(it) }
+                        ?: ScreenIssue.Local(R.string.connection_unavailable)
+                    mutable.value = mutable.value.copy(connecting = null, pairing = null, error = issue)
+                }
             }
         }
     }

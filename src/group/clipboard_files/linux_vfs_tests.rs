@@ -698,7 +698,7 @@ fn native_child(command: &str, arguments: &[&OsStr]) -> NativeChild {
             .args(arguments)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
+            .stderr(Stdio::inherit())
             .spawn()
             .unwrap(),
     )
@@ -782,8 +782,10 @@ fn process_cpu() -> Duration {
 fn native_window(title: &str) -> String {
     let mut window = None;
     eventually(
-        Duration::from_secs(5),
-        "The private Nautilus window did not appear",
+        // On a cold private bus, Nautilus starts GVfs and Tracker services
+        // before the destination window becomes visible.
+        Duration::from_secs(15),
+        &format!("The private Nautilus window for {title} did not appear"),
         || {
             let output = native_output(
                 "xdotool",

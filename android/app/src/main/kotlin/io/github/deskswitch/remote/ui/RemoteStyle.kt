@@ -2,6 +2,7 @@ package io.github.deskswitch.remote.ui
 
 import android.content.Context
 import android.content.res.ColorStateList
+import android.content.res.Configuration
 import android.graphics.Canvas
 import android.graphics.Color
 import android.graphics.ColorFilter
@@ -15,21 +16,100 @@ import android.view.MotionEvent
 import android.view.View
 import android.view.animation.DecelerateInterpolator
 
+internal class RemotePalette(
+    val background: Int,
+    val surface: Int,
+    val raised: Int,
+    val border: Int,
+    val ink: Int,
+    val muted: Int,
+    val accent: Int,
+    val accentInk: Int,
+    val success: Int,
+    val danger: Int,
+    val dangerSurface: Int,
+    val dangerBorder: Int,
+    val accentSurface: Int,
+    val switchTrack: Int,
+    val selectionSurface: Int,
+    val ripple: Int,
+    val touchpadGlyph: Int,
+    val touchpadGlow: Int,
+    val touchpadTop: Int,
+    val touchpadMiddle: Int,
+    val touchpadBottom: Int,
+    val touchpadBorder: Int,
+    val touchpadFeedbackFill: Int,
+    val touchpadFeedbackStroke: Int,
+)
+
 internal object RemoteStyle {
-    val background = Color.rgb(13, 18, 25)
-    val surface = Color.rgb(22, 32, 45)
-    val raised = Color.rgb(29, 43, 59)
-    val border = Color.rgb(45, 62, 81)
-    val ink = Color.rgb(233, 241, 249)
-    val muted = Color.rgb(158, 179, 199)
-    val accent = Color.rgb(75, 196, 244)
-    val accentInk = Color.rgb(8, 29, 41)
-    val success = Color.rgb(96, 221, 180)
-    val danger = Color.rgb(255, 160, 151)
+    private val dark = RemotePalette(
+        background = Color.rgb(13, 18, 25),
+        surface = Color.rgb(22, 32, 45),
+        raised = Color.rgb(29, 43, 59),
+        border = Color.rgb(45, 62, 81),
+        ink = Color.rgb(233, 241, 249),
+        muted = Color.rgb(158, 179, 199),
+        accent = Color.rgb(75, 196, 244),
+        accentInk = Color.rgb(8, 29, 41),
+        success = Color.rgb(96, 221, 180),
+        danger = Color.rgb(255, 160, 151),
+        dangerSurface = Color.rgb(51, 32, 37),
+        dangerBorder = Color.rgb(99, 58, 63),
+        accentSurface = Color.rgb(26, 56, 75),
+        switchTrack = Color.rgb(42, 69, 86),
+        selectionSurface = Color.rgb(30, 65, 83),
+        ripple = Color.argb(45, 150, 222, 255),
+        touchpadGlyph = Color.rgb(101, 152, 183),
+        touchpadGlow = Color.argb(65, 75, 196, 244),
+        touchpadTop = Color.rgb(24, 42, 58),
+        touchpadMiddle = Color.rgb(20, 30, 43),
+        touchpadBottom = Color.rgb(18, 28, 40),
+        touchpadBorder = Color.rgb(49, 73, 95),
+        touchpadFeedbackFill = Color.rgb(35, 83, 108),
+        touchpadFeedbackStroke = Color.rgb(102, 186, 226),
+    )
+    private val light = RemotePalette(
+        background = Color.rgb(244, 246, 250),
+        surface = Color.WHITE,
+        raised = Color.rgb(232, 238, 246),
+        border = Color.rgb(196, 208, 224),
+        ink = Color.rgb(34, 44, 67),
+        muted = Color.rgb(81, 94, 117),
+        accent = Color.rgb(12, 101, 143),
+        accentInk = Color.WHITE,
+        success = Color.rgb(19, 111, 82),
+        danger = Color.rgb(162, 69, 53),
+        dangerSurface = Color.rgb(255, 241, 237),
+        dangerBorder = Color.rgb(221, 173, 163),
+        accentSurface = Color.rgb(223, 242, 249),
+        switchTrack = Color.rgb(143, 172, 191),
+        selectionSurface = Color.rgb(223, 242, 249),
+        ripple = Color.argb(38, 12, 101, 143),
+        touchpadGlyph = Color.rgb(53, 113, 147),
+        touchpadGlow = Color.argb(56, 12, 101, 143),
+        touchpadTop = Color.rgb(222, 239, 249),
+        touchpadMiddle = Color.rgb(238, 246, 251),
+        touchpadBottom = Color.rgb(230, 239, 248),
+        touchpadBorder = Color.rgb(136, 164, 187),
+        touchpadFeedbackFill = Color.rgb(71, 143, 180),
+        touchpadFeedbackStroke = Color.rgb(12, 101, 143),
+    )
+
+    fun palette(context: Context): RemotePalette {
+        val night = context.resources.configuration.uiMode and Configuration.UI_MODE_NIGHT_MASK
+        return if (night == Configuration.UI_MODE_NIGHT_YES) dark else light
+    }
 
     fun dp(context: Context, value: Float) = value * context.resources.displayMetrics.density
 
-    fun shape(context: Context, color: Int = surface, radius: Float = 18f, stroke: Int? = border): GradientDrawable =
+    fun shape(
+        context: Context,
+        color: Int = palette(context).surface,
+        radius: Float = 18f,
+        stroke: Int? = palette(context).border,
+    ): GradientDrawable =
         GradientDrawable().apply {
             setColor(color)
             cornerRadius = dp(context, radius)
@@ -37,10 +117,23 @@ internal object RemoteStyle {
         }
 
     fun interactive(context: Context, primary: Boolean = false, selected: Boolean = false): Drawable {
-        val color = when { primary -> accent; selected -> Color.rgb(30, 65, 83); else -> surface }
-        return RippleDrawable(ColorStateList.valueOf(Color.argb(45, 150, 222, 255)),
-            shape(context, color, if (selected) 13f else 17f, if (selected) accent else if (primary) null else border),
-            shape(context, Color.WHITE, 17f, null))
+        val colors = palette(context)
+        val color = when {
+            primary -> colors.accent
+            selected -> colors.selectionSurface
+            else -> colors.surface
+        }
+        val stroke = when {
+            selected -> colors.accent
+            primary -> null
+            else -> colors.border
+        }
+        val radius = if (selected) 13f else 17f
+        return RippleDrawable(
+            ColorStateList.valueOf(colors.ripple),
+            shape(context, color, radius, stroke),
+            shape(context, Color.WHITE, radius, null),
+        )
     }
 
     /** Finite press feedback; no animation work remains after release/cancel. */
@@ -63,6 +156,7 @@ internal enum class Glyph { BRAND, SETTINGS, DISCONNECT, KEYBOARD, TOUCHPAD, JOY
 
 /** Small code-native icons share one optical size and stroke weight. */
 internal class GlyphDrawable(private val context: Context, private val glyph: Glyph, private var color: Int) : Drawable() {
+    private val colors = RemoteStyle.palette(context)
     private val paint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         style = Paint.Style.STROKE
         strokeWidth = 1.65f
@@ -85,7 +179,7 @@ internal class GlyphDrawable(private val context: Context, private val glyph: Gl
         when (glyph) {
             Glyph.BRAND -> {
                 canvas.drawRoundRect(3f, 3f, 15f, 15f, 2f, 2f, paint)
-                paint.color = RemoteStyle.background; paint.style = Paint.Style.FILL
+                paint.color = colors.background; paint.style = Paint.Style.FILL
                 canvas.drawRoundRect(8f, 8f, 22f, 22f, 2f, 2f, paint)
                 paint.color = color; paint.style = Paint.Style.STROKE
                 canvas.drawRoundRect(9f, 9f, 21f, 21f, 2f, 2f, paint)
@@ -93,7 +187,7 @@ internal class GlyphDrawable(private val context: Context, private val glyph: Gl
             }
             Glyph.SETTINGS -> {
                 line(4f, 7f, 20f, 7f); line(4f, 17f, 20f, 17f)
-                paint.style = Paint.Style.FILL; paint.color = RemoteStyle.surface
+                paint.style = Paint.Style.FILL; paint.color = colors.surface
                 canvas.drawCircle(9f, 7f, 3f, paint); canvas.drawCircle(15f, 17f, 3f, paint)
                 paint.style = Paint.Style.STROKE; paint.color = color
                 canvas.drawCircle(9f, 7f, 3f, paint); canvas.drawCircle(15f, 17f, 3f, paint)

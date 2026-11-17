@@ -3,4 +3,5 @@
     <item type="id" name="connect" /><item type="id" name="disconnect" />
     <item type="id" name="address" /><item type="id" name="pair" />
     <item type="id" name="settings" />
+    <item type="id" name="pointer_mode" />
 </resources>

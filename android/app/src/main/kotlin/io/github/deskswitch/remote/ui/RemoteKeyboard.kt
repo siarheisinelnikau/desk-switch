@@ -6,11 +6,12 @@ import android.view.View
 import android.view.inputmethod.BaseInputConnection
 import android.view.inputmethod.EditorInfo
 import android.view.inputmethod.InputConnection
+import io.github.deskswitch.remote.R
 
 /** IME composition stays on the phone. Only committed text is sent to the PC. */
 class RemoteKeyboard(context: Context, private val text: (String) -> Unit, private val tap: (Int) -> Unit) : View(context) {
     private var composing = ""
-    init { isFocusable = true; isFocusableInTouchMode = true; contentDescription = "Remote keyboard" }
+    init { isFocusable = true; isFocusableInTouchMode = true; contentDescription = context.getString(R.string.remote_keyboard) }
     override fun onCheckIsTextEditor() = true
     override fun onCreateInputConnection(info: EditorInfo): InputConnection {
         info.inputType = android.text.InputType.TYPE_CLASS_TEXT or android.text.InputType.TYPE_TEXT_FLAG_CAP_SENTENCES

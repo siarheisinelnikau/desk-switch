@@ -13,7 +13,11 @@ Use an Android phone as a keyboard and pointing device for your Desk Switch work
 
 1. Open the experimental build of Desk Switch on the computer and the Android app on the phone. Join the same local network on both devices.
 2. Select the computer on the phone and confirm the matching code on both screens. Desk Switch remembers approved computers and phones.
-3. Use the **Touchpad** or **Joystick** and tap **Keyboard** to type in the computer's focused app. **Controls** saves the speed of each mode separately. Use the power icon in the top bar to disconnect.
+3. Tap the pointer mode icon beside **Controls** to switch between **Touchpad** and **Joystick**. Tap **Keyboard** to type in the computer's focused app. **Controls** saves the speed of each mode separately. Use the power icon in the top bar to disconnect.
+
+The pointing surface fades its hint when you use the remote. It brings the hint back after 15 seconds of inactivity.
+
+Under **Controls → Appearance**, choose a light, dark, or system theme and use the system language or choose English, Russian, German, French, Spanish, or Italian. Appearance settings are saved on the phone.
 
 Use two fingers to scroll, or tap once and drag on the second touch. A second quick tap still double-clicks. Hold the **Scroll** joystick between the left and right mouse buttons and move up or down for continuous scrolling. Moving farther changes the speed. **Controls** lets you disable double-tap scrolling, set the gesture and joystick speeds separately, and reverse the scroll direction.
 
@@ -22,6 +26,18 @@ Use two fingers to scroll, or tap once and drag on the second touch. A second qu
   <img src="../docs/android-joystick.png" width="250" alt="Phone remote in joystick mode">
   <img src="../docs/android-settings.png" width="250" alt="Android controls for input modes, speed, and cursor preview">
 </p>
+
+<details>
+<summary>Light theme and landscape layout</summary>
+
+<p>
+  <img src="../docs/android-light-remote.png" width="250" alt="Light-theme phone remote in Russian">
+  <img src="../docs/android-light-settings.png" width="250" alt="Light-theme controls screen in Russian">
+</p>
+
+![Landscape phone remote with compact title row and pointer mode toggle](../docs/android-landscape.png)
+
+</details>
 
 <details>
 <summary>Finding and pairing a computer</summary>
