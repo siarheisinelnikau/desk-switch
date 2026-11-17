@@ -108,10 +108,9 @@ def main():
                     assert extension('EnableExtension', host) == (True,)
                 wait_for(lambda: extension('GetExtensionInfo', host)[0].get('state') == 1,
                     'The AppIndicator extension did not finish enabling')
-                if extension('GetExtensionInfo', UUID)[0].get('state') != 1:
-                    assert extension('EnableExtension', UUID) == (True,)
-                wait_for(lambda: extension('GetExtensionInfo', UUID)[0].get('state') == 1,
-                    'The tray companion did not finish enabling')
+                assert extension('GetExtensionInfo', UUID)[0].get('state') != 1, 'The test must start with our companion disabled'
+                initial_enabled = shell("global.settings.get_strv('enabled-extensions')")
+                initial_disabled = shell("global.settings.get_strv('disabled-extensions')")
                 wait_for(lambda: call('org.freedesktop.DBus', '/org/freedesktop/DBus',
                     'org.freedesktop.DBus', 'NameHasOwner', '(s)', ('org.kde.StatusNotifierWatcher',))[0],
                     'The native tray watcher did not acquire its private bus name')
@@ -119,9 +118,15 @@ def main():
                 assert native_env.get('DISPLAY'), 'The private GNOME must provide its own XWayland display'
                 env.update({name: value for name, value in native_env.items() if value})
                 env['DESK_SWITCH_PREVIEW_LANGUAGE'] = 'en'
+                env['DESK_SWITCH_PREVIEW_TRAY_SETUP'] = '1'
                 with (args.out / 'application.log').open('w') as app_log:
                     app = subprocess.Popen([str(args.binary.resolve()), 'gui-preview', 'shared-four',
                         '--state-dir', str(home / 'profile')], env=env, stdout=app_log, stderr=app_log)
+                    wait_for(lambda: extension('GetExtensionInfo', UUID)[0].get('state') == 1,
+                        'Application startup did not automatically enable its tray integration')
+                    assert set(shell("global.settings.get_strv('enabled-extensions')")) == set(initial_enabled) | {UUID}
+                    assert shell("global.settings.get_strv('disabled-extensions')") == [item for item in initial_disabled if item != UUID]
+                    assert shell("global.settings.get_boolean('disable-user-extensions')") is False
                     icon = "Object.values(Main.panel.statusArea).find(i => i._indicator?.id === 'desk-switch')"
                     wait_for(lambda: shell(f'Boolean(({icon})?.visible)'), 'The actual AppIndicator did not appear')
                     shell(f'global.deskSwitchTestIcon = () => {icon}; true')
@@ -180,7 +185,7 @@ def main():
                     assert not visible('Desk Switch'), 'Opening the popup also restored the main window'
                     assert app.poll() is None
                     version = subprocess.check_output(['gnome-shell', '--version'], env=env, text=True, timeout=3).strip()
-                    (args.out / 'result.json').write_text(json.dumps({'gnome': version, 'virtual_click_cycles': 3,
+                    (args.out / 'result.json').write_text(json.dumps({'gnome': version, 'automatic_companion_setup': True, 'virtual_click_cycles': 3,
                         'left_click_device_popup': True, 'right_click_native_menu': True, 'hidden_root_popup': True,
                         'scope': 'Actual GNOME/AppIndicator/packaged companion on a private headless compositor; synthetic application and virtual pointer only.'}, indent=2) + '\n')
                     print('PASS: actual GNOME primary clicks open the device popup, secondary clicks open its native menu, and a hidden main window stays hidden.')
