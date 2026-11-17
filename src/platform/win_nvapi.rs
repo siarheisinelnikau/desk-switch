@@ -136,11 +136,11 @@ pub(super) fn prepare(gdi: &str) -> Result<Prepared> {
         "The selected monitor is not driven by NVIDIA"
     );
     // SAFETY: the display handle is live and the array holds the SDK's maximum
-    // 64 physical GPU handles. The first result drives this display's active output.
+    // 64 physical GPU handles. Require one unambiguous physical GPU below.
     let gpu_status = unsafe { gpus(handle, gpu.as_mut_ptr(), &mut count) };
     ensure!(
-        gpu_status == 0 && (1..=64).contains(&count) && !gpu[0].is_null(),
-        "Cannot identify the selected monitor's NVIDIA GPU"
+        gpu_status == 0 && count == 1 && !gpu[0].is_null(),
+        "Cannot unambiguously identify the selected monitor's NVIDIA GPU"
     );
     // SAFETY: the handle identifies that same display and mask is a live output.
     let output_status = unsafe { output(handle, &mut mask) };
