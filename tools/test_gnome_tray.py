@@ -94,6 +94,8 @@ def main():
                                ('disable-user-extensions', 'false')]:
                 subprocess.run(['gsettings', 'set', 'org.gnome.shell', key, value],
                     env=env, check=True, timeout=3, capture_output=True)
+            subprocess.run(['gsettings', 'set', 'org.gnome.desktop.interface', 'enable-animations', 'false'],
+                env=env, check=True, timeout=3, capture_output=True)
             with (args.out / 'shell.log').open('w') as log:
                 compositor = subprocess.Popen(['gnome-shell', '--headless', '--wayland', '--unsafe-mode',
                     '--virtual-monitor=1920x1080', '--wayland-display=desk-switch-test'],
@@ -138,6 +140,17 @@ def main():
                 env.update({name: value for name, value in native_env.items() if value})
                 env['DESK_SWITCH_PREVIEW_LANGUAGE'] = 'en'
                 env['DESK_SWITCH_PREVIEW_TRAY_BACKEND'] = args.backend
+                # A headless seat starts without a physical keyboard. Create
+                # virtual devices before XWayland clients acquire focus, so
+                # their wl_keyboard receives its initial focus/enter event.
+                shell("(async () => { const Clutter = (await import('gi://Clutter')).default; "
+                    "const seat = global.stage.context.get_backend().get_default_seat(); "
+                    "global.deskSwitchTestPointer = seat.create_virtual_device(Clutter.InputDeviceType.POINTER_DEVICE); "
+                    "global.deskSwitchTestKeyboard = seat.create_virtual_device(Clutter.InputDeviceType.KEYBOARD_DEVICE); "
+                    "global.deskSwitchTestKeys = []; global.stage.connect('captured-event', (_stage, event) => { "
+                    "if ([Clutter.EventType.KEY_PRESS, Clutter.EventType.KEY_RELEASE].includes(event.type())) "
+                    "global.deskSwitchTestKeys.push({type: event.type(), code: event.get_key_code(), symbol: event.get_key_symbol()}); "
+                    "return Clutter.EVENT_PROPAGATE; }); return true; })()")
                 if args.backend == 'legacy':
                     # Measure this exact native GTK/XEmbed path before the
                     # click walkthrough. Only synthetic windows are created.
@@ -209,9 +222,6 @@ def main():
                     wait_for(lambda: shell('!Main.layoutManager._startingUp && !Main.overview.visible && !Main.overview.animationInProgress && '
                         'global.deskSwitchTestIcon()?.mapped && global.deskSwitchTestIcon().width > 0 && '
                         'global.deskSwitchTestIcon().height > 0'), 'The panel button is not ready for physical hit testing')
-                    shell("(async () => { const Clutter = (await import('gi://Clutter')).default; "
-                        "const seat = global.stage.context.get_backend().get_default_seat(); global.deskSwitchTestPointer = seat.create_virtual_device(Clutter.InputDeviceType.POINTER_DEVICE); global.deskSwitchTestKeyboard = seat.create_virtual_device(Clutter.InputDeviceType.KEYBOARD_DEVICE); return true; })()")
-
                     def click(button):
                         # Virtual seat requests are asynchronous. Sending motion,
                         # press and release in one Eval can click before the new
@@ -280,6 +290,7 @@ def main():
                         "icon: icon ? {mapped: icon.mapped, position: icon.get_transformed_position(), "
                         "size: [icon.width, icon.height], menu: icon.menu?.isOpen ?? false} : null, "
                         "focus: global.display.focus_window?.get_description(), "
+                        "keyFocus: global.stage.key_focus?.toString(), keyboardEvents: global.deskSwitchTestKeys ?? [], "
                         "overviewAnimating: Main.overview.animationInProgress, "
                         "windows: global.get_window_actors().map(a => { const r = a.meta_window.get_frame_rect(); return {pid: a.meta_window.get_pid(), "
                         "title: a.meta_window.get_title(), visible: a.visible, "
