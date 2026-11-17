@@ -168,7 +168,9 @@ def main():
                 menu('Quit Desk Switch')
                 wait_for(lambda: process.poll() is not None, 'Quit did not exit while the main window was hidden')
                 assert process.returncode == 0, (args.out / 'lifecycle.log').read_text()
-            for case, filename in [('shared-four-quick-controls', 'device-popup.png'), ('shared-four', 'workspace-main.png')]:
+            for case, filename in [('shared-four-quick-controls', 'device-popup.png'),
+                                   ('shared-four', 'workspace-main.png'),
+                                   ('shared-four-settings', 'workspace-settings.png')]:
                 with (args.out / f'{case}-capture.log').open('w') as log:
                     process = subprocess.Popen([str(args.binary.resolve()), 'gui-preview', case,
                         '--state-dir', str(state / case)], env=dict(env,
