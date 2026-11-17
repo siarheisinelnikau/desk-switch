@@ -989,5 +989,10 @@
   "Version restored": "Version wiederhergestellt",
   "Retry sharing": "Freigabe erneut starten",
   "Saved {minutes} min ago": "Vor {minutes} Min. gespeichert",
-  "Saved {hours} h ago": "Vor {hours} Std. gespeichert"
+  "Saved {hours} h ago": "Vor {hours} Std. gespeichert",
+  "Device protocol mismatch: this PC {} (protocol {}), other PC {} (protocol {}). Update the PC with the older protocol.": "Nicht kompatible Geräteprotokolle: dieser PC {} (Protokoll {}), anderer PC {} (Protokoll {}). Aktualisieren Sie den PC mit dem älteren Protokoll.",
+  "Device protocol mismatch: this PC {} (protocol {}), other PC does not report a device protocol. Update that PC.": "Nicht kompatible Geräteprotokolle: dieser PC {} (Protokoll {}), der andere PC meldet kein Geräteprotokoll. Aktualisieren Sie den anderen PC.",
+  "Tray device popup": "Geräte-Popup im Infobereich",
+  "Repair tray popup": "Popup im Infobereich reparieren",
+  "Check tray integration": "Integration im Infobereich prüfen"
 }

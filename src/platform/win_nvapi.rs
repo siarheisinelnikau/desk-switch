@@ -51,7 +51,7 @@ impl Api {
             unsafe { LoadLibraryExW(w!("nvapi64.dll"), null_mut(), LOAD_LIBRARY_SEARCH_SYSTEM32) };
         ensure!(
             !module.is_null(),
-            "LG input switching needs the installed NVIDIA NVAPI driver; no standard input command was sent"
+            "LG input switching needs the installed NVIDIA NVAPI driver; no input command was sent"
         );
         // SAFETY: `module` is our live loaded library, and the symbol is NUL terminated.
         let query = unsafe { GetProcAddress(module, c"nvapi_QueryInterface".as_ptr().cast()) };
@@ -109,7 +109,8 @@ impl Drop for Api {
 }
 
 pub(super) struct Prepared {
-    api: Api,
+    // Own the library/initialization for every borrowed function and GPU handle.
+    _api: Api,
     gpu: Handle,
     output: u32,
     write: Write,
@@ -149,26 +150,26 @@ pub(super) fn prepare(gdi: &str) -> Result<Prepared> {
         "The selected NVIDIA monitor output is ambiguous"
     );
     Ok(Prepared {
-        api,
+        _api: api,
         gpu: gpu[0],
         output: mask,
         write,
     })
 }
 impl Prepared {
-    pub(super) fn write_lg(&self, value: u8) -> Result<()> {
+    pub(super) fn write_input(&self, value: u8) -> Result<()> {
         ensure!(
-            matches!(value, 0x90 | 0x91 | 0xd0),
+            matches!(value, 0x11 | 0x12 | 0x0f),
             "Unsupported LG input value"
         );
-        let mut register = 0x50;
+        let mut source = 0x51;
         let mut packet = crate::video::lg::packet(value);
         let mut info = I2cInfo {
             version: size_of::<I2cInfo>() as u32 | (3 << 16),
             display_mask: self.output,
             ddc_port: 1,
             address: 0x6e,
-            register: &mut register,
+            register: &mut source,
             register_size: 1,
             data: packet.as_mut_ptr(),
             size: packet.len() as u32,
@@ -178,20 +179,66 @@ impl Prepared {
             port_set: 0,
         };
         println!(
-            "LG input write: NVIDIA output {:#x}, source 0x50, VCP 0xf4, value {value:#04x}; one I2C command",
+            "LG input write: NVIDIA output {:#x}, source 0x51, VCP 0x60, value {value:#04x}; one I2C command",
             self.output
         );
-        // SAFETY: API/GPU lifetime is owned by this Prepared instance. repr(C)
-        // matches NV_I2C_INFO_V3, both packet buffers remain live and writable
-        // through this one synchronous call, addressed only to the selected output.
+        // SAFETY: the selected GPU/output and all buffers stay live through
+        // exactly one synchronous SDK call. This is the same transport and
+        // standard packet verified on the physical 27GK750F, without retries.
         let status = unsafe { (self.write)(self.gpu, &mut info) };
         ensure!(
             status == 0,
-            "NVIDIA LG input command failed with status {status}; no retry was sent"
+            "NVIDIA standard input command failed with status {status}; no retry"
         );
-        // Keep the library visibly borrowed until the native call completes.
-        let _ = &self.api;
         Ok(())
+    }
+    #[cfg(test)]
+    pub(super) fn inspect_input_read(&self, source: u8, feature: u8) -> Result<Vec<u8>> {
+        ensure!(
+            matches!((source, feature), (0x51, 0x60) | (0x50, 0xf4)),
+            "Only the two named input-feature reads are supported"
+        );
+        // SAFETY: this ID is the public SDK's I2CRead with the same I2C_INFO ABI.
+        let read: Write = unsafe { self._api.function(0x2fde12c5)? };
+        let mut source = source;
+        // Opcode 0x01 requests a value. It never selects an input (opcode 0x03).
+        let mut query = [0x82, 0x01, feature, 0x6e ^ source ^ 0x82 ^ 0x01 ^ feature];
+        let mut info = I2cInfo {
+            version: size_of::<I2cInfo>() as u32 | (3 << 16),
+            display_mask: self.output,
+            ddc_port: 1,
+            address: 0x6e,
+            register: &mut source,
+            register_size: 1,
+            data: query.as_mut_ptr(),
+            size: query.len() as u32,
+            deprecated_speed: 0xffff,
+            speed: 0,
+            port: 0,
+            port_set: 0,
+        };
+        // SAFETY: all owned buffers and this exact selected output stay live;
+        // the packet requests a value and contains no input-selection opcode.
+        let status = unsafe { (self.write)(self.gpu, &mut info) };
+        ensure!(
+            status == 0,
+            "NVIDIA input query failed with status {status}"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        let mut reply = vec![0; 11];
+        info.address = 0x6f;
+        info.register = null_mut();
+        info.register_size = 0;
+        info.data = reply.as_mut_ptr();
+        info.size = reply.len() as u32;
+        // SAFETY: I2CRead writes only into the live reply buffer; the API and
+        // selected GPU/output outlive the synchronous read.
+        let status = unsafe { read(self.gpu, &mut info) };
+        ensure!(
+            status == 0,
+            "NVIDIA input reply failed with status {status}"
+        );
+        Ok(reply)
     }
 }
 

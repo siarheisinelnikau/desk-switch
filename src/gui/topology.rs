@@ -5,6 +5,9 @@ use eframe::egui::{self, Color32, FontId, Pos2, Rect, RichText, Sense, Stroke, V
 
 const CYAN: Color32 = Color32::from_rgb(75, 196, 244);
 const GREEN: Color32 = Color32::from_rgb(83, 217, 177);
+#[path = "topology_motion.rs"]
+mod motion;
+use motion::{Fade, Phase};
 
 #[derive(Clone, Default, PartialEq)]
 pub(super) struct Scene {
@@ -38,9 +41,13 @@ struct MouseWave {
     angle: f32,
     opacity: f32,
     updated: f64,
+    fade: Fade,
 }
 impl MouseWave {
-    fn update(&mut self, direction: Vec2, active: bool, now: f64) {
+    fn update(&mut self, direction: Vec2, active_until: f64, now: f64) {
+        if now - self.updated > 1.2 {
+            self.fade = Fade::default();
+        }
         let dt = (now - self.updated).clamp(0.0, 0.1) as f32;
         self.updated = now;
         if direction.length_sq() > 0.5 {
@@ -50,11 +57,7 @@ impl MouseWave {
                 - std::f32::consts::PI;
             self.angle += difference * (1.0 - (-dt / 0.18).exp());
         }
-        let target = if active { 1.0 } else { 0.0 };
-        self.opacity += (target - self.opacity) * (1.0 - (-dt / 0.14).exp());
-        if self.opacity < 0.001 {
-            self.opacity = 0.0;
-        }
+        self.opacity = self.fade.update_until(active_until, now);
     }
 }
 
@@ -67,8 +70,9 @@ fn mouse_wave(ui: &egui::Ui, activity: &super::activity::Activity, now: f64) -> 
             angle: activity.direction.angle(),
             opacity: 0.0,
             updated: now,
+            fade: Fade::default(),
         });
-        wave.update(activity.direction, now - activity.moved < 0.65, now);
+        wave.update(activity.direction, activity.moved + 0.65, now);
         data.insert_temp(id, wave);
         wave
     })
@@ -255,17 +259,34 @@ pub(super) fn show(
             } else {
                 super::activity::read(ui)
             };
-            let recent_input = now - activity.moved < 0.85
-                || now - activity.wheel < 0.6
-                || activity.released.iter().any(|t| now - t < 0.6);
-            let animating = !reduced
-                && !ui.input(|i| i.viewport().minimized.unwrap_or(false))
-                && (now < transition || recent_input);
+            let active_until = activity.released.iter().fold(
+                transition
+                    .max(activity.moved + 0.85)
+                    .max(activity.wheel + 0.6),
+                |until, released| until.max(released + 0.6),
+            );
+            let enabled = !reduced && !ui.input(|i| i.viewport().minimized.unwrap_or(false));
+            let feedback = motion::read(
+                ui,
+                now,
+                active_until,
+                std::array::from_fn(|i| {
+                    scene.ports[i].source.is_some()
+                        && !scene.ports[i].muted
+                        && !scene.ports[i].error
+                }),
+                &activity,
+                enabled,
+            );
+            let animating = feedback.animating;
             if animating {
                 ui.ctx()
-                    .request_repaint_after(std::time::Duration::from_millis(60));
+                    .request_repaint_after(std::time::Duration::from_millis(33));
             }
-            let phase = animating.then_some((now % 120.0) as f32);
+            let phase = animating.then_some(Phase {
+                time: now,
+                opacity: feedback.opacity,
+            });
             let mouse_wave = mouse_wave(ui, &activity, now);
             let device_y = rect.bottom() - if compact { 33.0 } else { 69.0 };
             let slot_width = rect.width() / 5.0;
@@ -308,11 +329,12 @@ pub(super) fn show(
                     continue;
                 };
                 let color = super::view::contrast_color(scene.peers[source].color, dark);
-                let active_phase = if port.muted || port.error {
-                    None
-                } else {
-                    phase
-                };
+                let active_phase = phase
+                    .map(|phase| Phase {
+                        opacity: feedback.ports[index],
+                        ..phase
+                    })
+                    .filter(|phase| phase.opacity > 0.0);
                 let device = devices[index] - egui::vec2(0.0, if compact { 17.0 } else { 34.0 });
                 let start = peer_rects[source].center_bottom()
                     + egui::vec2((index as f32 - 2.0) * if compact { 3.0 } else { 6.0 }, 0.0);
@@ -517,8 +539,7 @@ pub(super) fn show(
                             center - egui::vec2(0.0, 8.0),
                             if compact { 0.48 } else { 1.18 },
                             [color, surface],
-                            &activity,
-                            now,
+                            &feedback.keys,
                             phase,
                         );
                     } else {
@@ -530,17 +551,23 @@ pub(super) fn show(
                             icon_center,
                             scale,
                             color,
-                            &activity,
                             &mouse_wave,
+                            &feedback,
                             phase,
                         );
                     }
                     if matches!(index, 0 | 4)
-                        && port.source.is_some()
-                        && !port.muted
-                        && let Some(time) = phase
+                        && feedback.ports[index] > 0.0
+                        && let Some(phase) = phase
                     {
-                        waveform(&painter, icon_center, scale, color, time, index);
+                        waveform(
+                            &painter,
+                            icon_center,
+                            scale,
+                            color.gamma_multiply(feedback.ports[index]),
+                            phase.time.rem_euclid(std::f64::consts::TAU / 8.0) as f32,
+                            index,
+                        );
                     }
                 }
                 if port.muted || port.error {
@@ -642,7 +669,7 @@ fn cable(
     painter: &egui::Painter,
     endpoints: [Pos2; 2],
     color: Color32,
-    phase: Option<f32>,
+    phase: Option<Phase>,
     receiving: bool,
     compact: bool,
     index: usize,
@@ -690,11 +717,11 @@ fn cable(
     for endpoint in [start, end] {
         painter.circle_filled(endpoint, if compact { 1.7 } else { 2.5 }, color);
     }
-    if let Some(time) = phase {
+    if let Some(phase) = phase {
         // Both segments carry a slow continuous stream. The receiving segment
         // follows the source segment in the same host -> device -> peer direction.
-        let t =
-            (time / 3.8 - index as f32 * 0.06 - if receiving { 0.5 } else { 0.0 }).rem_euclid(1.0);
+        let t = (phase.time / 3.8 - index as f64 * 0.06 - if receiving { 0.5 } else { 0.0 })
+            .rem_euclid(1.0) as f32;
         let head = point(points, t);
         let trail_start = (t - 0.10).max(0.0);
         let trail = (0..=8)
@@ -703,7 +730,10 @@ fn cable(
         if t > 0.0001 {
             painter.add(egui::Shape::line(
                 trail,
-                Stroke::new(if compact { 1.8 } else { 2.5 }, color),
+                Stroke::new(
+                    if compact { 1.8 } else { 2.5 },
+                    color.gamma_multiply(phase.opacity),
+                ),
             ));
         }
         arrow(
@@ -711,9 +741,9 @@ fn cable(
             head,
             point(points, (t + 0.015).min(1.0)) - point(points, (t - 0.015).max(0.0)),
             if painter.ctx().theme() == egui::Theme::Dark {
-                Color32::WHITE
+                Color32::WHITE.gamma_multiply(phase.opacity)
             } else {
-                color
+                color.gamma_multiply(phase.opacity)
             },
             if compact { 2.2 } else { 3.4 },
         );
@@ -744,7 +774,7 @@ fn computer(
     scale: f32,
     colors: [Color32; 2],
     host: bool,
-    phase: Option<f32>,
+    phase: Option<Phase>,
 ) {
     let [color, bg] = colors;
     let pt = |x, y| center + egui::vec2(x, y) * scale;
@@ -762,11 +792,11 @@ fn computer(
             [pt(-9.0, 24.0), pt(9.0, 24.0)],
             Stroke::new(2.0 * scale, bg),
         );
-        if let Some(time) = phase {
-            let x = -23.0 + (time / 4.0).fract() * 46.0;
+        if let Some(phase) = phase {
+            let x = -23.0 + (phase.time / 4.0).fract() as f32 * 46.0;
             p.line_segment(
                 [pt(x - 4.0, 11.0), pt(x + 4.0, 11.0)],
-                Stroke::new(1.8 * scale, color),
+                Stroke::new(1.8 * scale, color.gamma_multiply(phase.opacity)),
             );
         }
     } else {
@@ -781,11 +811,11 @@ fn computer(
             );
         }
         p.circle_filled(pt(0.0, 1.0), 2.7 * scale, color);
-        if let Some(time) = phase {
+        if let Some(phase) = phase {
             p.circle_stroke(
                 pt(0.0, 1.0),
-                (5.3 + (time * 1.8).sin() * 0.9) * scale,
-                Stroke::new(scale, color.gamma_multiply(0.5)),
+                (5.3 + (phase.time * 1.8).sin() as f32 * 0.9) * scale,
+                Stroke::new(scale, color.gamma_multiply(0.5 * phase.opacity)),
             );
         }
     }
@@ -798,7 +828,7 @@ fn display(
     color: Color32,
     bg: Color32,
     caption: &str,
-    phase: Option<f32>,
+    phase: Option<Phase>,
 ) {
     let screen = Rect::from_center_size(center, egui::vec2(122.0, 72.0) * scale);
     p.rect_filled(screen.expand(4.0 * scale), 9, color.gamma_multiply(0.05));
@@ -811,7 +841,9 @@ fn display(
     );
     let inner = screen.shrink(5.0 * scale);
     p.rect_filled(inner, 3, Color32::from_rgb(13, 53, 75));
-    let shift = phase.map(|t| (t * 2.0).sin() * 3.0 * scale).unwrap_or(0.0);
+    let shift = phase
+        .map(|p| (p.time * 2.0).sin() as f32 * 3.0 * scale * p.opacity)
+        .unwrap_or(0.0);
     for (offset, tint) in [
         (0.0, Color32::from_rgb(17, 77, 105)),
         (16.0, Color32::from_rgb(23, 105, 131)),
@@ -903,9 +935,8 @@ fn keyboard(
     center: Pos2,
     scale: f32,
     colors: [Color32; 2],
-    activity: &super::activity::Activity,
-    now: f64,
-    phase: Option<f32>,
+    keys: &[f32; 66],
+    phase: Option<Phase>,
 ) {
     let [color, bg] = colors;
     let bounds = Rect::from_center_size(center, egui::vec2(120.0, 48.0) * scale);
@@ -916,9 +947,9 @@ fn keyboard(
         Stroke::new(1.4 * scale, color),
         egui::StrokeKind::Inside,
     );
-    let sweep = phase.map(|time| (time / 5.0).fract() * 14.0);
+    let sweep = phase.map(|phase| ((phase.time / 5.0).fract() as f32 * 14.0, phase.opacity));
     let mut bottom_x = -55.0;
-    for index in 0..66 {
+    for (index, &lit) in keys.iter().enumerate() {
         let (x, y, width) = if index < 56 {
             (
                 -55.0 + (index % 14) as f32 * 8.0,
@@ -931,25 +962,27 @@ fn keyboard(
             bottom_x += width + 2.0;
             (x, 14.0, width)
         };
-        let recent = (now - activity.released[index]).clamp(0.0, 0.32) < 0.32;
-        let lit = activity.keys[index] || recent;
-        let glow = sweep.is_some_and(|s| (s - (index % 14) as f32).abs() < 1.2);
+        let glow = sweep
+            .map(|(s, opacity)| {
+                let distance = (s - (index % 14) as f32 + 7.0).rem_euclid(14.0) - 7.0;
+                (1.0 - distance.abs() / 1.2).clamp(0.0, 1.0) * opacity
+            })
+            .unwrap_or(0.0);
         let rect = Rect::from_min_size(
             center + egui::vec2(x, y) * scale,
             egui::vec2(width, 5.0) * scale,
         );
-        if lit {
-            p.rect_filled(rect.expand(scale), 1, color.gamma_multiply(0.22));
+        if lit > 0.0 {
+            p.rect_filled(rect.expand(scale), 1, color.gamma_multiply(0.22 * lit));
         }
-        p.rect_filled(
-            rect,
-            1,
-            if lit {
-                Color32::from_rgb(219, 249, 255)
-            } else {
-                color.gamma_multiply(if glow { 0.8 } else { 0.28 })
-            },
-        );
+        p.rect_filled(rect, 1, color.gamma_multiply(0.28 + 0.52 * glow));
+        if lit > 0.0 {
+            p.rect_filled(
+                rect,
+                1,
+                Color32::from_rgb(219, 249, 255).gamma_multiply(lit),
+            );
+        }
     }
 }
 
@@ -958,46 +991,44 @@ fn mouse_motion(
     center: Pos2,
     scale: f32,
     color: Color32,
-    activity: &super::activity::Activity,
     wave: &MouseWave,
-    phase: Option<f32>,
+    feedback: &motion::Frame,
+    phase: Option<Phase>,
 ) {
-    let now = wave.updated;
-    let Some(time) = phase else {
-        return;
-    };
-    let wheel = center + egui::vec2(0.0, -7.0 + (time * 1.5).sin()) * scale;
-    p.line_segment(
-        [
-            wheel - egui::vec2(0.0, 1.7 * scale),
-            wheel + egui::vec2(0.0, 1.7 * scale),
-        ],
-        Stroke::new(
-            1.8 * scale,
-            if now - activity.wheel < 0.4 {
-                Color32::WHITE
-            } else {
-                color
-            },
-        ),
-    );
     for (index, x) in [-3.5, 3.5].into_iter().enumerate() {
-        if activity.buttons[index] {
+        if feedback.buttons[index] > 0.0 {
             p.rect_filled(
                 Rect::from_center_size(
                     center + egui::vec2(x, -6.0) * scale,
                     egui::vec2(4.0, 6.0) * scale,
                 ),
                 2,
-                Color32::WHITE,
+                Color32::WHITE.gamma_multiply(feedback.buttons[index]),
             );
         }
     }
+    let Some(phase) = phase else {
+        return;
+    };
+    let wheel =
+        center + egui::vec2(0.0, -7.0 + (phase.time * 1.5).sin() as f32 * phase.opacity) * scale;
+    let wheel_color = Color32::from(
+        egui::Rgba::from(color) * (1.0 - feedback.wheel) + egui::Rgba::WHITE * feedback.wheel,
+    )
+    .gamma_multiply(phase.opacity);
+    p.line_segment(
+        [
+            wheel - egui::vec2(0.0, 1.7 * scale),
+            wheel + egui::vec2(0.0, 1.7 * scale),
+        ],
+        Stroke::new(1.8 * scale, wheel_color),
+    );
     if wave.opacity > 0.0 {
         for index in 0..3 {
-            let progress = (time * 0.7 + index as f32 / 3.0).fract();
+            let progress = (phase.time * 0.7 + index as f64 / 3.0).fract() as f32;
             let distance = 16.0 + progress * 15.0;
-            let opacity = wave.opacity * (std::f32::consts::PI * progress).sin().powi(2);
+            let opacity =
+                wave.opacity * phase.opacity * (std::f32::consts::PI * progress).sin().powi(2);
             let points = (0..=12)
                 .map(|i| {
                     let a = wave.angle - 0.55 + i as f32 / 12.0 * 1.1;
@@ -1024,19 +1055,24 @@ mod tests {
             angle: initial,
             opacity: 0.0,
             updated: 0.0,
+            fade: Fade::default(),
         };
-        wave.update(target, true, 0.016);
+        wave.update(target, f64::INFINITY, 0.016);
         assert!(wave.angle > initial && wave.angle < initial + 2.0_f32.to_radians());
+        assert_eq!(wave.opacity, 0.0);
+        wave.update(target, f64::INFINITY, 0.032);
         assert!(wave.opacity > 0.0 && wave.opacity < 1.0);
         for frame in 2..=100 {
-            wave.update(target, true, frame as f64 * 0.016);
+            wave.update(target, f64::INFINITY, frame as f64 * 0.016);
         }
         assert!(wave.opacity > 0.99);
         let before = wave.opacity;
-        wave.update(target, false, 1.616);
+        wave.update(target, 1.616, 1.616);
+        assert_eq!(wave.opacity, before);
+        wave.update(target, 1.616, 1.632);
         assert!(wave.opacity > 0.0 && wave.opacity < before);
         for frame in 102..=220 {
-            wave.update(target, false, frame as f64 * 0.016);
+            wave.update(target, 1.616, frame as f64 * 0.016);
         }
         assert_eq!(wave.opacity, 0.0);
     }
@@ -1144,7 +1180,8 @@ mod tests {
         for time in [0.1, 0.2, 0.36] {
             assert!(repaint_delay(&ctx, &scene, time, false) < std::time::Duration::MAX);
         }
-        for time in [0.6, 4.0, 60.0] {
+        assert!(repaint_delay(&ctx, &scene, 0.6, false) < std::time::Duration::MAX);
+        for time in [1.3, 4.0, 60.0] {
             assert_eq!(
                 settled_repaint_delay(&ctx, &scene, time, false),
                 std::time::Duration::MAX
@@ -1155,7 +1192,7 @@ mod tests {
         assert!(repaint_delay(&ctx, &changed, 60.1, false) < std::time::Duration::MAX);
         assert!(repaint_delay(&ctx, &changed, 60.3, false) < std::time::Duration::MAX);
         assert_eq!(
-            settled_repaint_delay(&ctx, &changed, 61.0, false),
+            settled_repaint_delay(&ctx, &changed, 61.4, false),
             std::time::Duration::MAX
         );
     }

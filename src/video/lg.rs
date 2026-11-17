@@ -1,10 +1,10 @@
-//! LG's private input-selection protocol. Logical port values stay MCCS values
-//! in saved settings and on the wire; translation happens only at the device.
+//! Model identification and standard MCCS input packets for the LG 27GK750F.
+//! This model uses VCP 0x60, not the private 0xf4 dialect of some other LGs.
 use anyhow::{Result, bail};
 
 pub fn input(edid: &[u8], logical: u16) -> Result<Option<u8>> {
-    // Use this workaround only for the identified model, never for every LG or
-    // merely because a monitor happens to advertise a manufacturer VCP feature.
+    // Use the NVIDIA transport only for the identified model, never for every
+    // LG or merely because a monitor advertises a manufacturer VCP feature.
     if edid.len() < 128
         || !edid.starts_with(&[0, 255, 255, 255, 255, 255, 255, 0])
         || edid[8..10] != [0x1e, 0x6d]
@@ -26,9 +26,7 @@ pub fn input(edid: &[u8], logical: u16) -> Result<Option<u8>> {
         return Ok(None);
     }
     Ok(Some(match logical {
-        0x11 => 0x90,
-        0x12 => 0x91,
-        0x0f => 0xd0,
+        0x11 | 0x12 | 0x0f => logical as u8,
         other => bail!(
             "LG 27GK750F does not have configured input 0x{other:04x}; choose HDMI 1, HDMI 2 or DisplayPort"
         ),
@@ -37,8 +35,8 @@ pub fn input(edid: &[u8], logical: u16) -> Result<Option<u8>> {
 
 #[cfg(any(windows, test))]
 pub fn packet(value: u8) -> [u8; 6] {
-    let mut packet = [0x84, 0x03, 0xf4, 0, value, 0];
-    packet[5] = packet[..5].iter().fold(0x6e ^ 0x50, |sum, byte| sum ^ byte);
+    let mut packet = [0x84, 0x03, 0x60, 0, value, 0];
+    packet[5] = packet[..5].iter().fold(0x6e ^ 0x51, |sum, byte| sum ^ byte);
     packet
 }
 
@@ -56,16 +54,17 @@ pub fn fixture() -> Vec<u8> {
 mod tests {
     use super::*;
     #[test]
-    fn model_specific_input_packets_use_the_lg_source_address() {
+    fn identified_lg_uses_standard_mccs_packets_in_both_directions() {
         let mut edid = fixture();
-        assert_eq!(input(&edid, 0x11).unwrap(), Some(0x90));
-        assert_eq!(input(&edid, 0x12).unwrap(), Some(0x91));
-        assert_eq!(input(&edid, 0x0f).unwrap(), Some(0xd0));
+        assert_eq!(input(&edid, 0x11).unwrap(), Some(0x11));
+        assert_eq!(input(&edid, 0x12).unwrap(), Some(0x12));
+        assert_eq!(input(&edid, 0x0f).unwrap(), Some(0x0f));
         assert!(input(&edid, 0x10).is_err());
-        for value in [0x90, 0x91, 0xd0] {
+        assert_eq!(packet(0x11), [0x84, 0x03, 0x60, 0x00, 0x11, 0xc9]);
+        for value in [0x11, 0x12, 0x0f] {
             let bytes = packet(value);
-            assert_eq!(&bytes[..5], &[0x84, 0x03, 0xf4, 0, value]);
-            assert_eq!(bytes.iter().fold(0x6e ^ 0x50, |sum, byte| sum ^ byte), 0);
+            assert_eq!(&bytes[..5], &[0x84, 0x03, 0x60, 0, value]);
+            assert_eq!(bytes.iter().fold(0x6e ^ 0x51, |sum, byte| sum ^ byte), 0);
         }
         edid[59] = b'X';
         assert_eq!(input(&edid, 0x11).unwrap(), None);

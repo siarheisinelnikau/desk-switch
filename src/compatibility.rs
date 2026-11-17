@@ -54,26 +54,7 @@ impl Version {
     }
 
     fn compatible(&self, peer: &Self) -> bool {
-        if self.protocol != peer.protocol {
-            return false;
-        }
-        if self.app == peer.app {
-            return true;
-        }
-        let (Ok(local), Ok(remote)) = (
-            semver::Version::parse(&self.app),
-            semver::Version::parse(&peer.app),
-        ) else {
-            return false;
-        };
-        local.major == remote.major
-            && local.minor == remote.minor
-            && (local.major, local.minor) >= (0, 9)
-            && local.patch.abs_diff(remote.patch) <= 1
-            && local.pre.is_empty()
-            && remote.pre.is_empty()
-            && local.build.is_empty()
-            && remote.build.is_empty()
+        self.protocol == peer.protocol
     }
 
     pub fn require(&self, peer: Option<&Self>) -> Result<()> {
@@ -99,13 +80,13 @@ impl fmt::Display for Mismatch {
         if let Some(peer) = &self.peer {
             write!(
                 f,
-                "Incompatible versions: this PC {} (protocol {}), other PC {} (protocol {}). Update both PCs to the same version.",
+                "Device protocol mismatch: this PC {} (protocol {}), other PC {} (protocol {}). Update the PC with the older protocol.",
                 self.local.app, self.local.protocol, peer.app, peer.protocol
             )
         } else {
             write!(
                 f,
-                "Incompatible versions: this PC {} (protocol {}), other PC does not report a version (legacy client). Update both PCs to the same version.",
+                "Device protocol mismatch: this PC {} (protocol {}), other PC does not report a device protocol. Update that PC.",
                 self.local.app, self.local.protocol
             )
         }
@@ -131,19 +112,27 @@ mod tests {
         let legacy = local.require(None).unwrap_err().to_string();
         assert_eq!(
             crate::i18n::tr_language("en", &known),
-            "Incompatible versions: this PC 0.4.3 (protocol 5), other PC 0.4.2 (protocol 4). Update both PCs to the same version."
+            "Device protocol mismatch: this PC 0.4.3 (protocol 5), other PC 0.4.2 (protocol 4). Update the PC with the older protocol."
         );
         assert_eq!(
             crate::i18n::tr_language("en", &legacy),
-            "Incompatible versions: this PC 0.4.3 (protocol 5), other PC does not report a version (legacy client). Update both PCs to the same version."
+            "Device protocol mismatch: this PC 0.4.3 (protocol 5), other PC does not report a device protocol. Update that PC."
         );
         for (language, prefix, protocol) in [
-            ("en", "Incompatible versions:", "protocol"),
-            ("ru", "Несовместимые версии:", "протокол"),
-            ("de", "Inkompatible Versionen:", "Protokoll"),
-            ("fr", "Versions incompatibles :", "protocole"),
-            ("es", "Versiones incompatibles:", "protocolo"),
-            ("it", "Versioni incompatibili:", "protocollo"),
+            ("en", "Device protocol mismatch:", "protocol"),
+            ("ru", "Несовместимые протоколы устройств:", "протокол"),
+            ("de", "Nicht kompatible Geräteprotokolle:", "Protokoll"),
+            ("fr", "Protocoles d’appareil incompatibles :", "protocole"),
+            (
+                "es",
+                "Protocolos de dispositivos incompatibles:",
+                "protocolo",
+            ),
+            (
+                "it",
+                "Protocolli dei dispositivi incompatibili:",
+                "protocollo",
+            ),
         ] {
             let translated = crate::i18n::tr_language(language, &known);
             let translated_legacy = crate::i18n::tr_language(language, &legacy);
@@ -170,28 +159,27 @@ mod tests {
     }
 
     #[test]
-    fn adjacent_stable_patches_share_only_the_same_wire_protocol() {
+    fn application_versions_do_not_gate_a_matching_device_protocol() {
         let local = Version {
             app: "0.9.1".into(),
             protocol: 9,
         };
-        for app in ["0.9.0", "0.9.2"] {
-            assert!(
-                local
-                    .require(Some(&Version {
-                        app: app.into(),
-                        protocol: 9
-                    }))
-                    .is_ok()
-            );
-        }
-        for (app, protocol) in [
-            ("0.9.2", 10),
-            ("0.9.3", 9),
-            ("0.9.2-rc.1", 9),
-            ("0.10.0", 9),
-            ("0.8.1", 9),
+        for app in [
+            "0.9.0",
+            "0.9.3",
+            "0.11.2",
+            "1.2.3",
+            "0.11.3-rc.1+test",
+            "development",
         ] {
+            let peer = Version {
+                app: app.into(),
+                protocol: 9,
+            };
+            assert!(local.require(Some(&peer)).is_ok(), "{app}");
+            assert!(peer.require(Some(&local)).is_ok(), "{app}");
+        }
+        for (app, protocol) in [("0.9.2", 10), ("0.9.1", 8), ("0.11.3", 10)] {
             assert!(
                 local
                     .require(Some(&Version {
@@ -204,7 +192,7 @@ mod tests {
     }
 
     #[test]
-    fn requires_exact_app_and_protocol_and_rejects_legacy_payloads() {
+    fn requires_a_matching_protocol_and_rejects_legacy_payloads() {
         let current = Version::current();
         assert_eq!(
             Version::decode(&current.encode().unwrap()).unwrap(),
@@ -217,7 +205,7 @@ mod tests {
                     app: format!("{VERSION}-different"),
                     ..current.clone()
                 }))
-                .is_err()
+                .is_ok()
         );
         assert!(
             current

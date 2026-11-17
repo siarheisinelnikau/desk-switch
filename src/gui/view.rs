@@ -308,6 +308,18 @@ pub(super) fn paint_device(
 ) {
     let point = |x, y| center + Vec2::new(x, y) * scale;
     let stroke = |width: f32| Stroke::new((width * scale).max(0.8), color);
+    let bar = |from: egui::Pos2, to: egui::Pos2| {
+        let pixels = painter.ctx().pixels_per_point();
+        let rect = egui::Rect::from_two_pos(from, to).expand(stroke(1.5).width * 0.5);
+        let min = (rect.min.to_vec2() * pixels).round() / pixels;
+        let max =
+            ((rect.max.to_vec2() * pixels).round() / pixels).max(min + Vec2::splat(1.0 / pixels));
+        painter.rect_filled(
+            egui::Rect::from_min_max(min.to_pos2(), max.to_pos2()),
+            0,
+            color,
+        );
+    };
     match icon {
         DeviceIcon::Keyboard => {
             let rect = egui::Rect::from_center_size(center, Vec2::new(36.0, 22.0) * scale);
@@ -354,16 +366,21 @@ pub(super) fn paint_device(
                 stroke(1.6),
                 egui::StrokeKind::Inside,
             );
-            for (from, to) in [
-                ((-9.0, 0.0), (-9.0, 5.0)),
-                ((9.0, 0.0), (9.0, 5.0)),
-                ((-9.0, 5.0), (0.0, 10.0)),
-                ((9.0, 5.0), (0.0, 10.0)),
-                ((0.0, 10.0), (0.0, 15.0)),
-                ((-5.0, 15.0), (5.0, 15.0)),
-            ] {
-                painter.line_segment([point(from.0, from.1), point(to.0, to.1)], stroke(1.5));
-            }
+            painter.add(egui::Shape::line(
+                [
+                    (-9.0, 0.0),
+                    (-9.0, 5.0),
+                    (0.0, 10.0),
+                    (9.0, 5.0),
+                    (9.0, 0.0),
+                ]
+                .into_iter()
+                .map(|(x, y)| point(x, y))
+                .collect(),
+                stroke(1.5),
+            ));
+            bar(point(0.0, 10.0), point(0.0, 15.0));
+            bar(point(-5.0, 15.0), point(5.0, 15.0));
         }
         DeviceIcon::Display => {
             painter.rect_stroke(
@@ -372,8 +389,8 @@ pub(super) fn paint_device(
                 stroke(1.5),
                 egui::StrokeKind::Inside,
             );
-            painter.line_segment([point(0.0, 7.0), point(0.0, 13.0)], stroke(1.5));
-            painter.line_segment([point(-8.0, 13.0), point(8.0, 13.0)], stroke(1.5));
+            bar(point(0.0, 7.0), point(0.0, 13.0));
+            bar(point(-8.0, 13.0), point(8.0, 13.0));
         }
     }
 }
@@ -2553,6 +2570,10 @@ impl Desktop {
         self.cable_open = open;
     }
 }
+
+#[cfg(test)]
+#[path = "view_icons.rs"]
+mod icon_raster_tests;
 
 #[cfg(test)]
 mod workspace_visual_tests {
