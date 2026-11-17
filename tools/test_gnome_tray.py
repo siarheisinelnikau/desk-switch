@@ -99,6 +99,18 @@ def main():
                     'The private extension loader did not start')
                 shell('(async () => { await Main.extensionManager._initializationPromise; return true; })()')
                 shell('Main.overview.hide(); true')
+                # A real package can be installed after login. Shell does not
+                # discover new local UUIDs in that already running session.
+                # Exercise that boundary instead of promising a hot install.
+                probe_uuid = 'desk-switch-discovery-probe@siarheisinelnikau'
+                probe = data / 'gnome-shell/extensions' / probe_uuid
+                probe.mkdir(parents=True)
+                probe_metadata = json.loads((ROOT / 'packaging/linux/gnome-extension/metadata.json').read_text())
+                probe_metadata['uuid'] = probe_uuid
+                (probe / 'metadata.json').write_text(json.dumps(probe_metadata))
+                (probe / 'extension.js').write_text('export default class Probe { enable() {} disable() {} }\n')
+                assert extension('GetExtensionInfo', probe_uuid) == ({},)
+                assert extension('EnableExtension', probe_uuid) == (False,), 'GNOME unexpectedly discovered a new local UUID at runtime'
                 available = call('org.gnome.Shell.Extensions', '/org/gnome/Shell/Extensions',
                     'org.gnome.Shell.Extensions', 'ListExtensions', '()', ())[0]
                 host = next((uuid for uuid in ['ubuntu-appindicators@ubuntu.com', 'appindicatorsupport@rgcjonas.gmail.com']
@@ -185,7 +197,8 @@ def main():
                     assert not visible('Desk Switch'), 'Opening the popup also restored the main window'
                     assert app.poll() is None
                     version = subprocess.check_output(['gnome-shell', '--version'], env=env, text=True, timeout=3).strip()
-                    (args.out / 'result.json').write_text(json.dumps({'gnome': version, 'automatic_companion_setup': True, 'virtual_click_cycles': 3,
+                    (args.out / 'result.json').write_text(json.dumps({'gnome': version, 'automatic_companion_setup': True,
+                        'new_local_extension_requires_new_session': True, 'virtual_click_cycles': 3,
                         'left_click_device_popup': True, 'right_click_native_menu': True, 'hidden_root_popup': True,
                         'scope': 'Actual GNOME/AppIndicator/packaged companion on a private headless compositor; synthetic application and virtual pointer only.'}, indent=2) + '\n')
                     print('PASS: actual GNOME primary clicks open the device popup, secondary clicks open its native menu, and a hidden main window stays hidden.')

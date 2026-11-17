@@ -90,7 +90,7 @@ impl Native {
             // GNOME does not offer a general background data-control protocol.
             // Never silently use an Xwayland clipboard with different content.
             Gnome::new().map(Self::Gnome).context(
-                "Enable or reload Desk Switch Tray in GNOME Extensions to share files on Wayland",
+                "The GNOME tray integration is unavailable. Check Application > Tray device popup; a new desktop session may be required after installation",
             )
         } else {
             X11::new().map(Self::X11)
@@ -120,7 +120,7 @@ impl Gnome {
         let version: u32 = proxy.call("Version", &())?;
         ensure!(
             version >= 2,
-            "Reload Desk Switch Tray in GNOME Extensions to enable on-demand file copy and move"
+            "Sign out and sign back in to load the updated GNOME file clipboard integration"
         );
         Ok(Self {
             connection,
@@ -142,7 +142,7 @@ impl Gnome {
                 self.paths = None;
                 self.refresh = true;
                 return Err(error).context(
-                        "Enable or reload Desk Switch Tray in GNOME Extensions to share files on Wayland",
+                        "The GNOME tray integration is unavailable. Check Application > Tray device popup; a new desktop session may be required after installation",
                     );
             }
         };
@@ -190,7 +190,7 @@ impl Gnome {
             )
         };
         let (accepted, serial): (bool, u32) = result.context(
-            "Enable or reload Desk Switch Tray in GNOME Extensions to share files on Wayland",
+            "The GNOME tray integration is unavailable. Check Application > Tray device popup; a new desktop session may be required after installation",
         )?;
         ensure!(
             serial != 0,

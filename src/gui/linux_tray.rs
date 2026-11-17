@@ -263,8 +263,8 @@ mod tests {
             });
             true
         }
-        fn reload_extension(&self, _: &str) -> zbus::fdo::Result<()> {
-            panic!("ReloadExtension is unsupported on the supported GNOME releases");
+        fn reload_extension(&self, uuid: &str) -> zbus::fdo::Result<()> {
+            panic!("ReloadExtension is unsupported on the supported GNOME releases: {uuid}");
         }
     }
     struct Bridge(Arc<Desktop>);
