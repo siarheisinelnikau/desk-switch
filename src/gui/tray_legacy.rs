@@ -1,6 +1,8 @@
 //! GTK's native XEmbed tray, also used by DownloadManager. GNOME's standard
 //! AppIndicator host forwards these clicks without an application companion.
 use super::{Action, State, dispatch, entries, icon_rgba};
+#[path = "tray_legacy_shape.rs"]
+mod shape;
 use eframe::egui;
 use gtk::{
     gdk, gdk_pixbuf,
@@ -36,9 +38,7 @@ impl Tray {
         if std::env::var("DESK_SWITCH_PREVIEW_TRAY_BACKEND").as_deref() == Ok("sni") {
             return None;
         }
-        if std::env::var_os("DISPLAY").is_none() {
-            return None;
-        }
+        std::env::var_os("DISPLAY")?;
         let (ready, receiver) = mpsc::sync_channel(1);
         #[allow(deprecated)]
         let (updates, messages) = MainContext::channel(Priority::DEFAULT);
@@ -77,6 +77,7 @@ impl Tray {
                     return;
                 }
                 online.store(true, Ordering::Relaxed);
+                let _shape = shape::follow(&icon);
                 let changed = online.clone();
                 let changed_ctx = ctx.clone();
                 icon.connect_notify_local(Some("embedded"), move |icon, _| {

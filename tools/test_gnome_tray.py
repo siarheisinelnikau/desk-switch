@@ -202,7 +202,7 @@ def main():
                             f"global.deskSwitchTestPointer.notify_button(GLib.get_monotonic_time(), {button}, Clutter.ButtonState.RELEASED); return true; }})()")
                         wait_for(lambda: shell(f'(global.get_pointer()[2] & {mask}) === 0'), 'The virtual button release was not delivered')
 
-                    for _ in range(3):
+                    for cycle in range(3):
                         click(1)
                         wait_for(lambda: visible('Desk Switch quick controls'), 'A completed left-click did not open the device popup')
                         assert not menu_visible(), 'Left-click opened the native menu'
@@ -210,6 +210,11 @@ def main():
                         wait_for(lambda: not visible('Desk Switch quick controls'), 'A second left-click did not dismiss the popup')
                         click(3)
                         wait_for(menu_visible, 'Right-click did not open the native menu')
+                        if cycle == 0:
+                            success, _ = call('org.gnome.Shell.Screenshot', '/org/gnome/Shell/Screenshot',
+                                'org.gnome.Shell.Screenshot', 'Screenshot', '(bbs)',
+                                (False, False, str(args.out.resolve() / 'native-tray-menu.png')))
+                            assert success, 'The private desktop did not save the native tray/menu proof'
                         if args.backend == 'sni':
                             shell('global.deskSwitchTestIcon().menu.close(); true')
                         else:

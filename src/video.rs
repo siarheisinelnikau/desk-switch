@@ -10,6 +10,7 @@ use std::{
 };
 use tokio::sync::oneshot;
 
+#[cfg(any(windows, target_os = "linux", test))]
 pub(crate) mod lg;
 
 pub const SETTLE: Duration = Duration::from_millis(600);
