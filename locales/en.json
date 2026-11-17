@@ -989,5 +989,10 @@
   "Version restored": "Version restored",
   "Retry sharing": "Retry sharing",
   "Saved {minutes} min ago": "Saved {minutes} min ago",
-  "Saved {hours} h ago": "Saved {hours} h ago"
+  "Saved {hours} h ago": "Saved {hours} h ago",
+  "Device protocol mismatch: this PC {} (protocol {}), other PC {} (protocol {}). Update the PC with the older protocol.": "Device protocol mismatch: this PC {} (protocol {}), other PC {} (protocol {}). Update the PC with the older protocol.",
+  "Device protocol mismatch: this PC {} (protocol {}), other PC does not report a device protocol. Update that PC.": "Device protocol mismatch: this PC {} (protocol {}), other PC does not report a device protocol. Update that PC.",
+  "Tray device popup": "Tray device popup",
+  "Repair tray popup": "Repair tray popup",
+  "Check tray integration": "Check tray integration"
 }

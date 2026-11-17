@@ -268,7 +268,67 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn both_channels_reject_app_or_protocol_mismatch_on_both_pcs() {
+    async fn both_native_channels_exchange_encrypted_data_across_application_versions() {
+        use crate::compatibility::{PROTOCOL, Version};
+        for prologue in [
+            b"Desk Switch protocol 1".as_slice(),
+            b"Desk Switch audio 1".as_slice(),
+        ] {
+            let host = identity();
+            let peer = identity();
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let client = async {
+                let mut stream = TcpStream::connect(address).await.unwrap();
+                authenticate_versioned(
+                    &mut stream,
+                    &host,
+                    &peer.public,
+                    true,
+                    prologue,
+                    &Version {
+                        app: "0.9.0".into(),
+                        protocol: PROTOCOL,
+                    },
+                )
+                .await
+                .unwrap()
+            };
+            let server = async {
+                let mut stream = listener.accept().await.unwrap().0;
+                authenticate_versioned(
+                    &mut stream,
+                    &peer,
+                    &host.public,
+                    false,
+                    prologue,
+                    &Version::current(),
+                )
+                .await
+                .unwrap()
+            };
+            let (mut sending, mut receiving) = tokio::join!(client, server);
+            let mut ciphertext = [0; 128];
+            let mut plaintext = [0; 128];
+            let length = sending
+                .write_message(b"same device protocol", &mut ciphertext)
+                .unwrap();
+            let decoded = receiving
+                .read_message(&ciphertext[..length], &mut plaintext)
+                .unwrap();
+            assert_eq!(&plaintext[..decoded], b"same device protocol");
+            let length = receiving
+                .write_message(b"accepted", &mut ciphertext)
+                .unwrap();
+            let decoded = sending
+                .read_message(&ciphertext[..length], &mut plaintext)
+                .unwrap();
+            assert_eq!(&plaintext[..decoded], b"accepted");
+        }
+    }
+
+    #[tokio::test]
+    async fn both_channels_reject_device_protocol_mismatch_on_both_pcs() {
         use crate::compatibility::{Mismatch, PROTOCOL, Version};
         for prologue in [
             b"Desk Switch protocol 1".as_slice(),
@@ -277,7 +337,7 @@ mod tests {
             for remote in [
                 Version {
                     app: format!("{}-different", crate::compatibility::VERSION),
-                    protocol: PROTOCOL,
+                    protocol: PROTOCOL - 1,
                 },
                 Version {
                     protocol: PROTOCOL + 1,

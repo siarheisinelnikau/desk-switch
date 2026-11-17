@@ -557,7 +557,7 @@ impl Monitor for Ddc {
             crate::video::lg::input(&monitor.2, input).map_err(crate::video::not_issued)?
         {
             let driver = super::win_nvapi::prepare(&monitor.1).map_err(crate::video::not_issued)?;
-            return driver.write_lg(value);
+            return driver.write_input(value);
         }
         println!(
             "DDC write issued: process {}, input {input:#06x}; exactly one SetVCPFeature call.",
@@ -759,6 +759,39 @@ mod tests {
         let _prepared = super::super::win_nvapi::prepare(&gdi)?;
         println!("LG 27GK750F: NVIDIA driver binding ready; no I2C write was issued");
         Ok(())
+    }
+
+    #[test]
+    #[ignore = "Read-only input queries on explicitly selected physical LG hardware"]
+    fn inspect_lg_input_reads() -> Result<()> {
+        ensure!(
+            std::env::var("DESK_SWITCH_INSPECT_LG").as_deref() == Ok("1"),
+            "Set DESK_SWITCH_INSPECT_LG=1 for read-only input queries"
+        );
+        let (_, gdi) = one_lg()?;
+        let driver = super::super::win_nvapi::prepare(&gdi)?;
+        for (source, feature) in [(0x51, 0x60), (0x50, 0xf4)] {
+            match driver.inspect_input_read(source, feature) {
+                Ok(reply) => {
+                    println!("Input GET source {source:#04x} feature {feature:#04x}: {reply:02x?}")
+                }
+                Err(error) => {
+                    println!("Input GET source {source:#04x} feature {feature:#04x}: {error:#}")
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "One physical standard NVIDIA HDMI1 selection; requires explicit confirmation"]
+    fn select_lg_standard_hdmi1_once() -> Result<()> {
+        ensure!(
+            std::env::var("DESK_SWITCH_CONFIRM_LG_HDMI1").as_deref() == Ok("27GK750F-standard"),
+            "Explicit confirmation for one standard LG 27GK750F HDMI1 test is required"
+        );
+        let (_, gdi) = one_lg()?;
+        super::super::win_nvapi::prepare(&gdi)?.write_input(0x11)
     }
 
     #[test]

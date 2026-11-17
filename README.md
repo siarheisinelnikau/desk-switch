@@ -4,7 +4,7 @@
 
 ![Desk Switch workspace with four connected computers](docs/workspace-four-computers.png)
 
-Download matching versions from [Releases](https://github.com/siarheisinelnikau/desk-switch/releases/latest) for **Windows x86-64** or **Ubuntu 24.04/26.04 x86-64**. Link computers with **+ Add a computer** and confirm matching codes on both ends. Click a computer in the workspace diagram to switch, **F12** to cycle, or **F11** to return input.
+Download Desk Switch from [Releases](https://github.com/siarheisinelnikau/desk-switch/releases/latest) for **Windows x86-64** or **Ubuntu 24.04/26.04 x86-64**. Link computers with **+ Add a computer** and confirm matching codes on both ends. Device and workspace protocol numbers determine compatibility; application version numbers can differ. Click a computer in the workspace diagram to switch, **F12** to cycle, or **F11** to return input.
 
 ## What it does
 
@@ -23,7 +23,7 @@ A connected majority can replace an offline coordinator. Two computers need both
 
 Left-click the tray icon for a compact workspace diagram, direct computer switching, sharing controls and per-computer volume. Right-click opens the native menu. **X** hides the window in the tray; **Quit application** exits.
 
-Device connections animate briefly when routes change, then settle. Hidden windows stop rendering. On Windows, the visible keyboard and mouse respond to local physical key presses, clicks, scrolling and movement direction. Input feedback is temporary and is never saved or sent over the network. Expand **Sharing & volume** in the main window for source choices and additional controls.
+Device connections animate briefly when routes change, then settle. Activity indicators fade in and out; renewed activity reverses a fade from its current opacity. Hidden windows stop rendering. On Windows, the visible keyboard and mouse respond to local physical key presses, clicks, scrolling and movement direction. Input feedback is temporary and is never saved or sent over the network. Expand **Sharing & volume** in the main window for source choices and additional controls.
 
 ![Desk Switch tray popup with sharing controls and per-computer volume](docs/workspace-quick-controls.png)
 

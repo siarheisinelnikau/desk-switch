@@ -691,11 +691,11 @@ impl Workspace {
             .activation
             .checked_add(1)
             .context("Too many input switches")?;
-        let explicit_pc_change = target.is_none()
-            && position.is_none()
-            && self.active_input.as_deref() != Some(destination);
+        let explicit_pc_selection = target.is_none() && position.is_none();
+        let repeated_pc_selection =
+            explicit_pc_selection && self.active_input.as_deref() == Some(destination);
         let command = if monitor
-            && (self.confirmed_monitor.as_deref() != Some(destination) || explicit_pc_change)
+            && (self.confirmed_monitor.as_deref() != Some(destination) || explicit_pc_selection)
         {
             let eligible = |key: &str| {
                 self.members.get(key).is_some_and(|member| {
@@ -704,11 +704,17 @@ impl Workspace {
                         && !member.node.monitor.id.is_empty()
                 })
             };
-            let writer = self
-                .confirmed_monitor
-                .as_deref()
-                .filter(|key| eligible(key))
-                .unwrap_or(requester);
+            // A new explicit click can follow a manual OSD change. When the
+            // logical target is already selected, use the requesting display
+            // connection rather than trusting its stale input confirmation.
+            let writer = if repeated_pc_selection && eligible(requester) {
+                requester
+            } else {
+                self.confirmed_monitor
+                    .as_deref()
+                    .filter(|key| eligible(key))
+                    .unwrap_or(requester)
+            };
             ensure!(
                 eligible(writer),
                 "Use a PC connected to the shared monitor to select its next input."
@@ -1589,7 +1595,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn explicit_pc_change_selects_the_monitor_once_even_when_confirmation_was_cached() {
+    fn explicit_pc_selection_can_retry_a_stale_confirmation_once_per_click() {
         let mut state = fixture(2);
         state.settings.monitor_enabled = true;
         let source = key(1);
@@ -1614,9 +1620,57 @@ pub(crate) mod tests {
         assert_eq!(state.members[&target].input_ready, state.activation);
         let completed = state.activation;
         state.activate(&source, &target, None).unwrap();
-        assert!(state.monitor_command.is_none());
+        let retry = state.monitor_command.clone().unwrap();
+        assert_eq!(retry.id, completed + 1);
+        assert_eq!(retry.writer, source);
+        assert_eq!(retry.destination, target);
+        assert_eq!(retry.input, 16);
+        assert!(!retry.prepared);
         assert_eq!(state.input_request, completed + 1);
+        let pending = state.clone();
+        assert!(state.activate(&source, &target, None).is_err());
+        assert_eq!(state, pending);
+        confirm_monitor(&mut state, &source, Some(retry.id));
+        assert!(!state.switch_pending());
         state.validate().unwrap();
+    }
+
+    #[test]
+    fn different_app_versions_with_matching_protocols_can_request_dp_to_hdmi() {
+        let mut state = fixture(2);
+        let source = key(1);
+        let target = key(2);
+        state.settings.monitor_enabled = true;
+        state
+            .members
+            .get_mut(&source)
+            .unwrap()
+            .node
+            .version
+            .as_mut()
+            .unwrap()
+            .app = "0.11.0".into();
+        state
+            .members
+            .get_mut(&target)
+            .unwrap()
+            .node
+            .version
+            .as_mut()
+            .unwrap()
+            .app = "0.11.3".into();
+        state.members.get_mut(&source).unwrap().node.monitor.input = Some(0x0f);
+        state.members.get_mut(&target).unwrap().node.monitor.input = Some(0x11);
+        state.confirmed_monitor = Some(source.clone());
+        state.activate(&source, &target, None).unwrap();
+        let command = state.monitor_command.clone().unwrap();
+        assert_eq!(command.writer, source);
+        assert_eq!(command.input, 0x11);
+        assert!(state.monitor_result(&source, command.id, None).is_err());
+        state.monitor_prepared(&target, command.id, None).unwrap();
+        state.monitor_result(&source, command.id, None).unwrap();
+        assert_eq!(state.confirmed_monitor, Some(target));
+        assert!(!state.switch_pending());
     }
 
     #[test]
@@ -1792,7 +1846,7 @@ pub(crate) mod tests {
             .version
             .as_mut()
             .unwrap()
-            .app = "old".into();
+            .protocol = crate::compatibility::PROTOCOL + 1;
         assert_eq!(workspace.routes(&key(1)).input_targets.len(), 1);
         assert_eq!(workspace.routes(&key(2)).audio_sources.len(), 1);
         assert_eq!(workspace.routes(&key(1)).clipboard_peers.len(), 1);

@@ -279,16 +279,8 @@ fn selection_args(edid: &[u8], input: u16) -> Result<Vec<String>> {
         "--mccs=2.2".into(),
         "--maxtries=1,0,0".into(),
     ];
-    if let Some(value) = crate::video::lg::input(edid, input)? {
-        args.extend([
-            "--i2c-source-addr=0x50".into(),
-            "setvcp".into(),
-            "f4".into(),
-            format!("0x{value:02x}"),
-        ]);
-    } else {
-        args.extend(["setvcp".into(), "60".into(), format!("0x{input:04x}")]);
-    }
+    crate::video::lg::input(edid, input)?;
+    args.extend(["setvcp".into(), "60".into(), format!("0x{input:04x}")]);
     Ok(args)
 }
 
@@ -429,7 +421,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn lg_selection_uses_private_source_and_never_retries_a_standard_command() {
+    fn lg_selection_uses_standard_input_codes_with_no_write_retry_or_readback() {
         let args = selection_args(&crate::video::lg::fixture(), 0x11).unwrap();
         assert_eq!(
             args,
@@ -437,14 +429,15 @@ mod tests {
                 "--noverify",
                 "--mccs=2.2",
                 "--maxtries=1,0,0",
-                "--i2c-source-addr=0x50",
                 "setvcp",
-                "f4",
-                "0x90"
+                "60",
+                "0x0011"
             ]
         );
         let standard = selection_args(&[], 0x11).unwrap();
         assert_eq!(&standard[3..], ["setvcp", "60", "0x0011"]);
+        let return_to_dp = selection_args(&crate::video::lg::fixture(), 0x0f).unwrap();
+        assert_eq!(&return_to_dp[3..], ["setvcp", "60", "0x000f"]);
         assert!(selection_args(&crate::video::lg::fixture(), 3).is_err());
     }
 

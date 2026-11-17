@@ -989,5 +989,10 @@
   "Version restored": "Versión restaurada",
   "Retry sharing": "Reintentar compartir",
   "Saved {minutes} min ago": "Guardado hace {minutes} min",
-  "Saved {hours} h ago": "Guardado hace {hours} h"
+  "Saved {hours} h ago": "Guardado hace {hours} h",
+  "Device protocol mismatch: this PC {} (protocol {}), other PC {} (protocol {}). Update the PC with the older protocol.": "Protocolos de dispositivos incompatibles: este PC {} (protocolo {}), otro PC {} (protocolo {}). Actualice el PC con el protocolo más antiguo.",
+  "Device protocol mismatch: this PC {} (protocol {}), other PC does not report a device protocol. Update that PC.": "Protocolos de dispositivos incompatibles: este PC {} (protocolo {}), el otro PC no informa de un protocolo de dispositivos. Actualice ese PC.",
+  "Tray device popup": "Ventana de dispositivos de la bandeja",
+  "Repair tray popup": "Reparar ventana de la bandeja",
+  "Check tray integration": "Comprobar integración de la bandeja"
 }

@@ -989,5 +989,10 @@
   "Version restored": "Версия восстановлена",
   "Retry sharing": "Повторить запуск доступа",
   "Saved {minutes} min ago": "Сохранено {minutes} мин назад",
-  "Saved {hours} h ago": "Сохранено {hours} ч назад"
+  "Saved {hours} h ago": "Сохранено {hours} ч назад",
+  "Device protocol mismatch: this PC {} (protocol {}), other PC {} (protocol {}). Update the PC with the older protocol.": "Несовместимые протоколы устройств: этот ПК {} (протокол {}), другой ПК {} (протокол {}). Обновите ПК с более старым протоколом.",
+  "Device protocol mismatch: this PC {} (protocol {}), other PC does not report a device protocol. Update that PC.": "Несовместимые протоколы устройств: этот ПК {} (протокол {}), другой ПК не сообщает протокол устройств. Обновите другой ПК.",
+  "Tray device popup": "Попап устройств из трея",
+  "Repair tray popup": "Восстановить попап из трея",
+  "Check tray integration": "Проверить интеграцию трея"
 }

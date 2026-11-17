@@ -580,13 +580,19 @@ mod tests {
             ));
             let message = worker.version_error.as_ref().unwrap();
             let english = crate::i18n::tr_language("en", message);
-            assert!(english.starts_with("Incompatible versions:"), "{english}");
+            assert!(
+                english.starts_with("Device protocol mismatch:"),
+                "{english}"
+            );
             assert!(
                 !english
                     .chars()
                     .any(|c| ('\u{0400}'..='\u{04ff}').contains(&c))
             );
-            assert!(crate::i18n::tr_language("ru", message).starts_with("Несовместимые версии:"));
+            assert!(
+                crate::i18n::tr_language("ru", message)
+                    .starts_with("Несовместимые протоколы устройств:")
+            );
         }
     }
 
