@@ -2,11 +2,11 @@
 #[cfg(any(windows, target_os = "linux", test))]
 use crate::mobile::screen::MAX_PNG;
 use crate::mobile::screen::Options;
+#[cfg(target_os = "linux")]
+use anyhow::Context;
 use anyhow::Result;
 #[cfg(any(windows, target_os = "linux", test))]
 use anyhow::ensure;
-#[cfg(target_os = "linux")]
-use anyhow::{Context, bail};
 #[cfg(any(windows, target_os = "linux", test))]
 use image::{ImageEncoder, Rgb, RgbImage};
 
