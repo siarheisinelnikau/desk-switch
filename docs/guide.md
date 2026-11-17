@@ -113,7 +113,7 @@ Use **Ctrl+X** followed by **Ctrl+V** for a move. Desk Switch preserves original
 
 The progress window shows **Receiving files**, verification and any confirmed source cleanup separately. **Files transferred** reports the completed transfer between computers; the file manager controls writing into its final destination. Desk Switch reports **Copied** or **Moved** only when the required native confirmation and cleanup are complete. A newer local clipboard copy is preserved; reconnecting does not republish an older offer. Shared clipboard is off by default. Disabling it stops new offers and publication, and received content is not forwarded repeatedly.
 
-On **GNOME Wayland**, Desk Switch enables its bundled **Desk Switch Tray** integration automatically at startup. A new desktop session is needed if GNOME has not discovered a first installation yet or still has older extension code imported. The companion supplies both the clipboard bridge and the tray click behavior. Without it, Desk Switch reports that sharing is unavailable on that session. Windows and supported X11 sessions use their native file clipboard backends. **Native file paste into Finder is unavailable on macOS**; text/images and explicit **Send files…** remain available, including sending files to a Mac.
+On **GNOME Wayland**, Desk Switch enables its bundled **Desk Switch Tray** integration automatically at startup. A new desktop session is needed if GNOME has not discovered a first installation yet or still has older extension code imported. The companion supplies the clipboard bridge; native tray popup clicks work independently of it. Without it, Desk Switch reports that sharing is unavailable on that session. Windows and supported X11 sessions use their native file clipboard backends. **Native file paste into Finder is unavailable on macOS**; text/images and explicit **Send files…** remain available, including sending files to a Mac.
 
 ## Files and folders
 
@@ -167,9 +167,9 @@ Use **Quit application** from quick controls or the native tray menu to release 
 
 ![Compact quick controls for a four-computer workspace, with a scrollable volume list](workspace-quick-controls.png)
 
-On **Ubuntu GNOME**, Desk Switch enables its tray integration automatically at launch for left-click popup and right-click native-menu behavior. No separate enablement step is needed. If the package was first installed during an existing desktop session, sign out and sign back in once so GNOME discovers it; Desk Switch enables it on the next launch. Other desktops need an AppIndicator/StatusNotifier host and may apply their own click policy.
+On **Ubuntu GNOME**, native XEmbed tray controls open the device popup with a single left-click immediately after installation, without enabling an application extension or signing out. The right button opens the native GTK menu, as in DownloadManager. If a desktop does not provide XEmbed, Desk Switch falls back to StatusNotifier/AppIndicator; GNOME's SNI click policy then uses the optional bundled companion.
 
-After a companion update, sign out of Ubuntu and back in to load the new extension code. The application window uses X11/XWayland when available so closing it can hide it in the tray and quick controls can be positioned beside the indicator. This does not change native Wayland keyboard/mouse capture. A desktop without XWayland cannot provide these window-hiding and placement operations through the current native Wayland window backend.
+After a companion update, sign out of Ubuntu and back in to load its new Wayland clipboard/pointer code; this is not needed for native tray popup clicks. The application window uses X11/XWayland when available so closing it can hide it in the tray and quick controls can be positioned beside the indicator. This does not change native Wayland keyboard/mouse capture. A desktop without XWayland cannot provide these window-hiding and placement operations through the current native Wayland window backend.
 
 Login startup is enabled after the first launch and can be disabled in Settings for any selected computer. Startup uses that computer's saved profile and auto-connect choice.
 
