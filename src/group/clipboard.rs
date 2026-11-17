@@ -326,7 +326,7 @@ fn backend() -> Result<Box<dyn Backend>> {
         return gnome::Gnome::new()
             .map(|backend| Box::new(backend) as Box<dyn Backend>)
             .context(
-                "Enable Desk Switch Tray in GNOME Extensions to share text and images on Wayland",
+                "The GNOME tray integration is unavailable. Check Application > Tray device popup; a new desktop session may be required after installation",
             );
     }
     Ok(Box::new(Native {
