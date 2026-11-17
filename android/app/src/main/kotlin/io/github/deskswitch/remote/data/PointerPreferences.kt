@@ -15,6 +15,10 @@ class PointerPreferences(context: Context) : PointerSettingsStore {
             joystickSpeed = prefs.getFloat("joystick_speed", 1000f),
             previewEnabled = prefs.getBoolean("preview_enabled", false),
             previewFps = prefs.getInt("preview_fps", 10),
+            doubleTapScroll = prefs.getBoolean("double_tap_scroll", true),
+            scrollGestureSpeed = prefs.getFloat("scroll_gesture_speed", 1f),
+            scrollStickSpeed = prefs.getFloat("scroll_stick_speed", 1f),
+            invertScroll = prefs.getBoolean("invert_scroll", false),
         ).normalized()
     }.getOrDefault(PointerSettings())
 
@@ -24,6 +28,10 @@ class PointerPreferences(context: Context) : PointerSettingsStore {
             .putFloat("touchpad_speed", value.touchpadSpeed)
             .putFloat("joystick_speed", value.joystickSpeed)
             .putBoolean("preview_enabled", value.previewEnabled)
-            .putInt("preview_fps", value.previewFps).apply()
+            .putInt("preview_fps", value.previewFps)
+            .putBoolean("double_tap_scroll", value.doubleTapScroll)
+            .putFloat("scroll_gesture_speed", value.scrollGestureSpeed)
+            .putFloat("scroll_stick_speed", value.scrollStickSpeed)
+            .putBoolean("invert_scroll", value.invertScroll).apply()
     }
 }

@@ -59,6 +59,7 @@ class RemoteActivity : ComponentActivity() {
     private var keyboard: RemoteKeyboard? = null
     private var keyboardButton: Button? = null
     private var touchpad: TouchpadView? = null
+    private var scrollStick: ScrollStickView? = null
     private val largeControls = mutableListOf<View>()
     private val modeButtons = mutableMapOf<PointerMode, Button>()
     private var settingsDialog: Dialog? = null
@@ -165,6 +166,7 @@ class RemoteActivity : ComponentActivity() {
         if (captureCase == null) model.foreground(false)
         touchpad?.preview(null)
         touchpad?.cancelInteractions(false)
+        scrollStick?.cancelInteraction()
         super.onPause()
     }
 
@@ -235,7 +237,7 @@ class RemoteActivity : ComponentActivity() {
         addView(icon(Glyph.SETTINGS, "Control settings") { settings() }.apply { id = R.id.settings },
             LinearLayout.LayoutParams(dp(48), dp(48)).apply { leftMargin = dp(10) })
         if (connected != null) addView(icon(Glyph.DISCONNECT, "Disconnect from workspace", RemoteStyle.danger) {
-            touchpad?.cancelInteractions(false); hideKeyboard(); model.disconnect()
+            touchpad?.cancelInteractions(false); scrollStick?.cancelInteraction(); hideKeyboard(); model.disconnect()
         }.apply { id = R.id.disconnect }, LinearLayout.LayoutParams(dp(48), dp(48)).apply { leftMargin = dp(8) })
     }
 
@@ -250,6 +252,7 @@ class RemoteActivity : ComponentActivity() {
         val previous = last
         last = state
         touchpad?.cancelInteractions(false)
+        scrollStick?.cancelInteraction(); scrollStick = null
         keyboard?.discardComposition(); keyboard = null; keyboardButton = null
         touchpad = null; remotePreviewError = null; largeControls.clear(); modeButtons.clear()
         content.removeAllViews()
@@ -405,10 +408,20 @@ class RemoteActivity : ComponentActivity() {
         val pad = TouchpadView(this, model::input).apply { id = R.id.touchpad; preferences(settings); touchpad = this }
         add(surface, pad, if (landscape) 0 else 12, 1f)
         val controls = column()
-        val left = button("Left click", glyph = Glyph.LEFT_CLICK) { model.click(272) }
-        val right = button("Right click", glyph = Glyph.RIGHT_CLICK) { model.click(273) }
-        if (landscape) { add(controls, left, 8); add(controls, right, 10) }
-        else add(controls, row(left, right), 10)
+        val left = if (landscape) icon(Glyph.LEFT_CLICK, "Left click", RemoteStyle.ink) { model.click(272) }
+            else button("Left click", glyph = Glyph.LEFT_CLICK) { model.click(272) }
+        val right = if (landscape) icon(Glyph.RIGHT_CLICK, "Right click", RemoteStyle.ink) { model.click(273) }
+            else button("Right click", glyph = Glyph.RIGHT_CLICK) { model.click(273) }
+        val stick = ScrollStickView(this, model::input).apply { preferences(settings); scrollStick = this }
+        val clicks = LinearLayout(this).apply {
+            gravity = Gravity.CENTER_VERTICAL
+            addView(left, LinearLayout.LayoutParams(0, dp(52), 1f))
+            addView(stick, LinearLayout.LayoutParams(dp(72), dp(52)).apply {
+                marginStart = dp(8); marginEnd = dp(8)
+            })
+            addView(right, LinearLayout.LayoutParams(0, dp(52), 1f))
+        }
+        add(controls, clicks, 10)
         val shortcutButtons = arrayOf(
             button("Back") { model.chord(56, 105) },
             button("Space") { model.tap(57) },
@@ -435,6 +448,7 @@ class RemoteActivity : ComponentActivity() {
 
     private fun updateControls(settings: PointerSettings) {
         touchpad?.preferences(settings)
+        scrollStick?.preferences(settings)
         for ((mode, control) in modeButtons) {
             selectMode(control, mode == settings.mode)
         }
@@ -476,6 +490,7 @@ class RemoteActivity : ComponentActivity() {
     }
     private fun showKeyboard() {
         touchpad?.cancelInteractions()
+        scrollStick?.cancelInteraction()
         if (keyboard == null) {
             keyboard = RemoteKeyboard(this, { value ->
                 runCatching { model.text(value) }.onFailure {
@@ -503,7 +518,7 @@ class RemoteActivity : ComponentActivity() {
     private fun settings() {
         if (settingsDialog?.isShowing == true) return
         if (captureCase == null) model.foreground(false)
-        touchpad?.cancelInteractions(false); hideKeyboard()
+        touchpad?.cancelInteractions(false); scrollStick?.cancelInteraction(); hideKeyboard()
         val settings = last?.controls ?: PointerSettings()
         val sheet = column().apply {
             setPadding(dp(22), dp(20), dp(22), dp(22))
@@ -516,6 +531,21 @@ class RemoteActivity : ComponentActivity() {
         val list = column()
         add(list, text("CONTROL MODE", 11f, RemoteStyle.muted, true), 10)
         add(list, modeControl(settings, register = false), 22)
+        add(list, text("SCROLLING", 11f, RemoteStyle.muted, true), 6)
+        add(list, controlSwitch("Double-tap to scroll", settings.doubleTapScroll) { enabled ->
+            setControls(currentControls().copy(doubleTapScroll = enabled))
+        }, 2)
+        add(list, text("Tap, then touch again and drag to scroll. Two fingers also scroll.", 13f, RemoteStyle.muted), 16)
+        slider(list, "Scroll gesture speed", settings.scrollGestureSpeed, 0.5f, 3f, { "%.1f×".format(Locale.US, it) }) {
+            setControls(currentControls().copy(scrollGestureSpeed = it))
+        }
+        slider(list, "Scroll joystick speed", settings.scrollStickSpeed, 0.5f, 3f, { "%.1f×".format(Locale.US, it) }) {
+            setControls(currentControls().copy(scrollStickSpeed = it))
+        }
+        add(list, controlSwitch("Reverse scroll direction", settings.invertScroll) { enabled ->
+            setControls(currentControls().copy(invertScroll = enabled))
+        }, 22)
+        add(list, text("POINTER SPEED", 11f, RemoteStyle.muted, true), 10)
         slider(list, "Touchpad speed", settings.touchpadSpeed, 0.35f, 3f, { "%.1f×".format(Locale.US, it) }) { value ->
             setControls(currentControls().copy(touchpadSpeed = value))
         }
@@ -529,24 +559,14 @@ class RemoteActivity : ComponentActivity() {
             setControls(currentControls().copy(previewFps = kotlin.math.round(value).toInt()))
         }
         fpsControls.visibility = if (settings.previewEnabled) View.VISIBLE else View.GONE
-        val previewToggle = Switch(this).apply {
-            text = "Cursor preview"; textSize = 16f; setTextColor(RemoteStyle.ink)
-            typeface = Typeface.create("sans-serif-medium", Typeface.NORMAL)
-            contentDescription = "Show cursor preview from computer"
-            minimumHeight = dp(52); switchPadding = dp(18)
-            isChecked = settings.previewEnabled
-            thumbTintList = android.content.res.ColorStateList(arrayOf(intArrayOf(android.R.attr.state_checked), intArrayOf()),
-                intArrayOf(RemoteStyle.accent, RemoteStyle.muted))
-            trackTintList = android.content.res.ColorStateList.valueOf(Color.rgb(42, 69, 86))
-            setOnCheckedChangeListener { _, enabled ->
-                setControls(currentControls().copy(previewEnabled = enabled))
-                fpsControls.visibility = if (enabled) View.VISIBLE else View.GONE
-                if (enabled && captureCase == null) fpsControls.apply {
-                    alpha = 0f
-                    animate().alpha(1f).setDuration(180).start()
-                }
+        val previewToggle = controlSwitch("Cursor preview", settings.previewEnabled) { enabled ->
+            setControls(currentControls().copy(previewEnabled = enabled))
+            fpsControls.visibility = if (enabled) View.VISIBLE else View.GONE
+            if (enabled && captureCase == null) fpsControls.apply {
+                alpha = 0f
+                animate().alpha(1f).setDuration(180).start()
             }
-        }
+        }.apply { contentDescription = "Show cursor preview from computer" }
         add(list, previewToggle, 4)
         add(list, text("Shows the area around the PC pointer. Allow cursor preview in Desk Switch on the computer.", 13f, RemoteStyle.muted)
             .also { previewMessage = it }, 14)
@@ -566,9 +586,9 @@ class RemoteActivity : ComponentActivity() {
         }
         add(list, text("Desk Switch Remote ${BuildConfig.VERSION_NAME}", 12f, RemoteStyle.muted), 8)
         add(list, text("Control pauses when this app leaves the screen.", 12f, RemoteStyle.muted), 14)
-        add(list, button("Open-source license") {
-            val license = javaClass.classLoader!!.getResourceAsStream("licenses/noise-java/LICENSE.txt")!!.bufferedReader().use { it.readText() }
-            AlertDialog.Builder(this).setTitle("Noise-Java · MIT").setMessage(license).setPositiveButton("Done", null).show()
+        add(list, button("Open-source licenses") {
+            val licenses = resources.openRawResource(R.raw.native_licenses).bufferedReader().use { it.readText() }
+            AlertDialog.Builder(this).setTitle("Open-source licenses").setMessage(licenses).setPositiveButton("Done", null).show()
         }, 0)
         val scroll = ScrollView(this).apply {
             overScrollMode = View.OVER_SCROLL_NEVER
@@ -599,6 +619,17 @@ class RemoteActivity : ComponentActivity() {
         }
         settingsDialog = dialog
         dialog.show()
+    }
+
+    private fun controlSwitch(title: String, enabled: Boolean, changed: (Boolean) -> Unit) = Switch(this).apply {
+        text = title; textSize = 16f; setTextColor(RemoteStyle.ink)
+        typeface = Typeface.create("sans-serif-medium", Typeface.NORMAL)
+        minimumHeight = dp(52); switchPadding = dp(18)
+        isChecked = enabled
+        thumbTintList = android.content.res.ColorStateList(arrayOf(intArrayOf(android.R.attr.state_checked), intArrayOf()),
+            intArrayOf(RemoteStyle.accent, RemoteStyle.muted))
+        trackTintList = android.content.res.ColorStateList.valueOf(Color.rgb(42, 69, 86))
+        setOnCheckedChangeListener { _, checked -> changed(checked) }
     }
 
     private fun slider(parent: LinearLayout, title: String, value: Float, minimum: Float, maximum: Float,

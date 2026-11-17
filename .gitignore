@@ -12,3 +12,4 @@ __pycache__/
 /android/.local/
 /android/local.properties
 /android/**/build/
+/android/native/target/

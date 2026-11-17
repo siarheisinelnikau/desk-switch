@@ -511,7 +511,9 @@ async fn a_shared_phone_follows_the_selected_pc_after_monitor_settle_without_rep
         })
         .await?;
     let paused = Input::Move { dx: 999, dy: 999 };
+    let paused_scroll = Input::Scroll { dx: 120, dy: -120 };
     phone.event(paused).await?;
+    phone.event(paused_scroll).await?;
     let rejected = phone.request_text("typed during monitor switch").await?;
     assert!(
         rejected
@@ -543,9 +545,19 @@ async fn a_shared_phone_follows_the_selected_pc_after_monitor_settle_without_rep
         phone.ping().await?;
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
+    let remote_scroll = Input::Scroll { dx: -35, dy: 240 };
+    phone.event(remote_scroll).await?;
+    phone
+        .wait(|| target.proof.lock().unwrap().inputs.contains(&remote_scroll))
+        .await?;
     phone.text("Привет, второй ПК 👋").await?;
-    assert!(!target.proof.lock().unwrap().inputs.contains(&held));
-    assert!(!target.proof.lock().unwrap().inputs.contains(&paused));
+    {
+        let target = target.proof.lock().unwrap();
+        assert!(!target.inputs.contains(&held));
+        assert!(!target.inputs.contains(&paused));
+        assert!(!target.inputs.contains(&paused_scroll));
+    }
+    assert!(!source.proof.lock().unwrap().inputs.contains(&remote_scroll));
     assert_eq!(target.proof.lock().unwrap().texts, ["Привет, второй ПК 👋"]);
     assert_eq!(source.proof.lock().unwrap().texts, ["source"]);
     phone
@@ -602,11 +614,17 @@ async fn a_shared_phone_follows_the_selected_pc_after_monitor_settle_without_rep
         phone.ping().await?;
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
-    // The paused press and old held button are never replayed to either PC.
+    let local_scroll = Input::Scroll { dx: 240, dy: -35 };
+    phone.event(local_scroll).await?;
+    phone
+        .wait(|| source.proof.lock().unwrap().inputs.contains(&local_scroll))
+        .await?;
     phone.text("back on source").await?;
-    assert_eq!(
-        source.proof.lock().unwrap().texts,
-        ["source", "back on source"]
-    );
+    {
+        let source = source.proof.lock().unwrap();
+        assert!(!source.inputs.contains(&paused_scroll));
+        assert_eq!(source.texts, ["source", "back on source"]);
+    }
+    assert!(!target.proof.lock().unwrap().inputs.contains(&local_scroll));
     Ok(())
 }
