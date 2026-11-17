@@ -2,7 +2,6 @@ package io.github.deskswitch.remote.data
 
 import io.github.deskswitch.remote.domain.*
 import org.json.JSONObject
-import java.net.Socket
 import java.security.MessageDigest
 import java.util.Collections
 import java.util.concurrent.LinkedBlockingQueue
@@ -20,7 +19,7 @@ class NoiseSessionFactory(private val phoneName: String = "Android remote", priv
     override fun setPreviewErrorListener(listener: (String?) -> Unit) { previewErrorListener = listener }
     override fun setInputErrorListener(listener: (String) -> Unit) { inputErrorListener = listener }
 
-    private val sockets = Collections.synchronizedSet(mutableSetOf<Socket>())
+    private val sockets = Collections.synchronizedSet(mutableSetOf<NoiseSocket>())
     private val cancelled = AtomicBoolean(false)
     private fun open(computer: Computer, port: Int, width: Int) = NoiseSocket.open(computer.host, port, width) {
         synchronized(sockets) { check(!cancelled.get()) { "Connection cancelled" }; sockets.add(it) }
@@ -200,7 +199,6 @@ class NoiseSessionFactory(private val phoneName: String = "Android remote", priv
         private fun stop(error: String?) {
             if (!stopped.compareAndSet(false, true)) return
             this@NoiseSessionFactory.close()
-            runCatching { control.close() }; runCatching { data.close() }
             workers.forEach { it.interrupt() }
             commands.clear()
             barriers.values.forEach { it.cancel(true) }; barriers.clear()

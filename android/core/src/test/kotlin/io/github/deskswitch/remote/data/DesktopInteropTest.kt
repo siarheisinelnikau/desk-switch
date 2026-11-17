@@ -1,6 +1,5 @@
 package io.github.deskswitch.remote.data
 
-import com.southernstorm.noise.protocol.Noise
 import io.github.deskswitch.remote.domain.*
 import org.json.JSONObject
 import org.junit.Assert.*
@@ -16,10 +15,7 @@ class DesktopInteropTest {
         assumeTrue("Run with the isolated desktop fixture", directory != null)
         val info = JSONObject(File(directory!!, "ready.json").readText())
         val computer = Computer("TV", info.getString("host"), info.getInt("port"), info.getInt("inputPort"))
-        val dh = Noise.createDH("25519")
-        dh.generateKeyPair()
-        val identity = Identity(ByteArray(32).also { dh.getPrivateKey(it, 0) }, ByteArray(32).also { dh.getPublicKey(it, 0) })
-        dh.destroy()
+        val identity = noiseIdentity()
         val closed = CountDownLatch(1)
         val preview = CountDownLatch(1)
         var trusted: Computer? = null

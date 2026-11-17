@@ -68,15 +68,20 @@ jobs:
           java-version: '23'
       - name: Install the pinned Android SDK packages
         if: matrix.os == 'ubuntu-24.04'
-        timeout-minutes: 5
-        run: '"$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "platforms;android-35" "build-tools;35.0.0"'
+        timeout-minutes: 10
+        run: |
+          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "platforms;android-35" "build-tools;35.0.0" "ndk;28.2.13676358"
+          rustup target add aarch64-linux-android armv7-linux-androideabi x86_64-linux-android i686-linux-android
       - name: Build and check the experimental Android app
         if: matrix.os == 'ubuntu-24.04'
         timeout-minutes: 10
         working-directory: android
         env:
           GRADLE_USER_HOME: ${{ github.workspace }}/android/.gradle-user
-        run: bash ./gradlew :core:test :app:testDebugUnitTest :app:lintDebug :app:assembleDebug --no-daemon --max-workers=2
+        run: |
+          cargo fmt --manifest-path native/Cargo.toml --check
+          cargo clippy --locked --manifest-path native/Cargo.toml --target-dir core/build/noise/host -- -D warnings
+          bash ./gradlew :core:test :app:testDebugUnitTest :app:lintDebug :app:assembleDebug --no-daemon --max-workers=2
       - name: Check Android against the actual desktop protocol with synthetic input
         if: matrix.os == 'ubuntu-24.04'
         timeout-minutes: 3

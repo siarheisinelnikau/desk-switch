@@ -4,4 +4,4 @@ dependencyResolutionManagement {
     repositories { google(); mavenCentral() }
 }
 rootProject.name = "DeskSwitchRemote"
-include(":noise", ":core", ":app")
+include(":core", ":app")

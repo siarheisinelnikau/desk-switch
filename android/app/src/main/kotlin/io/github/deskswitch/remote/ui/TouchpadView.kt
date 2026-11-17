@@ -17,10 +17,12 @@ import android.view.MotionEvent
 import android.view.View
 import android.view.ViewConfiguration
 import android.view.animation.DecelerateInterpolator
+import io.github.deskswitch.remote.domain.DoubleTapScroll
 import io.github.deskswitch.remote.domain.Input
 import io.github.deskswitch.remote.domain.PointerMode
 import io.github.deskswitch.remote.domain.PointerMotion
 import io.github.deskswitch.remote.domain.PointerSettings
+import io.github.deskswitch.remote.domain.ScrollMotion
 import kotlin.math.hypot
 import kotlin.math.min
 
@@ -28,8 +30,11 @@ import kotlin.math.min
 class TouchpadView(context: Context, private val send: (Input) -> Unit) : View(context) {
     private val paint = Paint(Paint.ANTI_ALIAS_FLAG or Paint.FILTER_BITMAP_FLAG)
     private val density = resources.displayMetrics.density
-    private val slop = ViewConfiguration.get(context).scaledTouchSlop
+    private val configuration = ViewConfiguration.get(context)
+    private val slop = configuration.scaledTouchSlop
+    private val doubleTap = DoubleTapScroll(ViewConfiguration.getDoubleTapTimeout().toLong(), configuration.scaledDoubleTapSlop, slop)
     private val motion = PointerMotion()
+    private val scroll = ScrollMotion()
     private var preferences = PointerSettings()
     private var surface: Shader? = null
     private var preview: Bitmap? = null
@@ -45,7 +50,6 @@ class TouchpadView(context: Context, private val send: (Input) -> Unit) : View(c
     private var startX = 0f; private var startY = 0f
     private var anchorX = 0f; private var anchorY = 0f
     private var stickX = 0f; private var stickY = 0f
-    private var scrollX = 0f; private var scrollY = 0f
     private var began = 0L
     private var down = false; private var two = false; private var moved = false; private var dragging = false
     private var feedback = 0f
@@ -76,7 +80,9 @@ class TouchpadView(context: Context, private val send: (Input) -> Unit) : View(c
 
     fun preferences(value: PointerSettings) {
         val next = value.normalized()
-        if (next.mode != preferences.mode) cancelInteractions()
+        if (next == preferences) return
+        if (next.mode != preferences.mode || next.doubleTapScroll != preferences.doubleTapScroll) cancelInteractions(false)
+        if (next.scrollGestureSpeed != preferences.scrollGestureSpeed || next.invertScroll != preferences.invertScroll) scroll.reset()
         preferences = next
         updateDescription()
         invalidate()
@@ -90,9 +96,11 @@ class TouchpadView(context: Context, private val send: (Input) -> Unit) : View(c
     }
 
     private fun updateDescription() {
-        contentDescription = if (preferences.mode == PointerMode.JOYSTICK)
-            "Joystick. Touch anywhere and move outward to move the pointer faster. Tap to click. Two fingers scroll."
-        else "Touchpad. Move one finger, tap to click, hold to drag, or use two fingers to scroll."
+        val description = if (preferences.mode == PointerMode.JOYSTICK)
+            "Joystick. Touch anywhere and move outward to move the pointer faster."
+        else "Touchpad. Move one finger to steer the pointer."
+        contentDescription = description + " Tap to click. Hold to drag. Two fingers scroll." +
+            if (preferences.doubleTapScroll) " Tap, then touch and drag to scroll." else ""
     }
 
     override fun onSizeChanged(w: Int, h: Int, oldw: Int, oldh: Int) {
@@ -143,7 +151,12 @@ class TouchpadView(context: Context, private val send: (Input) -> Unit) : View(c
             if (roomy) {
                 paint.color = RemoteStyle.muted
                 paint.textSize = android.util.TypedValue.applyDimension(android.util.TypedValue.COMPLEX_UNIT_SP, 12f, resources.displayMetrics)
-                canvas.drawText(if (preferences.mode == PointerMode.JOYSTICK) "Push farther from the centre to move faster" else "Tap to click · Hold to drag · Two fingers scroll", width / 2f,
+                val hint = when {
+                    preferences.doubleTapScroll -> "Tap, then drag to scroll"
+                    preferences.mode == PointerMode.JOYSTICK -> "Push farther to move faster"
+                    else -> "Tap to click · Hold to drag · Two fingers scroll"
+                }
+                canvas.drawText(hint, width / 2f,
                     centerY + size / 2 + 54 * density, paint)
             }
         }
@@ -243,35 +256,47 @@ class TouchpadView(context: Context, private val send: (Input) -> Unit) : View(c
         when (event.actionMasked) {
             MotionEvent.ACTION_DOWN -> {
                 val previousFeedback = feedback
-                cancelInteractions(false)
+                finishInteraction(false)
                 feedback = previousFeedback
                 down = true; startX = event.x; startY = event.y; lastX = event.x; lastY = event.y
-                visualStick = preferences.mode == PointerMode.JOYSTICK
+                doubleTap.begin(event.eventTime, event.x, event.y, preferences.doubleTapScroll)
+                visualStick = !doubleTap.reserved && preferences.mode == PointerMode.JOYSTICK
                 anchorX = event.x; anchorY = event.y; began = event.eventTime
                 parent.requestDisallowInterceptTouchEvent(true)
-                postDelayed(hold, ViewConfiguration.getLongPressTimeout().toLong())
+                if (!doubleTap.reserved) postDelayed(hold, ViewConfiguration.getLongPressTimeout().toLong())
                 animateFeedback(1f)
             }
             MotionEvent.ACTION_POINTER_DOWN -> {
+                if (!down) return true
                 removeCallbacks(hold); stopFrames()
+                if (doubleTap.reserved) moved = true
+                doubleTap.reset()
                 if (dragging) { send(Input.Button(272, false)); dragging = false }
                 two = true
                 visualStick = false
                 lastX = (event.getX(0) + event.getX(1)) / 2
                 lastY = (event.getY(0) + event.getY(1)) / 2
                 startX = lastX; startY = lastY
-                scrollX = 0f; scrollY = 0f
+                scroll.reset()
+            }
+            MotionEvent.ACTION_POINTER_UP -> {
+                // Rebase if one of the two fingers used for the centroid changes.
+                if (two && event.pointerCount > 2) {
+                    val first = if (event.actionIndex == 0) 1 else 0
+                    val second = if (event.actionIndex <= 1) 2 else 1
+                    lastX = (event.getX(first) + event.getX(second)) / 2
+                    lastY = (event.getY(first) + event.getY(second)) / 2
+                }
             }
             MotionEvent.ACTION_MOVE -> {
+                if (!down) return true
                 val x = if (event.pointerCount >= 2) (event.getX(0) + event.getX(1)) / 2 else event.x
                 val y = if (event.pointerCount >= 2) (event.getY(0) + event.getY(1)) / 2 else event.y
                 if (hypot(x - startX, y - startY) > slop) { moved = true; removeCallbacks(hold) }
-                if (two && event.pointerCount >= 2) {
-                    scrollX += (x - lastX) / density * 3.5f
-                    scrollY += (y - lastY) / density * 3.5f
-                    val dx = scrollX.toInt().coerceIn(-4096, 4096)
-                    val dy = scrollY.toInt().coerceIn(-4096, 4096)
-                    if (dx != 0 || dy != 0) { send(Input.Scroll(dx, dy)); scrollX -= dx; scrollY -= dy }
+                if ((two && event.pointerCount >= 2) || doubleTap.move(x - startX, y - startY)) {
+                    scroll.gesture((x - lastX) / density, (y - lastY) / density, preferences)?.let(send)
+                } else if (doubleTap.reserved) {
+                    // Keep the second touch quiet until it becomes a click or a scroll.
                 } else if (!two && preferences.mode == PointerMode.JOYSTICK) {
                     stickX = (x - anchorX) / radius
                     stickY = (y - anchorY) / radius
@@ -283,10 +308,13 @@ class TouchpadView(context: Context, private val send: (Input) -> Unit) : View(c
                 lastX = x; lastY = y
             }
             MotionEvent.ACTION_UP -> {
-                if (!moved && !dragging && event.eventTime - began < ViewConfiguration.getLongPressTimeout()) {
+                val tap = down && !moved && !dragging && event.eventTime - began < ViewConfiguration.getLongPressTimeout() &&
+                    (two || hypot(event.x - startX, event.y - startY) <= slop)
+                if (tap) {
                     if (two) click(273) else performClick()
                 }
-                cancelInteractions()
+                doubleTap.finish(event.eventTime, event.x, event.y, tap && !two)
+                finishInteraction(true)
             }
             MotionEvent.ACTION_CANCEL -> cancelInteractions()
         }
@@ -295,12 +323,23 @@ class TouchpadView(context: Context, private val send: (Input) -> Unit) : View(c
     }
 
     fun cancelInteractions(animate: Boolean = true) {
+        doubleTap.reset()
+        finishInteraction(animate)
+        invalidate()
+    }
+
+    private fun finishInteraction(animate: Boolean) {
         removeCallbacks(hold); stopFrames()
         if (dragging) send(Input.Button(272, false))
         down = false; two = false; moved = false; dragging = false
         if (!animate) { stickX = 0f; stickY = 0f }
-        scrollX = 0f; scrollY = 0f
+        scroll.reset()
         if (animate) animateFeedback(0f) else { feedbackAnimation?.cancel(); feedback = 0f }
+    }
+
+    override fun onWindowFocusChanged(hasWindowFocus: Boolean) {
+        super.onWindowFocusChanged(hasWindowFocus)
+        if (!hasWindowFocus) cancelInteractions(false)
     }
 
     override fun onDetachedFromWindow() {

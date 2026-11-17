@@ -15,10 +15,12 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--test-binary', type=Path)
     parser.add_argument('--out', type=Path, default=ROOT / 'target/android-interop')
+    parser.add_argument('--offline', action='store_true', help='Use the local Cargo and Gradle caches')
     args = parser.parse_args()
+    offline = ['--offline'] if args.offline else []
     if args.test_binary is None:
         result = subprocess.run(['cargo', 'test', '--locked', '--features', 'android-remote',
-            '--jobs', '2', '--no-run', '--message-format=json'], cwd=ROOT,
+            '--jobs', '2', '--no-run', '--message-format=json', *offline], cwd=ROOT,
             stdout=subprocess.PIPE, text=True, check=True)
         artifacts = (json.loads(line) for line in result.stdout.splitlines() if line.startswith('{'))
         args.test_binary = next(Path(item['executable']) for item in artifacts
@@ -28,6 +30,8 @@ def main():
     output.mkdir(parents=True)
     (output / '.isolated-mobile-proof').touch()
     environment = dict(os.environ, DESK_SWITCH_MOBILE_PROOF=str(output))
+    if args.offline:
+        environment['CARGO_NET_OFFLINE'] = 'true'
     with (output / 'desktop.log').open('wb') as log:
         process = subprocess.Popen([str(args.test_binary.resolve()),
             'mobile::tests::external_android_client_controls_a_fake_sink', '--ignored', '--exact', '--nocapture'],
@@ -41,7 +45,7 @@ def main():
             wrapper = ROOT / 'android' / ('gradlew.bat' if os.name == 'nt' else 'gradlew')
             with (output / 'android-jvm.log').open('wb') as android_log:
                 result = subprocess.run([str(wrapper), ':core:test', '--tests', '*DesktopInteropTest',
-                    '--no-daemon', '--max-workers=2', '--rerun-tasks'], cwd=wrapper.parent,
+                    '--no-daemon', '--max-workers=2', *offline], cwd=wrapper.parent,
                     env=environment, stdout=android_log, stderr=subprocess.STDOUT, timeout=90)
             assert result.returncode == 0, (output / 'android-jvm.log').read_text(errors='replace')
             assert process.wait(timeout=15) == 0, (output / 'desktop.log').read_text(errors='replace')
