@@ -168,13 +168,14 @@ def main():
                 menu('Quit Desk Switch')
                 wait_for(lambda: process.poll() is not None, 'Quit did not exit while the main window was hidden')
                 assert process.returncode == 0, (args.out / 'lifecycle.log').read_text()
-            with (args.out / 'capture.log').open('w') as log:
-                process = subprocess.Popen([str(args.binary.resolve()), 'gui-preview', 'shared-four-quick-controls',
-                    '--state-dir', str(state / 'capture')], env=dict(env,
-                    DESK_SWITCH_CAPTURE_TO=str(args.out.resolve() / 'device-popup.png')), stdout=log, stderr=log)
-                wait_for(lambda: process.poll() is not None, 'The bounded popup capture did not exit', 10)
-                assert process.returncode == 0, (args.out / 'capture.log').read_text()
-                assert (args.out / 'device-popup.png').stat().st_size > 1000
+            for case, filename in [('shared-four-quick-controls', 'device-popup.png'), ('shared-four', 'workspace-main.png')]:
+                with (args.out / f'{case}-capture.log').open('w') as log:
+                    process = subprocess.Popen([str(args.binary.resolve()), 'gui-preview', case,
+                        '--state-dir', str(state / case)], env=dict(env,
+                        DESK_SWITCH_CAPTURE_TO=str(args.out.resolve() / filename)), stdout=log, stderr=log)
+                    wait_for(lambda: process.poll() is not None, 'The bounded capture did not exit', 10)
+                    assert process.returncode == 0, (args.out / f'{case}-capture.log').read_text()
+                    assert (args.out / filename).stat().st_size > 1000
             (args.out / 'lifecycle.json').write_text(json.dumps({
                 'backend': rendering['backend'], 'native_window_system': 'X11', 'root_id': root,
                 'close_restore_cycles': 2, 'menu_popup_with_main_visible': True,

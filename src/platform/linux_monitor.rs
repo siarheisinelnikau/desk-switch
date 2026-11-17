@@ -17,6 +17,7 @@ struct Display {
     connector: String,
     bus: Option<u32>,
     fingerprint: String,
+    edid: Vec<u8>,
 }
 
 fn displays() -> Result<Vec<Display>> {
@@ -44,6 +45,7 @@ fn displays() -> Result<Vec<Display>> {
             connector,
             bus,
             fingerprint: crate::workspace::hardware::display_key(&edid),
+            edid,
         });
     }
     displays.sort_by(|a, b| a.connector.cmp(&b.connector));
@@ -258,22 +260,36 @@ impl Monitor for Ddc {
     }
 
     fn write(&mut self, input: u16) -> Result<()> {
-        let bus = displays()
-            .and_then(|displays| selected_bus(&displays, &self.0))
-            .map_err(crate::video::not_issued)?;
-        ddcutil(
-            bus,
-            &[
-                "--noverify",
-                "--mccs=2.2",
-                "--maxtries=1,0,0",
-                "setvcp",
-                "60",
-                &format!("0x{input:04x}"),
-            ],
-        )?;
+        let displays = displays().map_err(crate::video::not_issued)?;
+        let bus = selected_bus(&displays, &self.0).map_err(crate::video::not_issued)?;
+        let display = displays
+            .iter()
+            .find(|display| display.id == self.0)
+            .unwrap();
+        let args = selection_args(&display.edid, input).map_err(crate::video::not_issued)?;
+        let args = args.iter().map(String::as_str).collect::<Vec<_>>();
+        ddcutil(bus, &args)?;
         Ok(())
     }
+}
+
+fn selection_args(edid: &[u8], input: u16) -> Result<Vec<String>> {
+    let mut args = vec![
+        "--noverify".into(),
+        "--mccs=2.2".into(),
+        "--maxtries=1,0,0".into(),
+    ];
+    if let Some(value) = crate::video::lg::input(edid, input)? {
+        args.extend([
+            "--i2c-source-addr=0x50".into(),
+            "setvcp".into(),
+            "f4".into(),
+            format!("0x{value:02x}"),
+        ]);
+    } else {
+        args.extend(["setvcp".into(), "60".into(), format!("0x{input:04x}")]);
+    }
+    Ok(args)
 }
 
 pub fn probe(only: Option<&str>) -> Result<()> {
@@ -413,6 +429,26 @@ mod tests {
     use super::*;
 
     #[test]
+    fn lg_selection_uses_private_source_and_never_retries_a_standard_command() {
+        let args = selection_args(&crate::video::lg::fixture(), 0x11).unwrap();
+        assert_eq!(
+            args,
+            [
+                "--noverify",
+                "--mccs=2.2",
+                "--maxtries=1,0,0",
+                "--i2c-source-addr=0x50",
+                "setvcp",
+                "f4",
+                "0x90"
+            ]
+        );
+        let standard = selection_args(&[], 0x11).unwrap();
+        assert_eq!(&standard[3..], ["setvcp", "60", "0x0011"]);
+        assert!(selection_args(&crate::video::lg::fixture(), 3).is_err());
+    }
+
+    #[test]
     fn an_inactive_port_does_not_need_hotplug_before_the_source_selects_it() {
         assert!(!disabled_connected_output(
             Some("disconnected\n"),
@@ -515,12 +551,14 @@ mod tests {
                 connector: "card0-DP-1".into(),
                 bus: Some(2),
                 fingerprint: String::new(),
+                edid: Vec::new(),
             },
             Display {
                 id: "shared".into(),
                 connector: "card0-HDMI-A-1".into(),
                 bus: Some(5),
                 fingerprint: String::new(),
+                edid: Vec::new(),
             },
         ];
         assert_eq!(selected_bus(&fixture, "shared").unwrap(), 5);

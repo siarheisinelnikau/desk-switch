@@ -905,7 +905,13 @@ impl Desktop {
                                         self.page = Page::Diagnostics;
                                     }
                                     ui.horizontal_wrapped(|ui| {
-                                        if ui.small_button(tr("Settings")).clicked() {
+                                        if ui
+                                            .add(
+                                                egui::Button::new(tr("Settings"))
+                                                    .min_size(egui::vec2(0.0, 32.0)),
+                                            )
+                                            .clicked()
+                                        {
                                             self.transfers.close();
                                             self.group.add_open = false;
                                             self.group.selected = member.node.key.clone();
