@@ -148,46 +148,45 @@ impl Native {
         }
     }
     pub(crate) async fn text(&mut self, value: String) -> Result<()> {
-        #[cfg(test)]
-        if let Self::Proof(sink) = self {
-            sink.proof.lock().unwrap().texts.push(value);
-            return Ok(());
-        }
-        #[cfg(windows)]
-        {
-            unicode(&value)
-        }
-        #[cfg(target_os = "linux")]
-        {
-            let Self::Linux { sink, writer } = self else {
-                unreachable!()
-            };
-            if writer.is_none() {
-                *writer = Some(crate::group::clipboard::RemoteText::start()?);
-            }
-            let mut result = writer.as_ref().unwrap().write(value)?;
-            loop {
-                tokio::select! {
-                    result = &mut result => { result?.map_err(anyhow::Error::msg)?; break; },
-                    result = sink.poll() => result?,
+        match self {
+            #[cfg(windows)]
+            Self::Windows(_) => unicode(&value),
+            #[cfg(target_os = "linux")]
+            Self::Linux { sink, writer } => {
+                if writer.is_none() {
+                    *writer = Some(crate::group::clipboard::RemoteText::start()?);
                 }
+                let mut result = writer.as_ref().unwrap().write(value)?;
+                loop {
+                    tokio::select! {
+                        result = &mut result => { result?.map_err(anyhow::Error::msg)?; break; },
+                        result = sink.poll() => result?,
+                    }
+                }
+                for (code, down) in [(29, true), (47, true), (47, false), (29, false)] {
+                    sink.event(Input::Key { code, down })?;
+                }
+                Ok(())
             }
-            for (code, down) in [(29, true), (47, true), (47, false), (29, false)] {
-                self.event(Input::Key { code, down })?;
+            #[cfg(test)]
+            Self::Proof(sink) => {
+                sink.proof.lock().unwrap().texts.push(value);
+                Ok(())
             }
-            Ok(())
-        }
-        #[cfg(not(any(windows, target_os = "linux")))]
-        {
-            let _ = value;
-            anyhow::bail!("Unsupported text destination")
+            #[cfg(not(any(windows, target_os = "linux")))]
+            Self::Unsupported => {
+                let _ = value;
+                anyhow::bail!("Unsupported text destination")
+            }
         }
     }
-    pub(crate) async fn close(&mut self) {
+    pub(crate) async fn close(mut self) {
         let _ = self.release();
         #[cfg(target_os = "linux")]
-        if let Self::Linux { sink, .. } = self {
-            sink.close().await;
+        match self {
+            Self::Linux { sink, .. } => (*sink).close().await,
+            #[cfg(test)]
+            Self::Proof(_) => {}
         }
     }
 }

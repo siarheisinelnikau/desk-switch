@@ -468,7 +468,7 @@ impl Engine {
                 }
             }
         }
-        if let Some(mut local) = self.local.take() {
+        if let Some(local) = self.local.take() {
             local.close().await;
         }
         self.remote = None;
