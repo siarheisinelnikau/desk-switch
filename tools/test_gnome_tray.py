@@ -94,8 +94,9 @@ def main():
                                ('disable-user-extensions', 'false')]:
                 subprocess.run(['gsettings', 'set', 'org.gnome.shell', key, value],
                     env=env, check=True, timeout=3, capture_output=True)
-            subprocess.run(['gsettings', 'set', 'org.gnome.desktop.interface', 'enable-animations', 'false'],
-                env=env, check=True, timeout=3, capture_output=True)
+            for key in ['enable-animations', 'enable-hot-corners']:
+                subprocess.run(['gsettings', 'set', 'org.gnome.desktop.interface', key, 'false'],
+                    env=env, check=True, timeout=3, capture_output=True)
             with (args.out / 'shell.log').open('w') as log:
                 compositor = subprocess.Popen(['gnome-shell', '--headless', '--wayland', '--unsafe-mode',
                     '--virtual-monitor=1920x1080', '--wayland-display=desk-switch-test'],
@@ -147,10 +148,13 @@ def main():
                     "const seat = global.stage.context.get_backend().get_default_seat(); "
                     "global.deskSwitchTestPointer = seat.create_virtual_device(Clutter.InputDeviceType.POINTER_DEVICE); "
                     "global.deskSwitchTestKeyboard = seat.create_virtual_device(Clutter.InputDeviceType.KEYBOARD_DEVICE); "
+                    "global.deskSwitchTestPointer.notify_absolute_motion(GLib.get_monotonic_time(), 960, 540); "
                     "global.deskSwitchTestKeys = []; global.stage.connect('captured-event', (_stage, event) => { "
                     "if ([Clutter.EventType.KEY_PRESS, Clutter.EventType.KEY_RELEASE].includes(event.type())) "
                     "global.deskSwitchTestKeys.push({type: event.type(), code: event.get_key_code(), symbol: event.get_key_symbol()}); "
                     "return Clutter.EVENT_PROPAGATE; }); return true; })()")
+                wait_for(lambda: shell('global.get_pointer()[0] === 960 && global.get_pointer()[1] === 540'),
+                    'The private pointer did not initialize away from desktop hot corners')
                 if args.backend == 'legacy':
                     # Measure this exact native GTK/XEmbed path before the
                     # click walkthrough. Only synthetic windows are created.
@@ -223,6 +227,7 @@ def main():
                         'global.deskSwitchTestIcon()?.mapped && global.deskSwitchTestIcon().width > 0 && '
                         'global.deskSwitchTestIcon().height > 0'), 'The panel button is not ready for physical hit testing')
                     def click(button):
+                        assert not shell('Main.overview.visible'), 'The test desktop unexpectedly entered its overview'
                         # Virtual seat requests are asynchronous. Sending motion,
                         # press and release in one Eval can click before the new
                         # device reaches the indicator, especially during login.
