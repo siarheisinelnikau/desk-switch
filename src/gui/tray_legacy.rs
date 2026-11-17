@@ -183,6 +183,9 @@ fn menu(
     ctx: &egui::Context,
 ) -> gtk::Menu {
     let menu = gtk::Menu::new();
+    menu.set_anchor_hints(
+        gdk::AnchorHints::FLIP_Y | gdk::AnchorHints::SLIDE_X | gdk::AnchorHints::SLIDE_Y,
+    );
     for entry in entries(state) {
         if let Some((label, action, enabled)) = entry {
             // Native clicks already work; keep extension setup out of this menu.
