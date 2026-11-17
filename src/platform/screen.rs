@@ -309,7 +309,7 @@ fn wayland() -> bool {
 #[cfg(target_os = "linux")]
 enum Linux {
     Gnome(zbus::blocking::Connection),
-    X11(x11rb::rust_connection::RustConnection, usize),
+    X11(Box<x11rb::rust_connection::RustConnection>, usize),
 }
 #[cfg(target_os = "linux")]
 impl Capture {
@@ -327,7 +327,7 @@ impl Capture {
                 )
             } else {
                 let (connection, screen) = x11rb::connect(None)?;
-                Linux::X11(connection, screen)
+                Linux::X11(Box::new(connection), screen)
             });
         }
         let result = match self.connection.as_ref().unwrap() {
