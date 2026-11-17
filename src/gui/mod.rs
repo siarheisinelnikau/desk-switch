@@ -735,6 +735,12 @@ impl Desktop {
         self.resource_panel.tick(ctx);
         #[cfg(debug_assertions)]
         if self.preview.is_some() {
+            // Only the private GNOME integration test opts into setup. Ordinary
+            // synthetic previews must never change the user's desktop state.
+            #[cfg(target_os = "linux")]
+            if std::env::var_os("DESK_SWITCH_PREVIEW_TRAY_SETUP").is_some() {
+                self.linux_tray.tick(ctx);
+            }
             self.preview_tick(ctx);
             return;
         }

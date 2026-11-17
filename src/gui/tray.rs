@@ -159,7 +159,7 @@ mod native {
             };
             vec![
                 item("Quick controls", Action::QuickOpen { x: 0, y: 0 }, true),
-                item("Set up left-click popup…", Action::TraySetup, true),
+                item("Tray popup status…", Action::TraySetup, true),
                 item("Открыть Desk Switch", Action::Show, true),
                 MenuItem::Separator,
                 item(
