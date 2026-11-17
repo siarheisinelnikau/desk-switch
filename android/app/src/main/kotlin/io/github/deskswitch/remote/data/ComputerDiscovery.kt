@@ -10,7 +10,7 @@ import java.util.concurrent.atomic.AtomicBoolean
 class ComputerDiscovery(
     context: Context,
     private val changed: (List<Computer>) -> Unit,
-    private val failed: (String?) -> Unit,
+    private val failed: (Int?) -> Unit,
 ) : AutoCloseable {
     private val manager = context.getSystemService(NsdManager::class.java)
     private val closed = AtomicBoolean(false)
@@ -21,7 +21,7 @@ class ComputerDiscovery(
         override fun onDiscoveryStarted(type: String) { if (!closed.get()) failed(null) }
         override fun onDiscoveryStopped(type: String) = Unit
         override fun onStartDiscoveryFailed(type: String, code: Int) {
-            if (!closed.get()) failed("Wi-Fi discovery could not start ($code). Reopen the app to retry, or add the computer by address.")
+            if (!closed.get()) failed(code)
         }
         override fun onStopDiscoveryFailed(type: String, code: Int) = Unit
         override fun onServiceFound(service: NsdServiceInfo) = synchronized(this@ComputerDiscovery) {

@@ -95,14 +95,24 @@ impl FailoverWorkspace {
         stored.revision = 40;
         stored.activation = 9;
         stored.input_request = 9;
-        stored.active_input = Some(target.clone());
-        stored.input_intent = Some(target.clone());
-        stored.active_monitor = Some(target.clone());
-        stored.confirmed_monitor = Some(if pending_monitor {
-            keys[1].clone()
+        if large_roster {
+            // This fixture exercises transport with large payloads. Keep input
+            // inactive so peer bootstrap cannot queue an automatic fail-open or
+            // restore commit that changes the revision under the settings edit.
+            stored.settings.keyboard_enabled = false;
+            stored.settings.mouse_enabled = false;
         } else {
-            target.clone()
-        });
+            stored.active_input = Some(target.clone());
+            stored.input_intent = Some(target.clone());
+            stored.active_monitor = Some(target.clone());
+            stored.confirmed_monitor = Some(if pending_monitor {
+                keys[1].clone()
+            } else {
+                target.clone()
+            });
+            stored.settings.input = workspace::Selection::Computer(keys[1].clone());
+            stored.settings.monitor_enabled = true;
+        }
         if pending_monitor {
             stored.monitor_command = Some(model::MonitorCommand {
                 prepared: false,
@@ -122,8 +132,6 @@ impl FailoverWorkspace {
                 result: None,
             });
         }
-        stored.settings.input = workspace::Selection::Computer(keys[1].clone());
-        stored.settings.monitor_enabled = true;
         stored.members = members
             .iter()
             .map(|member| (member.node.key.clone(), member.clone()))

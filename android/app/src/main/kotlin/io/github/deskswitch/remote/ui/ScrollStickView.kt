@@ -11,13 +11,16 @@ import android.view.KeyEvent
 import android.view.MotionEvent
 import android.view.View
 import android.view.accessibility.AccessibilityNodeInfo
+import io.github.deskswitch.remote.R
 import io.github.deskswitch.remote.domain.Input
 import io.github.deskswitch.remote.domain.PointerSettings
 import io.github.deskswitch.remote.domain.ScrollMotion
 import kotlin.math.abs
 
 internal class ScrollStickView(context: Context, private val send: (Input) -> Unit) : View(context) {
+    private val colors = RemoteStyle.palette(context)
     private val density = resources.displayMetrics.density
+    private val label = context.getString(R.string.scroll_label)
     private val paint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         typeface = Typeface.create("sans-serif-medium", Typeface.NORMAL)
         textSize = TypedValue.applyDimension(TypedValue.COMPLEX_UNIT_SP, 12f, resources.displayMetrics)
@@ -35,8 +38,8 @@ internal class ScrollStickView(context: Context, private val send: (Input) -> Un
 
     init {
         background = RemoteStyle.interactive(context)
-        contentDescription = "Scroll joystick. Push up or down and hold to scroll."
-        tooltipText = "Drag up or down to scroll"
+        contentDescription = context.getString(R.string.scroll_joystick_accessibility)
+        tooltipText = context.getString(R.string.scroll_joystick_tooltip)
         isFocusable = true
         importantForAccessibility = IMPORTANT_FOR_ACCESSIBILITY_YES
     }
@@ -51,9 +54,9 @@ internal class ScrollStickView(context: Context, private val send: (Input) -> Un
     override fun onDraw(canvas: Canvas) {
         super.onDraw(canvas)
         val centerY = height / 2f
-        val fitsLabel = paint.measureText("Scroll") + 33 * density <= width
+        val fitsLabel = paint.measureText(label) + 33 * density <= width
         val centerX = if (fitsLabel) 18 * density else width / 2f
-        paint.color = RemoteStyle.muted
+        paint.color = colors.muted
         paint.strokeWidth = 1.4f * density
         for (direction in -1..1 step 2) {
             val tip = centerY + direction * 16 * density
@@ -61,8 +64,8 @@ internal class ScrollStickView(context: Context, private val send: (Input) -> Un
             canvas.drawLine(centerX, tip, centerX - 4 * density, edge, paint)
             canvas.drawLine(centerX, tip, centerX + 4 * density, edge, paint)
         }
-        if (fitsLabel) canvas.drawText("Scroll", 30 * density, centerY - (paint.ascent() + paint.descent()) / 2, paint)
-        paint.color = RemoteStyle.accent
+        if (fitsLabel) canvas.drawText(label, 30 * density, centerY - (paint.ascent() + paint.descent()) / 2, paint)
+        paint.color = colors.accent
         canvas.drawCircle(centerX, centerY + displacement * 8 * density, 4.5f * density, paint)
     }
 
