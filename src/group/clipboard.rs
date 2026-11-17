@@ -326,7 +326,7 @@ fn backend() -> Result<Box<dyn Backend>> {
         return gnome::Gnome::new()
             .map(|backend| Box::new(backend) as Box<dyn Backend>)
             .context(
-                "The GNOME tray integration is unavailable. Check Application > Tray device popup; a new desktop session may be required after installation",
+                "The GNOME clipboard integration is unavailable. A new desktop session may be required after installation",
             );
     }
     Ok(Box::new(Native {
