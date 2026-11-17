@@ -11,6 +11,7 @@ const UUID: &str = "desk-switch@siarheisinelnikau";
 
 #[derive(Default)]
 pub(super) struct Integration {
+    direct_popup: bool,
     started: bool,
     pending: Option<mpsc::Receiver<Result<bool, String>>>,
     pub ready: bool,
@@ -18,7 +19,9 @@ pub(super) struct Integration {
 }
 
 impl Integration {
-    pub fn tick(&mut self, ctx: &egui::Context) {
+    pub fn tick(&mut self, ctx: &egui::Context, direct_popup: bool) {
+        self.direct_popup = direct_popup;
+        self.ready |= direct_popup;
         if !self.started && is_gnome() {
             self.start(ctx, true);
         }
@@ -30,7 +33,7 @@ impl Integration {
             self.pending = None;
             match result {
                 Ok(ready) => {
-                    self.ready = ready;
+                    self.ready = ready || self.direct_popup;
                     self.message = if ready {
                         "Left-click opens the device popup. Right-click opens the desktop menu."
                     } else {
@@ -38,7 +41,7 @@ impl Integration {
                     }.into();
                 }
                 Err(error) => {
-                    self.ready = false;
+                    self.ready = self.direct_popup;
                     self.message = error;
                 }
             }
@@ -66,14 +69,16 @@ impl Integration {
     }
 
     pub fn show(&mut self, ui: &mut egui::Ui) {
-        if !is_gnome() {
+        if !is_gnome() || self.direct_popup {
             return;
         }
         egui::Frame::group(ui.style())
             .inner_margin(16)
             .show(ui, |ui| {
                 ui.strong(crate::i18n::tr("Tray device popup"));
-                ui.label(crate::i18n::tr(&self.message));
+                ui.label(crate::i18n::tr(if self.direct_popup {
+                    "Left-click opens the device popup. Right-click opens the desktop menu. No GNOME companion is required for these tray controls."
+                } else { &self.message }));
                 if !self.ready
                     && ui
                         .add_enabled(
@@ -340,13 +345,13 @@ mod tests {
         let mut integration = Integration::default();
         let deadline = Instant::now() + Duration::from_secs(3);
         while !integration.ready && Instant::now() < deadline {
-            integration.tick(&ctx);
+            integration.tick(&ctx, false);
             std::thread::sleep(Duration::from_millis(10));
         }
         assert!(integration.ready, "{}", integration.message);
         assert_eq!(*desktop.calls.lock().unwrap(), [UUID]);
         for _ in 0..10 {
-            integration.tick(&ctx);
+            integration.tick(&ctx, false);
         }
         assert!(check_on(&client, true).unwrap());
         assert_eq!(

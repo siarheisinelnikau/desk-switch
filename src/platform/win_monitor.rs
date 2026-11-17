@@ -422,6 +422,11 @@ fn edid(path: &[u16]) -> Result<Vec<u8>> {
 }
 
 fn identity(screen: &Screen) -> Result<(String, String)> {
+    let (id, name, _) = identity_data(screen)?;
+    Ok((id, name))
+}
+
+fn identity_data(screen: &Screen) -> Result<(String, String, Vec<u8>)> {
     let mut found = None;
     for index in 0..64 {
         let mut device = DISPLAY_DEVICEW {
@@ -452,14 +457,16 @@ fn identity(screen: &Screen) -> Result<(String, String)> {
     let device = found.context("no active physical monitor interface for this Windows screen")?;
     let path = wide_text(&device.DeviceID).to_ascii_lowercase();
     ensure!(!path.is_empty(), "empty Windows monitor interface path");
-    let fingerprint = hex(&Sha256::digest(edid(&device.DeviceID)?));
+    let data = edid(&device.DeviceID)?;
+    let fingerprint = hex(&Sha256::digest(&data));
     Ok((
         format!("{path}|{fingerprint}"),
         wide_text(&device.DeviceString),
+        data,
     ))
 }
 
-struct Physical(PHYSICAL_MONITOR);
+struct Physical(PHYSICAL_MONITOR, String, Vec<u8>);
 impl Drop for Physical {
     fn drop(&mut self) {
         // SAFETY: the handle was opened by GetPhysicalMonitorsFromHMONITOR and
@@ -471,6 +478,7 @@ impl Drop for Physical {
 }
 
 fn physical(screen: &Screen) -> Result<Physical> {
+    let (_, _, edid) = identity_data(screen)?;
     let mut count = 0;
     // SAFETY: the screen owns a live monitor handle and `count` is a live
     // out-parameter.
@@ -487,7 +495,7 @@ fn physical(screen: &Screen) -> Result<Physical> {
     if unsafe { GetPhysicalMonitorsFromHMONITOR(screen.handle, count, &mut monitor) } == 0 {
         return Err(io::Error::last_os_error()).context("opening Windows DDC/CI handle");
     }
-    Ok(Physical(monitor))
+    Ok(Physical(monitor, screen.name.clone(), edid))
 }
 
 fn select(id: &str) -> Result<Physical> {
@@ -545,6 +553,12 @@ impl Monitor for Ddc {
 
     fn write(&mut self, input: u16) -> Result<()> {
         let monitor = select(&self.0).map_err(crate::video::not_issued)?;
+        if let Some(value) =
+            crate::video::lg::input(&monitor.2, input).map_err(crate::video::not_issued)?
+        {
+            let driver = super::win_nvapi::prepare(&monitor.1).map_err(crate::video::not_issued)?;
+            return driver.write_lg(value);
+        }
         println!(
             "DDC write issued: process {}, input {input:#06x}; exactly one SetVCPFeature call.",
             std::process::id()
@@ -721,6 +735,42 @@ pub fn read_monitor(id: &str) -> Result<super::MonitorInfo> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn one_lg() -> Result<(String, String)> {
+        let mut found = Vec::new();
+        for screen in screens()? {
+            let (id, _, data) = identity_data(&screen)?;
+            if crate::video::lg::input(&data, 0x11)?.is_some() {
+                found.push((id, screen.name));
+            }
+        }
+        ensure!(found.len() == 1, "Expected exactly one LG 27GK750F");
+        Ok(found.remove(0))
+    }
+
+    #[test]
+    #[ignore = "Read-only NVIDIA binding check on explicitly selected physical hardware"]
+    fn inspect_lg_nvidia_binding() -> Result<()> {
+        ensure!(
+            std::env::var("DESK_SWITCH_INSPECT_LG").as_deref() == Ok("1"),
+            "Set DESK_SWITCH_INSPECT_LG=1 for this read-only check"
+        );
+        let (_, gdi) = one_lg()?;
+        let _prepared = super::super::win_nvapi::prepare(&gdi)?;
+        println!("LG 27GK750F: NVIDIA driver binding ready; no I2C write was issued");
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "One physical HDMI1 selection; requires explicit user confirmation"]
+    fn select_lg_hdmi1_once() -> Result<()> {
+        ensure!(
+            std::env::var("DESK_SWITCH_CONFIRM_LG_HDMI1").as_deref() == Ok("27GK750F"),
+            "Explicit confirmation for LG 27GK750F HDMI1 is required"
+        );
+        let (id, _) = one_lg()?;
+        crate::video::select_once(Ddc(id), 0x11)
+    }
 
     fn desktop() -> Vec<(String, ScreenRect, String)> {
         vec![

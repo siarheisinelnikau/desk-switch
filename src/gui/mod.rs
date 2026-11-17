@@ -739,7 +739,10 @@ impl Desktop {
             // synthetic previews must never change the user's desktop state.
             #[cfg(target_os = "linux")]
             if std::env::var_os("DESK_SWITCH_PREVIEW_TRAY_SETUP").is_some() {
-                self.linux_tray.tick(ctx);
+                self.linux_tray.tick(
+                    ctx,
+                    self.tray.as_ref().is_some_and(tray::Tray::direct_popup),
+                );
             }
             self.preview_tick(ctx);
             return;
@@ -748,7 +751,10 @@ impl Desktop {
             crate::updater::acknowledge_shared_start(&self.dir);
         }
         #[cfg(target_os = "linux")]
-        self.linux_tray.tick(ctx);
+        self.linux_tray.tick(
+            ctx,
+            self.tray.as_ref().is_some_and(tray::Tray::direct_popup),
+        );
         if self.startup_pending {
             self.startup_pending = false;
             self.startup(ctx);

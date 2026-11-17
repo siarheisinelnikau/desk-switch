@@ -22,6 +22,8 @@ PACKAGE_MARKER = re.compile(r"^<!-- cargo-package: ([^ ]+) ([^ ]+) -->$", re.MUL
 # These files contain package-specific copyright notices or attribution and are
 # therefore reproduced in addition to the common MIT and Apache-2.0 terms.
 VENDORED_TEXTS = {
+    "assets/third-party/download-manager/LICENSE": "DownloadManager tray integration (MIT)",
+    "assets/third-party/nvapi/LICENSE": "NVIDIA NVAPI ABI declarations (MIT)",
     "assets/third-party/file-transfer/cap-std-LICENSE-MIT": "cap-std and cap-fs-ext (MIT option)",
     "assets/third-party/file-transfer/fuser-LICENSE-MIT": "fuser (MIT option)",
     "assets/third-party/file-transfer/nix-LICENSE-MIT": "nix (MIT option)",

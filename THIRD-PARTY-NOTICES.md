@@ -10,7 +10,7 @@ python tools/gen_third_party_notices.py
 
 To check the committed inventory without Cargo or network access, run `python tools/gen_third_party_notices.py --check`.
 
-The resolved graph contains **506 third-party Cargo packages**. The root package `desk-switch` is excluded from that count. Additional non-Cargo bundled components are listed separately.
+The resolved graph contains **544 third-party Cargo packages**. The root package `desk-switch` is excluded from that count. Additional non-Cargo bundled components are listed separately.
 
 ## Desk Switch License
 
@@ -197,6 +197,24 @@ The original VB-Audio installer archives are separate donationware, not part of 
 - **Homepage:** Not specified in Cargo metadata
 - **Authors:** David Tolnay <dtolnay@gmail.com>
 
+### atk 0.18.2
+
+<!-- cargo-package: atk 0.18.2 -->
+
+- **License (Cargo metadata):** `MIT`; see [MIT license terms](#appendix-a-mit-license)
+- **Repository:** https://github.com/gtk-rs/gtk3-rs
+- **Homepage:** https://gtk-rs.org/
+- **Authors:** The gtk-rs Project Developers
+
+### atk-sys 0.18.2
+
+<!-- cargo-package: atk-sys 0.18.2 -->
+
+- **License (Cargo metadata):** `MIT`; see [MIT license terms](#appendix-a-mit-license)
+- **Repository:** https://github.com/gtk-rs/gtk3-rs
+- **Homepage:** https://gtk-rs.org/
+- **Authors:** The gtk-rs Project Developers
+
 ### atomic-waker 1.1.2
 
 <!-- cargo-package: atomic-waker 1.1.2 -->
@@ -375,6 +393,24 @@ The original VB-Audio installer archives are separate donationware, not part of 
 - **Homepage:** Not specified in Cargo metadata
 - **Authors:** Carl Lerche <me@carllerche.com>; Sean McArthur <sean@seanmonstar.com>
 
+### cairo-rs 0.18.5
+
+<!-- cargo-package: cairo-rs 0.18.5 -->
+
+- **License (Cargo metadata):** `MIT`; see [MIT license terms](#appendix-a-mit-license)
+- **Repository:** https://github.com/gtk-rs/gtk-rs-core
+- **Homepage:** https://gtk-rs.org/
+- **Authors:** The gtk-rs Project Developers
+
+### cairo-sys-rs 0.18.2
+
+<!-- cargo-package: cairo-sys-rs 0.18.2 -->
+
+- **License (Cargo metadata):** `MIT`; see [MIT license terms](#appendix-a-mit-license)
+- **Repository:** https://github.com/gtk-rs/gtk-rs-core
+- **Homepage:** https://gtk-rs.org/
+- **Authors:** The gtk-rs Project Developers
+
 ### calloop 0.13.0
 
 <!-- cargo-package: calloop 0.13.0 -->
@@ -449,6 +485,15 @@ The original VB-Audio installer archives are separate donationware, not part of 
 - **License (Cargo metadata):** `MIT OR Apache-2.0`; see [MIT license terms](#appendix-a-mit-license) and [Apache-2.0 license terms](#appendix-b-apache-20-license)
 - **Repository:** https://github.com/rust-lang/cc-rs
 - **Homepage:** https://github.com/rust-lang/cc-rs
+
+### cfg-expr 0.15.8
+
+<!-- cargo-package: cfg-expr 0.15.8 -->
+
+- **License (Cargo metadata):** `MIT OR Apache-2.0`; see [MIT license terms](#appendix-a-mit-license) and [Apache-2.0 license terms](#appendix-b-apache-20-license)
+- **Repository:** https://github.com/EmbarkStudios/cfg-expr
+- **Homepage:** https://github.com/EmbarkStudios/cfg-expr
+- **Authors:** Embark <opensource@embark-studios.com>; Jake Shadle <jake.shadle@embark-studios.com>
 
 ### cfg-if 1.0.5
 
@@ -1116,6 +1161,15 @@ The `cfg_aliases!` macro uses a lot of the code from [`tectonic_cfg_support::tar
 - **Homepage:** https://github.com/mit-plv/fiat-crypto
 - **Authors:** Fiat Crypto library authors <jgross@mit.edu>
 
+### field-offset 0.3.6
+
+<!-- cargo-package: field-offset 0.3.6 -->
+
+- **License (Cargo metadata):** `MIT OR Apache-2.0`; see [MIT license terms](#appendix-a-mit-license) and [Apache-2.0 license terms](#appendix-b-apache-20-license)
+- **Repository:** https://github.com/Diggsey/rust-field-offset
+- **Homepage:** Not specified in Cargo metadata
+- **Authors:** Diggory Blake <diggsey@googlemail.com>
+
 ### find-msvc-tools 0.1.15
 
 <!-- cargo-package: find-msvc-tools 0.1.15 -->
@@ -1240,6 +1294,14 @@ The `cfg_aliases!` macro uses a lot of the code from [`tectonic_cfg_support::tar
 - **Repository:** https://github.com/rust-lang/futures-rs
 - **Homepage:** https://rust-lang.github.io/futures-rs
 
+### futures-executor 0.3.34
+
+<!-- cargo-package: futures-executor 0.3.34 -->
+
+- **License (Cargo metadata):** `MIT OR Apache-2.0`; see [MIT license terms](#appendix-a-mit-license) and [Apache-2.0 license terms](#appendix-b-apache-20-license)
+- **Repository:** https://github.com/rust-lang/futures-rs
+- **Homepage:** https://rust-lang.github.io/futures-rs
+
 ### futures-io 0.3.34
 
 <!-- cargo-package: futures-io 0.3.34 -->
@@ -1289,6 +1351,42 @@ The `cfg_aliases!` macro uses a lot of the code from [`tectonic_cfg_support::tar
 - **Repository:** https://github.com/rust-lang/futures-rs
 - **Homepage:** https://rust-lang.github.io/futures-rs
 
+### gdk 0.18.2
+
+<!-- cargo-package: gdk 0.18.2 -->
+
+- **License (Cargo metadata):** `MIT`; see [MIT license terms](#appendix-a-mit-license)
+- **Repository:** https://github.com/gtk-rs/gtk3-rs
+- **Homepage:** https://gtk-rs.org/
+- **Authors:** The gtk-rs Project Developers
+
+### gdk-pixbuf 0.18.5
+
+<!-- cargo-package: gdk-pixbuf 0.18.5 -->
+
+- **License (Cargo metadata):** `MIT`; see [MIT license terms](#appendix-a-mit-license)
+- **Repository:** https://github.com/gtk-rs/gtk-rs-core
+- **Homepage:** https://gtk-rs.org/
+- **Authors:** The gtk-rs Project Developers
+
+### gdk-pixbuf-sys 0.18.0
+
+<!-- cargo-package: gdk-pixbuf-sys 0.18.0 -->
+
+- **License (Cargo metadata):** `MIT`; see [MIT license terms](#appendix-a-mit-license)
+- **Repository:** https://github.com/gtk-rs/gtk-rs-core
+- **Homepage:** https://gtk-rs.org/
+- **Authors:** The gtk-rs Project Developers
+
+### gdk-sys 0.18.2
+
+<!-- cargo-package: gdk-sys 0.18.2 -->
+
+- **License (Cargo metadata):** `MIT`; see [MIT license terms](#appendix-a-mit-license)
+- **Repository:** https://github.com/gtk-rs/gtk3-rs
+- **Homepage:** https://gtk-rs.org/
+- **Authors:** The gtk-rs Project Developers
+
 ### generic-array 0.14.7
 
 <!-- cargo-package: generic-array 0.14.7 -->
@@ -1334,6 +1432,24 @@ The `cfg_aliases!` macro uses a lot of the code from [`tectonic_cfg_support::tar
 - **Homepage:** Not specified in Cargo metadata
 - **Authors:** The Rand Project Developers
 
+### gio 0.18.4
+
+<!-- cargo-package: gio 0.18.4 -->
+
+- **License (Cargo metadata):** `MIT`; see [MIT license terms](#appendix-a-mit-license)
+- **Repository:** https://github.com/gtk-rs/gtk-rs-core
+- **Homepage:** https://gtk-rs.org/
+- **Authors:** The gtk-rs Project Developers
+
+### gio-sys 0.18.1
+
+<!-- cargo-package: gio-sys 0.18.1 -->
+
+- **License (Cargo metadata):** `MIT`; see [MIT license terms](#appendix-a-mit-license)
+- **Repository:** https://github.com/gtk-rs/gtk-rs-core
+- **Homepage:** https://gtk-rs.org/
+- **Authors:** The gtk-rs Project Developers
+
 ### gl_generator 0.14.0
 
 <!-- cargo-package: gl_generator 0.14.0 -->
@@ -1342,6 +1458,33 @@ The `cfg_aliases!` macro uses a lot of the code from [`tectonic_cfg_support::tar
 - **Repository:** https://github.com/brendanzab/gl-rs/
 - **Homepage:** https://github.com/brendanzab/gl-rs/
 - **Authors:** Brendan Zabarauskas <bjzaba@yahoo.com.au>; Corey Richardson; Arseny Kapoulkine
+
+### glib 0.18.5
+
+<!-- cargo-package: glib 0.18.5 -->
+
+- **License (Cargo metadata):** `MIT`; see [MIT license terms](#appendix-a-mit-license)
+- **Repository:** https://github.com/gtk-rs/gtk-rs-core
+- **Homepage:** https://gtk-rs.org/
+- **Authors:** The gtk-rs Project Developers
+
+### glib-macros 0.18.5
+
+<!-- cargo-package: glib-macros 0.18.5 -->
+
+- **License (Cargo metadata):** `MIT`; see [MIT license terms](#appendix-a-mit-license)
+- **Repository:** https://github.com/gtk-rs/gtk-rs-core
+- **Homepage:** https://gtk-rs.org/
+- **Authors:** The gtk-rs Project Developers
+
+### glib-sys 0.18.1
+
+<!-- cargo-package: glib-sys 0.18.1 -->
+
+- **License (Cargo metadata):** `MIT`; see [MIT license terms](#appendix-a-mit-license)
+- **Repository:** https://github.com/gtk-rs/gtk-rs-core
+- **Homepage:** https://gtk-rs.org/
+- **Authors:** The gtk-rs Project Developers
 
 ### glifo 0.1.1
 
@@ -1405,6 +1548,42 @@ The `cfg_aliases!` macro uses a lot of the code from [`tectonic_cfg_support::tar
 - **Homepage:** Not specified in Cargo metadata
 - **Authors:** Kirill Chibisov <contact@kchibisov.com>
 
+### gobject-sys 0.18.0
+
+<!-- cargo-package: gobject-sys 0.18.0 -->
+
+- **License (Cargo metadata):** `MIT`; see [MIT license terms](#appendix-a-mit-license)
+- **Repository:** https://github.com/gtk-rs/gtk-rs-core
+- **Homepage:** https://gtk-rs.org/
+- **Authors:** The gtk-rs Project Developers
+
+### gtk 0.18.2
+
+<!-- cargo-package: gtk 0.18.2 -->
+
+- **License (Cargo metadata):** `MIT`; see [MIT license terms](#appendix-a-mit-license)
+- **Repository:** https://github.com/gtk-rs/gtk3-rs
+- **Homepage:** https://gtk-rs.org/
+- **Authors:** The gtk-rs Project Developers
+
+### gtk-sys 0.18.2
+
+<!-- cargo-package: gtk-sys 0.18.2 -->
+
+- **License (Cargo metadata):** `MIT`; see [MIT license terms](#appendix-a-mit-license)
+- **Repository:** https://github.com/gtk-rs/gtk3-rs
+- **Homepage:** https://gtk-rs.org/
+- **Authors:** The gtk-rs Project Developers
+
+### gtk3-macros 0.18.2
+
+<!-- cargo-package: gtk3-macros 0.18.2 -->
+
+- **License (Cargo metadata):** `MIT`; see [MIT license terms](#appendix-a-mit-license)
+- **Repository:** https://github.com/gtk-rs/gtk3-rs
+- **Homepage:** https://gtk-rs.org/
+- **Authors:** The gtk-rs Project Developers
+
 ### guillotiere 0.7.0
 
 <!-- cargo-package: guillotiere 0.7.0 -->
@@ -1446,6 +1625,23 @@ The `cfg_aliases!` macro uses a lot of the code from [`tectonic_cfg_support::tar
 
 - **License (Cargo metadata):** `MIT OR Apache-2.0`; see [MIT license terms](#appendix-a-mit-license) and [Apache-2.0 license terms](#appendix-b-apache-20-license)
 - **Repository:** https://github.com/rust-lang/hashbrown
+- **Homepage:** Not specified in Cargo metadata
+
+### heck 0.4.1
+
+<!-- cargo-package: heck 0.4.1 -->
+
+- **License (Cargo metadata):** `MIT OR Apache-2.0`; see [MIT license terms](#appendix-a-mit-license) and [Apache-2.0 license terms](#appendix-b-apache-20-license)
+- **Repository:** https://github.com/withoutboats/heck
+- **Homepage:** https://github.com/withoutboats/heck
+- **Authors:** Without Boats <woboats@gmail.com>
+
+### heck 0.5.0
+
+<!-- cargo-package: heck 0.5.0 -->
+
+- **License (Cargo metadata):** `MIT OR Apache-2.0`; see [MIT license terms](#appendix-a-mit-license) and [Apache-2.0 license terms](#appendix-b-apache-20-license)
+- **Repository:** https://github.com/withoutboats/heck
 - **Homepage:** Not specified in Cargo metadata
 
 ### hermit-abi 0.5.3
@@ -2368,6 +2564,24 @@ The `cfg_aliases!` macro uses a lot of the code from [`tectonic_cfg_support::tar
 - **Vendored license texts:**
   - `assets/third-party/file-transfer/page-size-LICENSE-MIT`: reproduced in [Appendix C](#appendix-c-vendored-license-and-notice-texts)
 
+### pango 0.18.3
+
+<!-- cargo-package: pango 0.18.3 -->
+
+- **License (Cargo metadata):** `MIT`; see [MIT license terms](#appendix-a-mit-license)
+- **Repository:** https://github.com/gtk-rs/gtk-rs-core
+- **Homepage:** https://gtk-rs.org/
+- **Authors:** The gtk-rs Project Developers
+
+### pango-sys 0.18.0
+
+<!-- cargo-package: pango-sys 0.18.0 -->
+
+- **License (Cargo metadata):** `MIT`; see [MIT license terms](#appendix-a-mit-license)
+- **Repository:** https://github.com/gtk-rs/gtk-rs-core
+- **Homepage:** https://gtk-rs.org/
+- **Authors:** The gtk-rs Project Developers
+
 ### parking 2.2.1
 
 <!-- cargo-package: parking 2.2.1 -->
@@ -2541,6 +2755,24 @@ The `cfg_aliases!` macro uses a lot of the code from [`tectonic_cfg_support::tar
 - **Homepage:** https://icu4x.unicode.org
 - **Authors:** The ICU4X Project Developers
 
+### proc-macro-crate 1.3.1
+
+<!-- cargo-package: proc-macro-crate 1.3.1 -->
+
+- **License (Cargo metadata):** `MIT OR Apache-2.0`; see [MIT license terms](#appendix-a-mit-license) and [Apache-2.0 license terms](#appendix-b-apache-20-license)
+- **Repository:** https://github.com/bkchr/proc-macro-crate
+- **Homepage:** Not specified in Cargo metadata
+- **Authors:** Bastian Köcher <git@kchr.de>
+
+### proc-macro-crate 2.0.2
+
+<!-- cargo-package: proc-macro-crate 2.0.2 -->
+
+- **License (Cargo metadata):** `MIT OR Apache-2.0`; see [MIT license terms](#appendix-a-mit-license) and [Apache-2.0 license terms](#appendix-b-apache-20-license)
+- **Repository:** https://github.com/bkchr/proc-macro-crate
+- **Homepage:** Not specified in Cargo metadata
+- **Authors:** Bastian Köcher <git@kchr.de>
+
 ### proc-macro-crate 3.5.0
 
 <!-- cargo-package: proc-macro-crate 3.5.0 -->
@@ -2549,6 +2781,24 @@ The `cfg_aliases!` macro uses a lot of the code from [`tectonic_cfg_support::tar
 - **Repository:** https://github.com/bkchr/proc-macro-crate
 - **Homepage:** Not specified in Cargo metadata
 - **Authors:** Bastian Köcher <git@kchr.de>
+
+### proc-macro-error 1.0.4
+
+<!-- cargo-package: proc-macro-error 1.0.4 -->
+
+- **License (Cargo metadata):** `MIT OR Apache-2.0`; see [MIT license terms](#appendix-a-mit-license) and [Apache-2.0 license terms](#appendix-b-apache-20-license)
+- **Repository:** https://gitlab.com/CreepySkeleton/proc-macro-error
+- **Homepage:** Not specified in Cargo metadata
+- **Authors:** CreepySkeleton <creepy-skeleton@yandex.ru>
+
+### proc-macro-error-attr 1.0.4
+
+<!-- cargo-package: proc-macro-error-attr 1.0.4 -->
+
+- **License (Cargo metadata):** `MIT OR Apache-2.0`; see [MIT license terms](#appendix-a-mit-license) and [Apache-2.0 license terms](#appendix-b-apache-20-license)
+- **Repository:** https://gitlab.com/CreepySkeleton/proc-macro-error
+- **Homepage:** Not specified in Cargo metadata
+- **Authors:** CreepySkeleton <creepy-skeleton@yandex.ru>
 
 ### proc-macro2 1.0.107
 
@@ -3004,6 +3254,14 @@ The `cfg_aliases!` macro uses a lot of the code from [`tectonic_cfg_support::tar
 - **Homepage:** Not specified in Cargo metadata
 - **Authors:** David Tolnay <dtolnay@gmail.com>
 
+### serde_spanned 0.6.9
+
+<!-- cargo-package: serde_spanned 0.6.9 -->
+
+- **License (Cargo metadata):** `MIT OR Apache-2.0`; see [MIT license terms](#appendix-a-mit-license) and [Apache-2.0 license terms](#appendix-b-apache-20-license)
+- **Repository:** https://github.com/toml-rs/toml
+- **Homepage:** Not specified in Cargo metadata
+
 ### serde_spanned 1.1.2
 
 <!-- cargo-package: serde_spanned 1.1.2 -->
@@ -3244,6 +3502,15 @@ The `cfg_aliases!` macro uses a lot of the code from [`tectonic_cfg_support::tar
 - **Homepage:** https://dalek.rs/
 - **Authors:** Isis Lovecruft <isis@patternsinthevoid.net>; Henry de Valence <hdevalence@hdevalence.ca>
 
+### syn 1.0.109
+
+<!-- cargo-package: syn 1.0.109 -->
+
+- **License (Cargo metadata):** `MIT OR Apache-2.0`; see [MIT license terms](#appendix-a-mit-license) and [Apache-2.0 license terms](#appendix-b-apache-20-license)
+- **Repository:** https://github.com/dtolnay/syn
+- **Homepage:** Not specified in Cargo metadata
+- **Authors:** David Tolnay <dtolnay@gmail.com>
+
 ### syn 2.0.119
 
 <!-- cargo-package: syn 2.0.119 -->
@@ -3280,6 +3547,15 @@ The `cfg_aliases!` macro uses a lot of the code from [`tectonic_cfg_support::tar
 - **Homepage:** Not specified in Cargo metadata
 - **Authors:** Nika Layzell <nika@thelayzells.com>
 
+### system-deps 6.2.2
+
+<!-- cargo-package: system-deps 6.2.2 -->
+
+- **License (Cargo metadata):** `MIT OR Apache-2.0`; see [MIT license terms](#appendix-a-mit-license) and [Apache-2.0 license terms](#appendix-b-apache-20-license)
+- **Repository:** https://github.com/gdesmott/system-deps
+- **Homepage:** Not specified in Cargo metadata
+- **Authors:** Guillaume Desmottes <guillaume.desmottes@collabora.com>; Josh Triplett <josh@joshtriplett.org>
+
 ### tap 1.0.1
 
 <!-- cargo-package: tap 1.0.1 -->
@@ -3288,6 +3564,15 @@ The `cfg_aliases!` macro uses a lot of the code from [`tectonic_cfg_support::tar
 - **Repository:** https://github.com/myrrlyn/tap
 - **Homepage:** https://github.com/myrrlyn/tap
 - **Authors:** Elliott Linder <elliott.darfink@gmail.com>; myrrlyn <self@myrrlyn.dev>
+
+### target-lexicon 0.12.16
+
+<!-- cargo-package: target-lexicon 0.12.16 -->
+
+- **License (Cargo metadata):** `Apache-2.0 WITH LLVM-exception`; see [Apache-2.0 license terms](#appendix-b-apache-20-license)
+- **Repository:** https://github.com/bytecodealliance/target-lexicon
+- **Homepage:** Not specified in Cargo metadata
+- **Authors:** Dan Gohman <sunfish@mozilla.com>
 
 ### tempfile 3.27.0
 
@@ -3396,6 +3681,15 @@ The `cfg_aliases!` macro uses a lot of the code from [`tectonic_cfg_support::tar
 - **Repository:** https://github.com/rustls/tokio-rustls
 - **Homepage:** https://github.com/rustls/tokio-rustls
 
+### toml 0.8.2
+
+<!-- cargo-package: toml 0.8.2 -->
+
+- **License (Cargo metadata):** `MIT OR Apache-2.0`; see [MIT license terms](#appendix-a-mit-license) and [Apache-2.0 license terms](#appendix-b-apache-20-license)
+- **Repository:** https://github.com/toml-rs/toml
+- **Homepage:** https://github.com/toml-rs/toml
+- **Authors:** Alex Crichton <alex@alexcrichton.com>
+
 ### toml 0.9.12+spec-1.1.0
 
 <!-- cargo-package: toml 0.9.12+spec-1.1.0 -->
@@ -3403,6 +3697,15 @@ The `cfg_aliases!` macro uses a lot of the code from [`tectonic_cfg_support::tar
 - **License (Cargo metadata):** `MIT OR Apache-2.0`; see [MIT license terms](#appendix-a-mit-license) and [Apache-2.0 license terms](#appendix-b-apache-20-license)
 - **Repository:** https://github.com/toml-rs/toml
 - **Homepage:** Not specified in Cargo metadata
+
+### toml_datetime 0.6.3
+
+<!-- cargo-package: toml_datetime 0.6.3 -->
+
+- **License (Cargo metadata):** `MIT OR Apache-2.0`; see [MIT license terms](#appendix-a-mit-license) and [Apache-2.0 license terms](#appendix-b-apache-20-license)
+- **Repository:** https://github.com/toml-rs/toml
+- **Homepage:** https://github.com/toml-rs/toml
+- **Authors:** Alex Crichton <alex@alexcrichton.com>
 
 ### toml_datetime 0.7.5+spec-1.1.0
 
@@ -3419,6 +3722,24 @@ The `cfg_aliases!` macro uses a lot of the code from [`tectonic_cfg_support::tar
 - **License (Cargo metadata):** `MIT OR Apache-2.0`; see [MIT license terms](#appendix-a-mit-license) and [Apache-2.0 license terms](#appendix-b-apache-20-license)
 - **Repository:** https://github.com/toml-rs/toml
 - **Homepage:** Not specified in Cargo metadata
+
+### toml_edit 0.19.15
+
+<!-- cargo-package: toml_edit 0.19.15 -->
+
+- **License (Cargo metadata):** `MIT OR Apache-2.0`; see [MIT license terms](#appendix-a-mit-license) and [Apache-2.0 license terms](#appendix-b-apache-20-license)
+- **Repository:** https://github.com/toml-rs/toml
+- **Homepage:** Not specified in Cargo metadata
+- **Authors:** Andronik Ordian <write@reusable.software>; Ed Page <eopage@gmail.com>
+
+### toml_edit 0.20.2
+
+<!-- cargo-package: toml_edit 0.20.2 -->
+
+- **License (Cargo metadata):** `MIT OR Apache-2.0`; see [MIT license terms](#appendix-a-mit-license) and [Apache-2.0 license terms](#appendix-b-apache-20-license)
+- **Repository:** https://github.com/toml-rs/toml
+- **Homepage:** Not specified in Cargo metadata
+- **Authors:** Andronik Ordian <write@reusable.software>; Ed Page <eopage@gmail.com>
 
 ### toml_edit 0.25.18+spec-1.1.0
 
@@ -3691,6 +4012,15 @@ The `cfg_aliases!` macro uses a lot of the code from [`tectonic_cfg_support::tar
 - **License (Cargo metadata):** `Apache-2.0 OR MIT`; see [MIT license terms](#appendix-a-mit-license) and [Apache-2.0 license terms](#appendix-b-apache-20-license)
 - **Repository:** https://github.com/linebender/vello
 - **Homepage:** Not specified in Cargo metadata
+
+### version-compare 0.2.1
+
+<!-- cargo-package: version-compare 0.2.1 -->
+
+- **License (Cargo metadata):** `MIT`; see [MIT license terms](#appendix-a-mit-license)
+- **Repository:** https://gitlab.com/timvisee/version-compare
+- **Homepage:** https://timvisee.com/projects/version-compare/
+- **Authors:** Tim Visee <3a4fb3964f@sinenomine.email>
 
 ### version_check 0.9.5
 
@@ -4225,6 +4555,14 @@ The `cfg_aliases!` macro uses a lot of the code from [`tectonic_cfg_support::tar
 - **Repository:** https://github.com/rust-windowing/winit
 - **Homepage:** Not specified in Cargo metadata
 - **Authors:** The winit contributors; Pierre Krieger <pierre.krieger1708@gmail.com>
+
+### winnow 0.5.40
+
+<!-- cargo-package: winnow 0.5.40 -->
+
+- **License (Cargo metadata):** `MIT`; see [MIT license terms](#appendix-a-mit-license)
+- **Repository:** https://github.com/winnow-rs/winnow
+- **Homepage:** Not specified in Cargo metadata
 
 ### winnow 0.7.15
 
@@ -4767,6 +5105,34 @@ This is the exact `vendor/egui_software_backend/LICENSE-APACHE` text and the sta
 
 The following texts are copied verbatim from the repository. Each file appears once; packages and bundled components above refer to these copies where applicable.
 
+### `assets/third-party/download-manager/LICENSE`
+
+**Applies to:** DownloadManager tray integration (MIT)
+
+```text
+MIT License
+
+Copyright (c) 2026 DownloadManager contributors
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+```
+
 ### `assets/third-party/file-transfer/cap-std-LICENSE-MIT`
 
 **Applies to:** cap-std and cap-fs-ext (MIT option)
@@ -4953,6 +5319,34 @@ SOFTWARE.
 MIT License
 
 Copyright (c) 2020 Bilal Elmoussaoui
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+```
+
+### `assets/third-party/nvapi/LICENSE`
+
+**Applies to:** NVIDIA NVAPI ABI declarations (MIT)
+
+```text
+MIT License
+
+Copyright (c) 2019-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal

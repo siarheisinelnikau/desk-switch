@@ -84,6 +84,40 @@ pub(super) fn dispatch(sender: &Sender<Action>, ctx: &egui::Context, action: Act
 }
 
 #[cfg(target_os = "linux")]
+#[path = "tray_legacy.rs"]
+mod legacy;
+
+#[cfg(target_os = "linux")]
+fn entries(state: State) -> Vec<Option<(&'static str, Action, bool)>> {
+    vec![
+        Some(("Quick controls", Action::QuickOpen { x: 0, y: 0 }, true)),
+        Some(("Tray popup status…", Action::TraySetup, true)),
+        Some(("Открыть Desk Switch", Action::Show, true)),
+        None,
+        Some((state.switch_label(), Action::Switch, state.connected)),
+        Some((
+            "Switch shared monitor",
+            Action::MonitorSwitch,
+            state.monitor,
+        )),
+        Some(("Set up shared monitor…", Action::MonitorSetup, true)),
+        Some(("Аварийный возврат", Action::Emergency, state.emergency)),
+        None,
+        Some((
+            if state.sound {
+                "Выключить аудиоподключение"
+            } else {
+                "Включить аудиоподключение"
+            },
+            Action::Sound,
+            true,
+        )),
+        None,
+        Some(("Завершить Desk Switch", Action::Quit, true)),
+    ]
+}
+
+#[cfg(target_os = "linux")]
 mod native {
     use super::*;
     use ksni::blocking::TrayMethods;
@@ -157,46 +191,31 @@ mod native {
                 }
                 .into()
             };
-            vec![
-                item("Quick controls", Action::QuickOpen { x: 0, y: 0 }, true),
-                item("Tray popup status…", Action::TraySetup, true),
-                item("Открыть Desk Switch", Action::Show, true),
-                MenuItem::Separator,
-                item(
-                    self.state.switch_label(),
-                    Action::Switch,
-                    self.state.connected,
-                ),
-                item(
-                    "Switch shared monitor",
-                    Action::MonitorSwitch,
-                    self.state.monitor,
-                ),
-                item("Set up shared monitor…", Action::MonitorSetup, true),
-                item("Аварийный возврат", Action::Emergency, self.state.emergency),
-                MenuItem::Separator,
-                item(
-                    if self.state.sound {
-                        "Выключить аудиоподключение"
-                    } else {
-                        "Включить аудиоподключение"
-                    },
-                    Action::Sound,
-                    true,
-                ),
-                MenuItem::Separator,
-                item("Завершить Desk Switch", Action::Quit, true),
-            ]
+            entries(self.state)
+                .into_iter()
+                .map(|entry| match entry {
+                    Some((label, action, enabled)) => item(label, action, enabled),
+                    None => MenuItem::Separator,
+                })
+                .collect()
         }
     }
 
     pub struct Tray {
-        handle: ksni::blocking::Handle<Item>,
+        handle: Option<ksni::blocking::Handle<Item>>,
+        legacy: Option<legacy::Tray>,
         available: Arc<AtomicBool>,
     }
 
     impl Tray {
         pub fn new(sender: Sender<Action>, ctx: egui::Context) -> Result<Self> {
+            if let Some(legacy) = legacy::Tray::try_new(sender.clone(), ctx.clone()) {
+                return Ok(Self {
+                    handle: None,
+                    legacy: Some(legacy),
+                    available: Arc::new(AtomicBool::new(false)),
+                });
+            }
             let available = Arc::new(AtomicBool::new(true));
             let handle = Item {
                 language: crate::i18n::current_code().into(),
@@ -207,22 +226,39 @@ mod native {
             }
             .assume_sni_available(true)
             .spawn()?;
-            Ok(Self { handle, available })
+            Ok(Self {
+                handle: Some(handle),
+                legacy: None,
+                available,
+            })
+        }
+        pub fn direct_popup(&self) -> bool {
+            self.legacy.as_ref().is_some_and(legacy::Tray::available)
         }
         pub fn available(&self) -> bool {
-            self.available.load(Ordering::Relaxed) && !self.handle.is_closed()
+            self.direct_popup()
+                || self.handle.as_ref().is_some_and(|handle| {
+                    self.available.load(Ordering::Relaxed) && !handle.is_closed()
+                })
         }
         pub fn update(&mut self, state: State) {
-            self.handle.update(|item| {
-                item.language = crate::i18n::current_code().into();
-                item.state = state;
-            });
+            if let Some(legacy) = &self.legacy {
+                legacy.update(state);
+            }
+            if let Some(handle) = &self.handle {
+                handle.update(|item| {
+                    item.language = crate::i18n::current_code().into();
+                    item.state = state;
+                });
+            }
         }
     }
 
     impl Drop for Tray {
         fn drop(&mut self) {
-            self.handle.shutdown();
+            if let Some(handle) = &self.handle {
+                handle.shutdown();
+            }
         }
     }
 }

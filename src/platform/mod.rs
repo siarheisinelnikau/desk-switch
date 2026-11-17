@@ -31,6 +31,8 @@ mod win_input;
 #[cfg(windows)]
 mod win_monitor;
 #[cfg(windows)]
+mod win_nvapi;
+#[cfg(windows)]
 mod win_receive;
 #[cfg(windows)]
 mod windows;

@@ -776,7 +776,10 @@ impl Desktop {
     pub(super) fn transfer_card_action(&mut self, ui: &mut egui::Ui, key: &str, online: bool) {
         if key != self.public_key
             && ui
-                .add_enabled(online, egui::Button::new(tr("Send files…")))
+                .add_enabled(
+                    online,
+                    egui::Button::new(tr("Send files…")).min_size(egui::vec2(0.0, 32.0)),
+                )
                 .clicked()
         {
             self.open_transfers(Some(key));
