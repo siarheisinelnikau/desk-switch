@@ -69,7 +69,7 @@ def main():
                 process.kill()
                 process.wait(timeout=4)
 
-    app = compositor = None
+    app = compositor = cycle = None
     with tempfile.TemporaryDirectory(prefix='desk-switch-gnome-') as temporary:
         home = Path(temporary)
         runtime = home / 'runtime'
@@ -210,7 +210,7 @@ def main():
                                 assert 0 <= rect['x'] < 1920 and 0 <= rect['y'] < 1080, window
                                 assert rect['x'] + rect['width'] <= 1920, window
                                 assert rect['y'] + rect['height'] <= 1080, window
-                                return True
+                                return window
                         return False
 
                     def visible(title):
@@ -254,7 +254,7 @@ def main():
                         click(1)
                         wait_for(lambda: not visible('Desk Switch quick controls'), 'A second left-click did not dismiss the popup')
                         click(3)
-                        wait_for(menu_visible, 'Right-click did not open the native menu')
+                        native_menu = wait_for(menu_visible, 'Right-click did not open the native menu')
                         if cycle == 0:
                             success, _ = call('org.gnome.Shell.Screenshot', '/org/gnome/Shell/Screenshot',
                                 'org.gnome.Shell.Screenshot', 'Screenshot', '(bbs)',
@@ -263,11 +263,27 @@ def main():
                         if args.backend == 'sni':
                             shell('global.deskSwitchTestIcon().menu.close(); true')
                         else:
-                            # Use the native seat's evdev Escape code and let
-                            # each request reach the compositor separately.
-                            for state in ['PRESSED', 'RELEASED']:
+                            # X11 mapping precedes Wayland input readiness.
+                            # Hit the actual menu surface before sending keys,
+                            # then observe Escape's result before releasing it.
+                            rect = native_menu['rect']
+                            x, y = rect['x'] + rect['width'] // 2, rect['y'] + rect['height'] // 2
+                            description = json.dumps(native_menu['description'])
+                            wait_for(lambda: shell("(async () => { const Clutter = (await import('gi://Clutter')).default; "
+                                "const [px, py] = global.get_pointer(); "
+                                f"if (Math.abs(px - {x}) > 1 || Math.abs(py - {y}) > 1) {{ "
+                                f"global.deskSwitchTestPointer.notify_absolute_motion(GLib.get_monotonic_time(), {x}, {y}); return false; }} "
+                                "for (let actor = global.stage.get_actor_at_pos(Clutter.PickMode.REACTIVE, px, py); actor; actor = actor.get_parent()) "
+                                f"if (actor.meta_window?.get_description() === {description}) return true; return false; }})()"),
+                                'The virtual pointer did not reach the actual GTK menu surface')
+                            def escape(state):
                                 shell("(async () => { const Clutter = (await import('gi://Clutter')).default; "
                                     f"global.deskSwitchTestKeyboard.notify_key(GLib.get_monotonic_time(), 1, Clutter.KeyState.{state}); return true; }})()")
+                            escape('PRESSED')
+                            try:
+                                wait_for(lambda: not menu_visible(), 'Escape did not dismiss the input-ready GTK menu')
+                            finally:
+                                escape('RELEASED')
                         wait_for(lambda: not menu_visible(), 'The native menu did not dismiss')
                     shell(f"global.get_window_actors().find(a => a.meta_window.get_pid() === {pid} && a.meta_window.get_title() === 'Desk Switch').meta_window.delete(global.get_current_time()); true")
                     wait_for(lambda: not visible('Desk Switch'), 'Close did not leave the main window hidden')
@@ -296,6 +312,7 @@ def main():
                         "title: a.meta_window.get_title(), visible: a.visible, "
                         "description: a.meta_window.get_description(), type: a.meta_window.get_window_type(), "
                         "rect: {x: r.x, y: r.y, width: r.width, height: r.height}}; })}; })()")
+                    diagnostics['cycle'] = cycle
                     (args.out / 'diagnostics.json').write_text(json.dumps(diagnostics, indent=2) + '\n')
                     for window in diagnostics['windows']:
                         if app is not None and window['pid'] == app.pid:
