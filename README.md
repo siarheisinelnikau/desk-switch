@@ -27,7 +27,7 @@ Device connections animate briefly when routes change, then settle. Hidden windo
 
 ![Desk Switch tray popup with sharing controls and per-computer volume](docs/workspace-quick-controls.png)
 
-On Ubuntu GNOME, open **Application → Tray device popup → Enable or reload tray popup** once. The tray menu also has **Set up left-click popup…**. If GNOME has not discovered the installed companion yet, sign out and sign in once, then enable it here. Left-click opens the device popup; right-click keeps GNOME's native menu.
+On Ubuntu GNOME, Desk Switch enables its bundled tray integration automatically at startup. Left-click opens the device popup; right-click keeps GNOME's native menu. No manual extension setup is needed. If the package was installed for the first time during an existing GNOME session, sign out and sign back in once so GNOME discovers it; activation is automatic on the next launch. **Application → Tray device popup** shows any desktop-policy or session issue.
 
 <details>
 <summary>Settings</summary>
