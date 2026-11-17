@@ -179,9 +179,25 @@ def main():
                     def menu_visible():
                         if args.backend == 'sni':
                             return shell('Boolean(global.deskSwitchTestIcon()?.menu?.isOpen)')
-                        return shell("(async () => { const Meta = (await import('gi://Meta')).default; return "
-                            f"global.get_window_actors().some(a => a.visible && a.meta_window.get_pid() === {pid} && "
-                            "[Meta.WindowType.POPUP_MENU, Meta.WindowType.DROPDOWN_MENU].includes(a.meta_window.get_window_type())); })()")
+                        windows = shell("(async () => { const Meta = (await import('gi://Meta')).default; return "
+                            f"global.get_window_actors().filter(a => a.meta_window.get_pid() === {pid} && "
+                            "[Meta.WindowType.POPUP_MENU, Meta.WindowType.DROPDOWN_MENU].includes(a.meta_window.get_window_type()))"
+                            ".map(a => ({description: a.meta_window.get_description(), rect: a.meta_window.get_frame_rect()})); })()")
+                        for window in windows:
+                            # Compositor actors can survive an X11 unmap. Check
+                            # the actual GTK window rather than a stale actor.
+                            xid = window['description'].split()[0]
+                            assert xid.startswith('0x'), window
+                            info = subprocess.run(['xwininfo', '-id', xid], env=env,
+                                capture_output=True, text=True, timeout=2)
+                            if info.returncode == 0 and 'Map State: IsViewable' in info.stdout:
+                                rect = window['rect']
+                                assert rect['width'] > 0 and rect['height'] > 0, window
+                                assert 0 <= rect['x'] < 1920 and 0 <= rect['y'] < 1080, window
+                                assert rect['x'] + rect['width'] <= 1920, window
+                                assert rect['y'] + rect['height'] <= 1080, window
+                                return True
+                        return False
 
                     def visible(title):
                         return shell(f'global.get_window_actors().some(a => a.meta_window.get_pid() === {pid} && '
@@ -189,7 +205,7 @@ def main():
 
                     wait_for(lambda: visible('Desk Switch'), 'The native main window is missing')
                     shell('Main.overview.hide(); true')
-                    wait_for(lambda: shell('!Main.layoutManager._startingUp && !Main.overview.visible && '
+                    wait_for(lambda: shell('!Main.layoutManager._startingUp && !Main.overview.visible && !Main.overview.animationInProgress && '
                         'global.deskSwitchTestIcon()?.mapped && global.deskSwitchTestIcon().width > 0 && '
                         'global.deskSwitchTestIcon().height > 0'), 'The panel button is not ready for physical hit testing')
                     shell("(async () => { const Clutter = (await import('gi://Clutter')).default; "
@@ -258,8 +274,20 @@ def main():
                         "{pointer: global.get_pointer(), overview: Main.overview.visible, "
                         "icon: icon ? {mapped: icon.mapped, position: icon.get_transformed_position(), "
                         "size: [icon.width, icon.height], menu: icon.menu?.isOpen ?? false} : null, "
-                        "windows: global.get_window_actors().map(a => ({pid: a.meta_window.get_pid(), title: a.meta_window.get_title(), visible: a.visible}))}; })()")
+                        "focus: global.display.focus_window?.get_description(), "
+                        "overviewAnimating: Main.overview.animationInProgress, "
+                        "windows: global.get_window_actors().map(a => ({pid: a.meta_window.get_pid(), "
+                        "title: a.meta_window.get_title(), visible: a.visible, "
+                        "description: a.meta_window.get_description(), type: a.meta_window.get_window_type(), "
+                        "rect: a.meta_window.get_frame_rect()}))}; })()")
                     (args.out / 'diagnostics.json').write_text(json.dumps(diagnostics, indent=2) + '\n')
+                    for window in diagnostics['windows']:
+                        if app is not None and window['pid'] == app.pid:
+                            xid = window['description'].split()[0]
+                            if xid.startswith('0x'):
+                                info = subprocess.run(['xwininfo', '-id', xid], env=env,
+                                    capture_output=True, text=True, timeout=2)
+                                (args.out / f'window-{xid}.log').write_text(info.stdout + info.stderr)
                 except (GLib.Error, AssertionError):
                     pass
             stop(app)
