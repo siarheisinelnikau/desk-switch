@@ -363,6 +363,10 @@ impl Desktop {
                 &self.public_key,
                 workspace::PORT,
                 ctx.clone(),
+                #[cfg(feature = "android-remote")]
+                self.mobile.available(),
+                #[cfg(feature = "android-remote")]
+                self.mobile.screen_allowed(),
             ) {
                 Ok(discovery) => self.discovery = Some(discovery),
                 Err(error) => self.discovery_error = Some(error.to_string()),
@@ -618,6 +622,12 @@ impl Desktop {
         }
         self.tick_group_compat(ctx);
         if let Some(state) = self.group.workspace.clone() {
+            #[cfg(feature = "android-remote")]
+            self.mobile.route(
+                Some(&state),
+                &self.public_key,
+                self.quitting || self.install_pending || self.prefs.pause_local_sharing,
+            );
             if self.group.selected.is_empty() {
                 self.group.selected = self.public_key.clone();
             }
@@ -735,10 +745,20 @@ impl Desktop {
             }
             self.tick_group_monitor(&state, ctx);
         }
+        #[cfg(feature = "android-remote")]
+        if self.group.workspace.is_none() {
+            self.mobile.route(
+                None,
+                &self.public_key,
+                self.quitting || self.install_pending || self.prefs.pause_local_sharing,
+            );
+        }
         let mut node = self.local_node();
         self.group.data.report(&mut node);
         self.group.report_network(&mut node);
         self.report_group_monitor_history(&mut node);
+        #[cfg(feature = "android-remote")]
+        self.mobile.annotate(&mut node);
         node.monitor_error = self.group.monitor_error.clone();
         if self.group.last_node.as_ref() != Some(&node)
             || self.group.last_volume != self.group.data.volume
@@ -1035,6 +1055,8 @@ impl Desktop {
                         });
                     }
                 }
+                #[cfg(feature = "android-remote")]
+                self.mobile.shared_devices(ui, &state, &self.public_key);
             });
     }
 
@@ -1573,14 +1595,20 @@ impl Desktop {
                         .selected_text(match value.as_deref() {
                             Some(id) => devices
                                 .iter()
-                                .find(|device| device.id == id)
+                                .find(|device| {
+                                    device.id == id
+                                        && super::topology::phone_id(&device.id).is_none()
+                                })
                                 .map(|device| device.name.clone())
                                 .unwrap_or_else(|| tr("Unavailable")),
                             None => tr("Automatic"),
                         })
                         .show_ui(ui, |ui| {
                             ui.selectable_value(value, None, tr("Automatic"));
-                            for device in devices {
+                            for device in devices
+                                .iter()
+                                .filter(|device| super::topology::phone_id(&device.id).is_none())
+                            {
                                 ui.selectable_value(value, Some(device.id.clone()), &device.name);
                             }
                         });

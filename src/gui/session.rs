@@ -220,6 +220,8 @@ impl Desktop {
         if let Some(remote) = &self.pair.remote {
             node.ack = Plan::build(&node, remote).digest(&node, remote);
         }
+        #[cfg(feature = "android-remote")]
+        self.mobile.annotate(&mut node);
         node
     }
 
@@ -336,6 +338,10 @@ impl Desktop {
                 &self.public_key,
                 service.port,
                 ctx.clone(),
+                #[cfg(feature = "android-remote")]
+                self.mobile.available(),
+                #[cfg(feature = "android-remote")]
+                self.mobile.screen_allowed(),
             ) {
                 Ok(discovery) => self.discovery = Some(discovery),
                 Err(error) => self.discovery_error = Some(format!("{error:#}")),

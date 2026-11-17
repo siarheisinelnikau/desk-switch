@@ -1,5 +1,71 @@
-//! Ephemeral physical input feedback. No text, history, file or network output.
+//! Ephemeral local and received input feedback. No text or persistent history.
 use eframe::egui::{self, Vec2};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    sync::{Arc, Mutex},
+    time::{Duration, Instant},
+};
+
+struct Remote {
+    latest: crate::feedback::Snapshot,
+    pending: bool,
+    arrived: Instant,
+    visual: Activity,
+}
+#[derive(Default)]
+pub(super) struct Bus {
+    sources: BTreeMap<u32, Remote>,
+    views: BTreeSet<egui::ViewportId>,
+}
+fn bus(ctx: &egui::Context) -> Arc<Mutex<Bus>> {
+    ctx.data_mut(|data| {
+        data.get_temp_mut_or_default::<Arc<Mutex<Bus>>>(id().with("received"))
+            .clone()
+    })
+}
+pub(crate) fn receive(ctx: &egui::Context, source: u32, mut snapshot: crate::feedback::Snapshot) {
+    let bus = bus(ctx);
+    let views = {
+        let mut bus = bus.lock().unwrap();
+        if bus.sources.len() >= 32 && !bus.sources.contains_key(&source) {
+            return;
+        }
+        if bus.views.is_empty() {
+            snapshot.released = [0; 4];
+            snapshot.released_buttons = 0;
+            snapshot.motion = None;
+            snapshot.wheel = false;
+        }
+        let entry = bus.sources.entry(source).or_insert_with(|| Remote {
+            latest: Default::default(),
+            pending: false,
+            arrived: Instant::now(),
+            visual: Activity::default(),
+        });
+        if entry.pending {
+            entry.latest.merge(snapshot);
+        } else {
+            entry.latest = snapshot;
+        }
+        entry.pending = true;
+        entry.arrived = Instant::now();
+        bus.views.clone()
+    };
+    for viewport in views {
+        ctx.request_repaint_of(viewport);
+    }
+}
+pub(crate) fn disconnected(ctx: &egui::Context, source: u32) {
+    let bus = bus(ctx);
+    let views = {
+        let mut bus = bus.lock().unwrap();
+        bus.sources.remove(&source);
+        bus.views.clone()
+    };
+    for viewport in views {
+        ctx.request_repaint_of(viewport);
+    }
+}
 
 pub(super) const KEYS: [u16; 66] = [
     1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26,
@@ -14,6 +80,7 @@ pub(super) struct Activity {
     pub direction: Vec2,
     pub moved: f64,
     pub buttons: [bool; 3],
+    pub clicked: [f64; 3],
     pub wheel: f64,
 }
 impl Default for Activity {
@@ -24,6 +91,7 @@ impl Default for Activity {
             direction: Vec2::ZERO,
             moved: -1000.0,
             buttons: [false; 3],
+            clicked: [-1000.0; 3],
             wheel: -1000.0,
         }
     }
@@ -37,6 +105,7 @@ pub(super) fn begin_frame(ctx: &egui::Context, viewport: egui::ViewportId) {
     ctx.data_mut(|data| {
         data.remove::<bool>(id().with(viewport));
     });
+    bus(ctx).lock().unwrap().views.remove(&viewport);
 }
 #[cfg(any(windows, target_os = "linux"))]
 pub(super) fn interested(ctx: &egui::Context, viewport: egui::ViewportId) -> bool {
@@ -76,6 +145,9 @@ pub(super) fn record(
                 state: pressed,
             } if button < 3 => {
                 state.buttons[button as usize] = pressed == ElementState::Pressed;
+                if pressed == ElementState::Released {
+                    state.clicked[button as usize] = time;
+                }
             }
             DeviceEvent::MouseWheel { .. } => state.wheel = time,
             _ => {}
@@ -115,10 +187,21 @@ pub(super) fn clear(ctx: &egui::Context) {
     ctx.data_mut(|data| {
         data.remove::<Activity>(id());
     });
+    let bus = bus(ctx);
+    let mut bus = bus.lock().unwrap();
+    bus.views.clear();
+    for remote in bus.sources.values_mut() {
+        remote.visual = Activity::default();
+        remote.latest.released = [0; 4];
+        remote.latest.released_buttons = 0;
+        remote.latest.motion = None;
+        remote.latest.wheel = false;
+        remote.pending = true;
+    }
 }
 
 pub(super) fn read(ui: &egui::Ui) -> Activity {
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "linux"))]
     {
         let viewport = ui.ctx().viewport_id();
         ui.ctx()
@@ -177,13 +260,149 @@ pub(super) fn read(ui: &egui::Ui) -> Activity {
             }
         });
     }
-    ui.ctx()
-        .data(|data| data.get_temp::<Activity>(id()).unwrap_or_default())
+    let mut result = ui
+        .ctx()
+        .data(|data| data.get_temp::<Activity>(id()).unwrap_or_default());
+    let bus = bus(ui.ctx());
+    let mut bus = bus.lock().unwrap();
+    bus.views.insert(ui.ctx().viewport_id());
+    let now = ui.input(|input| input.time);
+    for remote in bus.sources.values_mut() {
+        if remote.pending {
+            for (index, code) in KEYS.iter().copied().enumerate() {
+                remote.visual.keys[index] = remote.latest.key(code);
+                if remote.latest.was_released(code)
+                    && remote.arrived.elapsed() < Duration::from_millis(650)
+                {
+                    remote.visual.released[index] = now;
+                }
+            }
+            remote.visual.buttons = std::array::from_fn(|i| remote.latest.buttons & (1 << i) != 0);
+            if remote.arrived.elapsed() < Duration::from_millis(650) {
+                for i in 0..3 {
+                    if remote.latest.released_buttons & (1 << i) != 0 {
+                        remote.visual.clicked[i] = now;
+                    }
+                }
+                if let Some([dx, dy]) = remote.latest.motion {
+                    let delta = Vec2::new(dx as f32, dy as f32);
+                    if delta.length_sq() > 0.5 {
+                        remote.visual.direction = delta.normalized();
+                        remote.visual.moved = now;
+                    }
+                }
+                if remote.latest.wheel {
+                    remote.visual.wheel = now;
+                }
+            }
+            remote.pending = false;
+        }
+        for i in 0..KEYS.len() {
+            result.keys[i] |= remote.visual.keys[i];
+            result.released[i] = result.released[i].max(remote.visual.released[i]);
+        }
+        for i in 0..3 {
+            result.buttons[i] |= remote.visual.buttons[i];
+            result.clicked[i] = result.clicked[i].max(remote.visual.clicked[i]);
+        }
+        if remote.visual.moved > result.moved {
+            result.moved = remote.visual.moved;
+            result.direction = remote.visual.direction;
+        }
+        result.wheel = result.wheel.max(remote.visual.wheel);
+    }
+    result
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn frame(ctx: &egui::Context, time: f64) -> Activity {
+        let mut result = None;
+        let _ = ctx.run_ui(
+            egui::RawInput {
+                time: Some(time),
+                ..Default::default()
+            },
+            |ui| result = Some(read(ui)),
+        );
+        result.unwrap()
+    }
+
+    #[test]
+    fn accepted_remote_events_reach_the_visible_view_and_quick_taps_survive_coalescing() {
+        use crate::wire::Input;
+        let ctx = egui::Context::default();
+        frame(&ctx, 1.0);
+        let mut reporter = crate::feedback::Reporter::default();
+        for event in [
+            Input::Key {
+                code: 30,
+                down: true,
+            },
+            Input::Key {
+                code: 30,
+                down: false,
+            },
+            Input::Button {
+                code: 272,
+                down: true,
+            },
+            Input::Button {
+                code: 272,
+                down: false,
+            },
+        ] {
+            receive(&ctx, 42, reporter.record(event, Instant::now()).unwrap());
+        }
+        let state = frame(&ctx, 2.0);
+        assert!(!state.keys[KEYS.iter().position(|code| *code == 30).unwrap()]);
+        assert_eq!(
+            state.released[KEYS.iter().position(|code| *code == 30).unwrap()],
+            2.0
+        );
+        assert!(!state.buttons[0]);
+        assert_eq!(state.clicked[0], 2.0);
+        disconnected(&ctx, 42);
+        assert!(bus(&ctx).lock().unwrap().sources.is_empty());
+    }
+
+    #[cfg(any(windows, target_os = "linux"))]
+    #[test]
+    fn hidden_input_keeps_current_holds_without_replaying_transient_activity_on_restore() {
+        use crate::wire::Input;
+        let ctx = egui::Context::default();
+        frame(&ctx, 1.0);
+        let mut reporter = crate::feedback::Reporter::default();
+        receive(
+            &ctx,
+            1,
+            reporter
+                .record(Input::Move { dx: 6, dy: -3 }, Instant::now())
+                .unwrap(),
+        );
+        clear(&ctx);
+        receive(
+            &ctx,
+            1,
+            reporter
+                .record(
+                    Input::Key {
+                        code: 42,
+                        down: true,
+                    },
+                    Instant::now(),
+                )
+                .unwrap(),
+        );
+        let state = frame(&ctx, 2.0);
+        assert!(state.keys[KEYS.iter().position(|code| *code == 42).unwrap()]);
+        assert!(state.moved < 0.0);
+        assert!(state.released.iter().all(|time| *time < 0.0));
+        disconnected(&ctx, 1);
+        assert!(frame(&ctx, 3.0).keys.iter().all(|down| !down));
+    }
     #[test]
     fn physical_feedback_keeps_only_current_keys_and_short_release_timestamps() {
         let mut state = Activity::default();

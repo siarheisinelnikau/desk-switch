@@ -5,3 +5,10 @@
 /.release-private/
 /dist/
 __pycache__/
+/android/.gradle/
+/android/.gradle-user/
+/android/.kotlin/
+/android/build/
+/android/.local/
+/android/local.properties
+/android/**/build/

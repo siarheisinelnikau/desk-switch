@@ -1,0 +1,4 @@
+gradlew text eol=lf
+
+# Preserve the original bytes of the vendored Noise-Java sources.
+noise/src/main/java/** -whitespace

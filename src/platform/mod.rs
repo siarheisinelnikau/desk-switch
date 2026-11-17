@@ -11,6 +11,8 @@ mod macos;
 mod macos_keys;
 #[cfg(target_os = "macos")]
 mod macos_monitor;
+#[cfg(feature = "android-remote")]
+pub(crate) mod mobile;
 mod monitor_service;
 #[cfg(target_os = "linux")]
 pub mod portal;
@@ -191,3 +193,6 @@ pub struct MonitorInfo {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub native: Option<crate::edge::NativeScreen>,
 }
+
+#[cfg(feature = "android-remote")]
+pub(crate) mod screen;

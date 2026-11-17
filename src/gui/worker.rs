@@ -139,6 +139,7 @@ impl Worker {
             command.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
         }
         let mut child = command.spawn().context("запуск фоновой службы")?;
+        let feedback_source = child.id();
         let input = child.stdin.take();
         let (send, events) = mpsc::sync_channel(256);
         for stream in [
@@ -152,6 +153,15 @@ impl Worker {
                 .spawn(move || {
                     for line in BufReader::new(stream).lines() {
                         let Ok(mut line) = line else { break };
+                        if let Some(json) = line.strip_prefix(crate::feedback::PREFIX) {
+                            if json.len() <= 2048
+                                && let Ok(value) = serde_json::from_str(json)
+                                && let Some(ctx) = &ctx
+                            {
+                                super::activity::receive(ctx, feedback_source, value);
+                            }
+                            continue;
+                        }
                         let structured = line.starts_with("@desk-switch");
                         let limit = if structured { 65536 } else { 8192 };
                         if line.len() > limit {
@@ -170,6 +180,7 @@ impl Worker {
                         }
                     }
                     if let Some(ctx) = &ctx {
+                        super::activity::disconnected(ctx, feedback_source);
                         ctx.request_repaint_of(eframe::egui::ViewportId::ROOT);
                     }
                 })?;

@@ -233,6 +233,38 @@ enum Packet {
     Error(String),
 }
 
+#[cfg(feature = "android-remote")]
+pub(crate) fn remote_text(value: serde_json::Value, peer: &str) -> Result<String> {
+    use sha2::Digest;
+    let Packet::Clipboard {
+        source,
+        mime,
+        bytes,
+        digest,
+    } = serde_json::from_value(value)?
+    else {
+        anyhow::bail!("Only a text clipboard record is accepted from a phone remote");
+    };
+    ensure!(
+        source == peer,
+        "Remote text identity does not match its authenticated connection"
+    );
+    ensure!(
+        mime == "text/plain;charset=utf-8" && !bytes.is_empty() && bytes.len() <= 8192,
+        "Remote text must be UTF-8 and at most 8 KiB"
+    );
+    ensure!(
+        crate::config::hex(&sha2::Sha256::digest(&bytes)) == digest,
+        "Remote text checksum mismatch"
+    );
+    Ok(String::from_utf8(bytes)?)
+}
+
+#[cfg(feature = "android-remote")]
+pub(crate) fn remote_text_ack() -> serde_json::Value {
+    serde_json::to_value(Packet::Ping).unwrap()
+}
+
 enum Command {
     Action(Box<Action>),
     Disconnect,

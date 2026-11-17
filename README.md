@@ -29,6 +29,8 @@ Device connections animate briefly when routes change, then settle. Activity ind
 
 On Ubuntu GNOME, native tray controls work on the first launch: left-click opens the device popup and right-click opens the desktop menu. The popup does not require the bundled GNOME companion or a new desktop login. The optional companion still provides GNOME Wayland clipboard and screen-edge integration; those features can require a new desktop session after installation.
 
+The experimental [Android phone remote](android/README.md) adds phones as input sources in the same workspace. A phone can use a touchpad, a joystick, and its keyboard to control a selected computer over Wi-Fi.
+
 <details>
 <summary>Settings</summary>
 

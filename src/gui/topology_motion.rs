@@ -140,7 +140,13 @@ pub(super) fn read(
                 state.keys[i].update_until(activity.released[i] + 0.12, now)
             }
         });
-        let buttons = std::array::from_fn(|i| state.buttons[i].update(activity.buttons[i], now));
+        let buttons = std::array::from_fn(|i| {
+            if activity.buttons[i] {
+                state.buttons[i].update(true, now)
+            } else {
+                state.buttons[i].update_until(activity.clicked[i] + 0.12, now)
+            }
+        });
         let wheel = state.wheel.update_until(activity.wheel + 0.12, now);
         let pending = state.scene.pending()
             || state.wheel.pending()

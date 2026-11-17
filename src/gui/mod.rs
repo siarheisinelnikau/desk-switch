@@ -1,4 +1,4 @@
-mod activity;
+pub(crate) mod activity;
 mod file_progress;
 mod group;
 mod group_compat;
@@ -12,6 +12,8 @@ mod linux_tray;
 #[cfg(target_os = "linux")]
 mod linux_window;
 mod management;
+#[cfg(feature = "android-remote")]
+mod mobile;
 mod model;
 mod paired_update;
 mod popup;
@@ -86,6 +88,8 @@ fn update_failure_status(preparing: bool, error: &anyhow::Error) -> String {
 }
 
 pub struct Desktop {
+    #[cfg(feature = "android-remote")]
+    mobile: mobile::Panel,
     group: group::Group,
     ctx: egui::Context,
     dir: PathBuf,
@@ -283,6 +287,8 @@ impl Desktop {
             Err(error) => (None, Some(format!("{error:#}"))),
         };
         Self {
+            #[cfg(feature = "android-remote")]
+            mobile: Default::default(),
             group: Default::default(),
             ctx,
             dir,
@@ -731,6 +737,11 @@ impl Desktop {
     }
 
     fn tick(&mut self, ctx: &egui::Context) {
+        #[cfg(feature = "android-remote")]
+        if self.mobile.tick(self.quitting) {
+            self.action(Action::Show, ctx);
+            self.page = Page::Application;
+        }
         self.transfers.tick(ctx);
         self.resource_panel.tick(ctx);
         #[cfg(debug_assertions)]
@@ -1163,9 +1174,21 @@ impl Desktop {
         if !self.startup_valid {
             return;
         }
-        let result = std::env::current_exe()
-            .map_err(anyhow::Error::from)
-            .and_then(|exe| crate::autostart::sync(self.prefs.autostart, &exe, &self.dir));
+        #[cfg(feature = "android-remote")]
+        if self.prefs.phone_remote {
+            let name = crate::discovery::computer_name();
+            self.mobile
+                .enable(&self.dir, name, ctx, self.prefs.phone_screen_preview);
+        }
+        let result = if cfg!(feature = "android-remote")
+            && std::env::args().any(|arg| arg == "--experimental-mobile")
+        {
+            Ok(())
+        } else {
+            std::env::current_exe()
+                .map_err(anyhow::Error::from)
+                .and_then(|exe| crate::autostart::sync(self.prefs.autostart, &exe, &self.dir))
+        };
         if let Err(error) = result {
             self.notice = Some((format!("{error:#}"), true));
         }

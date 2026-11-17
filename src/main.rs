@@ -13,6 +13,7 @@ mod crash;
 mod diagnostics_log;
 mod discovery;
 mod edge;
+mod feedback;
 mod gate;
 mod group;
 mod gui;
@@ -24,6 +25,8 @@ mod lifecycle;
 mod listen;
 #[cfg(target_os = "macos")]
 mod macos_native;
+#[cfg(feature = "android-remote")]
+mod mobile;
 #[cfg(any(windows, target_os = "linux", target_os = "macos"))]
 mod platform;
 mod transport;
@@ -102,6 +105,8 @@ fn run() -> Result<()> {
         ["gui", "--tray", "--state-dir", path] => {
             gui::run_at(true, std::path::PathBuf::from(path))?
         }
+        #[cfg(feature = "android-remote")]
+        ["gui", "--experimental-mobile"] => gui::run(false)?,
         #[cfg(debug_assertions)]
         ["gui-preview", case, "--state-dir", path] => {
             gui::run_preview(case, std::path::PathBuf::from(path))?

@@ -230,6 +230,9 @@ struct Hello {
     control_protocol: Option<u16>,
     #[serde(default)]
     workspace_protocol: Option<u16>,
+    #[cfg(feature = "android-remote")]
+    #[serde(default)]
+    phone_preview: bool,
 }
 impl Hello {
     fn validate(&self) -> Result<()> {
@@ -288,6 +291,8 @@ pub(crate) struct Candidate {
     pub(crate) address: SocketAddr,
     pub(crate) version: Version,
     pub(crate) workspace_protocol: Option<u16>,
+    #[cfg(feature = "android-remote")]
+    pub(crate) phone_preview: bool,
 }
 pub(crate) async fn authenticate(
     stream: TcpStream,
@@ -340,6 +345,8 @@ async fn authenticate_version(
         port,
         control_protocol: Some(super::management::PROTOCOL),
         workspace_protocol: Some(crate::group::model::PROTOCOL),
+        #[cfg(feature = "android-remote")]
+        phone_preview: true,
     })?;
     let mut remote = None;
     let mut buffer = vec![0; LIMIT];
@@ -386,6 +393,8 @@ async fn authenticate_version(
         requested: outgoing,
         address,
         workspace_protocol: remote.workspace_protocol,
+        #[cfg(feature = "android-remote")]
+        phone_preview: remote.phone_preview,
     })
 }
 
@@ -428,6 +437,26 @@ async fn send_frame(
     Ok(())
 }
 impl Candidate {
+    #[cfg(feature = "android-remote")]
+    pub(crate) async fn send_json(&mut self, value: &serde_json::Value) -> Result<()> {
+        let bytes = serde_json::to_vec(value)?;
+        ensure!(bytes.len() + 16 <= LIMIT, "control record is too large");
+        let mut encrypted = vec![0; bytes.len() + 16];
+        let length = self.noise.write_message(&bytes, &mut encrypted)?;
+        timeout(
+            AUTH_TIMEOUT,
+            write_record(&mut self.stream, &encrypted[..length]),
+        )
+        .await??;
+        Ok(())
+    }
+    #[cfg(feature = "android-remote")]
+    pub(crate) async fn receive_json(&mut self) -> Result<serde_json::Value> {
+        let bytes = read_record(&mut self.stream).await?;
+        let mut plain = vec![0; bytes.len()];
+        let length = self.noise.read_message(&bytes, &mut plain)?;
+        Ok(serde_json::from_slice(&plain[..length])?)
+    }
     async fn send(&mut self, frame: Frame) -> Result<()> {
         let data = serde_json::to_vec(&frame)?;
         let mut encrypted = vec![0; LIMIT];
@@ -1237,6 +1266,8 @@ mod tests {
             port: 4001,
             control_protocol: Some(99),
             workspace_protocol: None,
+            #[cfg(feature = "android-remote")]
+            phone_preview: false,
         };
         assert!(unsupported.validate().is_err());
     }
