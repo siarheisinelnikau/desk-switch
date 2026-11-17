@@ -232,51 +232,21 @@ async fn pairing_code_is_visible_before_phone_confirmation_and_decline_never_gra
 
 #[tokio::test]
 async fn forgotten_phone_disconnects_releases_held_input_and_requires_new_consent() -> Result<()> {
-    use crate::wire::{Input, Message};
+    use crate::wire::Input;
     let fixture = Fixture::new()?;
-    let mut peer = fixture.connect().await?;
-    let pending = fixture.request()?;
-    let _ = pending.reply.send(true);
-    peer.send_json(&json!({"Decision":true})).await?;
-    assert_eq!(peer.receive_json().await?, json!({"Decision":true}));
-    peer.send_json(&json!("Pinned")).await?;
-    assert_eq!(peer.receive_json().await?, json!("Pinned"));
-    let stream =
-        tokio::net::TcpStream::connect((std::net::Ipv4Addr::LOCALHOST, fixture.input)).await?;
-    let mut pipe = crate::transport::Pipe::connect(stream, &fixture.phone, &peer.key, true).await?;
-    pipe.send(Message::Prepare {
-        id: 1,
-        inputs: None,
-        edge: None,
-    })
-    .await?;
-    assert_eq!(
-        pipe.messages.recv().await.context("input closed")??,
-        Message::Ready(1)
-    );
-    pipe.send(Message::Activate(1)).await?;
-    assert_eq!(
-        pipe.messages.recv().await.context("input closed")??,
-        Message::Active(1)
-    );
+    let control = Phone::control(&fixture, &fixture.phone, "Test phone").await?;
+    let mut phone = Phone::native(&fixture, &fixture.phone, control).await?;
     let held = Input::Key {
         code: 42,
         down: true,
     };
-    pipe.send(Message::Event(held)).await?;
-    pipe.send(Message::Ping(2)).await?;
-    assert_eq!(
-        pipe.messages.recv().await.context("input closed")??,
-        Message::Pong(2)
-    );
-    assert!(fixture.proof.lock().unwrap().inputs.contains(&held));
-    fixture
-        .service
-        .as_ref()
-        .unwrap()
-        .forget(&config::hex(&fixture.phone.public))?;
+    phone.event(held).await?;
+    phone
+        .wait(|| fixture.proof.lock().unwrap().inputs.contains(&held))
+        .await?;
+    fixture.service.as_ref().unwrap().forget(&phone.key)?;
     assert!(matches!(
-        timeout(Duration::from_secs(2), pipe.messages.recv()).await?,
+        timeout(Duration::from_secs(2), phone.input.messages.recv()).await?,
         None | Some(Err(_))
     ));
     assert!(fixture.proof.lock().unwrap().inputs.contains(&Input::Key {
@@ -284,7 +254,7 @@ async fn forgotten_phone_disconnects_releases_held_input_and_requires_new_consen
         down: false
     }));
     assert!(saved(&fixture.dir)?.is_empty());
-    drop(peer);
+    drop(phone);
     let mut again = fixture.connect().await?;
     let pending = fixture.request()?;
     let _ = pending.reply.send(false);
