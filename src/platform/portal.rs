@@ -118,7 +118,11 @@ pub struct Portal {
 impl Portal {
     pub async fn open(edge: Option<Edge>) -> Result<Self> {
         let dir = crate::config::state_dir()?;
-        let permission_lock = crate::config::lock(&dir, "portal.lock")
+        Self::open_at(edge, &dir).await
+    }
+
+    pub(crate) async fn open_at(edge: Option<Edge>, dir: &Path) -> Result<Self> {
+        let permission_lock = crate::config::lock(dir, "portal.lock")
             .context("another input session is already using this profile's Wayland permission")?;
         let portal = tokio::select! {
             result = check() => result?,
@@ -134,7 +138,7 @@ impl Portal {
         .await??;
         // Restore tokens are single use. Consume the old token before requesting
         // consent and save its replacement as soon as Start succeeds.
-        let restore_token = take_restore_token(&dir);
+        let restore_token = take_restore_token(dir);
         let setup = timeout(Duration::from_secs(120), async {
             portal
                 .select_devices(
@@ -157,7 +161,7 @@ impl Portal {
                     .contains(DeviceType::Keyboard | DeviceType::Pointer),
                 "the portal did not grant both keyboard and pointer"
             );
-            if let Err(error) = save_restore_token(&dir, granted.restore_token()) {
+            if let Err(error) = save_restore_token(dir, granted.restore_token()) {
                 eprintln!("Could not save the Wayland permission for the next session: {error:#}");
             }
             let fd = portal

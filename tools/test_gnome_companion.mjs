@@ -1,5 +1,5 @@
 // Exercise the shipped extension's event handlers and clipboard API with fake
-// Shell objects. No real pointer events, Shell session or clipboard is touched.
+// Shell objects. No real pointer events, Shell session, screen or clipboard is touched.
 import assert from 'node:assert/strict';
 import {readFile} from 'node:fs/promises';
 import vm from 'node:vm';
@@ -11,6 +11,19 @@ class Signals {
     emit(name, ...args) { for (const handler of this.handlers.values()) if (handler.name === name) handler.callback(this, ...args); }
 }
 const stage = new Signals();
+const previewPaints = [], previewEncodes = [], pendingPreviewEncodes = [];
+let previewPng = Uint8Array.from([137, 80, 78, 71, 13, 10, 26, 10]);
+let holdPreviewEncode = false, previewEncodeError = null, previewPaintError = null;
+stage.paint_to_content = function (rectangle, scale, colorState, flags) {
+    if (previewPaintError) throw previewPaintError;
+    assert.equal(scale, 1);
+    if (arguments.length === 3) flags = colorState;
+    else assert.equal(colorState, null);
+    assert.equal(flags, 2);
+    assert(rectangle.width > 0 && rectangle.width <= 640 && rectangle.height > 0 && rectangle.height <= 480);
+    previewPaints.push({...rectangle});
+    return {get_texture: () => ({get_width: () => rectangle.width, get_height: () => rectangle.height})};
+};
 let eventTarget;
 stage.get_event_actor = () => eventTarget;
 let target = null;
@@ -45,9 +58,14 @@ const GLib = {
 };
 const calls = [];
 const Gio = {
+    MemoryOutputStream: {new_resizable() {
+        let closed = false;
+        return {bytes: new Uint8Array(), close() { closed = true; }, is_closed: () => closed,
+            steal_as_bytes() { assert(closed); return {get_data: () => this.bytes}; }};
+    }},
     Cancellable: class { cancel() { this.cancelled = true; } },
     IOErrorEnum: {CANCELLED: 1}, BusType: {SESSION: 0}, BusNameOwnerFlags: {NONE: 0}, DBusCallFlags: {NONE: 0},
-    FileQueryInfoFlags: {NOFOLLOW_SYMLINKS: 1}, FileType: {REGULAR: 1},
+    FileQueryInfoFlags: {NONE: 0, NOFOLLOW_SYMLINKS: 1}, FileType: {REGULAR: 1},
     File: {new_for_path(path) {
         return {
             read_async(_priority, _cancel, callback) {
@@ -71,18 +89,21 @@ const Gio = {
                 };
             },
             query_info_async(_attributes, flags, _priority, _cancel, callback) {
-                assert.equal(flags, Gio.FileQueryInfoFlags.NOFOLLOW_SYMLINKS);
+                assert(flags === Gio.FileQueryInfoFlags.NOFOLLOW_SYMLINKS ||
+                    flags === Gio.FileQueryInfoFlags.NONE && /^\/proc\/\d+\/exe$/.test(path));
                 queueMicrotask(() => callback(this, {}));
             },
             query_info_finish() {
                 if (!fileInfo.has(path)) throw new Error('Fixture metadata unavailable');
                 const info = fileInfo.get(path);
                 return {get_symlink_target: () => info.target, get_file_type: () => info.type,
-                    get_attribute_uint32: name => { assert.equal(name, 'unix::uid'); return info.uid; }};
+                    get_attribute_uint32: name => info[name.split('::')[1]],
+                    get_attribute_uint64: name => info[name.split('::')[1]]};
             },
         };
     }},
     DBusExportedObject: {wrapJSObject() { return {export() { exports++; }, unexport() { exports--; }}; }},
+    Credentials: {new() { return {get_unix_user: () => 1000}; }},
     DBus: {session: {
         call(name, path, interface_, method, arguments_, _reply, _flags, timeout, cancel, callback) {
             if (method === 'Activate') {
@@ -106,6 +127,7 @@ const Gio = {
     }},
     bus_own_name() { return ++owned; }, bus_unown_name() { owned--; },
 };
+const previewMemoryOutputStream = Gio.MemoryOutputStream;
 function icon(id, busName, x) {
     const actor = new Signals();
     Object.assign(actor, {
@@ -120,9 +142,24 @@ function icon(id, busName, x) {
 }
 const own = icon('desk-switch', ':1.4', 100), other = icon('another-app', ':1.9', 130);
 const boxes = [new Signals(), new Signals(), new Signals()];
-const Main = {panel: {_leftBox: boxes[0], _centerBox: boxes[1], _rightBox: boxes[2], statusArea: {own, other}}, activateWindow: (window, timestamp) => focused.push({window, timestamp})};
-const Clutter = {EventType: {BUTTON_PRESS: 1, BUTTON_RELEASE: 2}, BUTTON_PRIMARY: 1, EVENT_PROPAGATE: false, EVENT_STOP: true, PickMode: {REACTIVE: 0}};
-const sandbox = {Clutter, Gio, GLib, Meta: {SelectionType: {SELECTION_CLIPBOARD: 1}}, St: {Clipboard: {get_default: () => clipboard}, ClipboardType: {CLIPBOARD: 1}}, Main, Extension: class {}, global: {stage, display, get_window_actors: () => windows.map(meta_window => ({meta_window})), get_current_time: () => 1234, get_pointer: () => { pointerReads++; return pointer; }}, console, TextEncoder, TextDecoder};
+const Main = {panel: {_leftBox: boxes[0], _centerBox: boxes[1], _rightBox: boxes[2], statusArea: {own, other}}, activateWindow: (window, timestamp) => focused.push({window, timestamp}),
+    sessionMode: {allowScreencast: true, isLocked: false, isGreeter: false}, screenShield: {locked: false},
+    layoutManager: {monitors: [{x: -1920, y: 0, width: 1920, height: 1080}, {x: 0, y: 0, width: 1920, height: 1080}]}};
+const Clutter = {EventType: {BUTTON_PRESS: 1, BUTTON_RELEASE: 2}, BUTTON_PRIMARY: 1, EVENT_PROPAGATE: false, EVENT_STOP: true, PickMode: {REACTIVE: 0}, PaintFlag: {FORCE_CURSORS: 2}};
+const Shell = {Screenshot: class {}};
+Shell.Screenshot.composite_to_stream = (texture, x, y, width, height, scale, cursor, cursorX, cursorY, cursorScale, stream, callback) => {
+    assert.equal(x, 0); assert.equal(y, 0); assert.equal(scale, 1); assert.equal(cursor, null);
+    assert.equal(width, texture.get_width()); assert.equal(height, texture.get_height());
+    previewEncodes.push({width, height});
+    const result = {error: previewEncodeError};
+    stream.bytes = previewPng;
+    const complete = () => callback(null, result);
+    if (holdPreviewEncode) pendingPreviewEncodes.push(complete);
+    else queueMicrotask(complete);
+};
+Shell.Screenshot.composite_to_stream_finish = result => { if (result.error) throw result.error; return {}; };
+const Config = {PACKAGE_VERSION: '50.0'};
+const sandbox = {Clutter, Gio, GLib, Shell, Config, Meta: {SelectionType: {SELECTION_CLIPBOARD: 1}}, St: {Clipboard: {get_default: () => clipboard}, ClipboardType: {CLIPBOARD: 1}}, Main, Extension: class {}, global: {stage, display, get_window_actors: () => windows.map(meta_window => ({meta_window})), get_current_time: () => 1234, get_pointer: () => { pointerReads++; return pointer; }}, console, TextEncoder, TextDecoder};
 const source = (await readFile(new URL('../packaging/linux/gnome-extension/extension.js', import.meta.url), 'utf8'))
     .replace(/^import .*;\r?\n/gm, '').replace('export default class DeskSwitchTray', 'globalThis.Subject = class DeskSwitchTray');
 vm.runInNewContext(source, sandbox, {filename: 'Desk Switch GNOME extension.js'});
@@ -514,3 +551,112 @@ assert.equal(calls.length, beforeEventActor + 1);
 eventExtension.disable();
 eventTarget = undefined;
 console.log('PASS: GNOME event-actor routing activates only our completed primary click; the native secondary menu is preserved.');
+
+// Cursor preview uses a separate explicit request: the ordinary companion never
+// samples screen pixels. Only this fixture's generated PNG bytes are returned.
+assert.equal(previewPaints.length, 0);
+Gio.MemoryOutputStream = previewMemoryOutputStream;
+const previewExtension = new sandbox.Subject(); previewExtension.enable();
+for (const [id, callback] of idle) { idle.delete(id); callback(); }
+previewExtension._cursorPreviewRectangleType = class { constructor(geometry) { Object.assign(this, geometry); } };
+const previewCapability = new Invocation();
+await previewExtension.CursorPreviewVersionAsync([], previewCapability);
+assert.deepEqual(Array.from(previewCapability.result.data), [1]);
+assert.equal(previewPaints.length, 0, 'capability queries must not capture screen pixels');
+const deniedPreview = new Invocation(':1.6');
+await previewExtension.CaptureCursorRegionAsync([384, 256], deniedPreview);
+assert(deniedPreview.error); assert.equal(previewPaints.length, 0,
+    'an input child or unrelated caller cannot capture through the GUI-only API');
+for (const size of [[0, 256], [127, 256], [641, 256], [384, 95], [384, 481], [384.5, 256]]) {
+    const invalid = new Invocation(); await previewExtension.CaptureCursorRegionAsync(size, invalid);
+    assert(invalid.error); assert.equal(previewPaints.length, 0);
+}
+for (const [owner, field] of [[Main.sessionMode, 'isLocked'], [Main.sessionMode, 'isGreeter'], [Main.screenShield, 'locked']]) {
+    owner[field] = true;
+    const locked = new Invocation(); await previewExtension.CaptureCursorRegionAsync([384, 256], locked);
+    assert(locked.error); assert.equal(previewPaints.length, 0);
+    owner[field] = false;
+}
+Main.sessionMode.allowScreencast = false;
+const restricted = new Invocation(); await previewExtension.CaptureCursorRegionAsync([384, 256], restricted);
+assert(restricted.error); assert.equal(previewPaints.length, 0);
+Main.sessionMode.allowScreencast = true;
+
+pointer[0] = -1915; pointer[1] = 4;
+const topLeft = new Invocation(); await previewExtension.CaptureCursorRegionAsync([384, 256], topLeft);
+assert.equal(topLeft.result.signature, '(ay)');
+assert.deepEqual(Array.from(topLeft.result.data[0]), Array.from(previewPng));
+assert.deepEqual(previewPaints.at(-1), {x: -1920, y: 0, width: 384, height: 256},
+    'negative monitor coordinates and edges clamp the requested region before allocation');
+assert.deepEqual(previewEncodes.at(-1), {width: 384, height: 256});
+pointer[0] = 1919; pointer[1] = 1079;
+Config.PACKAGE_VERSION = '49.2';
+const bottomRight = new Invocation(); await previewExtension.CaptureCursorRegionAsync([640, 480], bottomRight);
+assert(bottomRight.result); assert.deepEqual(previewPaints.at(-1), {x: 1280, y: 600, width: 640, height: 480});
+Config.PACKAGE_VERSION = '50.0';
+
+holdPreviewEncode = true;
+const firstPreview = new Invocation();
+const firstOperation = previewExtension.CaptureCursorRegionAsync([384, 256], firstPreview);
+for (let i = 0; i < 30 && pendingPreviewEncodes.length === 0; i++) await Promise.resolve();
+assert.equal(pendingPreviewEncodes.length, 1);
+const beforeBusy = previewPaints.length;
+const busyPreview = new Invocation(); await previewExtension.CaptureCursorRegionAsync([384, 256], busyPreview);
+assert(busyPreview.error); assert.equal(previewPaints.length, beforeBusy,
+    'overlapping requests cannot allocate another capture texture');
+Main.sessionMode.isLocked = true;
+pendingPreviewEncodes.shift()(); await firstOperation;
+assert(firstPreview.error); assert.equal(firstPreview.result, undefined,
+    'a desktop that locked during encoding cannot publish the captured frame');
+Main.sessionMode.isLocked = false;
+holdPreviewEncode = false;
+
+const originalPng = previewPng;
+previewPng = new Uint8Array(2 * 1024 * 1024 + 1);
+const oversizedPreview = new Invocation(); await previewExtension.CaptureCursorRegionAsync([384, 256], oversizedPreview);
+assert(oversizedPreview.error); assert.equal(previewExtension._cursorPreviewLease, null);
+previewPng = originalPng;
+previewEncodeError = new Error('Fixture PNG encode failure');
+const failedPreview = new Invocation(); await previewExtension.CaptureCursorRegionAsync([384, 256], failedPreview);
+assert(failedPreview.error); assert.equal(previewExtension._cursorPreviewLease, null);
+previewEncodeError = null;
+
+holdPreviewEncode = true;
+const disabledPreview = new Invocation();
+const disabledOperation = previewExtension.CaptureCursorRegionAsync([384, 256], disabledPreview);
+for (let i = 0; i < 30 && pendingPreviewEncodes.length === 0; i++) await Promise.resolve();
+assert.equal(pendingPreviewEncodes.length, 1);
+previewExtension.disable();
+pendingPreviewEncodes.shift()(); await disabledOperation;
+assert(disabledPreview.error); assert.equal(disabledPreview.result, undefined);
+assert.equal(previewExtension._cursorPreviewLease, null);
+assert.equal(exports, 0); assert.equal(owned, 0); assert.equal(idle.size, 0); assert.equal(timeouts.size, 0);
+holdPreviewEncode = false;
+console.log('PASS: cursor preview is exact-GUI-authorized, request-only, region-bounded and memory-only; lock, overlap, oversized frames, encode failure and disable reject safely. No physical screen was captured.');
+
+const legacyExtension = new sandbox.Subject();
+legacyExtension.enable();
+legacyExtension._icons.clear();
+const installedPath = '/usr/lib/desk-switch/desk-switch';
+const installedFile = {type: Gio.FileType.REGULAR, uid: 0, mode: 0o755, device: 12, inode: 321};
+fileInfo.set(installedPath, installedFile);
+for (const [sender, pid, mode, inode, args] of [
+    [':1.13', 4208, 0o755, 321, ['gui', '--tray']],
+    [':1.12', 4207, 0o777, 321, ['gui']],
+    [':1.11', 4206, 0o755, 322, ['gui']],
+    [':1.10', 4205, 0o755, 321, ['gui']],
+    [':1.9', 4204, 0o755, 321, ['run', '--role', 'host']],
+]) {
+    installedFile.mode = mode;
+    processFixture(pid, {uid: pid === 4205 ? 2000 : 1000, executable: installedPath});
+    Object.assign(fileInfo.get(`/proc/${pid}/exe`), {device: 12, inode});
+    procFiles.set(`/proc/${pid}/cmdline`, [installedPath, ...args, ''].join('\0'));
+    if (pid === 4208) {
+        assert.equal(await legacyExtension._authorizeCaller(new Invocation(sender)), pid);
+        legacyExtension._allowedCallers.delete(sender);
+    } else
+        await assert.rejects(legacyExtension._authorizeCaller(new Invocation(sender)), /Only the running Desk Switch/);
+}
+fileInfo.delete(installedPath);
+legacyExtension.disable();
+console.log('PASS: legacy tray callers require the installed GUI executable, matching inode, safe mode and desktop user.');

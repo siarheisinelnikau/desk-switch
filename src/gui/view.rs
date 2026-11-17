@@ -295,7 +295,11 @@ impl DeviceIcon {
                     .collect();
             }
         };
-        devices.iter().map(|device| device.name.as_str()).collect()
+        devices
+            .iter()
+            .filter(|device| super::topology::phone_id(&device.id).is_none())
+            .map(|device| device.name.as_str())
+            .collect()
     }
 }
 
@@ -739,6 +743,10 @@ fn device_picker(
     devices: &[crate::audio::AudioDevice],
     automatic_name: Option<&str>,
 ) {
+    let devices = devices
+        .iter()
+        .filter(|device| super::topology::phone_id(&device.id).is_none())
+        .collect::<Vec<_>>();
     ui.horizontal(|ui| {
         ui.label(crate::i18n::tr(label));
         let caption = choice
@@ -769,7 +777,7 @@ fn device_picker(
             .selected_text(caption)
             .show_ui(ui, |ui| {
                 ui.selectable_value(choice, None, crate::i18n::tr("Автоматически"));
-                for device in devices {
+                for device in &devices {
                     ui.selectable_value(choice, Some(device.id.clone()), &device.name);
                 }
             });
@@ -822,6 +830,8 @@ impl Desktop {
                 });
             });
         if !self.quitting {
+            #[cfg(feature = "android-remote")]
+            self.mobile.confirmation(&ctx);
             if !self.group.layout_editor.is_open() && !self.transfers.is_open() {
                 self.settings_windows(&ctx);
             }
@@ -981,6 +991,21 @@ impl Desktop {
                             .id_salt("workspace-settings-scroll")
                             .auto_shrink([false, false])
                             .show(ui, |ui| {
+                                #[cfg(feature = "android-remote")]
+                                {
+                                    let name = self.local_node().name;
+                                    if self.mobile.show(
+                                        ui,
+                                        &self.dir,
+                                        name,
+                                        &mut self.prefs.phone_remote,
+                                        &mut self.prefs.phone_screen_preview,
+                                    ) {
+                                        self.discovery.take();
+                                        let _ = self.prefs.save(&self.dir);
+                                    }
+                                    ui.add_space(12.0);
+                                }
                                 if self.group.workspace.is_some() || self.group.removed {
                                     self.group_settings(ui);
                                 } else {

@@ -919,6 +919,29 @@ impl Desktop {
                         });
                 }
                 node.shared = Default::default();
+                if case.starts_with("shared-four-phones") {
+                    node.diagnostics
+                        .logs
+                        .push(super::topology::PHONE_RELAY_CAPABILITY.into());
+                    let phones: &[(u8, &str, &str)] = match index {
+                        0 => &[(0xaa, "Pixel phone", ""), (0xbb, "Galaxy phone", "-local")],
+                        1 => &[(0xdd, "Living room phone", "")],
+                        3 => &[(0xcc, "Tablet", "-offline")],
+                        _ => &[],
+                    };
+                    for (key, name, state) in phones {
+                        let device = crate::audio::AudioDevice {
+                            id: format!(
+                                "desk-switch-phone{state}:{}",
+                                format!("{key:02x}").repeat(32)
+                            ),
+                            name: (*name).into(),
+                            default: false,
+                        };
+                        node.devices.keyboards.push(device.clone());
+                        node.devices.mice.push(device);
+                    }
+                }
                 node.ack.clear();
                 if let Some(management) = &mut node.management {
                     management.update.ready = false;
@@ -1020,9 +1043,14 @@ impl Desktop {
             self.group.workspace = Some(state);
             self.group.preview = true;
             self.group.selected = self.public_key.clone();
+            #[cfg(feature = "android-remote")]
+            if case.starts_with("shared-four-phones") {
+                self.mobile.fixture();
+            }
             if matches!(
                 case,
                 "shared-four-settings"
+                    | "shared-four-phones-settings"
                     | "shared-four-settings-error"
                     | "shared-four-update-download-error"
                     | "shared-four-edge-settings"

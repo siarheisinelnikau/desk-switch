@@ -336,6 +336,64 @@ fn backend() -> Result<Box<dyn Backend>> {
     }))
 }
 
+#[cfg(all(feature = "android-remote", target_os = "linux"))]
+fn phone_paste() -> &'static Mutex<Option<String>> {
+    static PASTE: std::sync::OnceLock<Mutex<Option<String>>> = std::sync::OnceLock::new();
+    PASTE.get_or_init(|| Mutex::new(None))
+}
+
+#[cfg(all(feature = "android-remote", target_os = "linux"))]
+pub(crate) struct RemoteText {
+    send: std::sync::mpsc::SyncSender<(String, tokio::sync::oneshot::Sender<Result<(), String>>)>,
+}
+#[cfg(all(feature = "android-remote", target_os = "linux"))]
+impl RemoteText {
+    pub(crate) fn start() -> Result<Self> {
+        let (send, receive) = std::sync::mpsc::sync_channel::<(
+            String,
+            tokio::sync::oneshot::Sender<Result<(), String>>,
+        )>(1);
+        std::thread::Builder::new()
+            .name("Desk Switch remote text".into())
+            .spawn(move || {
+                let mut backend = None;
+                for (text, reply) in receive {
+                    let result = (|| {
+                        if backend.is_none() {
+                            backend = Some(self::backend()?);
+                        }
+                        let value = Value::Text(text);
+                        // Clipboard sharing observes this same desktop clipboard.
+                        // Serialize publishing and observing so typed phone text stays local.
+                        let mut private = phone_paste().lock().unwrap();
+                        backend.as_mut().unwrap().write(&value)?;
+                        *private = Some(value.fingerprint());
+                        Ok(())
+                    })()
+                    .map_err(|error: anyhow::Error| {
+                        format!("Could not publish remote text: {error:#}")
+                    });
+                    let _ = reply.send(result);
+                }
+            })?;
+        Ok(Self { send })
+    }
+    pub(crate) fn write(
+        &self,
+        text: String,
+    ) -> Result<tokio::sync::oneshot::Receiver<Result<(), String>>> {
+        ensure!(
+            !text.is_empty() && text.len() <= 8192,
+            "Invalid remote text size"
+        );
+        let (send, receive) = tokio::sync::oneshot::channel();
+        self.send
+            .try_send((text, send))
+            .context("Remote text is still being processed")?;
+        Ok(receive)
+    }
+}
+
 #[derive(Default)]
 struct Engine {
     fingerprint: Option<String>,
@@ -372,6 +430,8 @@ impl Engine {
         self.step(backend)
     }
     fn step(&mut self, backend: &mut dyn Backend) -> Result<Option<Content>> {
+        #[cfg(all(feature = "android-remote", target_os = "linux"))]
+        let mut phone_text = phone_paste().lock().unwrap();
         if let Some(value) = self.pending.as_ref() {
             self.rejected = None;
             let fingerprint = value.fingerprint();
@@ -395,6 +455,15 @@ impl Engine {
             return Ok(None);
         };
         let fingerprint = value.fingerprint();
+        #[cfg(all(feature = "android-remote", target_os = "linux"))]
+        {
+            if phone_text.as_ref() == Some(&fingerprint) {
+                self.fingerprint = Some(fingerprint);
+                self.rejected = None;
+                return Ok(None);
+            }
+            *phone_text = None;
+        }
         if self.fingerprint.as_ref() == Some(&fingerprint) {
             if let Some(error) = &self.rejected {
                 anyhow::bail!("{error}");

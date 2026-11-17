@@ -597,6 +597,7 @@ impl Handoff {
                     if self.logic.is_remote() && self.token == Some(token) && io.gate.current() == (token, Route::Remote) {
                         let event = coalesce_motion(token, event, &mut io.events, &mut self.pending_event);
                         pipe.send(Message::Event(event)).await?;
+                        crate::feedback::record(event);
                     }
                     continue;
                 }

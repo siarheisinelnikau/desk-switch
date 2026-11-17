@@ -3,8 +3,10 @@ import Clutter from 'gi://Clutter';
 import Gio from 'gi://Gio';
 import GLib from 'gi://GLib';
 import Meta from 'gi://Meta';
+import Shell from 'gi://Shell';
 import St from 'gi://St';
 import {Extension} from 'resource:///org/gnome/shell/extensions/extension.js';
+import * as Config from 'resource:///org/gnome/shell/misc/config.js';
 import * as Main from 'resource:///org/gnome/shell/ui/main.js';
 
 const INDICATOR_ID = 'desk-switch';
@@ -13,6 +15,7 @@ const CLIPBOARD_PATH = '/io/github/siarheisinelnikau/DeskSwitch/Clipboard';
 const CLIPBOARD_LIMIT = 8 * 1024 * 1024;
 const FILE_CLIPBOARD_LIMIT = 1024 * 1024;
 const FILE_CLIPBOARD_ROOTS = 10000;
+const CURSOR_PREVIEW_LIMIT = 2 * 1024 * 1024;
 const CLIPBOARD_INTERFACE = `<node><interface name="${CLIPBOARD_NAME}">
     <method name="Version"><arg type="u" direction="out"/></method>
     <method name="TrayVersion"><arg type="u" direction="out"/></method>
@@ -39,6 +42,11 @@ const CLIPBOARD_INTERFACE = `<node><interface name="${CLIPBOARD_NAME}">
     </method>
     <method name="ActivateWindow"><arg type="s" direction="in"/></method>
     <method name="PointerState"><arg type="i" direction="out"/><arg type="i" direction="out"/></method>
+    <method name="CursorPreviewVersion"><arg type="u" direction="out"/></method>
+    <method name="CaptureCursorRegion">
+        <arg type="u" direction="in"/><arg type="u" direction="in"/>
+        <arg type="ay" direction="out"/>
+    </method>
 </interface></node>`;
 
 export default class DeskSwitchTray extends Extension {
@@ -50,6 +58,7 @@ export default class DeskSwitchTray extends Extension {
         this._alive = true;
         this._allowedCallers = new Map();
         this._focusRequests = new Map();
+        this._cursorPreviewLease = null;
         this._clipboardSerial = 1;
         this._clipboardRejected = null;
         this._clipboardFilesRejected = null;
@@ -205,12 +214,53 @@ export default class DeskSwitchTray extends Extension {
         const callerPid = await this._processId(sender);
         const indicatorPids = await Promise.all(indicators.map(icon =>
             this._processId(icon._indicator.busName).catch(() => 0)));
-        if (!this._alive || callerPid <= 0 || !indicatorPids.includes(callerPid))
+        const allowed = callerPid > 0 && (indicatorPids.includes(callerPid) ||
+            await this._isPackagedGui(sender, callerPid).catch(() => false));
+        if (!this._alive || !allowed)
             throw new Error('Only the running Desk Switch process may use this clipboard bridge');
         if (this._allowedCallers.size > 64)
             this._allowedCallers.clear();
         this._allowedCallers.set(sender, callerPid);
         return callerPid;
+    }
+
+    async _isPackagedGui(sender, pid) {
+        // XEmbed has no StatusNotifierItem bus identity. Match the caller to
+        // the installed executable itself, including its filesystem identity.
+        const installed = '/usr/lib/desk-switch/desk-switch';
+        const uid = await this._userId(sender);
+        if (uid === 0 || uid !== Gio.Credentials.new().get_unix_user())
+            return false;
+        if (await this._executable(pid) !== installed)
+            return false;
+        const before = await this._processIdentity(pid);
+        if (!before.users.every(user => user === uid))
+            return false;
+        const args = (await this._boundedText(`/proc/${pid}/cmdline`, 8192)).split('\0');
+        if (args.pop() !== '' || args.shift() !== installed)
+            return false;
+        if (args.length && args.shift() !== 'gui')
+            return false;
+        const tray = args[0] === '--tray';
+        if (tray)
+            args.shift();
+        const validArgs = !args.length ||
+            (!tray && args.length === 1 && args[0] === '--experimental-mobile') ||
+            (args.length === 2 && args[0] === '--state-dir' && !!args[1]);
+        if (!validArgs)
+            return false;
+        const attributes = 'standard::type,unix::uid,unix::mode,unix::device,unix::inode';
+        const file = await this._fileInfo(installed, attributes);
+        const running = await this._fileInfo(`/proc/${pid}/exe`, attributes, Gio.FileQueryInfoFlags.NONE);
+        const after = await this._processIdentity(pid);
+        return file.get_file_type() === Gio.FileType.REGULAR &&
+            file.get_attribute_uint32('unix::uid') === 0 &&
+            !(file.get_attribute_uint32('unix::mode') & 0o022) &&
+            file.get_attribute_uint64('unix::inode') > 0 &&
+            file.get_attribute_uint32('unix::device') === running.get_attribute_uint32('unix::device') &&
+            file.get_attribute_uint64('unix::inode') === running.get_attribute_uint64('unix::inode') &&
+            before.started === after.started && after.users.every(user => user === uid) &&
+            (await this._processId(sender)) === pid && (await this._userId(sender)) === uid;
     }
 
     async _boundedText(path, limit) {
@@ -250,10 +300,10 @@ export default class DeskSwitchTray extends Extension {
         return new TextDecoder('utf-8', {fatal: true}).decode(data);
     }
 
-    _fileInfo(path, attributes) {
+    _fileInfo(path, attributes, flags = Gio.FileQueryInfoFlags.NOFOLLOW_SYMLINKS) {
         const file = Gio.File.new_for_path(path);
         return new Promise((resolve, reject) => {
-            file.query_info_async(attributes, Gio.FileQueryInfoFlags.NOFOLLOW_SYMLINKS,
+            file.query_info_async(attributes, flags,
                 GLib.PRIORITY_DEFAULT, this._cancellable, (source, result) => {
                     try { resolve(source.query_info_finish(result)); } catch (error) { reject(error); }
                 });
@@ -372,6 +422,126 @@ export default class DeskSwitchTray extends Extension {
             invocation.return_value(new GLib.Variant('(ii)', [x, y]));
         } catch (error) {
             this._clipboardError(invocation, error);
+        }
+    }
+
+    _cursorPreviewSession() {
+        if (!this._alive)
+            throw new Error('The Desk Switch companion is disabled');
+        if (!Main.sessionMode?.allowScreencast || Main.sessionMode.isLocked ||
+            Main.sessionMode.isGreeter || Main.screenShield?.locked)
+            throw new Error('Cursor preview is unavailable while the desktop is locked');
+        if (typeof global.stage.paint_to_content !== 'function' ||
+            typeof Shell.Screenshot.composite_to_stream !== 'function' ||
+            !Number.isInteger(Clutter.PaintFlag?.FORCE_CURSORS))
+            throw new Error('This GNOME session does not support cursor preview');
+    }
+
+    async CursorPreviewVersionAsync(_parameters, invocation) {
+        try {
+            await this._authorizeCaller(invocation);
+            this._cursorPreviewSession();
+            invocation.return_value(new GLib.Variant('(u)', [1]));
+        } catch (error) {
+            this._clipboardError(invocation, error);
+        }
+    }
+
+    async _cursorPreviewRectangle(geometry) {
+        // Mtk was introduced after the oldest supported Shell. Load its boxed
+        // rectangle only when preview is requested, preserving ordinary tray
+        // and clipboard startup on older sessions.
+        if (!this._cursorPreviewRectangleType) {
+            const rectangle = await import('gi://Mtk').then(module => module.default.Rectangle)
+                .catch(() => Meta.Rectangle);
+            if (typeof rectangle !== 'function')
+                throw new Error('This GNOME session has no capture rectangle API');
+            this._cursorPreviewRectangleType = rectangle;
+        }
+        return new this._cursorPreviewRectangleType(geometry);
+    }
+
+    _cursorPreviewGeometry(width, height) {
+        if (!Number.isInteger(width) || !Number.isInteger(height) ||
+            width < 128 || width > 640 || height < 96 || height > 480)
+            throw new Error('Cursor preview accepts regions from 128×96 to 640×480');
+        const [pointerX, pointerY] = global.get_pointer();
+        if (!Number.isFinite(pointerX) || !Number.isFinite(pointerY))
+            throw new Error('Pointer coordinates are unavailable');
+        const monitors = Main.layoutManager.monitors.filter(monitor =>
+            [monitor.x, monitor.y, monitor.width, monitor.height].every(Number.isFinite) &&
+            monitor.width > 0 && monitor.height > 0);
+        const clamp = (value, minimum, maximum) => Math.max(minimum, Math.min(maximum, value));
+        const distance = monitor =>
+            Math.max(monitor.x - pointerX, 0, pointerX - monitor.x - monitor.width) ** 2 +
+            Math.max(monitor.y - pointerY, 0, pointerY - monitor.y - monitor.height) ** 2;
+        const monitor = monitors.reduce((nearest, candidate) =>
+            nearest === null || distance(candidate) < distance(nearest) ? candidate : nearest, null);
+        if (!monitor)
+            throw new Error('No display is available for cursor preview');
+        width = Math.min(width, Math.floor(monitor.width));
+        height = Math.min(height, Math.floor(monitor.height));
+        return {
+            x: clamp(Math.round(pointerX - width / 2), monitor.x, monitor.x + monitor.width - width),
+            y: clamp(Math.round(pointerY - height / 2), monitor.y, monitor.y + monitor.height - height),
+            width, height,
+        };
+    }
+
+    async CaptureCursorRegionAsync([width, height], invocation) {
+        let lease = null;
+        let stream = null;
+        try {
+            // Screen pixels keep the stricter exact-GUI-PID policy. Managed
+            // children may observe PointerState but cannot capture a screen.
+            await this._authorizeCaller(invocation);
+            this._cursorPreviewSession();
+            const geometry = this._cursorPreviewGeometry(width, height);
+            if (this._cursorPreviewLease !== null)
+                throw new Error('A cursor preview capture is already in progress');
+            lease = {};
+            this._cursorPreviewLease = lease;
+            const rectangle = await this._cursorPreviewRectangle(geometry);
+            this._cursorPreviewSession();
+            if (this._cursorPreviewLease !== lease)
+                throw new Error('Cursor preview was cancelled');
+            const major = Number.parseInt(Config.PACKAGE_VERSION.split('.')[0], 10);
+            if (!Number.isInteger(major) || major < 45)
+                throw new Error('This GNOME version does not support cursor preview');
+            // Paint only the requested region at scale 1. Unlike capturing the
+            // full stage then cropping, the backing texture is bounded here.
+            const content = major >= 50
+                ? global.stage.paint_to_content(rectangle, 1, null, Clutter.PaintFlag.FORCE_CURSORS)
+                : global.stage.paint_to_content(rectangle, 1, Clutter.PaintFlag.FORCE_CURSORS);
+            const texture = content.get_texture();
+            if (!texture || texture.get_width() !== geometry.width || texture.get_height() !== geometry.height)
+                throw new Error('GNOME returned an unexpected preview size');
+            stream = Gio.MemoryOutputStream.new_resizable();
+            await new Promise((resolve, reject) => {
+                Shell.Screenshot.composite_to_stream(texture,
+                    0, 0, geometry.width, geometry.height, 1, null, 0, 0, 1,
+                    stream, (_source, result) => {
+                        try {
+                            Shell.Screenshot.composite_to_stream_finish(result);
+                            resolve();
+                        } catch (error) { reject(error); }
+                    });
+            });
+            this._cursorPreviewSession();
+            if (this._cursorPreviewLease !== lease)
+                throw new Error('Cursor preview was cancelled');
+            stream.close(null);
+            const bytes = stream.steal_as_bytes().get_data();
+            if (bytes.length === 0 || bytes.length > CURSOR_PREVIEW_LIMIT)
+                throw new Error('Cursor preview exceeds its memory limit');
+            invocation.return_value(new GLib.Variant('(ay)', [bytes]));
+        } catch (error) {
+            this._clipboardError(invocation, error);
+        } finally {
+            if (stream && !stream.is_closed())
+                stream.close(null);
+            if (this._cursorPreviewLease === lease)
+                this._cursorPreviewLease = null;
         }
     }
 
@@ -701,6 +871,7 @@ export default class DeskSwitchTray extends Extension {
 
     disable() {
         this._alive = false;
+        this._cursorPreviewLease = null;
         for (const pid of [...this._focusRequests.keys()])
             this._clearFocusRequest(pid);
         this._cancellable.cancel();

@@ -6,6 +6,9 @@ rust-version = "1.99"
 license = "GPL-3.0-or-later"
 description = "Share monitors, input and audio across Windows, Ubuntu and macOS computers"
 
+[features]
+android-remote = []
+
 [dependencies]
 rust-auto-updator = { path = "vendor/rust-auto-updator" }
 mdns-sd = "=0.21.4"
@@ -73,6 +76,7 @@ windows-sys = { version = "0.61", features = [
     "Win32_System_Console",
     "Win32_System_Power",
     "Win32_System_Registry",
+    "Win32_System_StationsAndDesktops",
     "Win32_System_Threading",
     "Win32_UI_HiDpi",
     "Win32_UI_Shell",

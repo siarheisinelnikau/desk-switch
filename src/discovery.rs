@@ -20,8 +20,7 @@ pub struct Peer {
 }
 impl Peer {
     pub fn compatible(&self) -> bool {
-        self.version == crate::compatibility::VERSION
-            && self.protocol == crate::compatibility::PROTOCOL
+        self.protocol == crate::compatibility::PROTOCOL
             && self.public_key.is_some()
             && self.control_port.is_some()
     }
@@ -51,6 +50,8 @@ impl Discovery {
         public_key: &str,
         control_port: u16,
         ctx: eframe::egui::Context,
+        #[cfg(feature = "android-remote")] phone_remote: bool,
+        #[cfg(feature = "android-remote")] screen_preview: bool,
     ) -> Result<Self> {
         ensure!(
             control_port != 0 && public_key.len() == 64,
@@ -78,6 +79,33 @@ impl Discovery {
             .into_iter()
             .map(|(key, value)| (key.to_owned(), value))
             .collect::<std::collections::HashMap<_, _>>();
+        #[cfg(feature = "android-remote")]
+        let properties = {
+            let mut properties = properties;
+            if phone_remote {
+                properties.insert("screen-preview".into(), "1".into());
+                properties.insert(
+                    "screen-preview-allowed".into(),
+                    u8::from(screen_preview).to_string(),
+                );
+                if crate::mobile::screen::available() {
+                    properties.insert("screen-capture".into(), "1".into());
+                }
+                properties.insert(
+                    "remote-port".into(),
+                    crate::mobile::CONTROL_PORT.to_string(),
+                );
+                properties.insert(
+                    "remote-input-port".into(),
+                    crate::mobile::INPUT_PORT.to_string(),
+                );
+                properties.insert(
+                    "workspace-protocol".into(),
+                    crate::group::model::PROTOCOL.to_string(),
+                );
+            }
+            properties
+        };
         let service = ServiceInfo::new(
             SERVICE,
             &id,
@@ -313,5 +341,27 @@ mod tests {
             assert!(!peer.compatible());
             assert_eq!(peer.protocol, protocol.parse::<u16>().unwrap());
         }
+    }
+
+    #[test]
+    fn application_versions_do_not_gate_device_protocol_compatibility() {
+        let peer = Peer {
+            id: "fixture".into(),
+            name: "PC".into(),
+            version: "99.1.0".into(),
+            protocol: crate::compatibility::PROTOCOL,
+            addresses: vec![],
+            public_key: Some("01".repeat(32)),
+            control_port: Some(45878),
+            control_protocol: Some(crate::workspace::management::PROTOCOL),
+        };
+        assert!(peer.compatible());
+        assert!(
+            !Peer {
+                protocol: peer.protocol + 1,
+                ..peer
+            }
+            .compatible()
+        );
     }
 }

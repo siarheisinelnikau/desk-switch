@@ -135,16 +135,62 @@ impl Pipe {
         peer: &Key,
         initiator: bool,
     ) -> Result<Self> {
-        let state = Arc::new(Mutex::new(
-            authenticate(
-                &mut stream,
-                ours,
-                peer,
-                initiator,
-                b"Desk Switch protocol 1",
-            )
-            .await?,
-        ));
+        let state = authenticate(
+            &mut stream,
+            ours,
+            peer,
+            initiator,
+            b"Desk Switch protocol 1",
+        )
+        .await?;
+        Ok(Self::authenticated(stream, state))
+    }
+
+    /// Identify one of the pending authenticated control peers from the first
+    /// original KK record. This allows phones on the same IP to connect in
+    /// either order without handing their input stream to the wrong session.
+    #[cfg(feature = "android-remote")]
+    pub(crate) async fn accept_any(
+        mut stream: TcpStream,
+        ours: &Identity,
+        peers: &[Key],
+    ) -> Result<(Key, Self)> {
+        ensure!(
+            !peers.is_empty() && peers.len() <= 64,
+            "No pending input peer"
+        );
+        stream.set_nodelay(true)?;
+        let mut record = [0; MAX_RECORD];
+        let length = timeout(
+            Duration::from_secs(2),
+            read_record(&mut stream, &mut record),
+        )
+        .await??;
+        for peer in peers {
+            let mut state = Builder::new(NOISE.parse()?)
+                .prologue(b"Desk Switch protocol 1")?
+                .local_private_key(&ours.private)?
+                .remote_public_key(peer)?
+                .build_responder()?;
+            let mut plain = [0; MAX_RECORD];
+            let Ok(size) = state.read_message(&record[..length], &mut plain) else {
+                continue;
+            };
+            let version = crate::compatibility::Version::decode(&plain[..size]).ok();
+            let ours = crate::compatibility::Version::current();
+            let size = state.write_message(&ours.encode()?, &mut plain)?;
+            timeout(IO_TIMEOUT, write_record(&mut stream, &plain[..size])).await??;
+            ours.require(version.as_ref())?;
+            return Ok((
+                *peer,
+                Self::authenticated(stream, state.into_transport_mode()?),
+            ));
+        }
+        anyhow::bail!("The native connection did not match a pending authenticated peer")
+    }
+
+    fn authenticated(stream: TcpStream, state: TransportState) -> Self {
+        let state = Arc::new(Mutex::new(state));
         let (mut stream, writer) = stream.into_split();
         let reader_state = Arc::clone(&state);
         let (send, messages) = mpsc::channel(64);
@@ -167,12 +213,12 @@ impl Pipe {
                 }
             }
         });
-        Ok(Self {
+        Self {
             state,
             writer,
             messages,
             reader,
-        })
+        }
     }
 
     pub async fn send(&mut self, message: Message) -> Result<()> {
@@ -192,6 +238,7 @@ impl Pipe {
 
 impl Drop for Pipe {
     fn drop(&mut self) {
+        crate::feedback::release();
         self.reader.abort();
     }
 }

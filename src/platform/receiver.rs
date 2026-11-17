@@ -85,6 +85,7 @@ async fn disconnect(
     video: Option<&(Inputs, VideoWorker)>,
 ) -> Result<()> {
     let released = sink.release();
+    crate::feedback::release();
     if transfer.is_some_and(|active| {
         active.mode == Mode::Video && matches!(active.stage, Stage::Active | Stage::Exiting)
     }) && let Some((inputs, worker)) = video
@@ -352,6 +353,7 @@ async fn session(
                             active.deadline = Instant::now() + SWITCH_TIMEOUT;
                             pipe.send(Message::ExitEdge { id: active.id, position }).await?;
                         }
+                        crate::feedback::record(input);
                         send_crossing(pipe, sink, Some(active)).await?;
                     }
                     Message::Reposition { id, generation, entry } => {
@@ -380,6 +382,7 @@ async fn session(
                     Message::Return(id) if active.id == id && (matches!(active.stage, Stage::Active | Stage::Exiting)
                         || active.stage == Stage::Armed && active.mode == Mode::Input && active.generation != 0) => {
                         sink.release()?;
+                        crate::feedback::release();
                         active.deadline = Instant::now() + SWITCH_TIMEOUT;
                         // Release input before the active receiver selects the saved host port.
                         active.stage = Stage::Returned;
@@ -400,6 +403,22 @@ async fn session(
             }
         }
     }
+}
+
+#[cfg(feature = "android-remote")]
+pub(super) async fn paired(
+    pipe: &mut Pipe,
+    sink: &mut impl Sink,
+    mut stop: tokio::sync::watch::Receiver<bool>,
+) -> Result<()> {
+    let mut transfer = None;
+    let mut last_id = 0;
+    let result = tokio::select! {
+        result = session(pipe, sink, None, &mut transfer, &mut last_id) => result,
+        _ = async { while !*stop.borrow_and_update() { if stop.changed().await.is_err() { break; } } } => Ok(()),
+    };
+    let released = disconnect(sink, transfer, None).await;
+    result.and(released)
 }
 
 async fn send_crossing(
