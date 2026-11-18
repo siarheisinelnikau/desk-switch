@@ -365,8 +365,6 @@ impl Desktop {
                 ctx.clone(),
                 #[cfg(feature = "android-remote")]
                 self.mobile.available(),
-                #[cfg(feature = "android-remote")]
-                self.mobile.screen_allowed(),
             ) {
                 Ok(discovery) => self.discovery = Some(discovery),
                 Err(error) => self.discovery_error = Some(error.to_string()),

@@ -37,7 +37,7 @@
     <string name="keyboard">Clavier</string>
     <string name="remote_keyboard">Clavier distant</string>
     <string name="hide_keyboard">Masquer le clavier</string>
-    <string name="preview_help">Affiche la zone autour du pointeur. Autorisez l’aperçu du pointeur dans Desk Switch sur l’ordinateur.</string>
+    <string name="preview_help">Affiche la zone autour du pointeur.</string>
     <string name="text_too_long">Le texte est trop long. Envoyez une sélection plus courte.</string>
     <string name="address_prompt">Saisissez son adresse IP locale ou son nom d’hôte.</string>
     <string name="connect">Connecter</string>

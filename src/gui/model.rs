@@ -17,7 +17,6 @@ pub struct Preferences {
     pub pause_local_sharing: bool,
     pub show_remote_cursor: bool,
     pub phone_remote: bool,
-    pub phone_screen_preview: bool,
     pub role: String,
     pub address: String,
     pub audio_mode: String,
@@ -45,7 +44,6 @@ impl Default for Preferences {
             pause_local_sharing: false,
             show_remote_cursor: true,
             phone_remote: true,
-            phone_screen_preview: false,
             role: if cfg!(windows) { "host" } else { "receiver" }.into(),
             address: "192.168.1.20:45876".into(),
             audio_mode: "receive".into(),
@@ -296,7 +294,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(
             dir.join("desktop.toml"),
-            "language='ru'\ntheme='light'\nvolume=25\nmuted=true",
+            "language='ru'\ntheme='light'\nvolume=25\nmuted=true\nphone_screen_preview=false",
         )
         .unwrap();
         let prefs = Preferences::load(&dir).unwrap();
@@ -307,6 +305,8 @@ mod tests {
         assert_eq!(prefs.workspace.shared.volume, 25);
         assert!(prefs.workspace.shared.muted);
         prefs.save(&dir).unwrap();
+        let serialized = std::fs::read_to_string(dir.join("desktop.toml")).unwrap();
+        assert!(!serialized.contains("phone_screen_preview"));
         let saved = Preferences::load(&dir).unwrap();
         assert_eq!(saved.workspace.shared.volume, 25);
         std::fs::remove_dir_all(dir).unwrap();

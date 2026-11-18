@@ -37,7 +37,7 @@
     <string name="keyboard">Tastatur</string>
     <string name="remote_keyboard">Ferntastatur</string>
     <string name="hide_keyboard">Tastatur ausblenden</string>
-    <string name="preview_help">Zeigt den Bereich um den Mauszeiger. Erlaube die Zeigervorschau in Desk Switch auf dem Computer.</string>
+    <string name="preview_help">Zeigt den Bereich um den Mauszeiger.</string>
     <string name="text_too_long">Der Text ist zu lang. Sende einen kürzeren Ausschnitt.</string>
     <string name="address_prompt">Gib die lokale IP-Adresse oder den Hostnamen ein.</string>
     <string name="connect">Verbinden</string>

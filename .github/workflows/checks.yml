@@ -150,6 +150,12 @@ jobs:
           python3 tools/package_deb.py --binary target/release/desk-switch --out dist
           python3 tools/verify_deb.py dist/*.deb
           sudo apt-get --simulate install ./dist/*.deb
+      - name: Package the Ubuntu phone remote experiment
+        if: matrix.os == 'ubuntu-24.04'
+        run: |
+          python3 tools/package_deb.py --binary target/release/desk-switch --out dist/experiment --android-experiment "$GITHUB_RUN_NUMBER"
+          python3 tools/verify_deb.py dist/experiment/*.deb --android-experiment "$GITHUB_RUN_NUMBER"
+          sudo apt-get --simulate install ./dist/experiment/*.deb
       - name: Prepare the Windows experiment for manual testing
         if: runner.os == 'Windows'
         shell: pwsh
@@ -166,5 +172,5 @@ jobs:
         if: matrix.os == 'ubuntu-24.04'
         with:
           name: ubuntu-phone-remote-experiment
-          path: dist/*.deb
+          path: dist/experiment/*.deb
           if-no-files-found: error

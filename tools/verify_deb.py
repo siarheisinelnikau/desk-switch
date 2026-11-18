@@ -13,9 +13,10 @@ import xml.etree.ElementTree as ET
 ROOT = Path(__file__).resolve().parents[1]
 
 
-def check(package):
+def check(package, android_experiment=None):
     version = tomllib.loads((ROOT / "Cargo.toml").read_text())["package"]["version"]
-    for field, expected in [("Package", "desk-switch"), ("Version", version), ("Architecture", "amd64")]:
+    package_version = f"{version}+android.{android_experiment}" if android_experiment is not None else version
+    for field, expected in [("Package", "desk-switch"), ("Version", package_version), ("Architecture", "amd64")]:
         actual = subprocess.check_output(["dpkg-deb", "--field", str(package), field], text=True).strip()
         assert actual == expected, (field, actual)
     dependencies = subprocess.check_output(["dpkg-deb", "--field", str(package), "Depends"], text=True)
@@ -70,4 +71,6 @@ def check(package):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("package", type=Path)
-    check(parser.parse_args().package.resolve())
+    parser.add_argument("--android-experiment", type=int, metavar="BUILD")
+    args = parser.parse_args()
+    check(args.package.resolve(), args.android_experiment)

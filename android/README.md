@@ -48,11 +48,11 @@ Use two fingers to scroll, or tap once and drag on the second touch. A second qu
 </p>
 </details>
 
-Enable **Allow cursor preview** on the paired computer and on each computer you want to preview. Enable **Cursor preview** in the phone's **Controls**. The area around the cursor fills the pointing surface, which still accepts gestures. Set a rate from 1 to 30 FPS. The preview pauses during a workspace switch and stops when the phone leaves the app or either setting is turned off. Frames are encrypted in transit and held only in memory.
+Enable **Cursor preview** in the phone's **Controls** and set a rate from 1 to 30 FPS. The area around the cursor fills the pointing surface, which still accepts gestures. The computer captures the preview only when a paired phone requests it. The preview pauses during a workspace switch and stops when the phone leaves the app or turns preview off. Frames are encrypted in transit and held only in memory.
 
 ![Phone remote and cursor preview settings in Desk Switch](../docs/android-desktop-settings.png)
 
-The Android app requires Android 8 or later. Install the experimental desktop build on each computer that should receive shared phone input. To try Ubuntu, connect to it directly from the phone, or mark the phone **Shared** and select Ubuntu in the desktop workspace. Approve the Wayland remote desktop prompt when it appears. Typed text pastes through the target computer's clipboard, and preview on GNOME Wayland uses the companion bundled with the Ubuntu package. If automatic discovery is unavailable, enter the computer's local IP address in the Android app.
+The Android app requires Android 8 or later. Install the experimental desktop build on each computer that should receive shared phone input. On Ubuntu, the `ubuntu-phone-remote-experiment` artifact includes a `.deb` named with `android-experiment`. It updates the existing Desk Switch installation and keeps the workspace settings. After restarting Desk Switch, check for **Phone remotes · Experimental** in its settings. Connect to Ubuntu directly from the phone, or mark the phone **Shared** and select Ubuntu in the desktop workspace. Approve the Wayland remote desktop prompt when it appears. Typed text pastes through the target computer's clipboard, and preview on GNOME Wayland uses the companion bundled with the Ubuntu package. If automatic discovery is unavailable, enter the computer's local IP address in the Android app.
 
 ## Updates and compatibility
 

@@ -37,7 +37,7 @@
     <string name="keyboard">Keyboard</string>
     <string name="remote_keyboard">Remote keyboard</string>
     <string name="hide_keyboard">Hide keyboard</string>
-    <string name="preview_help">Shows the area around the PC pointer. Allow cursor preview in Desk Switch on the computer.</string>
+    <string name="preview_help">Shows the area around the PC pointer.</string>
     <string name="text_too_long">Text is too long. Send a shorter selection.</string>
     <string name="address_prompt">Enter its local IP address or hostname.</string>
     <string name="connect">Connect</string>

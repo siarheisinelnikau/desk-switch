@@ -51,7 +51,6 @@ impl Discovery {
         control_port: u16,
         ctx: eframe::egui::Context,
         #[cfg(feature = "android-remote")] phone_remote: bool,
-        #[cfg(feature = "android-remote")] screen_preview: bool,
     ) -> Result<Self> {
         ensure!(
             control_port != 0 && public_key.len() == 64,
@@ -84,10 +83,7 @@ impl Discovery {
             let mut properties = properties;
             if phone_remote {
                 properties.insert("screen-preview".into(), "1".into());
-                properties.insert(
-                    "screen-preview-allowed".into(),
-                    u8::from(screen_preview).to_string(),
-                );
+                properties.insert("screen-preview-allowed".into(), "1".into());
                 if crate::mobile::screen::available() {
                     properties.insert("screen-capture".into(), "1".into());
                 }

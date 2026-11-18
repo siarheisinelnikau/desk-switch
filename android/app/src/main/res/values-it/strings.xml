@@ -37,7 +37,7 @@
     <string name="keyboard">Tastiera</string>
     <string name="remote_keyboard">Tastiera remota</string>
     <string name="hide_keyboard">Nascondi tastiera</string>
-    <string name="preview_help">Mostra l’area attorno al puntatore. Consenti l’anteprima del puntatore in Desk Switch sul computer.</string>
+    <string name="preview_help">Mostra l’area attorno al puntatore.</string>
     <string name="text_too_long">Il testo è troppo lungo. Invia una selezione più breve.</string>
     <string name="address_prompt">Inserisci l’indirizzo IP locale o il nome host.</string>
     <string name="connect">Connetti</string>

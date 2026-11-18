@@ -53,7 +53,6 @@ fn external_android_client_controls_a_fake_sink() -> Result<()> {
         0,
         Backend::Proof(proof.clone()),
     )?;
-    service.allow_screen(true);
     config::write_atomic(
         &output.join("ready.json"),
         &json!({"host":"127.0.0.1","port":control,"inputPort":input}).to_string(),
@@ -445,8 +444,6 @@ async fn a_shared_phone_follows_the_selected_pc_after_monitor_settle_without_rep
     let target = Fixture::new()?;
     let source_key = config::hex(&config::load_identity(&source.dir)?.public);
     let target_key = config::hex(&config::load_identity(&target.dir)?.public);
-    source.service.as_ref().unwrap().allow_screen(true);
-    target.service.as_ref().unwrap().allow_screen(true);
     target.service.as_ref().unwrap().set_routing(Routing {
         members: [source_key.clone()].into_iter().collect(),
         ..Default::default()
