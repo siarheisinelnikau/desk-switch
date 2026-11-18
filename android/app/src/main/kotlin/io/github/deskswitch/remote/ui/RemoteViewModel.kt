@@ -5,6 +5,8 @@ import androidx.annotation.StringRes
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import io.github.deskswitch.remote.R
+import io.github.deskswitch.remote.data.ProtocolKind
+import io.github.deskswitch.remote.data.ProtocolVersionMismatch
 import io.github.deskswitch.remote.domain.*
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
@@ -20,10 +22,15 @@ import java.util.concurrent.atomic.AtomicReference
 internal sealed interface ScreenIssue {
     data class Detail(val message: String) : ScreenIssue
     data class Local(@StringRes val resource: Int, val errorCode: Int? = null) : ScreenIssue
+    data class Protocol(val mismatch: ProtocolVersionMismatch) : ScreenIssue
 
     fun localized(context: Context): String = when (this) {
         is Detail -> message
         is Local -> if (errorCode == null) context.getString(resource) else context.getString(resource, errorCode)
+        is Protocol -> context.getString(when (mismatch.kind) {
+            ProtocolKind.DEVICE -> R.string.device_protocol_mismatch
+            ProtocolKind.WORKSPACE -> R.string.workspace_protocol_mismatch
+        }, mismatch.expected, mismatch.received)
     }
 }
 
@@ -156,8 +163,10 @@ class RemoteViewModel internal constructor(
             } catch (error: Exception) {
                 viewModelScope.launch {
                     if (generation.get() != run) return@launch
-                    val issue = error.message?.take(240)?.takeIf(String::isNotBlank)?.let { ScreenIssue.Detail(it) }
-                        ?: ScreenIssue.Local(R.string.connection_unavailable)
+                    val issue = if (error is ProtocolVersionMismatch) ScreenIssue.Protocol(error) else {
+                        error.message?.take(240)?.takeIf(String::isNotBlank)?.let { ScreenIssue.Detail(it) }
+                            ?: ScreenIssue.Local(R.string.connection_unavailable)
+                    }
                     mutable.value = mutable.value.copy(connecting = null, pairing = null, error = issue)
                 }
             }
