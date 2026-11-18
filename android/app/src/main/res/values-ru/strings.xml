@@ -37,7 +37,7 @@
     <string name="keyboard">Клавиатура</string>
     <string name="remote_keyboard">Удалённая клавиатура</string>
     <string name="hide_keyboard">Скрыть клавиатуру</string>
-    <string name="preview_help">Показывает область вокруг указателя. Разрешите предпросмотр в Desk Switch на компьютере.</string>
+    <string name="preview_help">Показывает область вокруг указателя.</string>
     <string name="text_too_long">Текст слишком длинный. Отправьте меньший фрагмент.</string>
     <string name="address_prompt">Введите локальный IP-адрес или имя компьютера.</string>
     <string name="connect">Подключиться</string>

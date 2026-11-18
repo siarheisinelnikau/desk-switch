@@ -999,7 +999,6 @@ impl Desktop {
                                         &self.dir,
                                         name,
                                         &mut self.prefs.phone_remote,
-                                        &mut self.prefs.phone_screen_preview,
                                     ) {
                                         self.discovery.take();
                                         let _ = self.prefs.save(&self.dir);

@@ -24,8 +24,9 @@ pub use routing::{Destination, Device, Routing};
 pub(crate) mod hub;
 mod relay;
 
-pub const CONTROL_PORT: u16 = 45882;
+pub const CONTROL_PORT: u16 = 45884;
 pub const INPUT_PORT: u16 = 45883;
+pub(crate) const LEGACY_CONTROL_PORT: u16 = 45882;
 fn enabled() -> bool {
     true
 }
@@ -231,15 +232,6 @@ impl Service {
                 state.epoch = state.epoch.wrapping_add(1);
             }
             state.routing = routing;
-            true
-        });
-    }
-    pub fn allow_screen(&self, enabled: bool) {
-        self.state.send_if_modified(|state| {
-            if state.allow_screen == enabled {
-                return false;
-            }
-            state.allow_screen = enabled;
             true
         });
     }

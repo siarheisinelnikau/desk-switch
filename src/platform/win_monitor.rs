@@ -466,7 +466,7 @@ fn identity_data(screen: &Screen) -> Result<(String, String, Vec<u8>)> {
     ))
 }
 
-struct Physical(PHYSICAL_MONITOR, String, Vec<u8>);
+struct Physical(PHYSICAL_MONITOR);
 impl Drop for Physical {
     fn drop(&mut self) {
         // SAFETY: the handle was opened by GetPhysicalMonitorsFromHMONITOR and
@@ -478,7 +478,6 @@ impl Drop for Physical {
 }
 
 fn physical(screen: &Screen) -> Result<Physical> {
-    let (_, _, edid) = identity_data(screen)?;
     let mut count = 0;
     // SAFETY: the screen owns a live monitor handle and `count` is a live
     // out-parameter.
@@ -495,24 +494,25 @@ fn physical(screen: &Screen) -> Result<Physical> {
     if unsafe { GetPhysicalMonitorsFromHMONITOR(screen.handle, count, &mut monitor) } == 0 {
         return Err(io::Error::last_os_error()).context("opening Windows DDC/CI handle");
     }
-    Ok(Physical(monitor, screen.name.clone(), edid))
+    Ok(Physical(monitor))
 }
 
-fn select(id: &str) -> Result<Physical> {
+fn select(id: &str) -> Result<(Screen, Vec<u8>)> {
     let mut matches = Vec::new();
     for screen in screens()? {
-        if identity(&screen).is_ok_and(|(found, _)| found == id) {
-            matches.push(screen);
+        if let Ok((found, _, edid)) = identity_data(&screen)
+            && found == id
+        {
+            matches.push((screen, edid));
         }
     }
     ensure!(
         matches.len() <= 1,
         "configured Windows physical display identity is ambiguous"
     );
-    let screen = matches
+    matches
         .pop()
-        .context("configured monitor identity is unavailable; run probe on its active input")?;
-    physical(&screen)
+        .context("configured monitor identity is unavailable; run probe on its active input")
 }
 
 fn read(handle: HANDLE) -> Result<u16> {
@@ -548,17 +548,20 @@ pub fn prepare(id: &str) -> Result<()> {
 
 impl Monitor for Ddc {
     fn read(&mut self) -> Result<u16> {
-        read(select(&self.0)?.0.hPhysicalMonitor)
+        let (screen, _) = select(&self.0)?;
+        read(physical(&screen)?.0.hPhysicalMonitor)
     }
 
     fn write(&mut self, input: u16) -> Result<()> {
-        let monitor = select(&self.0).map_err(crate::video::not_issued)?;
+        let (screen, edid) = select(&self.0).map_err(crate::video::not_issued)?;
         if let Some(value) =
-            crate::video::lg::input(&monitor.2, input).map_err(crate::video::not_issued)?
+            crate::video::lg::input(&edid, input).map_err(crate::video::not_issued)?
         {
-            let driver = super::win_nvapi::prepare(&monitor.1).map_err(crate::video::not_issued)?;
+            let driver =
+                super::win_nvapi::prepare(&screen.name).map_err(crate::video::not_issued)?;
             return driver.write_input(value);
         }
+        let monitor = physical(&screen).map_err(crate::video::not_issued)?;
         println!(
             "DDC write issued: process {}, input {input:#06x}; exactly one SetVCPFeature call.",
             std::process::id()
@@ -575,7 +578,8 @@ impl Monitor for Ddc {
 pub fn probe(only: Option<&str>) -> Result<()> {
     if let Some(id) = only {
         println!("Monitor ID: {id}");
-        return probe_physical(&select(id)?);
+        let (screen, _) = select(id)?;
+        return probe_physical(&physical(&screen)?);
     }
     let screens = screens()?;
     if screens.is_empty() {

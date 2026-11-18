@@ -23,6 +23,8 @@ use std::{
 use tokio::sync::{Semaphore, mpsc, watch};
 
 const PORT: u16 = 45882;
+#[cfg(feature = "android-remote")]
+const _: () = assert!(PORT != crate::mobile::CONTROL_PORT && PORT != crate::mobile::INPUT_PORT);
 #[cfg(test)]
 mod tests;
 #[derive(Clone, Debug, Default)]

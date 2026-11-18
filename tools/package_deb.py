@@ -20,8 +20,14 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--binary", type=Path, required=True)
     parser.add_argument("--out", type=Path, default=ROOT / "dist")
+    parser.add_argument("--android-experiment", type=int, metavar="BUILD")
     args = parser.parse_args()
+    if args.android_experiment is not None and args.android_experiment < 1:
+        parser.error("--android-experiment requires a positive build number")
     version = tomllib.loads((ROOT / "Cargo.toml").read_text())["package"]["version"]
+    package_version = (
+        f"{version}+android.{args.android_experiment}" if args.android_experiment is not None else version
+    )
     import re
     protocol = int(re.search(r"pub const PROTOCOL: u16 = (\d+);", (ROOT / "src/compatibility.rs").read_text())[1])
     binary = args.binary.resolve()
@@ -73,7 +79,7 @@ def main():
         (control / "postinst").chmod(0o755)
         size = math.ceil(sum(p.stat().st_size for p in stage.rglob("*") if p.is_file()) / 1024)
         (control / "control").write_text(
-            f"Package: desk-switch\nVersion: {version}\nArchitecture: amd64\n"
+            f"Package: desk-switch\nVersion: {package_version}\nArchitecture: amd64\n"
             "Maintainer: Desk Switch contributors <9218241+siarheisinelnikau@users.noreply.github.com>\n"
             "Section: utils\nPriority: optional\n"
             f"Installed-Size: {size}\nDepends: {dependencies}\n"
@@ -88,7 +94,12 @@ def main():
             os.utime(path, (epoch, epoch))
         os.utime(stage, (epoch, epoch))
         args.out.mkdir(parents=True, exist_ok=True)
-        output = args.out.resolve() / asset_names(version)["linux-x86_64-deb"]
+        name = (
+            f"desk-switch-v{version}-android-experiment.{args.android_experiment}-linux-x86-64.deb"
+            if args.android_experiment is not None
+            else asset_names(version)["linux-x86_64-deb"]
+        )
+        output = args.out.resolve() / name
         subprocess.run(["dpkg-deb", "--root-owner-group", "-Zxz", "--build", str(stage), str(output)],
                        check=True, env=dict(os.environ, SOURCE_DATE_EPOCH=str(epoch)))
         subprocess.run(["dpkg-deb", "--info", str(output)], check=True)

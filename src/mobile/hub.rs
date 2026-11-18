@@ -21,7 +21,6 @@ pub(super) struct Plan {
     pub routing: Routing,
     pub settings: u64,
     pub sharing: BTreeMap<String, bool>,
-    pub allow_screen: bool,
 }
 
 enum Command {
@@ -570,17 +569,14 @@ impl Engine {
                 Wake::Stop => return Ok(()),
                 Wake::Route => {}
                 Wake::Tick => {
-                    let preview = if self.applied.allow_screen {
-                        self.sources
-                            .values()
-                            .filter(|entry| !entry.local && entry.shared)
-                            .map(|entry| *entry.preview.borrow())
-                            .filter(|options| options.enabled)
-                            .max_by_key(|options| options.fps)
-                            .unwrap_or_default()
-                    } else {
-                        screen::Options::default()
-                    };
+                    let preview = self
+                        .sources
+                        .values()
+                        .filter(|entry| !entry.local && entry.shared)
+                        .map(|entry| *entry.preview.borrow())
+                        .filter(|options| options.enabled)
+                        .max_by_key(|options| options.fps)
+                        .unwrap_or_default();
                     if let Some(remote) = &mut self.remote {
                         let mut changed = self.plan.clone();
                         let result = tokio::select! {

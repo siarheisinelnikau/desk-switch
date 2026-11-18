@@ -2,6 +2,7 @@ package io.github.deskswitch.remote.data
 
 import io.github.deskswitch.remote.domain.*
 import org.json.JSONObject
+import java.io.IOException
 import java.security.MessageDigest
 import java.util.Collections
 import java.util.concurrent.LinkedBlockingQueue
@@ -28,23 +29,39 @@ class NoiseSessionFactory(
     private fun open(computer: Computer, port: Int, width: Int) = NoiseSocket.open(computer.host, port, width) {
         synchronized(sockets) { check(!cancelled.get()) { "Connection cancelled" }; sockets.add(it) }
     }
+
+    private fun openControl(computer: Computer): Pair<Computer, NoiseSocket> {
+        if (computer.advertisedKey != null ||
+            computer.port !in listOf(Computer.DEFAULT_CONTROL_PORT, Computer.LEGACY_CONTROL_PORT)) {
+            return computer to open(computer, computer.port, 2)
+        }
+        val preferred = computer.copy(port = Computer.DEFAULT_CONTROL_PORT)
+        return try {
+            preferred to open(preferred, preferred.port, 2)
+        } catch (failure: IOException) {
+            if (cancelled.get()) throw failure
+            val legacy = computer.copy(port = Computer.LEGACY_CONTROL_PORT)
+            legacy to open(legacy, legacy.port, 2)
+        }
+    }
+
     override fun connect(computer: Computer, identity: Identity, confirm: (Pairing) -> Boolean, onClosed: (String?) -> Unit): RemoteSession {
         require(computer.host.isNotBlank() && computer.host.length <= 253 && computer.port in 1..65535 && computer.inputPort in 1..65535)
         try {
-            val control = open(computer, computer.port, 2)
+            val (target, control) = openControl(computer)
             val hello = JSONObject().put("name", phoneName.filterNot(Char::isISOControl).trim().take(128).ifEmpty { "Android phone" }).put("app", appVersion)
-                .put("protocol", NativeWire.PROTOCOL).put("port", computer.port)
+                .put("protocol", NativeWire.PROTOCOL).put("port", target.port)
                 .put("phone_preview", true).put("control_protocol", 1).put("workspace_protocol", NativeWire.WORKSPACE_PROTOCOL)
-            val expected = computer.key?.let(::unhex)
+            val expected = target.key?.let(::unhex)
             val auth = control.handshake(identity, "XX", "Desk Switch workspace 1", hello.toString().toByteArray(), expected)
-            computer.advertisedKey?.let {
+            target.advertisedKey?.let {
                 require(MessageDigest.isEqual(unhex(it), auth.key)) { "The computer identity changed during discovery. Search again." }
             }
             val peer = JSONObject(String(auth.payload, Charsets.UTF_8))
             NativeWire.requireProtocols(peer.getInt("protocol"), peer.getInt("workspace_protocol"))
             val name = peer.getString("name")
             require(name.isNotBlank() && name.length <= 256 && name.none(Char::isISOControl))
-            val known = computer.copy(name = name, key = hex(auth.key), previewSupported = peer.optBoolean("phone_preview", false))
+            val known = target.copy(name = name, key = hex(auth.key), previewSupported = peer.optBoolean("phone_preview", false))
             val hash = MessageDigest.getInstance("SHA-256").digest(auth.hash)
             val code = "%03d %03d".format(java.util.Locale.ROOT, (((hash[0].toInt() and 255) shl 8) or (hash[1].toInt() and 255)) % 1000,
                 (((hash[2].toInt() and 255) shl 8) or (hash[3].toInt() and 255)) % 1000)

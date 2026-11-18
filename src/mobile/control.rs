@@ -150,8 +150,7 @@ pub(super) async fn run(
     let capable = peer.phone_preview;
     let (mut reader, writer) = Control::from_candidate(peer);
     let permit = |state: &super::hub::Plan| {
-        state.allow_screen
-            && provider.available()
+        provider.available()
             && !matches!(state.routing.destination, Destination::Paused { .. })
             && if local {
                 matches!(state.routing.destination, Destination::Local)
@@ -161,8 +160,7 @@ pub(super) async fn run(
             }
     };
     let remote_permit = |state: &super::hub::Plan| {
-        state.allow_screen
-            && !local
+        !local
             && state.sharing.get(&key).copied().unwrap_or(shared)
             && matches!(state.routing.destination, Destination::Remote { .. })
     };
@@ -197,7 +195,7 @@ pub(super) async fn run(
                     });
                     writer.send(&json!("Ping")).await?;
                     if options.enabled && !permit(&plan.borrow()) && !remote_permit(&plan.borrow()) {
-                        writer.send(&json!({"Error":"Cursor preview: unavailable or disabled on the selected computer"})).await?;
+                        writer.send(&json!({"Error":"Cursor preview: unavailable on the selected computer"})).await?;
                     }
                     continue;
                 }
@@ -228,7 +226,7 @@ pub(super) async fn run(
                 if options_value.enabled && (changed_target || previous && !next || previously_remote && !remote.enabled) {
                     last_remote = None;
                     let status = if next || remote.enabled { "waiting for the selected computer" }
-                        else { "unavailable or disabled on the selected computer" };
+                        else { "unavailable on the selected computer" };
                     writer.send(&json!({"Error":format!("Cursor preview: {status}")})).await?;
                 }
             }

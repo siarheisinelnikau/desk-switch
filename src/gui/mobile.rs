@@ -9,6 +9,7 @@ use eframe::egui;
 use std::collections::{BTreeMap, VecDeque};
 
 const GREEN: egui::Color32 = egui::Color32::from_rgb(83, 217, 177);
+const CONTROL_PORT_PREFIX: &str = "Phone remote control port: ";
 
 #[derive(Default)]
 pub(super) struct Panel {
@@ -17,7 +18,6 @@ pub(super) struct Panel {
     trusted: BTreeMap<String, Trusted>,
     devices: BTreeMap<String, Device>,
     status: String,
-    screen_preview: bool,
 }
 impl Panel {
     #[cfg(debug_assertions)]
@@ -49,25 +49,15 @@ impl Panel {
         self.service.is_some()
     }
 
-    pub fn screen_allowed(&self) -> bool {
-        self.available() && self.screen_preview
-    }
-    pub fn enable(
-        &mut self,
-        dir: &std::path::Path,
-        name: String,
-        ctx: &egui::Context,
-        screen_preview: bool,
-    ) {
-        self.screen_preview = screen_preview;
+    pub fn enable(&mut self, dir: &std::path::Path, name: String, ctx: &egui::Context) {
         match Service::start(dir.into(), name, ctx.clone()) {
             Ok(service) => {
-                service.allow_screen(screen_preview);
                 self.service = Some(service);
                 self.status = "Available over Wi-Fi".into();
             }
-            Err(_) => {
-                self.status = "Phone control could not start. Restart Desk Switch to retry.".into()
+            Err(error) => {
+                self.status = format!("Phone control could not start: {error:#}");
+                crate::diagnostics_log::append(&self.status);
             }
         }
     }
@@ -132,14 +122,20 @@ impl Panel {
     pub fn annotate(&self, node: &mut Node) {
         // Reuse the existing device inventory. These are peripherals, not peers.
         self.inventory(&mut node.devices);
-        node.diagnostics
-            .logs
-            .retain(|line| line != PHONE_RELAY_CAPABILITY);
+        let logs = &mut node.diagnostics.logs;
+        logs.retain(|line| {
+            line != PHONE_RELAY_CAPABILITY && !line.starts_with(CONTROL_PORT_PREFIX)
+        });
         if self.available() {
-            if node.diagnostics.logs.len() == crate::workspace::diagnostics::LINES {
-                node.diagnostics.logs.remove(0);
-            }
-            node.diagnostics.logs.push(PHONE_RELAY_CAPABILITY.into());
+            let overflow = logs
+                .len()
+                .saturating_sub(crate::workspace::diagnostics::LINES - 2);
+            logs.drain(..overflow);
+            logs.push(PHONE_RELAY_CAPABILITY.into());
+            logs.push(format!(
+                "{CONTROL_PORT_PREFIX}{}",
+                crate::mobile::CONTROL_PORT
+            ));
         }
     }
     fn inventory(&self, inventory: &mut Inventory) {
@@ -234,7 +230,6 @@ impl Panel {
         dir: &std::path::Path,
         name: String,
         enabled: &mut bool,
-        screen_preview: &mut bool,
     ) -> bool {
         let mut changed = false;
         egui::Frame::group(ui.style()).inner_margin(16).show(ui, |ui| {
@@ -242,19 +237,13 @@ impl Panel {
             ui.label("Use Android phones as touchpads and keyboards.");
             if ui.checkbox(enabled, "Allow phone remotes").changed() {
                 changed = true;
-                if *enabled { self.enable(dir, name, ui.ctx(), *screen_preview); }
+                if *enabled { self.enable(dir, name, ui.ctx()); }
                 else {
                     self.service = None; self.pending.clear(); self.devices.clear();
                     self.status = "Phone control is off".into();
                     super::activity::disconnected(ui.ctx(), u32::MAX);
                 }
             }
-            if ui.checkbox(screen_preview, "Allow cursor preview").changed() {
-                changed = true;
-                self.screen_preview = *screen_preview;
-                if let Some(service) = &self.service { service.allow_screen(*screen_preview); }
-            }
-            ui.weak("Cursor preview is off by default. A phone must also turn it on before any screen area is sent.");
             if !self.status.is_empty() { ui.label(&self.status); }
             ui.weak("Open Desk Switch on your phone on the same Wi-Fi. Confirm matching codes once; saved devices reconnect without another code.");
             let mut forget = None;
@@ -320,13 +309,8 @@ fn destination(state: Option<&Workspace>, own: &str, paused: bool) -> Destinatio
     if target == own {
         return Destination::Local;
     }
-    if !member
-        .node
-        .diagnostics
-        .logs
-        .iter()
-        .any(|line| line == PHONE_RELAY_CAPABILITY)
-    {
+    let logs = &member.node.diagnostics.logs;
+    if !logs.iter().any(|line| line == PHONE_RELAY_CAPABILITY) {
         return Destination::Paused {
             reason: format!(
                 "Install the experimental Desk Switch build on {} to control it from the phone",
@@ -338,7 +322,11 @@ fn destination(state: Option<&Workspace>, own: &str, paused: bool) -> Destinatio
         key: member.node.key.clone(),
         name: member.node.name.clone(),
         address: member.address,
-        control_port: crate::mobile::CONTROL_PORT,
+        control_port: logs
+            .iter()
+            .filter_map(|line| line.strip_prefix(CONTROL_PORT_PREFIX)?.parse::<u16>().ok())
+            .find(|port| *port != 0)
+            .unwrap_or(crate::mobile::LEGACY_CONTROL_PORT),
         input_port: crate::mobile::INPUT_PORT,
     }
 }
@@ -419,9 +407,27 @@ mod tests {
             .diagnostics
             .logs
             .push(PHONE_RELAY_CAPABILITY.into());
-        assert!(
-            matches!(destination(Some(&state), &own, false), Destination::Remote { key, .. } if key == target)
-        );
+        assert!(matches!(
+            destination(Some(&state), &own, false),
+            Destination::Remote { key, control_port, .. }
+                if key == target && control_port == crate::mobile::LEGACY_CONTROL_PORT
+        ));
+        state
+            .members
+            .get_mut(&target)
+            .unwrap()
+            .node
+            .diagnostics
+            .logs
+            .push(format!(
+                "{CONTROL_PORT_PREFIX}{}",
+                crate::mobile::CONTROL_PORT
+            ));
+        assert!(matches!(
+            destination(Some(&state), &own, false),
+            Destination::Remote { key, control_port, .. }
+                if key == target && control_port == crate::mobile::CONTROL_PORT
+        ));
         state.members.get_mut(&target).unwrap().node.monitor_error =
             Some("No destination signal".into());
         assert!(matches!(

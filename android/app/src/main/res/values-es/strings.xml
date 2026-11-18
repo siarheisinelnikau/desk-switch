@@ -37,7 +37,7 @@
     <string name="keyboard">Teclado</string>
     <string name="remote_keyboard">Teclado remoto</string>
     <string name="hide_keyboard">Ocultar teclado</string>
-    <string name="preview_help">Muestra el área alrededor del puntero. Permite la vista previa del puntero en Desk Switch en el ordenador.</string>
+    <string name="preview_help">Muestra el área alrededor del puntero.</string>
     <string name="text_too_long">El texto es demasiado largo. Envía una selección más corta.</string>
     <string name="address_prompt">Introduce su dirección IP local o su nombre de host.</string>
     <string name="connect">Conectar</string>

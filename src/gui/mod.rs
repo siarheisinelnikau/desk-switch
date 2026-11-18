@@ -1177,8 +1177,7 @@ impl Desktop {
         #[cfg(feature = "android-remote")]
         if self.prefs.phone_remote {
             let name = crate::discovery::computer_name();
-            self.mobile
-                .enable(&self.dir, name, ctx, self.prefs.phone_screen_preview);
+            self.mobile.enable(&self.dir, name, ctx);
         }
         let result = if cfg!(feature = "android-remote")
             && std::env::args().any(|arg| arg == "--experimental-mobile")

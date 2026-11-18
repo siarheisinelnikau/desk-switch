@@ -8,11 +8,16 @@ sealed interface Input {
 }
 
 data class Computer(
-    val name: String, val host: String, val port: Int = 45882,
+    val name: String, val host: String, val port: Int = DEFAULT_CONTROL_PORT,
     val inputPort: Int = 45883, val key: String? = null,
     val advertisedKey: String? = null,
     val previewSupported: Boolean = false,
-)
+) {
+    companion object {
+        const val DEFAULT_CONTROL_PORT = 45884
+        internal const val LEGACY_CONTROL_PORT = 45882
+    }
+}
 data class Identity(val privateKey: ByteArray, val publicKey: ByteArray)
 data class Pairing(val computer: Computer, val code: String, val publicKey: String)
 
