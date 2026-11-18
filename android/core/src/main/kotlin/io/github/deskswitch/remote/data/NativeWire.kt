@@ -3,15 +3,43 @@ package io.github.deskswitch.remote.data
 import io.github.deskswitch.remote.domain.Input
 import java.io.ByteArrayOutputStream
 
+enum class ProtocolKind { DEVICE, WORKSPACE }
+
+class ProtocolVersionMismatch(val kind: ProtocolKind, val expected: Int, val received: Int) :
+    IllegalArgumentException("Expected protocol $expected, received $received")
+
 /** The existing bincode DefaultOptions varint encoding; no new device messages. */
 object NativeWire {
     const val PROTOCOL = 9
     const val WORKSPACE_PROTOCOL = 3
-    const val VERSION = "0.2.0-experimental"
-    fun version(): ByteArray = "DESKVER2".toByteArray(Charsets.US_ASCII) + byteArrayOf(0, PROTOCOL.toByte(), VERSION.length.toByte()) + VERSION.toByteArray(Charsets.US_ASCII)
+    private const val MAX_VERSION_LENGTH = 48
+    private val versionHeader = "DESKVER2".toByteArray(Charsets.US_ASCII)
+
+    fun version(appVersion: String): ByteArray {
+        require(appVersion.length in 1..MAX_VERSION_LENGTH && appVersion.all { it.code <= 127 })
+        return versionHeader + byteArrayOf((PROTOCOL ushr 8).toByte(), PROTOCOL.toByte(), appVersion.length.toByte()) +
+            appVersion.toByteArray(Charsets.US_ASCII)
+    }
+
     fun requireVersion(bytes: ByteArray) {
-        require(bytes.size >= 12 && bytes.copyOfRange(0, 8).contentEquals("DESKVER2".toByteArray(Charsets.US_ASCII))) { "The computer does not report a device protocol" }
-        require(bytes[8].toInt() == 0 && bytes[9].toInt() == PROTOCOL && bytes.size == 11 + (bytes[10].toInt() and 255)) { "The computer uses a different device protocol" }
+        require(bytes.size >= 12 && versionHeader.indices.all { bytes[it] == versionHeader[it] }) {
+            "The computer does not report a device protocol"
+        }
+        val length = bytes[10].toInt() and 255
+        require(length in 1..MAX_VERSION_LENGTH && bytes.size == 11 + length && (11 until bytes.size).all { bytes[it] >= 0 }) {
+            "The computer sent an invalid device version"
+        }
+        val received = ((bytes[8].toInt() and 255) shl 8) or (bytes[9].toInt() and 255)
+        requireProtocol(ProtocolKind.DEVICE, PROTOCOL, received)
+    }
+
+    fun requireProtocols(device: Int, workspace: Int) {
+        requireProtocol(ProtocolKind.DEVICE, PROTOCOL, device)
+        requireProtocol(ProtocolKind.WORKSPACE, WORKSPACE_PROTOCOL, workspace)
+    }
+
+    private fun requireProtocol(kind: ProtocolKind, expected: Int, received: Int) {
+        if (received != expected) throw ProtocolVersionMismatch(kind, expected, received)
     }
     private fun ByteArrayOutputStream.uint(value: Long) {
         require(value >= 0)

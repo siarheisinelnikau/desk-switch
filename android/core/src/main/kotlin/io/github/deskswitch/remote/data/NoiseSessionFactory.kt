@@ -11,7 +11,11 @@ import java.util.concurrent.ArrayBlockingQueue
 import java.util.concurrent.TimeUnit
 import kotlin.concurrent.thread
 
-class NoiseSessionFactory(private val phoneName: String = "Android remote", private val onTrusted: (Computer) -> Unit = {}) : SessionFactory, AutoCloseable {
+class NoiseSessionFactory(
+    private val appVersion: String,
+    private val phoneName: String = "Android remote",
+    private val onTrusted: (Computer) -> Unit = {},
+) : SessionFactory, AutoCloseable {
     @Volatile private var previewListener: (ByteArray?) -> Unit = {}
     @Volatile private var previewErrorListener: (String?) -> Unit = {}
     @Volatile private var inputErrorListener: (String) -> Unit = {}
@@ -28,7 +32,7 @@ class NoiseSessionFactory(private val phoneName: String = "Android remote", priv
         require(computer.host.isNotBlank() && computer.host.length <= 253 && computer.port in 1..65535 && computer.inputPort in 1..65535)
         try {
             val control = open(computer, computer.port, 2)
-            val hello = JSONObject().put("name", phoneName.filterNot(Char::isISOControl).trim().take(128).ifEmpty { "Android phone" }).put("app", NativeWire.VERSION)
+            val hello = JSONObject().put("name", phoneName.filterNot(Char::isISOControl).trim().take(128).ifEmpty { "Android phone" }).put("app", appVersion)
                 .put("protocol", NativeWire.PROTOCOL).put("port", computer.port)
                 .put("phone_preview", true).put("control_protocol", 1).put("workspace_protocol", NativeWire.WORKSPACE_PROTOCOL)
             val expected = computer.key?.let(::unhex)
@@ -37,7 +41,7 @@ class NoiseSessionFactory(private val phoneName: String = "Android remote", priv
                 require(MessageDigest.isEqual(unhex(it), auth.key)) { "The computer identity changed during discovery. Search again." }
             }
             val peer = JSONObject(String(auth.payload, Charsets.UTF_8))
-            require(peer.getInt("protocol") == NativeWire.PROTOCOL && peer.getInt("workspace_protocol") == NativeWire.WORKSPACE_PROTOCOL) { "The computer uses a different protocol" }
+            NativeWire.requireProtocols(peer.getInt("protocol"), peer.getInt("workspace_protocol"))
             val name = peer.getString("name")
             require(name.isNotBlank() && name.length <= 256 && name.none(Char::isISOControl))
             val known = computer.copy(name = name, key = hex(auth.key), previewSupported = peer.optBoolean("phone_preview", false))
@@ -51,10 +55,10 @@ class NoiseSessionFactory(private val phoneName: String = "Android remote", priv
             control.send("\"Pinned\"".toByteArray())
             require(String(control.receive(), Charsets.UTF_8) == "\"Pinned\"") { "Pairing did not complete" }
             check(!cancelled.get()) { "Connection cancelled" }
-            onTrusted(known)
             val data = open(known, known.inputPort, 1)
-            val inputAuth = data.handshake(identity, "KK", "Desk Switch protocol 1", NativeWire.version(), auth.key)
+            val inputAuth = data.handshake(identity, "KK", "Desk Switch protocol 1", NativeWire.version(appVersion), auth.key)
             NativeWire.requireVersion(inputAuth.payload)
+            onTrusted(known)
             data.socket.soTimeout = 30_000
             data.send(NativeWire.prepare())
             require(data.receive().contentEquals(byteArrayOf(3, 1))) { "The computer could not prepare input. Check its permission dialog." }

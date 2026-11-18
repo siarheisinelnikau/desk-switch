@@ -24,7 +24,7 @@ Use two fingers to scroll, or tap once and drag on the second touch. A second qu
 <p>
   <img src="../docs/android-remote.png" width="250" alt="Phone remote with the touchpad and keyboard controls">
   <img src="../docs/android-joystick.png" width="250" alt="Phone remote in joystick mode">
-  <img src="../docs/android-settings.png" width="250" alt="Android controls for input modes, speed, and cursor preview">
+  <img src="../docs/android-settings.png" width="250" alt="Android controls for updates, scrolling, and pointer speed">
 </p>
 
 <details>
@@ -53,6 +53,16 @@ Enable **Allow cursor preview** on the paired computer and on each computer you 
 ![Phone remote and cursor preview settings in Desk Switch](../docs/android-desktop-settings.png)
 
 The Android app requires Android 8 or later. Install the experimental desktop build on each computer that should receive shared phone input. To try Ubuntu, connect to it directly from the phone, or mark the phone **Shared** and select Ubuntu in the desktop workspace. Approve the Wayland remote desktop prompt when it appears. Typed text pastes through the target computer's clipboard, and preview on GNOME Wayland uses the companion bundled with the Ubuntu package. If automatic discovery is unavailable, enter the computer's local IP address in the Android app.
+
+## Updates and compatibility
+
+Open **Controls → Updates** to see the installed app version, the device protocol, and the workspace protocol. A phone and computer can use different app versions when their device and workspace protocol versions match.
+
+The app checks for newer experimental Android prereleases in the background on startup. Turn off **Check for updates on startup** to disable that request. **Check for updates** remains available at any time. Use **Download and install** to download the signed APK and approve installation in Android. On the first update, Android might ask you to allow installs from Desk Switch Remote.
+
+Signed updates use the same certificate across releases. A local debug APK can update in place when it uses that certificate. The separate debug builds from GitHub Actions may use a different development certificate. See the [Android release setup](release/README.md) for build and signing details.
+
+<img src="../docs/android-updates.png" width="250" alt="Android update controls with the installed app and protocol versions">
 
 ## Build and verify
 

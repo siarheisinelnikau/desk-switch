@@ -1,5 +1,6 @@
 package io.github.deskswitch.remote.ui
 
+import android.app.Activity
 import android.app.AlertDialog
 import android.app.Dialog
 import android.content.Context
@@ -18,6 +19,7 @@ import android.view.animation.DecelerateInterpolator
 import android.view.inputmethod.InputMethodManager
 import android.widget.*
 import androidx.activity.ComponentActivity
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.activity.viewModels
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.ViewModel
@@ -26,11 +28,14 @@ import androidx.lifecycle.lifecycleScope
 import androidx.lifecycle.repeatOnLifecycle
 import io.github.deskswitch.remote.BuildConfig
 import io.github.deskswitch.remote.R
+import io.github.deskswitch.remote.data.ApkInstaller
 import io.github.deskswitch.remote.data.AppearancePreferences
 import io.github.deskswitch.remote.data.ComputerDiscovery
+import io.github.deskswitch.remote.data.NativeWire
 import io.github.deskswitch.remote.data.NoiseSessionFactory
 import io.github.deskswitch.remote.data.PhoneStore
 import io.github.deskswitch.remote.data.PointerPreferences
+import io.github.deskswitch.remote.data.UpdatePreferences
 import io.github.deskswitch.remote.data.phoneName
 import io.github.deskswitch.remote.domain.AppLanguage
 import io.github.deskswitch.remote.domain.AppTheme
@@ -39,6 +44,8 @@ import io.github.deskswitch.remote.domain.Computer
 import io.github.deskswitch.remote.domain.Pairing
 import io.github.deskswitch.remote.domain.PointerMode
 import io.github.deskswitch.remote.domain.PointerSettings
+import io.github.deskswitch.remote.update.GitHubUpdates
+import io.github.deskswitch.remote.update.UpdateFailure
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ensureActive
@@ -47,6 +54,7 @@ import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.withContext
 
 private const val RESTORE_CONTROLS = "restoreControls"
+private const val UPDATES_EXPANDED = "updatesExpanded"
 
 class RemoteActivity : ComponentActivity() {
     private val model: RemoteViewModel by viewModels {
@@ -54,12 +62,31 @@ class RemoteActivity : ComponentActivity() {
             @Suppress("UNCHECKED_CAST")
             override fun <T : ViewModel> create(modelClass: Class<T>): T = RemoteViewModel(
                 PhoneStore(applicationContext),
-                { onTrusted -> NoiseSessionFactory(phoneName(applicationContext), onTrusted) },
+                { onTrusted -> NoiseSessionFactory(BuildConfig.VERSION_NAME, phoneName(applicationContext), onTrusted) },
                 PointerPreferences(applicationContext),
                 AppearancePreferences(applicationContext),
             ) as T
         }
     }
+    private val installer by lazy { ApkInstaller(applicationContext) }
+    private val updates: UpdateViewModel by viewModels {
+        object : ViewModelProvider.Factory {
+            @Suppress("UNCHECKED_CAST")
+            override fun <T : ViewModel> create(modelClass: Class<T>): T = UpdateViewModel(
+                BuildConfig.VERSION_NAME, GitHubUpdates(), installer, UpdatePreferences(applicationContext),
+            ) as T
+        }
+    }
+    private val updateSystemActivity = registerForActivityResult(ActivityResultContracts.StartActivityForResult()) { result ->
+        if (!updates.handingOff) return@registerForActivityResult
+        updates.systemReturned(result.resultCode == Activity.RESULT_OK, result.resultCode == Activity.RESULT_CANCELED)
+        if (settingsDialog == null && captureCase == null) {
+            restoreControls = true
+            content.post { restoreSettingsIfRequested() }
+        }
+    }
+    private var updatesExpanded = false
+    private var renderUpdates: ((UpdateScreenState) -> Unit)? = null
     private var discovery: ComputerDiscovery? = null
     private lateinit var content: LinearLayout
     private var last: ScreenState? = null
@@ -79,7 +106,7 @@ class RemoteActivity : ComponentActivity() {
     private val landscape get() = resources.configuration.orientation == Configuration.ORIENTATION_LANDSCAPE
     private val captureCase by lazy {
         if (BuildConfig.DEBUG) intent.getStringExtra("preview")?.takeIf {
-            it in setOf("remote", "joystick", "nearby", "settings", "pairing")
+            it in setOf("remote", "joystick", "nearby", "settings", "pairing", "updates")
         } else null
     }
     private val previewComputer = Computer("Living room PC", "192.168.1.20")
@@ -95,6 +122,7 @@ class RemoteActivity : ComponentActivity() {
         setTheme(if (light) R.style.LightAppTheme else R.style.AppTheme)
         super.onCreate(savedInstanceState)
         restoreControls = savedInstanceState?.getBoolean(RESTORE_CONTROLS) == true
+        updatesExpanded = savedInstanceState?.getBoolean(UPDATES_EXPANDED) == true
         if (android.os.Build.VERSION.SDK_INT >= 30) {
             @Suppress("DEPRECATION")
             window.setDecorFitsSystemWindows(false)
@@ -131,10 +159,19 @@ class RemoteActivity : ComponentActivity() {
                 else -> ScreenState(nearby = listOf(previewComputer), controls = controls)
             }
             render(state)
-            if (captureCase == "settings") content.post { settings() } else capture(content)
+            if (captureCase == "settings" || captureCase == "updates") {
+                updatesExpanded = captureCase == "updates"
+                content.post { settings() }
+            } else capture(content)
         } else lifecycleScope.launch {
             repeatOnLifecycle(Lifecycle.State.STARTED) {
                 launch { model.state.collect(::render) }
+                launch { updates.state.collect { renderUpdates?.invoke(it) } }
+                launch {
+                    repeatOnLifecycle(Lifecycle.State.RESUMED) {
+                        updates.effects.collect(::handleUpdateEffect)
+                    }
+                }
                 launch {
                     model.inputErrors.collect { error ->
                         if (previewVisible && settingsDialog == null) {
@@ -160,15 +197,43 @@ class RemoteActivity : ComponentActivity() {
                 }
             }
         }
-        if (captureCase == null && restoreControls) content.post {
-            restoreControls = false
-            if (!isFinishing && !isDestroyed) settings()
+        if (captureCase == null) {
+            updates.startup()
+            if (restoreControls) content.post { restoreSettingsIfRequested() }
+        }
+    }
+
+    private fun restoreSettingsIfRequested() {
+        if (!restoreControls || isFinishing || isDestroyed) return
+        restoreControls = false
+        settings()
+    }
+
+    private fun handleUpdateEffect(effect: UpdateEffect) {
+        if (effect is UpdateEffect.StartupNotice) {
+            Toast.makeText(this, getString(R.string.update_available, effect.version), Toast.LENGTH_SHORT).show()
+            return
+        }
+        try {
+            val intent = when (effect) {
+                UpdateEffect.RequestPermission -> installer.permissionIntent()
+                is UpdateEffect.OpenInstaller -> installer.installIntent(effect.file)
+                is UpdateEffect.StartupNotice -> return
+            }
+            updateSystemActivity.launch(intent)
+        } catch (_: android.content.ActivityNotFoundException) {
+            updates.handoffFailed()
+        } catch (_: SecurityException) {
+            updates.handoffFailed()
+        } catch (_: IllegalArgumentException) {
+            updates.handoffFailed()
         }
     }
 
     override fun onSaveInstanceState(outState: Bundle) {
         super.onSaveInstanceState(outState)
         outState.putBoolean(RESTORE_CONTROLS, restoreControls || settingsDialog?.isShowing == true)
+        outState.putBoolean(UPDATES_EXPANDED, updatesExpanded)
     }
 
     override fun onStart() {
@@ -215,7 +280,7 @@ class RemoteActivity : ComponentActivity() {
         discovery?.close(); discovery = null
         keyboard?.discardComposition()
         settingsDialog?.dismiss(); settingsDialog = null
-        if (captureCase == null && !isChangingConfigurations) model.disconnect()
+        if (captureCase == null && !isChangingConfigurations && !updates.handingOff) model.disconnect()
         super.onStop()
     }
 
@@ -660,6 +725,7 @@ class RemoteActivity : ComponentActivity() {
         heading.addView(icon(Glyph.CLOSE, getString(R.string.close_settings)) { settingsDialog?.dismiss() }, LinearLayout.LayoutParams(dp(48), dp(48)).apply { leftMargin = dp(8) })
         add(sheet, heading, 14)
         val list = column()
+        addUpdatesPanel(list)
         add(list, text(getString(R.string.scrolling), 11f, colors.muted, true), 6)
         add(list, controlSwitch(getString(R.string.double_tap_scroll), settings.doubleTapScroll) { enabled ->
             setControls(currentControls().copy(doubleTapScroll = enabled))
@@ -725,7 +791,7 @@ class RemoteActivity : ComponentActivity() {
                 add(list, line, 12)
             }
         }
-        add(list, text(getString(R.string.app_version, BuildConfig.VERSION_NAME), 12f, colors.muted), 8)
+
         add(list, text(getString(R.string.background_help), 12f, colors.muted), 14)
         add(list, button(getString(R.string.licenses)) {
             val licenses = resources.openRawResource(R.raw.native_licenses).bufferedReader().use { it.readText() }
@@ -747,11 +813,12 @@ class RemoteActivity : ComponentActivity() {
             window?.setDimAmount(0.6f)
             setOnDismissListener {
                 settingsDialog = null; previewMessage = null
+                renderUpdates = null
                 if (captureCase == null) model.foreground(previewVisible && !restoreControls)
             }
             setOnShowListener {
                 window?.setLayout(-1, maxHeight)
-                if (captureCase == "settings") capture(window!!.decorView)
+                if (captureCase == "settings" || captureCase == "updates") capture(window!!.decorView)
                 else {
                     sheet.translationY = dp(24).toFloat(); sheet.alpha = 0f
                     sheet.animate().translationY(0f).alpha(1f).setDuration(220).setInterpolator(DecelerateInterpolator()).start()
@@ -760,6 +827,98 @@ class RemoteActivity : ComponentActivity() {
         }
         settingsDialog = dialog
         dialog.show()
+    }
+
+    private fun addUpdatesPanel(list: LinearLayout) {
+        val details = column().apply { visibility = if (updatesExpanded) View.VISIBLE else View.GONE }
+        val heading = button(getString(R.string.updates)) {
+            updatesExpanded = !updatesExpanded
+            details.visibility = if (updatesExpanded) View.VISIBLE else View.GONE
+        }.apply {
+            gravity = Gravity.CENTER_VERTICAL or Gravity.START
+        }
+        add(list, heading, 6)
+        add(list, details, 18)
+        add(details, text(getString(R.string.app_version, BuildConfig.VERSION_NAME), 14f, medium = true), 2)
+        add(details, text(getString(R.string.update_protocol_versions, NativeWire.PROTOCOL, NativeWire.WORKSPACE_PROTOCOL),
+            13f, colors.muted), 6)
+        val snapshot = if (captureCase == null) updates.state.value else UpdateScreenState()
+        val startup = controlSwitch(getString(R.string.update_startup), snapshot.startupCheck) {
+            if (captureCase == null) updates.setStartupCheck(it)
+        }
+        add(details, startup, 6)
+
+        val status = text("", 14f, colors.muted)
+        val progress = ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal).apply {
+            max = 100
+            progressTintList = android.content.res.ColorStateList.valueOf(colors.accent)
+        }
+        val check = updateButton(R.string.update_check) { updates.check() }
+        val download = updateButton(R.string.update_download, primary = true) { updates.downloadAndInstall() }
+        val cancel = updateButton(android.R.string.cancel) { updates.cancelDownload() }
+        val permission = updateButton(R.string.update_open_settings) { updates.requestPermission() }
+        val install = updateButton(R.string.update_install, primary = true) { updates.install() }
+        add(details, status, 8)
+        add(details, progress, 8)
+        add(details, download, 4)
+        add(details, check, 4)
+        add(details, cancel, 4)
+        add(details, permission, 4)
+        add(details, install, 4)
+
+        renderUpdates = { state ->
+            val update = state.status
+            startup.isChecked = state.startupCheck
+            status.text = updateMessage(update)
+            status.visibility = if (status.text.isEmpty()) View.GONE else View.VISIBLE
+            progress.visibility = if (update is UpdateStatus.Downloading) View.VISIBLE else View.GONE
+            if (update is UpdateStatus.Downloading) progress.progress = update.progress
+            check.visibility = if (update == UpdateStatus.Idle || update == UpdateStatus.Current ||
+                update == UpdateStatus.Checking || update is UpdateStatus.Failed || update is UpdateStatus.Available)
+                View.VISIBLE else View.GONE
+            check.isEnabled = update != UpdateStatus.Checking
+            download.visibility = if (update is UpdateStatus.Available || update is UpdateStatus.Failed && update.canRetryDownload)
+                View.VISIBLE else View.GONE
+            cancel.visibility = if (update is UpdateStatus.Downloading) View.VISIBLE else View.GONE
+            permission.visibility = if (update == UpdateStatus.PermissionRequired || update is UpdateStatus.HandoffFailed && update.permission)
+                View.VISIBLE else View.GONE
+            install.visibility = if (update == UpdateStatus.Ready || update == UpdateStatus.InstallFailed ||
+                update is UpdateStatus.HandoffFailed && !update.permission)
+                View.VISIBLE else View.GONE
+        }
+        renderUpdates?.invoke(snapshot)
+    }
+
+    private fun updateButton(title: Int, primary: Boolean = false, action: () -> Unit) =
+        button(getString(title), primary) {
+            if (captureCase == null) action()
+        }.apply {
+            isSingleLine = false
+            ellipsize = null
+        }
+
+    private fun updateMessage(status: UpdateStatus): String = when (status) {
+        UpdateStatus.Idle -> ""
+        UpdateStatus.Checking -> getString(R.string.update_checking)
+        UpdateStatus.Current -> getString(R.string.update_current)
+        is UpdateStatus.Available -> getString(R.string.update_available, status.update.version)
+        is UpdateStatus.Downloading -> getString(R.string.update_progress, status.progress)
+        UpdateStatus.Verifying -> getString(R.string.update_verifying)
+        UpdateStatus.Ready -> getString(R.string.update_ready)
+        UpdateStatus.PermissionRequired, UpdateStatus.AwaitingPermission -> getString(R.string.update_permission)
+        UpdateStatus.AwaitingInstall -> getString(R.string.update_confirm_install)
+        UpdateStatus.InstallFinished -> getString(R.string.update_installed)
+        UpdateStatus.InstallFailed -> getString(R.string.update_error_install_failed)
+        is UpdateStatus.HandoffFailed -> getString(R.string.update_error_installer)
+        is UpdateStatus.Failed -> getString(when (status.failure) {
+            UpdateFailure.NETWORK -> R.string.update_error_network
+            UpdateFailure.RATE_LIMIT -> R.string.update_error_rate_limit
+            UpdateFailure.RELEASE_DATA -> R.string.update_error_release
+            UpdateFailure.CORRUPT_FILE -> R.string.update_error_corrupt
+            UpdateFailure.INCOMPATIBLE_APK -> R.string.update_error_incompatible
+            UpdateFailure.SIGNER_MISMATCH -> R.string.update_error_signer
+            UpdateFailure.STORAGE -> R.string.update_error_storage
+        })
     }
 
     private fun controlSwitch(title: String, enabled: Boolean, changed: (Boolean) -> Unit) = Switch(this).apply {

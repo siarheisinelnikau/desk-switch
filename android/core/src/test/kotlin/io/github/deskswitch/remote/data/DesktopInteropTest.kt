@@ -19,7 +19,7 @@ class DesktopInteropTest {
         val closed = CountDownLatch(1)
         val preview = CountDownLatch(1)
         var trusted: Computer? = null
-        val factory = NoiseSessionFactory { trusted = it }
+        val factory = NoiseSessionFactory("9.8.7-fixture") { trusted = it }
         factory.setPreviewListener { frame ->
             if (frame != null && frame.size >= 24 && frame[19] == 1.toByte() && frame[23] == 1.toByte()) {
                 preview.countDown()
