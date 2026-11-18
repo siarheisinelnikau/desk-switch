@@ -1,12 +1,13 @@
 [package]
 name = "desk-switch"
-version = "0.11.3"
+version = "0.11.4"
 edition = "2024"
 rust-version = "1.99"
 license = "MIT"
 description = "Share monitors, input and audio across Windows, Ubuntu and macOS computers"
 
 [features]
+default = ["android-remote"]
 android-remote = []
 
 [dependencies]
