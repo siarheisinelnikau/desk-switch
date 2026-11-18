@@ -5,12 +5,12 @@ import org.json.JSONObject
 import java.io.IOException
 import java.security.MessageDigest
 import java.util.Collections
-import java.util.concurrent.LinkedBlockingQueue
 import java.util.concurrent.atomic.AtomicBoolean
-import java.util.concurrent.atomic.AtomicReference
 import java.util.concurrent.ArrayBlockingQueue
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.locks.ReentrantLock
 import kotlin.concurrent.thread
+import kotlin.concurrent.withLock
 
 class NoiseSessionFactory(
     private val appVersion: String,
@@ -49,10 +49,11 @@ class NoiseSessionFactory(
         require(computer.host.isNotBlank() && computer.host.length <= 253 && computer.port in 1..65535 && computer.inputPort in 1..65535)
         try {
             val (target, control) = openControl(computer)
+            val expected = target.key?.let(::unhex)
             val hello = JSONObject().put("name", phoneName.filterNot(Char::isISOControl).trim().take(128).ifEmpty { "Android phone" }).put("app", appVersion)
                 .put("protocol", NativeWire.PROTOCOL).put("port", target.port)
                 .put("phone_preview", true).put("control_protocol", 1).put("workspace_protocol", NativeWire.WORKSPACE_PROTOCOL)
-            val expected = target.key?.let(::unhex)
+                .put("phone_known", expected != null)
             val auth = control.handshake(identity, "XX", "Desk Switch workspace 1", hello.toString().toByteArray(), expected)
             target.advertisedKey?.let {
                 require(MessageDigest.isEqual(unhex(it), auth.key)) { "The computer identity changed during discovery. Search again." }
@@ -62,20 +63,31 @@ class NoiseSessionFactory(
             val name = peer.getString("name")
             require(name.isNotBlank() && name.length <= 256 && name.none(Char::isISOControl))
             val known = target.copy(name = name, key = hex(auth.key), previewSupported = peer.optBoolean("phone_preview", false))
-            val hash = MessageDigest.getInstance("SHA-256").digest(auth.hash)
-            val code = "%03d %03d".format(java.util.Locale.ROOT, (((hash[0].toInt() and 255) shl 8) or (hash[1].toInt() and 255)) % 1000,
-                (((hash[2].toInt() and 255) shl 8) or (hash[3].toInt() and 255)) % 1000)
-            check(expected != null || confirm(Pairing(known, code, known.key!!))) { "Pairing cancelled" }
+            val needsCode = requiresPairingCode(peer, expected != null) {
+                JSONObject(String(control.receive(), Charsets.UTF_8))
+            }
+            if (needsCode) {
+                val hash = MessageDigest.getInstance("SHA-256").digest(auth.hash)
+                val code = "%03d %03d".format(java.util.Locale.ROOT, (((hash[0].toInt() and 255) shl 8) or (hash[1].toInt() and 255)) % 1000,
+                    (((hash[2].toInt() and 255) shl 8) or (hash[3].toInt() and 255)) % 1000)
+                check(confirm(Pairing(known, code, known.key!!))) { "Pairing cancelled" }
+            }
             control.socket.soTimeout = 95_000
             control.send("{\"Decision\":true}".toByteArray())
-            require(JSONObject(String(control.receive(), Charsets.UTF_8)).getBoolean("Decision")) { "The computer declined pairing" }
+            val decision = JSONObject(String(control.receive(), Charsets.UTF_8))
+            require(decision.getBoolean("Decision")) { "The computer declined pairing" }
+            val workspace = WorkspaceWire.read(decision, known.key!!)
+            require(target.workspace == null || workspace?.id == target.workspace.id) {
+                "The computer no longer belongs to this workspace"
+            }
+            val trusted = known.copy(advertisedKey = null, advertisedWorkspaceId = null, workspace = workspace)
             control.send("\"Pinned\"".toByteArray())
             require(String(control.receive(), Charsets.UTF_8) == "\"Pinned\"") { "Pairing did not complete" }
             check(!cancelled.get()) { "Connection cancelled" }
             val data = open(known, known.inputPort, 1)
             val inputAuth = data.handshake(identity, "KK", "Desk Switch protocol 1", NativeWire.version(appVersion), auth.key)
             NativeWire.requireVersion(inputAuth.payload)
-            onTrusted(known)
+            onTrusted(trusted)
             data.socket.soTimeout = 30_000
             data.send(NativeWire.prepare())
             require(data.receive().contentEquals(byteArrayOf(3, 1))) { "The computer could not prepare input. Check its permission dialog." }
@@ -90,8 +102,6 @@ class NoiseSessionFactory(
         cancelled.set(true)
         synchronized(sockets) { sockets.forEach { runCatching { it.close() } }; sockets.clear() }
     }
-    private object PreviewRequest
-
     private inner class Connection(
         private val control: NoiseSocket,
         private val data: NoiseSocket,
@@ -101,17 +111,18 @@ class NoiseSessionFactory(
         private val onClosed: (String?) -> Unit,
     ) : RemoteSession {
         private val stopped = AtomicBoolean(false)
-        private val commands = LinkedBlockingQueue<Any>(128)
+        private val commands = InputQueue()
         private val previewLock = Any()
-        private val previewOptions = AtomicReference<ScreenOptions?>()
+        private val previewOptions = ArrayBlockingQueue<ScreenOptions>(1)
         private var showPreview = false
         private val acknowledgements = ArrayBlockingQueue<String>(1)
+        private val exchangeLock = ReentrantLock(true)
         private val controlPending = AtomicBoolean()
         private val ping = java.util.concurrent.atomic.AtomicLong()
         private val barriers = java.util.concurrent.ConcurrentHashMap<Long, java.util.concurrent.CompletableFuture<Unit>>()
-        private val workers = java.util.concurrent.CopyOnWriteArrayList<Thread>()
+        private val workers = mutableListOf<Thread>()
         fun start() {
-            workers += thread(name = "Desk Switch input", isDaemon = true) {
+            workers += thread(start = false, name = "Desk Switch input", isDaemon = true) {
                 guard {
                     while (!stopped.get()) {
                         when (val command = commands.take()) {
@@ -127,15 +138,20 @@ class NoiseSessionFactory(
                                 val response = exchange(ScreenProtocol.clipboard(source, "text/plain;charset=utf-8", command.toByteArray(Charsets.UTF_8)))
                                 if (response != ACKNOWLEDGED) inputErrorListener(response.removePrefix(TEXT_ERROR).take(200))
                             }
-                            PreviewRequest -> {
-                                val options = previewOptions.getAndSet(null) ?: continue
-                                check(exchange(ScreenProtocol.options(options, source)) == ACKNOWLEDGED) { "Unexpected preview response" }
-                            }
                         }
                     }
                 }
             }
-            workers += thread(name = "Desk Switch control", isDaemon = true) {
+            // A slow preview acknowledgement must leave native input free to send.
+            if (previewSupported) workers += thread(start = false, name = "Desk Switch preview", isDaemon = true) {
+                guard {
+                    while (!stopped.get()) {
+                        val options = previewOptions.take()
+                        check(exchange(ScreenProtocol.options(options, source)) == ACKNOWLEDGED) { "Unexpected preview response" }
+                    }
+                }
+            }
+            workers += thread(start = false, name = "Desk Switch control", isDaemon = true) {
                 guard {
                     while (!stopped.get()) {
                         val record = String(control.receive(), Charsets.UTF_8)
@@ -169,7 +185,7 @@ class NoiseSessionFactory(
                     }
                 }
             }
-            workers += thread(name = "Desk Switch heartbeat", isDaemon = true) {
+            workers += thread(start = false, name = "Desk Switch heartbeat", isDaemon = true) {
                 guard {
                     while (!stopped.get()) {
                         val id = NativeWire.pongId(data.receive())
@@ -177,7 +193,7 @@ class NoiseSessionFactory(
                     }
                 }
             }
-            workers += thread(name = "Desk Switch lease", isDaemon = true) {
+            workers += thread(start = false, name = "Desk Switch lease", isDaemon = true) {
                 guard {
                     while (!stopped.get()) {
                         data.send(NativeWire.ping(ping.incrementAndGet()))
@@ -185,12 +201,13 @@ class NoiseSessionFactory(
                     }
                 }
             }
+            workers.forEach { it.start() }
         }
-        private fun exchange(packet: ByteArray): String {
+        private fun exchange(packet: ByteArray): String = exchangeLock.withLock {
             check(controlPending.compareAndSet(false, true))
             try {
                 control.send(packet)
-                return checkNotNull(acknowledgements.poll(5, TimeUnit.SECONDS)) { "The computer did not acknowledge the command" }
+                checkNotNull(acknowledgements.poll(5, TimeUnit.SECONDS)) { "The computer did not acknowledge the command" }
             } finally {
                 controlPending.set(false)
             }
@@ -202,15 +219,15 @@ class NoiseSessionFactory(
                 showPreview = options.enabled
                 previewErrorListener(null)
                 if (!options.enabled) previewListener(null)
+                previewOptions.poll()
+                check(previewOptions.offer(options))
             }
-            if (previewOptions.getAndSet(options) == null &&
-                !commands.offer(PreviewRequest)) stop("The input queue is full. Reconnect to continue.")
         }
         private fun guard(block: () -> Unit) {
             try { block() } catch (_: Exception) { stop("Connection lost. Reconnect to continue. Pending input was discarded.") }
         }
         override fun input(event: Input) {
-            NativeWire.event(event)
+            NativeWire.validateEvent(event)
             if (!stopped.get() && !commands.offer(event)) stop("The input queue is full. Reconnect to continue.")
         }
         override fun text(value: String) {
@@ -241,4 +258,15 @@ class NoiseSessionFactory(
             return value.chunked(2).map { it.toInt(16).toByte() }.toByteArray()
         }
     }
+}
+
+internal fun requiresPairingCode(peer: JSONObject, pinned: Boolean, receive: () -> JSONObject): Boolean {
+    if (peer.opt("phone_pairing_status") != true) return !pinned
+    val status = receive().getJSONObject("PhonePairing")
+    val error = (status.opt("error") as? String).orEmpty().filterNot(Char::isISOControl).trim().take(200)
+    check(error.isEmpty()) { error }
+    val confirm = status.opt("confirm")
+    require(confirm is Boolean) { "The computer gave an invalid pairing status" }
+    check(confirm || pinned) { "Connect through a saved computer or confirm a pairing code" }
+    return confirm
 }

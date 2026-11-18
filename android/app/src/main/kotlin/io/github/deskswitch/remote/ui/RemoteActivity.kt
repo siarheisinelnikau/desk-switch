@@ -109,7 +109,8 @@ class RemoteActivity : ComponentActivity() {
             it in setOf("remote", "joystick", "nearby", "settings", "pairing", "updates")
         } else null
     }
-    private val previewComputer = Computer("Living room PC", "192.168.1.20")
+    private val previewComputer = Computer("Living room PC", "192.168.1.20",
+        advertisedWorkspaceId = "12".repeat(32))
     private val colors by lazy(LazyThreadSafetyMode.NONE) { RemoteStyle.palette(this) }
     private fun dp(value: Int) = RemoteStyle.dp(this, value.toFloat()).toInt()
 
@@ -349,7 +350,7 @@ class RemoteActivity : ComponentActivity() {
             isSingleLine = true
             ellipsize = TextUtils.TruncateAt.END
         }
-        val status = text(if (connected == null) getString(R.string.phone_remote) else getString(R.string.connected_computer, connected.name),
+        val status = text(if (connected == null) getString(R.string.phone_remote) else getString(R.string.connected_computer, connectionName(connected)),
             12f, if (connected == null) colors.muted else colors.success).apply {
             isSingleLine = true
             ellipsize = TextUtils.TruncateAt.END
@@ -415,7 +416,8 @@ class RemoteActivity : ComponentActivity() {
     private fun computers(state: ScreenState) {
         val title = getString(if (landscape) R.string.home_title else R.string.home_title_portrait)
         add(content, text(title, if (landscape) 26f else 34f, medium = true), 10)
-        add(content, text(getString(R.string.choose_computer), 15f, colors.muted), 22)
+        val hasWorkspace = (state.saved + state.nearby).any { it.isWorkspace }
+        add(content, text(getString(if (hasWorkspace) R.string.choose_connection else R.string.choose_computer), 15f, colors.muted), 22)
         (state.error?.localized(this) ?: state.discoveryError?.localized(this))?.let {
             add(content, text(it, 14f, colors.danger).apply {
                 setPadding(dp(15), dp(12), dp(15), dp(12))
@@ -424,9 +426,9 @@ class RemoteActivity : ComponentActivity() {
         }
         val list = column()
         val known = state.saved
-        val nearby = state.nearby.filterNot { found -> known.any { it.host == found.host } }
+        val nearby = state.nearby
         if (known.isNotEmpty()) {
-            add(list, text(getString(R.string.saved_computers), 11f, colors.muted, true), 10)
+            add(list, text(savedHeading(known), 11f, colors.muted, true), 10)
             known.forEach { add(list, computerCard(it, getString(R.string.saved_computer)), 10) }
         }
         if (nearby.isNotEmpty()) {
@@ -447,12 +449,22 @@ class RemoteActivity : ComponentActivity() {
         add(content, button(getString(R.string.add_computer), glyph = Glyph.ADD) { address() }.apply { id = R.id.connect }, 0)
     }
 
+    private val Computer.isWorkspace: Boolean get() = workspace != null || advertisedWorkspaceId != null
+
+    private fun connectionName(computer: Computer): String =
+        if (computer.isWorkspace) getString(R.string.workspace_name) else computer.name
+
+    private fun savedHeading(computers: List<Computer>): String =
+        getString(if (computers.any { it.workspace != null }) R.string.saved_connections else R.string.saved_computers)
+
     private fun computerCard(computer: Computer, status: String): View = LinearLayout(this).apply {
         orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER_VERTICAL
         setPadding(dp(16), dp(16), dp(16), dp(16))
         background = RemoteStyle.interactive(this@RemoteActivity)
         minimumHeight = dp(92); isClickable = true; isFocusable = true
-        contentDescription = getString(R.string.connect_to, computer.name, computer.host)
+        val name = connectionName(computer)
+        val address = if (computer.isWorkspace) getString(R.string.workspace_via, computer.name) else computer.host
+        contentDescription = getString(R.string.connect_to, name, address)
         val art = ImageView(this@RemoteActivity).apply {
             setImageDrawable(GlyphDrawable(this@RemoteActivity, Glyph.COMPUTER, colors.accent))
             setPadding(dp(12), dp(12), dp(12), dp(12))
@@ -460,9 +472,10 @@ class RemoteActivity : ComponentActivity() {
         }
         addView(art, LinearLayout.LayoutParams(dp(54), dp(54)).apply { rightMargin = dp(14) })
         val titles = column()
-        add(titles, text(computer.name, 17f, medium = true).apply { isSingleLine = true; ellipsize = TextUtils.TruncateAt.END }, 4)
-        add(titles, text(status, 12f, colors.muted), 3)
-        add(titles, text(computer.host, 11f, colors.muted), 0)
+        add(titles, text(name, 17f, medium = true).apply { maxLines = if (computer.isWorkspace) 2 else 1; ellipsize = TextUtils.TruncateAt.END }, 4)
+        val savedWorkspace = computer.workspace != null
+        add(titles, text(if (savedWorkspace) getString(R.string.saved_workspace) else status, 12f, colors.muted), 3)
+        add(titles, text(address, 11f, colors.muted).apply { maxLines = 2; ellipsize = TextUtils.TruncateAt.END }, 0)
         addView(titles, LinearLayout.LayoutParams(0, -2, 1f))
         addView(ImageView(this@RemoteActivity).apply { setImageDrawable(GlyphDrawable(this@RemoteActivity, Glyph.CHEVRON, colors.muted)) }, LinearLayout.LayoutParams(dp(22), dp(22)))
         RemoteStyle.press(this)
@@ -781,12 +794,12 @@ class RemoteActivity : ComponentActivity() {
         }, 20)
         val saved = if (captureCase != null) listOf(previewComputer) else model.state.value.saved
         if (saved.isNotEmpty()) {
-            add(list, text(getString(R.string.saved_computers), 11f, colors.muted, true), 12)
+            add(list, text(savedHeading(saved), 11f, colors.muted, true), 12)
             saved.forEach { computer ->
-                val line = row(text(computer.name, 15f).apply { maxLines = 2 }, button(getString(R.string.forget)) {
+                val line = row(text(connectionName(computer), 15f).apply { maxLines = 2 }, button(getString(R.string.forget)) {
                     model.forget(computer)
                     settingsDialog?.dismiss()
-                    Toast.makeText(this, getString(R.string.computer_forgotten), Toast.LENGTH_SHORT).show()
+                    Toast.makeText(this, getString(if (computer.isWorkspace) R.string.workspace_forgotten else R.string.computer_forgotten), Toast.LENGTH_SHORT).show()
                 })
                 add(list, line, 12)
             }

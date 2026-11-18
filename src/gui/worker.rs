@@ -102,7 +102,9 @@ impl Worker {
                 },
             );
         }
-        let interactive_query = args.first().is_some_and(|arg| arg == "input-access");
+        let interactive_query = args
+            .first()
+            .is_some_and(|arg| matches!(arg.as_str(), "input-access" | "native-input-access"));
         if kind != Kind::Query || interactive_query {
             command.env("DESK_SWITCH_MANAGED", "1");
         } else {
@@ -112,7 +114,7 @@ impl Worker {
         worker.interactive_query = interactive_query;
         if args
             .first()
-            .is_some_and(|arg| arg == "portal-check" || arg == "input-access")
+            .is_some_and(|arg| arg == "portal-check" || interactive_query)
         {
             worker.query_timeout = Duration::from_secs(140);
         }

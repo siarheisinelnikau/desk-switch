@@ -226,6 +226,26 @@ def main():
                     wait_for(lambda: shell('!Main.layoutManager._startingUp && !Main.overview.visible && !Main.overview.animationInProgress && '
                         'global.deskSwitchTestIcon()?.mapped && global.deskSwitchTestIcon().width > 0 && '
                         'global.deskSwitchTestIcon().height > 0'), 'The panel button is not ready for physical hit testing')
+                    if args.backend == 'sni':
+                        # Exercise real Mutter and Shell introspection on the
+                        # virtual display. The process identity comes from the
+                        # actual test application's tray item. Return only the
+                        # PNG header from the disposable compositor.
+                        header = shell(f"""(async () => {{
+                            const companion = Main.extensionManager.lookup({json.dumps(UUID)}).stateObj;
+                            let header;
+                            await companion.CaptureCursorRegionAsync([128, 96], {{
+                                get_sender: () => global.deskSwitchTestIcon()._indicator.busName,
+                                return_dbus_error: (name, message) => {{ throw new Error(`${{name}}: ${{message}}`); }},
+                                return_value: value => {{ header = Array.from(value.get_child_value(0).get_data_as_bytes().get_data().slice(0, 24)); }},
+                            }});
+                            return header;
+                        }})()""")
+                        assert header[:8] == [137, 80, 78, 71, 13, 10, 26, 10], header
+                        assert bytes(header[12:16]) == b'IHDR', header
+                        assert int.from_bytes(bytes(header[16:20]), 'big') == 128, header
+                        assert int.from_bytes(bytes(header[20:24]), 'big') == 96, header
+
                     def click(button):
                         assert not shell('Main.overview.visible'), 'The test desktop unexpectedly entered its overview'
                         # Virtual seat requests are asynchronous. Sending motion,

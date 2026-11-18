@@ -218,6 +218,9 @@ pub struct FileSettings {
     pub edge: Option<EdgeSettings>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub routes: Option<crate::edge::Routes>,
+    #[cfg(target_os = "linux")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub absolute_input: Option<bool>,
     pub capture: Option<CaptureSettings>,
 }
 
@@ -301,6 +304,8 @@ pub struct Settings {
     pub monitor: Option<(String, Inputs)>,
     pub edge: Option<Edge>,
     pub routes: Option<crate::edge::Routes>,
+    #[cfg(target_os = "linux")]
+    pub absolute_input: bool,
     #[cfg(any(windows, target_os = "macos"))]
     pub sharing: InputSharing,
     #[cfg(target_os = "linux")]
@@ -435,6 +440,13 @@ impl Settings {
         Ok(Self {
             monitor,
             edge,
+            #[cfg(target_os = "linux")]
+            absolute_input: config.absolute_input.unwrap_or_else(|| {
+                config
+                    .routes
+                    .as_ref()
+                    .is_some_and(|routes| !routes.boundaries.is_empty())
+            }),
             routes: config.routes,
             #[cfg(any(windows, target_os = "macos"))]
             sharing,

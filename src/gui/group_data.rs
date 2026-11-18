@@ -28,6 +28,8 @@ pub(super) struct Spec {
     sharing: config::InputSharing,
     cursor: bool,
     edge: bool,
+    #[cfg(target_os = "linux")]
+    absolute_input: bool,
     routes: crate::edge::Routes,
     entry: Option<u16>,
     display_entry: Option<crate::edge::Entry>,
@@ -264,6 +266,12 @@ fn desired_with_routes(
         },
         cursor: kind == Kind::Input && cursor,
         edge: kind == Kind::Input && state.settings.edge && state.settings.mouse_enabled,
+        // Boundaries are temporarily cleared during a handoff. Keep the same
+        // backend until the actual edge configuration or requested entry changes.
+        #[cfg(target_os = "linux")]
+        absolute_input: kind == Kind::Input
+            && ((state.settings.edge && state.settings.mouse_enabled && state.layout.revision > 0)
+                || state.active_input.as_deref() == Some(own) && state.display_entry.is_some()),
         routes: if kind == Kind::Input {
             edge_routes.clone()
         } else {
@@ -453,6 +461,8 @@ fn configure(root: &Path, spec: &Spec) -> Result<PathBuf> {
             monitor: None,
             edge: None,
             routes: (spec.kind == Kind::Input).then(|| spec.routes.clone()),
+            #[cfg(target_os = "linux")]
+            absolute_input: (spec.kind == Kind::Input).then_some(spec.absolute_input),
             capture: Some(config::CaptureSettings {
                 devices: spec.capture.clone(),
                 keyboard: spec.keyboard.clone(),
@@ -577,6 +587,19 @@ impl Data {
             }
         }
         self.error = None;
+    }
+    #[cfg(target_os = "linux")]
+    pub fn restart_input(&mut self) {
+        for task in self
+            .tasks
+            .values_mut()
+            .filter(|task| task.spec.kind == Kind::Input)
+        {
+            task.restart_requested = true;
+            task.restart_count = 0;
+            task.retry_after = None;
+            task.worker.stop();
+        }
     }
     #[cfg(target_os = "linux")]
     pub fn permission_denied(&self) -> bool {
@@ -1188,6 +1211,15 @@ mod tests {
         let original = desired(&state, &source, &[], true).unwrap()["input"].clone();
         assert_eq!(original.routes.boundaries.len(), 1);
         assert_eq!(original.routes.boundaries[0].side, Side::Right);
+        #[cfg(target_os = "linux")]
+        {
+            assert!(original.absolute_input);
+            let mut pending = original.clone();
+            pending.routes.boundaries.clear();
+            assert!(equivalent(&pending, &original));
+            pending.absolute_input = false;
+            assert!(!equivalent(&pending, &original));
+        }
 
         let mut arrangement = state.layout.clone();
         arrangement

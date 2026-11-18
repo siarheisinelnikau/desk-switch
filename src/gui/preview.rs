@@ -978,6 +978,7 @@ impl Desktop {
                 edge_paused: false,
                 edge_policy_revision: 0,
                 members,
+                phone_remotes: Default::default(),
                 active_input: Some("11".repeat(32)),
                 input_intent: None,
                 input_request: 0,

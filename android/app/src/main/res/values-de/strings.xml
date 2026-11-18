@@ -113,4 +113,10 @@
     <string name="device_protocol_mismatch">Geräteprotokolle stimmen nicht überein. Diese App erwartet %1$d. Der Computer verwendet %2$d.</string>
     <string name="workspace_protocol_mismatch">Arbeitsbereichsprotokolle stimmen nicht überein. Diese App erwartet %1$d. Der Computer verwendet %2$d.</string>
     <string name="update_error_install_failed">Android konnte das Update nicht installieren. Versuche es erneut.</string>
+    <string name="workspace_name">Desk Switch-Arbeitsbereich</string>
+    <string name="choose_connection">Wähle einen Arbeitsbereich oder Computer in deinem WLAN.</string>
+    <string name="saved_connections">DEINE VERBINDUNGEN</string>
+    <string name="saved_workspace">Gespeicherter Arbeitsbereich</string>
+    <string name="workspace_via">Über %1$s</string>
+    <string name="workspace_forgotten">Arbeitsbereich entfernt</string>
 </resources>

@@ -29,6 +29,7 @@ enum Command {
         key: String,
         name: String,
         local: bool,
+        workspace_id: Option<String>,
         active: watch::Receiver<bool>,
         preview: watch::Receiver<screen::Options>,
         reply: oneshot::Sender<Result<(), String>>,
@@ -69,6 +70,7 @@ pub(crate) struct Source {
     local: bool,
     shared: bool,
     key: String,
+    workspace_id: Option<String>,
     stop: watch::Sender<bool>,
     preview: watch::Sender<screen::Options>,
 }
@@ -79,6 +81,7 @@ impl Handle {
         name: String,
         local: bool,
         shared: bool,
+        workspace_id: Option<String>,
     ) -> Result<Source> {
         let source = self.next.fetch_add(1, Ordering::Relaxed);
         let (stop, active) = watch::channel(false);
@@ -89,6 +92,7 @@ impl Handle {
             local,
             shared,
             key: key.clone(),
+            workspace_id: workspace_id.clone(),
             stop,
             preview,
         };
@@ -99,6 +103,7 @@ impl Handle {
                 key,
                 name,
                 local,
+                workspace_id,
                 active,
                 preview: preview_options,
                 reply,
@@ -119,8 +124,12 @@ impl Source {
     }
     fn route(&self) -> Option<(u64, bool)> {
         let plan = self.handle.plan.borrow();
+        if !workspace_permits(&plan, &self.key, self.workspace_id.as_deref()) {
+            return None;
+        }
         let local = self.local
-            || !plan.sharing.get(&self.key).copied().unwrap_or(self.shared)
+            || self.workspace_id.is_none()
+                && !plan.sharing.get(&self.key).copied().unwrap_or(self.shared)
             || matches!(plan.routing.destination, Destination::Local);
         if self.local && matches!(plan.routing.destination, Destination::Paused { .. }) {
             return None;
@@ -141,6 +150,11 @@ impl Source {
         let Some((epoch, local)) = self.route() else {
             return Ok(());
         };
+        let motion = matches!(event, Input::Move { .. } | Input::Scroll { .. });
+        // Leave room for presses, releases, and text during a motion burst.
+        if motion && self.handle.commands.capacity() <= 16 {
+            return Ok(());
+        }
         let command = Command::Input {
             source: self.source,
             epoch,
@@ -150,7 +164,7 @@ impl Source {
         if let Err(error) = self.handle.commands.try_send(command) {
             // Motion is disposable. Never block a native heartbeat behind a
             // large motion burst; losing a transition closes this source.
-            if matches!(event, Input::Move { .. } | Input::Scroll { .. }) {
+            if motion {
                 return Ok(());
             }
             return Err(error.into());
@@ -248,15 +262,33 @@ struct Entry {
     key: String,
     local: bool,
     shared: bool,
+    workspace_id: Option<String>,
     active: watch::Receiver<bool>,
     preview: watch::Receiver<screen::Options>,
 }
-async fn route_changed(mut plan: watch::Receiver<Plan>, epoch: u64, key: String, shared: bool) {
+fn workspace_permits(plan: &Plan, key: &str, workspace_id: Option<&str>) -> bool {
+    workspace_id.is_none_or(|id| {
+        plan.routing
+            .workspace
+            .as_ref()
+            .is_some_and(|workspace| workspace.id == id && workspace.grants(key))
+    })
+}
+
+async fn route_changed(
+    mut plan: watch::Receiver<Plan>,
+    epoch: u64,
+    key: String,
+    shared: bool,
+    workspace_id: Option<String>,
+) {
     loop {
         {
             let current = plan.borrow();
             if current.epoch != epoch
-                || current.sharing.get(&key).copied().unwrap_or(true) != shared
+                || !workspace_permits(&current, &key, workspace_id.as_deref())
+                || workspace_id.is_none()
+                    && current.sharing.get(&key).copied().unwrap_or(true) != shared
             {
                 return;
             }
@@ -366,7 +398,7 @@ impl Engine {
     }
     fn devices(&self) {
         let peers = saved(&self.dir).unwrap_or_default();
-        let devices = peers
+        let mut devices: BTreeMap<_, _> = peers
             .into_iter()
             .map(|(key, trusted)| {
                 let connected = self
@@ -383,6 +415,28 @@ impl Engine {
                 )
             })
             .collect();
+        if let Some(workspace) = &self.applied.routing.workspace {
+            for (key, grant) in &workspace.grants {
+                let connected = self.sources.values().any(|entry| {
+                    entry.key == *key
+                        && entry.workspace_id.as_deref() == Some(workspace.id.as_str())
+                });
+                if let Some(name) = grant
+                    && connected
+                {
+                    devices.insert(
+                        key.clone(),
+                        Device {
+                            name: name.clone(),
+                            connected: true,
+                            shared: true,
+                        },
+                    );
+                } else if grant.is_none() {
+                    devices.remove(key);
+                }
+            }
+        }
         self.notify.send(Event::Devices(devices));
     }
     async fn paths(&mut self) -> Result<()> {
@@ -391,18 +445,32 @@ impl Engine {
                 && (!entry.local
                     || !matches!(self.applied.routing.destination, Destination::Paused { .. }))
         });
+        if !want_local && let Some(local) = self.local.take() {
+            self.local_ready.store(0, Ordering::Release);
+            local.close().await;
+        }
         if want_local && self.local.is_none() {
             self.local =
                 Some(crate::platform::mobile::Native::open(self.backend.clone(), &self.dir).await?);
         }
+        let local_ready = self.local.as_ref().is_some_and(|local| local.ready());
         self.local_ready.store(
-            if self.local.is_some() {
+            if local_ready {
                 self.applied.epoch.wrapping_add(1)
             } else {
                 0
             },
             Ordering::Release,
         );
+        if !local_ready {
+            let local_sources = self.local_holds.0.keys().copied().collect::<Vec<_>>();
+            self.local_holds.clear();
+            for source in local_sources {
+                for event in self.visual_holds.release(source) {
+                    self.visual(event);
+                }
+            }
+        }
         let want_remote = self
             .sources
             .values()
@@ -505,7 +573,18 @@ impl Engine {
             let removed: Vec<_> = self
                 .sources
                 .iter()
-                .filter(|(_, entry)| !entry.local && !peers.contains_key(&entry.key))
+                .filter(|(_, entry)| {
+                    !entry.local
+                        && (if entry.workspace_id.is_some() {
+                            !workspace_permits(
+                                &self.applied,
+                                &entry.key,
+                                entry.workspace_id.as_deref(),
+                            )
+                        } else {
+                            !peers.contains_key(&entry.key)
+                        })
+                })
                 .map(|(source, _)| *source)
                 .collect();
             for source in removed {
@@ -515,7 +594,7 @@ impl Engine {
             let changed: Vec<_> = self
                 .sources
                 .iter()
-                .filter(|(_, entry)| !entry.local)
+                .filter(|(_, entry)| !entry.local && entry.workspace_id.is_none())
                 .filter_map(|(source, entry)| {
                     peers
                         .get(&entry.key)
@@ -559,11 +638,12 @@ impl Engine {
                 biased;
                 _ = stopped(&mut stop) => Wake::Stop,
                 command = releases.recv() => command.map_or(Wake::Stop, Wake::Command),
-                command = commands.recv() => command.map_or(Wake::Stop, Wake::Command),
                 _ = self.plan.changed() => Wake::Route,
                 _ = heartbeat.tick() => Wake::Tick,
                 result = async { self.remote.as_mut().unwrap().poll().await }, if self.remote.is_some() => Wake::Remote(result),
                 result = async { self.local.as_mut().unwrap().poll().await }, if self.local.is_some() => Wake::Local(result),
+                // An input burst must leave time to send pings and consume their replies.
+                command = commands.recv() => command.map_or(Wake::Stop, Wake::Command),
             };
             match wake {
                 Wake::Stop => return Ok(()),
@@ -602,6 +682,7 @@ impl Engine {
                     key,
                     name,
                     local,
+                    workspace_id,
                     active,
                     preview,
                     reply,
@@ -610,15 +691,21 @@ impl Engine {
                         self.sources.len() < 64,
                         "Too many active remote input sources"
                     );
-                    let shared = saved(&self.dir)?
-                        .get(&key)
-                        .is_none_or(|trusted| trusted.shared);
+                    if !workspace_permits(&self.plan.borrow(), &key, workspace_id.as_deref()) {
+                        let _ = reply.send(Err("Workspace phone access is unavailable".into()));
+                        continue;
+                    }
+                    let shared = workspace_id.is_some()
+                        || saved(&self.dir)?
+                            .get(&key)
+                            .is_none_or(|trusted| trusted.shared);
                     self.sources.insert(
                         source,
                         Entry {
                             key,
                             local,
                             shared,
+                            workspace_id,
                             active,
                             preview,
                         },
@@ -661,15 +748,22 @@ impl Engine {
                 }) => {
                     if epoch != self.applied.epoch
                         || local != self.local_source(source)
-                        || !self
-                            .sources
-                            .get(&source)
-                            .is_some_and(|entry| !*entry.active.borrow())
+                        || !self.sources.get(&source).is_some_and(|entry| {
+                            !*entry.active.borrow()
+                                && workspace_permits(
+                                    &self.plan.borrow(),
+                                    &entry.key,
+                                    entry.workspace_id.as_deref(),
+                                )
+                        })
                     {
                         continue;
                     }
                     let accepted = if self.local_source(source) {
                         if let Some(local) = &mut self.local {
+                            if !local.ready() {
+                                continue;
+                            }
                             if let Some(event) = self.local_holds.event(source, event) {
                                 local.event(event)?;
                             }
@@ -700,10 +794,14 @@ impl Engine {
                 }) => {
                     if epoch != self.applied.epoch
                         || local != self.local_source(source)
-                        || !self
-                            .sources
-                            .get(&source)
-                            .is_some_and(|entry| !*entry.active.borrow())
+                        || !self.sources.get(&source).is_some_and(|entry| {
+                            !*entry.active.borrow()
+                                && workspace_permits(
+                                    &self.plan.borrow(),
+                                    &entry.key,
+                                    entry.workspace_id.as_deref(),
+                                )
+                        })
                     {
                         let _ = text
                             .reply
@@ -715,6 +813,7 @@ impl Engine {
                         self.applied.epoch,
                         self.sources[&source].key.clone(),
                         self.sources[&source].shared,
+                        self.sources[&source].workspace_id.clone(),
                     );
                     tokio::pin!(changed);
                     let mut source_stop = self.sources[&source].active.clone();
@@ -747,6 +846,55 @@ impl Engine {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn phone_motion_burst_leaves_room_for_button_transitions() {
+        let (commands, mut pending) = mpsc::channel(32);
+        let (releases, _releasing) = mpsc::unbounded_channel();
+        let (_plan, plan) = watch::channel(Plan::default());
+        let (_frames, frames) = watch::channel(None);
+        let (stop, _) = watch::channel(false);
+        let (preview, _) = watch::channel(screen::Options::default());
+        let source = Source {
+            handle: Handle {
+                commands,
+                releases,
+                plan,
+                local_ready: Arc::new(AtomicU64::new(1)),
+                remote_ready: Arc::default(),
+                next: Arc::default(),
+                frames,
+            },
+            source: 1,
+            local: true,
+            shared: true,
+            key: String::new(),
+            workspace_id: None,
+            stop,
+            preview,
+        };
+        for _ in 0..256 {
+            source.input(Input::Move { dx: 1, dy: 1 }).unwrap();
+        }
+        for down in [true, false] {
+            source.input(Input::Button { code: 272, down }).unwrap();
+        }
+        for _ in 0..16 {
+            assert!(matches!(
+                pending.try_recv(),
+                Ok(Command::Input {
+                    event: Input::Move { .. },
+                    ..
+                })
+            ));
+        }
+        for expected in [true, false] {
+            assert!(
+                matches!(pending.try_recv(), Ok(Command::Input { event: Input::Button { code: 272, down }, .. }) if down == expected)
+            );
+        }
+        assert!(pending.try_recv().is_err());
+    }
+
     #[test]
     fn one_phone_disconnect_never_releases_another_phones_modifier() {
         let mut holds = Holds::default();

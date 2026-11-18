@@ -261,6 +261,8 @@ pub struct Workspace {
     #[serde(default)]
     pub edge_policy_revision: u64,
     pub members: BTreeMap<Key, Member>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub phone_remotes: BTreeMap<Key, Option<String>>,
     pub active_input: Option<Key>,
     #[serde(default)]
     pub input_intent: Option<Key>,
@@ -282,12 +284,78 @@ pub struct Workspace {
     #[serde(default)]
     pub display_entry: Option<crate::edge::Entry>,
 }
+
+pub const PHONE_WORKSPACE_CAPABILITY: &str = "Phone remote workspace: 1";
+pub const MAX_PHONE_REMOTES: usize = 16;
+const MAX_PHONE_RECORDS: usize = 64;
+
+fn validate_phone_name(name: &str) -> Result<()> {
+    ensure!(
+        !name.trim().is_empty() && name.len() <= 256 && !name.chars().any(char::is_control),
+        "Invalid phone name"
+    );
+    Ok(())
+}
+
 impl Workspace {
     pub fn workspace_id(&self) -> &str {
         self.authority
             .as_ref()
             .map(|authority| authority.workspace_id.as_str())
             .unwrap_or(&self.hub)
+    }
+
+    pub fn phone_workspace_enabled(&self) -> bool {
+        self.authority.is_some()
+            && self.members.values().all(|member| {
+                member
+                    .node
+                    .diagnostics
+                    .logs
+                    .iter()
+                    .any(|line| line == PHONE_WORKSPACE_CAPABILITY)
+            })
+    }
+
+    pub fn set_phone_remote(
+        &mut self,
+        workspace: &str,
+        key: Key,
+        name: Option<String>,
+        reapprove: bool,
+    ) -> Result<()> {
+        ensure!(
+            self.workspace_id() == workspace && self.phone_workspace_enabled(),
+            "Workspace phone access is unavailable"
+        );
+        valid_key(&key)?;
+        if let Some(name) = &name {
+            validate_phone_name(name)?;
+        }
+        if self.phone_remotes.get(&key) == Some(&name) {
+            return Ok(());
+        }
+        ensure!(
+            name.is_none()
+                || match self.phone_remotes.get(&key) {
+                    None => !reapprove,
+                    Some(None) => reapprove,
+                    Some(Some(_)) => false,
+                },
+            "Phone approval changed; connect again"
+        );
+        ensure!(
+            self.phone_remotes.contains_key(&key) || self.phone_remotes.len() < MAX_PHONE_RECORDS,
+            "Too many workspace phone records"
+        );
+        ensure!(
+            name.is_none() || self.phone_remotes.values().flatten().count() < MAX_PHONE_REMOTES,
+            "Forget a phone before adding another remote"
+        );
+        let revision = self.next_revision()?;
+        self.phone_remotes.insert(key, name);
+        self.revision = revision;
+        Ok(())
     }
 
     fn next_revision(&self) -> Result<u64> {
@@ -305,6 +373,17 @@ impl Workspace {
             );
         }
         self.layout.validate_shape()?;
+        ensure!(
+            self.phone_remotes.len() <= MAX_PHONE_RECORDS
+                && self.phone_remotes.values().flatten().count() <= MAX_PHONE_REMOTES,
+            "Too many workspace phone records"
+        );
+        for (key, name) in &self.phone_remotes {
+            valid_key(key)?;
+            if let Some(name) = name {
+                validate_phone_name(name)?;
+            }
+        }
         ensure!(
             self.edge_policy_revision <= self.revision,
             "Invalid edge policy revision"
@@ -1219,6 +1298,7 @@ pub(crate) mod tests {
             edge_paused: false,
             edge_policy_revision: 0,
             members,
+            phone_remotes: BTreeMap::new(),
             active_input: None,
             input_intent: None,
             input_request: 0,
@@ -1231,6 +1311,59 @@ pub(crate) mod tests {
             active_display: None,
             display_entry: None,
         }
+    }
+
+    #[test]
+    fn phone_access_is_committed_to_one_workspace_and_revocable() {
+        let mut state = fixture(10);
+        let workspace = key(41);
+        state.authority = Some(Authority {
+            workspace_id: workspace.clone(),
+            term: 1,
+            index: 1,
+        });
+        let phone = key(42);
+        assert!(
+            state
+                .set_phone_remote(&workspace, phone.clone(), Some("Phone".into()), false)
+                .is_err()
+        );
+        for member in state.members.values_mut() {
+            member
+                .node
+                .diagnostics
+                .logs
+                .push(PHONE_WORKSPACE_CAPABILITY.into());
+        }
+        assert!(
+            state
+                .set_phone_remote(&key(43), phone.clone(), Some("Phone".into()), false)
+                .is_err()
+        );
+        state
+            .set_phone_remote(&workspace, phone.clone(), Some("Phone".into()), false)
+            .unwrap();
+        let revision = state.revision;
+        state
+            .set_phone_remote(&workspace, phone.clone(), Some("Phone".into()), false)
+            .unwrap();
+        assert_eq!(state.revision, revision);
+        let decoded: Workspace =
+            serde_json::from_value(serde_json::to_value(&state).unwrap()).unwrap();
+        assert!(decoded.phone_remotes[&phone].is_some());
+        state
+            .set_phone_remote(&workspace, phone.clone(), None, false)
+            .unwrap();
+        assert_eq!(state.phone_remotes.get(&phone), Some(&None));
+        assert!(
+            state
+                .set_phone_remote(&workspace, phone.clone(), Some("Phone".into()), false)
+                .is_err()
+        );
+        state
+            .set_phone_remote(&workspace, phone, Some("Phone".into()), true)
+            .unwrap();
+        state.validate().unwrap();
     }
 
     #[test]

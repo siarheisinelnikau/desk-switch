@@ -2232,6 +2232,19 @@ impl Desktop {
             {
                 self.scan(super::QueryKind::InputAccess);
             }
+            note(
+                ui,
+                "Enable native input to use a phone or share keyboard and mouse without the Wayland connection dialog. Screen edges that position the pointer still use Wayland. An administrator grants this desktop account permission to send virtual keyboard and mouse input.",
+            );
+            if ui
+                .add_enabled(
+                    self.query.is_none(),
+                    egui::Button::new(crate::i18n::tr("Enable native keyboard and mouse")),
+                )
+                .clicked()
+            {
+                self.scan(super::QueryKind::NativeInputAccess);
+            }
         });
     }
 

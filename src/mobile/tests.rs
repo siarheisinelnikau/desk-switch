@@ -230,6 +230,140 @@ async fn pairing_code_is_visible_before_phone_confirmation_and_decline_never_gra
 }
 
 #[tokio::test]
+async fn a_phone_approved_for_the_workspace_uses_either_ingress_and_revocation_closes_it()
+-> Result<()> {
+    let first = Fixture::new()?;
+    let second = Fixture::new()?;
+    let a = first.service.as_ref().unwrap();
+    let b = second.service.as_ref().unwrap();
+    let mut access = WorkspaceAccess {
+        id: "11".repeat(32),
+        can_enroll: true,
+        peers: [
+            config::hex(&config::load_identity(&first.dir)?.public),
+            config::hex(&config::load_identity(&second.dir)?.public),
+        ]
+        .into_iter()
+        .collect(),
+        grants: BTreeMap::new(),
+    };
+    let set_access = |service: &Service, scope: &WorkspaceAccess| {
+        service.set_routing(Routing {
+            workspace: Some(scope.clone()),
+            ..Default::default()
+        })
+    };
+    set_access(a, &access);
+    let mut entry = first.connect().await?;
+    let pending = first.request()?;
+    assert_eq!(pending.code, entry.code);
+    let _ = pending.reply.send(true);
+    entry.send_json(&json!({"Decision": true})).await?;
+    let decision = timeout(Duration::from_secs(2), entry.receive_json()).await??;
+    assert_eq!(
+        decision["workspace"],
+        json!({"id": access.id, "members": access.peers})
+    );
+    entry.send_json(&json!("Pinned")).await?;
+    let key = config::hex(&first.phone.public);
+    let approval_deadline = std::time::Instant::now() + Duration::from_secs(2);
+    loop {
+        let event = a
+            .events
+            .recv_timeout(approval_deadline.saturating_duration_since(std::time::Instant::now()))?;
+        if let Event::WorkspaceApproval {
+            workspace,
+            key: approved,
+            name,
+            reapprove,
+        } = event
+        {
+            assert_eq!(workspace, access.id);
+            assert_eq!(approved, key);
+            assert!(!reapprove);
+            access.grants.insert(key.clone(), Some(name));
+            break;
+        }
+    }
+    set_access(a, &access);
+    assert_eq!(
+        timeout(Duration::from_secs(2), entry.receive_json()).await??,
+        json!("Pinned")
+    );
+    drop(entry);
+    assert!(saved(&first.dir)?.is_empty());
+    config::write_atomic(
+        &second.dir.join("mobile-peers.json"),
+        &serde_json::to_string(&BTreeMap::from([(
+            key.clone(),
+            Trusted {
+                name: "Legacy copy".into(),
+                shared: true,
+            },
+        )]))?,
+    )?;
+    b.set_shared(&key, true)?;
+    set_access(b, &access);
+    let stream =
+        tokio::net::TcpStream::connect((std::net::Ipv4Addr::LOCALHOST, second.control)).await?;
+    let pin = config::hex(&config::load_identity(&second.dir)?.public);
+    let mut alternate = crate::workspace::net::authenticate(
+        stream,
+        &first.phone,
+        "Same phone",
+        true,
+        Some(&pin),
+        second.control,
+    )
+    .await?;
+    alternate.send_json(&json!({"Decision": true})).await?;
+    let decision = timeout(Duration::from_secs(2), alternate.receive_json()).await??;
+    assert_eq!(decision["Decision"], true);
+    assert_eq!(decision["workspace"]["id"], access.id);
+    assert!(
+        !b.events
+            .try_iter()
+            .any(|event| matches!(event, Event::Pair(_)))
+    );
+    alternate.send_json(&json!("Pinned")).await?;
+    assert_eq!(
+        timeout(Duration::from_secs(2), alternate.receive_json()).await??,
+        json!("Pinned")
+    );
+    let mut phone = Phone::native(&second, &first.phone, alternate).await?;
+    let down = crate::wire::Input::Button {
+        code: 272,
+        down: true,
+    };
+    phone.event(down).await?;
+    phone
+        .wait(|| second.proof.lock().unwrap().inputs.contains(&down))
+        .await?;
+    assert!(saved(&second.dir)?.is_empty());
+    access.grants.insert(key, None);
+    set_access(b, &access);
+    assert!(matches!(
+        timeout(Duration::from_secs(3), phone.input.messages.recv()).await?,
+        None | Some(Err(_))
+    ));
+    phone
+        .wait(|| {
+            second
+                .proof
+                .lock()
+                .unwrap()
+                .inputs
+                .contains(&crate::wire::Input::Button {
+                    code: 272,
+                    down: false,
+                })
+        })
+        .await?;
+    assert!(saved(&second.dir)?.is_empty());
+    Ok(())
+}
+
+#[tokio::test]
 async fn forgotten_phone_disconnects_releases_held_input_and_requires_new_consent() -> Result<()> {
     use crate::wire::Input;
     let fixture = Fixture::new()?;
@@ -437,18 +571,53 @@ async fn two_same_ip_phones_match_their_own_native_stream_and_one_forget_keeps_t
 }
 
 #[tokio::test]
-async fn a_shared_phone_follows_the_selected_pc_after_monitor_settle_without_replaying_input()
+async fn a_workspace_phone_follows_the_selected_pc_after_monitor_settle_without_replaying_input()
 -> Result<()> {
     use crate::wire::Input;
     let source = Fixture::new()?;
     let target = Fixture::new()?;
     let source_key = config::hex(&config::load_identity(&source.dir)?.public);
     let target_key = config::hex(&config::load_identity(&target.dir)?.public);
+    let phone_key = config::hex(&source.phone.public);
+    let access = WorkspaceAccess {
+        id: "21".repeat(32),
+        can_enroll: true,
+        peers: [source_key.clone(), target_key.clone()]
+            .into_iter()
+            .collect(),
+        grants: [(phone_key.clone(), Some("Routed phone".into()))]
+            .into_iter()
+            .collect(),
+    };
     target.service.as_ref().unwrap().set_routing(Routing {
         members: [source_key.clone()].into_iter().collect(),
+        workspace: Some(access.clone()),
         ..Default::default()
     });
-    let control = Phone::control(&source, &source.phone, "Routed phone").await?;
+    let ingress = source.service.as_ref().unwrap();
+    ingress.set_routing(Routing {
+        workspace: Some(access.clone()),
+        ..Default::default()
+    });
+    let stream =
+        tokio::net::TcpStream::connect((std::net::Ipv4Addr::LOCALHOST, source.control)).await?;
+    let mut control = crate::workspace::net::authenticate(
+        stream,
+        &source.phone,
+        "Routed phone",
+        true,
+        Some(&source_key),
+        source.control,
+    )
+    .await?;
+    control.send_json(&json!({"Decision": true})).await?;
+    let decision = timeout(Duration::from_secs(2), control.receive_json()).await??;
+    assert_eq!(decision["workspace"]["id"], access.id);
+    control.send_json(&json!("Pinned")).await?;
+    assert_eq!(
+        timeout(Duration::from_secs(2), control.receive_json()).await??,
+        json!("Pinned")
+    );
     let mut phone = Phone::native(&source, &source.phone, control).await?;
     let held = Input::Button {
         code: 272,
@@ -456,6 +625,10 @@ async fn a_shared_phone_follows_the_selected_pc_after_monitor_settle_without_rep
     };
     phone.event(held).await?;
     phone.text("source").await?;
+    assert!(saved(&source.dir)?.is_empty());
+    assert!(ingress.events.try_iter().any(|event| {
+        matches!(event, Event::Devices(devices) if devices.get(&phone_key).is_some_and(|device| device.connected && device.shared))
+    }));
     let members = [target_key.clone()].into_iter().collect();
     source.service.as_ref().unwrap().set_routing(Routing {
         generation: 2,
@@ -463,6 +636,7 @@ async fn a_shared_phone_follows_the_selected_pc_after_monitor_settle_without_rep
             reason: "Monitor switch is settling".into(),
         },
         members,
+        workspace: Some(access.clone()),
     });
     phone
         .wait(|| {
@@ -499,6 +673,7 @@ async fn a_shared_phone_follows_the_selected_pc_after_monitor_settle_without_rep
             input_port: target.input,
         },
         members: [target_key].into_iter().collect(),
+        workspace: Some(access.clone()),
     });
     // Probe fresh motion while keeping the source's existing native lease alive.
     let fresh = Input::Move { dx: 7, dy: -3 };
@@ -553,6 +728,44 @@ async fn a_shared_phone_follows_the_selected_pc_after_monitor_settle_without_rep
     })
     .await??;
     assert!(source_frame.starts_with(b"\x89PNG\r\n\x1a\n"));
+    let remote_button = |down| Input::Button { code: 273, down };
+    phone.event(remote_button(true)).await?;
+    phone
+        .wait(|| {
+            target
+                .proof
+                .lock()
+                .unwrap()
+                .inputs
+                .contains(&remote_button(true))
+        })
+        .await?;
+    let releases = target.proof.lock().unwrap().releases;
+    let deadline =
+        tokio::time::Instant::now() + crate::transport::LEASE + Duration::from_millis(250);
+    while tokio::time::Instant::now() < deadline {
+        for _ in 0..256 {
+            phone.event(Input::Move { dx: 1, dy: 0 }).await?;
+        }
+        phone.ping().await?;
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(
+        target.proof.lock().unwrap().releases,
+        releases,
+        "Sustained phone motion must not recycle the relay or release held input"
+    );
+    phone.event(remote_button(false)).await?;
+    phone
+        .wait(|| {
+            target
+                .proof
+                .lock()
+                .unwrap()
+                .inputs
+                .contains(&remote_button(false))
+        })
+        .await?;
     phone
         .control
         .send_json(&screen::Options::default().packet(&phone.key)?)
@@ -568,6 +781,7 @@ async fn a_shared_phone_follows_the_selected_pc_after_monitor_settle_without_rep
     );
     source.service.as_ref().unwrap().set_routing(Routing {
         generation: 3,
+        workspace: Some(access),
         ..Default::default()
     });
     let returned = Input::Move { dx: -7, dy: 4 };

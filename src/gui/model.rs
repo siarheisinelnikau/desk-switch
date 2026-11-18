@@ -236,6 +236,8 @@ impl Form {
         });
         Ok(FileSettings {
             routes: None,
+            #[cfg(target_os = "linux")]
+            absolute_input: None,
             monitor,
             edge,
             capture,

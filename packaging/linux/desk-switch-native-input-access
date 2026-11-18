@@ -1,0 +1,162 @@
+#!/usr/bin/python3 -I
+"""Authorize the Linux virtual-input device for one local desktop account."""
+import json
+import fcntl
+import os
+from pathlib import Path
+import pwd
+import re
+import stat
+import subprocess
+import sys
+import tempfile
+
+NODE = Path('/dev/uinput')
+STATE = Path('/etc/desk-switch/native-input')
+MODULE = Path('/etc/modules-load.d/desk-switch-native-input.conf')
+ENV = {'PATH': '/usr/sbin:/usr/bin:/sbin:/bin', 'LC_ALL': 'C'}
+
+
+def trusted(path, kind):
+    info = path.lstat()
+    if info.st_uid != 0 or info.st_mode & 0o022 or not kind(info.st_mode):
+        raise ValueError(f'Unexpected owner or permissions for {path}')
+
+
+def state(create=False):
+    if create:
+        STATE.parent.mkdir(mode=0o755, exist_ok=True)
+    trusted(STATE.parent, stat.S_ISDIR)
+    if create:
+        STATE.mkdir(mode=0o700, exist_ok=True)
+    trusted(STATE, stat.S_ISDIR)
+
+
+def replace(path, content):
+    handle = tempfile.NamedTemporaryFile(mode='w', dir=path.parent, delete=False)
+    temporary = Path(handle.name)
+    try:
+        with handle:
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def descriptor():
+    fd = os.open(NODE, os.O_PATH | os.O_NOFOLLOW | os.O_CLOEXEC)
+    info = os.fstat(fd)
+    if (stat.S_ISCHR(info.st_mode) and info.st_uid == 0
+            and info.st_rdev == os.makedev(10, 223)):
+        return fd
+    os.close(fd)
+    raise ValueError('The kernel virtual-input device is unavailable')
+
+
+def permission(uid, fd, grant):
+    flags = ['--modify', f'u:{uid}:rw'] if grant else ['--remove', f'u:{uid}']
+    subprocess.run(['/usr/bin/setfacl', *flags, f'/proc/self/fd/{fd}'],
+                   pass_fds=(fd,), env=ENV, check=True, timeout=5)
+
+
+def account(value):
+    if not re.fullmatch(r'[1-9][0-9]{0,9}', value) or int(value) >= 2**32:
+        raise ValueError('No unprivileged desktop user was authenticated')
+    return pwd.getpwuid(int(value))
+
+
+def change(grant):
+    user = account(os.environ.get('PKEXEC_UID', ''))
+    if grant and not NODE.exists():
+        subprocess.run(['/usr/sbin/modprobe', 'uinput'], env=ENV, check=True, timeout=5)
+        subprocess.run(['/usr/bin/udevadm', 'wait', '--initialized=false', '--timeout=2', str(NODE)],
+                       env=ENV, check=True, timeout=4)
+    state(create=True)
+    with lock():
+        change_locked(user, grant)
+
+
+def lock():
+    fd = os.open(STATE / '.lock', os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+    handle = os.fdopen(fd, 'wb')
+    try:
+        fcntl.flock(handle, fcntl.LOCK_EX)
+    except BaseException:
+        handle.close()
+        raise
+    return handle
+
+
+def change_locked(user, grant):
+    path = STATE / str(user.pw_uid)
+    if grant:
+        fd = descriptor()
+        try:
+            previous = path.exists()
+            replace(MODULE, 'uinput\n')
+            permission(user.pw_uid, fd, True)
+            try:
+                replace(path, json.dumps(user.pw_name))
+            except OSError:
+                if not previous:
+                    permission(user.pw_uid, fd, False)
+                raise
+        finally:
+            os.close(fd)
+    else:
+        # Remove the saved grant first, so udev cannot replay it after revocation.
+        path.unlink(missing_ok=True)
+        try:
+            fd = descriptor()
+        except FileNotFoundError:
+            pass
+        else:
+            try:
+                permission(user.pw_uid, fd, False)
+            finally:
+                os.close(fd)
+        if not any(re.fullmatch(r'[1-9][0-9]{0,9}', entry.name) for entry in STATE.iterdir()):
+            MODULE.unlink(missing_ok=True)
+
+
+def restore():
+    try:
+        state()
+    except FileNotFoundError:
+        return
+    with lock():
+        restore_locked()
+
+
+def restore_locked():
+    fd = descriptor()
+    try:
+        for entry in sorted(STATE.iterdir())[:128]:
+            try:
+                user = account(entry.name)
+                trusted(entry, stat.S_ISREG)
+                if json.loads(entry.read_text()) == user.pw_name:
+                    permission(user.pw_uid, fd, True)
+            except (OSError, KeyError, ValueError):
+                continue
+    finally:
+        os.close(fd)
+
+
+if __name__ == '__main__':
+    argument = sys.argv[1:]
+    try:
+        if os.geteuid() != 0:
+            raise ValueError('Run this helper through the system authorization dialog')
+        if argument == ['--restore'] and 'PKEXEC_UID' not in os.environ:
+            restore()
+        elif argument in ([], ['--revoke']):
+            change(grant=not argument)
+            print('@desk-switch-data ' + json.dumps(dict(native_input_access=not argument)))
+        else:
+            raise ValueError('Unsupported native input authorization command')
+    except Exception as error:
+        print(f'Native input permission could not be changed: {error}', file=sys.stderr)
+        sys.exit(1)

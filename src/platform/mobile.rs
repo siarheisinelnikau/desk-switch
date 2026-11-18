@@ -62,7 +62,7 @@ pub(crate) enum Native {
     Windows(Box<super::win_receive::NativeSink>),
     #[cfg(target_os = "linux")]
     Linux {
-        sink: Box<super::portal::Portal>,
+        sink: super::linux_input::LinuxInput,
         writer: Option<crate::group::clipboard::RemoteText>,
     },
     #[cfg(test)]
@@ -71,6 +71,19 @@ pub(crate) enum Native {
     Unsupported,
 }
 impl Native {
+    pub(crate) fn ready(&self) -> bool {
+        match self {
+            #[cfg(target_os = "linux")]
+            Self::Linux { sink, .. } => sink.phone_ready(),
+            #[cfg(windows)]
+            Self::Windows(_) => true,
+            #[cfg(test)]
+            Self::Proof(_) => true,
+            #[cfg(not(any(windows, target_os = "linux")))]
+            Self::Unsupported => false,
+        }
+    }
+
     pub(crate) async fn open(backend: Backend, _profile: &std::path::Path) -> Result<Self> {
         #[cfg(test)]
         if let Backend::Proof(proof) = &backend {
@@ -83,13 +96,7 @@ impl Native {
         #[cfg(windows)]
         let mut sink = super::win_receive::NativeSink::new(None)?;
         #[cfg(target_os = "linux")]
-        let mut sink = {
-            // Phone input has its own single-use permission token. Group PC
-            // receivers can open or migrate their token independently.
-            let permission_dir = _profile.join("phone-input-permission");
-            std::fs::create_dir_all(&permission_dir)?;
-            super::portal::Portal::open_at(None, &permission_dir).await?
-        };
+        let mut sink = super::linux_input::LinuxInput::open_phone(_profile).await?;
         #[cfg(any(windows, target_os = "linux"))]
         {
             sink.prepare(None, Mode::Input)?;
@@ -101,10 +108,7 @@ impl Native {
         }
         #[cfg(target_os = "linux")]
         {
-            Ok(Self::Linux {
-                sink: Box::new(sink),
-                writer: None,
-            })
+            Ok(Self::Linux { sink, writer: None })
         }
         #[cfg(not(any(windows, target_os = "linux")))]
         {
@@ -116,7 +120,7 @@ impl Native {
             #[cfg(windows)]
             Self::Windows(sink) => sink.poll().await,
             #[cfg(target_os = "linux")]
-            Self::Linux { sink, .. } => sink.poll().await,
+            Self::Linux { sink, .. } => sink.poll_phone().await,
             #[cfg(test)]
             Self::Proof(sink) => sink.poll().await,
             #[cfg(not(any(windows, target_os = "linux")))]
@@ -128,7 +132,12 @@ impl Native {
             #[cfg(windows)]
             Self::Windows(sink) => sink.event(event).map(|_| ()),
             #[cfg(target_os = "linux")]
-            Self::Linux { sink, .. } => sink.event(event).map(|_| ()),
+            Self::Linux { sink, .. } => {
+                if sink.phone_ready() {
+                    sink.event(event)?;
+                }
+                Ok(())
+            }
             #[cfg(test)]
             Self::Proof(sink) => sink.event(event).map(|_| ()),
             #[cfg(not(any(windows, target_os = "linux")))]
@@ -153,6 +162,10 @@ impl Native {
             Self::Windows(_) => unicode(&value),
             #[cfg(target_os = "linux")]
             Self::Linux { sink, writer } => {
+                ensure!(
+                    sink.phone_ready(),
+                    "The Ubuntu desktop is locked or inactive"
+                );
                 if writer.is_none() {
                     *writer = Some(crate::group::clipboard::RemoteText::start()?);
                 }
@@ -160,9 +173,16 @@ impl Native {
                 loop {
                     tokio::select! {
                         result = &mut result => { result?.map_err(anyhow::Error::msg)?; break; },
-                        result = sink.poll() => result?,
+                        result = sink.poll_phone() => {
+                            result?;
+                            ensure!(sink.phone_ready(), "The Ubuntu desktop is locked or inactive");
+                        },
                     }
                 }
+                ensure!(
+                    sink.phone_ready(),
+                    "The Ubuntu desktop is locked or inactive"
+                );
                 for (code, down) in [(29, true), (47, true), (47, false), (29, false)] {
                     sink.event(Input::Key { code, down })?;
                 }
@@ -184,7 +204,7 @@ impl Native {
         let _ = self.release();
         #[cfg(target_os = "linux")]
         match self {
-            Self::Linux { sink, .. } => (*sink).close().await,
+            Self::Linux { sink, .. } => sink.close().await,
             #[cfg(test)]
             Self::Proof(_) => {}
         }

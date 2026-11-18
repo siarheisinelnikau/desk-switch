@@ -113,4 +113,10 @@
     <string name="device_protocol_mismatch">Les protocoles appareil diffèrent. Cette application attend %1$d. L’ordinateur utilise %2$d.</string>
     <string name="workspace_protocol_mismatch">Les protocoles espace de travail diffèrent. Cette application attend %1$d. L’ordinateur utilise %2$d.</string>
     <string name="update_error_install_failed">Android n’a pas pu installer la mise à jour. Vous pouvez réessayer.</string>
+    <string name="workspace_name">Espace de travail Desk Switch</string>
+    <string name="choose_connection">Choisissez un espace de travail ou un ordinateur sur votre réseau Wi-Fi.</string>
+    <string name="saved_connections">VOS CONNEXIONS</string>
+    <string name="saved_workspace">Espace de travail enregistré</string>
+    <string name="workspace_via">Via %1$s</string>
+    <string name="workspace_forgotten">Espace de travail oublié</string>
 </resources>

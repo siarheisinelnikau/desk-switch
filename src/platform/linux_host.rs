@@ -1,6 +1,7 @@
 use super::{
     host::{self, Control},
-    portal::Portal,
+    linux_input::LinuxInput,
+    receiver::Sink,
 };
 use crate::{
     config::{Edge, Identity, Key},
@@ -51,11 +52,11 @@ impl CursorCommand {
         Ok(())
     }
 
-    fn enter_display(&self, portal: &mut Portal, entry: Entry) -> Result<()> {
+    fn enter_display(&self, portal: &mut LinuxInput, entry: Entry) -> Result<()> {
         let routes = crate::lifecycle::routes();
         let current = routes.borrow();
         self.check_entry(current.activation)?;
-        let result = portal.enter_display(entry);
+        let result = portal.reposition(entry);
         drop(current);
         result
     }
@@ -120,6 +121,10 @@ fn open_devices(paths: &[PathBuf]) -> Result<Vec<Device>> {
         );
         let device = Device::open(path).with_context(|| format!(
             "opening {}; grant this desktop user access to this selected event device during setup", path.display()))?;
+        ensure!(
+            device.input_id().bus_type() != evdev::BusType::BUS_VIRTUAL,
+            "select a physical keyboard or mouse for the Ubuntu host"
+        );
         ensure!(
             !crate::workspace::hardware::absolute_pointer(|code| {
                 device
@@ -317,6 +322,7 @@ pub async fn run(
     edge: Option<Edge>,
     capture_settings: crate::config::CaptureSettings,
     video: Option<(Inputs, VideoWorker)>,
+    absolute_input: bool,
 ) -> Result<()> {
     let paths = if capture_settings.devices.is_empty() {
         crate::workspace::hardware::inputs()?.2
@@ -333,8 +339,9 @@ pub async fn run(
         })
         .collect::<Vec<_>>();
     let mut devices = open_devices(&paths)?;
-    let mut portal = Portal::open(edge.clone()).await?;
+    let mut portal = LinuxInput::open(edge.clone(), absolute_input).await?;
     let result = async {
+        portal.wait_for_active_session().await?;
         let initial_routes = crate::lifecycle::routes().borrow().clone();
         portal.set_generation(initial_routes.activation);
         portal.set_routes(initial_routes)?;
@@ -343,7 +350,7 @@ pub async fn run(
         for device in &mut devices {
             device.grab().context("grabbing a selected input device; another application may own it")?;
             device.set_nonblocking(true)?;
-            // Ignore events queued while the portal consent dialog was open.
+            // Ignore events queued while the input backend was starting.
             let drain_deadline = Instant::now() + Duration::from_millis(100);
             loop {
                 ensure!(Instant::now() < drain_deadline, "release the selected input devices while startup completes");
@@ -383,7 +390,7 @@ pub async fn run(
 }
 
 async fn capture(
-    portal: &mut Portal,
+    portal: &mut LinuxInput,
     (mut streams, high_resolution): (Vec<evdev::EventStream>, Vec<[bool; 2]>),
     gate: Arc<Gate>,
     controls: mpsc::Sender<Control>,
@@ -511,7 +518,7 @@ async fn capture(
                 match event.destructure() {
                     EventSummary::Key(_, code, value) => {
                         // Hotkeys and keys routed to the peer do not reach the
-                        // local portal, but must still cancel local edge dwell.
+                        // local backend, but must still cancel local edge dwell.
                         portal.cancel_dwell();
                         let (control, input) = routing.key(device, code.0, value);
                         if let Some(control) = control
@@ -547,7 +554,7 @@ async fn capture(
 }
 
 fn route(
-    portal: &mut Portal,
+    portal: &mut LinuxInput,
     routing: &Routing,
     owner: Owner,
     input: Input,

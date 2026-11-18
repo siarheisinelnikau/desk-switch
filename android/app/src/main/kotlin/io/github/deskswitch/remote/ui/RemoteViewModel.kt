@@ -60,17 +60,15 @@ class RemoteViewModel internal constructor(
     private val generation = AtomicLong()
     private var factory: SessionFactory? = null
     private var session: RemoteSession? = null
+    private var discoveries: List<Computer> = emptyList()
     private val consent = AtomicReference<CompletableFuture<Boolean>?>()
     fun discovered(computers: List<Computer>) = viewModelScope.launch {
-        val saved = store.computers().map { known ->
-            computers.find { it.advertisedKey == known.key }?.copy(key = known.key) ?: known
-        }
-        val connected = mutable.value.connected?.let { current ->
-            computers.find { it.advertisedKey == current.key }?.let { found ->
-                current.copy(previewSupported = found.previewSupported)
-            } ?: current
-        }
-        mutable.value = mutable.value.copy(nearby = computers.sortedBy { it.name }, saved = saved, connected = connected)
+        discoveries = computers
+        mutable.value = withConnections(mutable.value)
+    }
+    private fun withConnections(state: ScreenState): ScreenState {
+        val choices = ConnectionChoices.from(store.computers(), discoveries)
+        return state.copy(saved = choices.saved, nearby = choices.nearby)
     }
     internal fun discoveryFailed(issue: ScreenIssue?) = viewModelScope.launch {
         mutable.value = mutable.value.copy(discoveryError = issue)
@@ -105,7 +103,13 @@ class RemoteViewModel internal constructor(
     fun connect(computer: Computer) {
         disconnect()
         val run = generation.incrementAndGet()
-        val adapter = makeFactory { saved -> if (generation.get() == run) store.save(saved) }
+        val authenticated = AtomicReference<Computer?>()
+        val adapter = makeFactory { saved ->
+            if (generation.get() == run) {
+                store.save(saved)
+                authenticated.set(saved)
+            }
+        }
         var lastInputErrorAt: Long? = null
         adapter.setInputErrorListener { error ->
             viewModelScope.launch {
@@ -132,9 +136,7 @@ class RemoteViewModel internal constructor(
         mutable.value = mutable.value.copy(connecting = computer, error = null)
         viewModelScope.launch(Dispatchers.IO) {
             try {
-                val known = store.computers().find { it.key == computer.advertisedKey }
-                    ?: store.computers().find { it.host == computer.host && it.port == computer.port }
-                val pinned = computer.copy(key = computer.key ?: known?.key)
+                val pinned = ConnectionChoices.pin(computer, store.computers())
                 val connected = adapter.connect(pinned, store.identity(), { pairing ->
                     val answer = CompletableFuture<Boolean>()
                     consent.set(answer)
@@ -154,9 +156,8 @@ class RemoteViewModel internal constructor(
                     if (generation.get() == run) {
                         session = connected
                         previewRequest = null
-                        val saved = store.computers().find { it.host == computer.host }
-                        val current = (saved ?: computer).copy(previewSupported = computer.previewSupported || saved?.previewSupported == true)
-                        mutable.value = mutable.value.copy(connecting = null, pairing = null, connected = current, saved = store.computers())
+                        mutable.value = withConnections(mutable.value.copy(connecting = null, pairing = null,
+                            connected = authenticated.get() ?: pinned))
                         updatePreview()
                     } else connected.close()
                 }
@@ -167,7 +168,7 @@ class RemoteViewModel internal constructor(
                         error.message?.take(240)?.takeIf(String::isNotBlank)?.let { ScreenIssue.Detail(it) }
                             ?: ScreenIssue.Local(R.string.connection_unavailable)
                     }
-                    mutable.value = mutable.value.copy(connecting = null, pairing = null, error = issue)
+                    mutable.value = withConnections(mutable.value.copy(connecting = null, pairing = null, error = issue))
                 }
             }
         }
@@ -183,9 +184,9 @@ class RemoteViewModel internal constructor(
     fun chord(vararg codes: Int) { codes.forEach { input(Input.Key(it, true)) }; codes.reversed().forEach { input(Input.Key(it, false)) } }
     fun click(code: Int) { input(Input.Button(code, true)); input(Input.Button(code, false)) }
     fun forget(computer: Computer) {
-        if (computer.key != null && mutable.value.connected?.key == computer.key) disconnect()
-        store.forget(computer.key)
-        mutable.value = mutable.value.copy(saved = store.computers())
+        if (mutable.value.connected?.let { ConnectionChoices.sameEntry(it, computer) } == true) disconnect()
+        store.forget(computer)
+        mutable.value = withConnections(mutable.value)
     }
     fun disconnect() {
         generation.incrementAndGet(); consent.getAndSet(null)?.complete(false)
