@@ -365,6 +365,8 @@ impl Desktop {
                 ctx.clone(),
                 #[cfg(feature = "android-remote")]
                 self.mobile.available(),
+                #[cfg(feature = "android-remote")]
+                self.mobile.advertised_workspace(),
             ) {
                 Ok(discovery) => self.discovery = Some(discovery),
                 Err(error) => self.discovery_error = Some(error.to_string()),
@@ -621,11 +623,15 @@ impl Desktop {
         self.tick_group_compat(ctx);
         if let Some(state) = self.group.workspace.clone() {
             #[cfg(feature = "android-remote")]
-            self.mobile.route(
+            if self.mobile.route(
                 Some(&state),
                 &self.public_key,
                 self.quitting || self.install_pending || self.prefs.pause_local_sharing,
-            );
+                self.group.service.as_ref(),
+            ) {
+                self.discovery = None;
+                ctx.request_repaint();
+            }
             if self.group.selected.is_empty() {
                 self.group.selected = self.public_key.clone();
             }
@@ -744,12 +750,16 @@ impl Desktop {
             self.tick_group_monitor(&state, ctx);
         }
         #[cfg(feature = "android-remote")]
-        if self.group.workspace.is_none() {
-            self.mobile.route(
+        if self.group.workspace.is_none()
+            && self.mobile.route(
                 None,
                 &self.public_key,
                 self.quitting || self.install_pending || self.prefs.pause_local_sharing,
-            );
+                self.group.service.as_ref(),
+            )
+        {
+            self.discovery = None;
+            ctx.request_repaint();
         }
         let mut node = self.local_node();
         self.group.data.report(&mut node);

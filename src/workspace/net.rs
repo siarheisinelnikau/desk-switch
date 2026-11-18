@@ -233,6 +233,12 @@ struct Hello {
     #[cfg(feature = "android-remote")]
     #[serde(default)]
     phone_preview: bool,
+    #[cfg(feature = "android-remote")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    phone_pairing_status: Option<bool>,
+    #[cfg(feature = "android-remote")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    phone_known: Option<bool>,
 }
 impl Hello {
     fn validate(&self) -> Result<()> {
@@ -293,6 +299,8 @@ pub(crate) struct Candidate {
     pub(crate) workspace_protocol: Option<u16>,
     #[cfg(feature = "android-remote")]
     pub(crate) phone_preview: bool,
+    #[cfg(feature = "android-remote")]
+    pub(crate) phone_known: Option<bool>,
 }
 pub(crate) async fn authenticate(
     stream: TcpStream,
@@ -347,6 +355,10 @@ async fn authenticate_version(
         workspace_protocol: Some(crate::group::model::PROTOCOL),
         #[cfg(feature = "android-remote")]
         phone_preview: true,
+        #[cfg(feature = "android-remote")]
+        phone_pairing_status: (!outgoing && port == crate::mobile::CONTROL_PORT).then_some(true),
+        #[cfg(feature = "android-remote")]
+        phone_known: None,
     })?;
     let mut remote = None;
     let mut buffer = vec![0; LIMIT];
@@ -395,6 +407,8 @@ async fn authenticate_version(
         workspace_protocol: remote.workspace_protocol,
         #[cfg(feature = "android-remote")]
         phone_preview: remote.phone_preview,
+        #[cfg(feature = "android-remote")]
+        phone_known: remote.phone_known,
     })
 }
 
@@ -1268,6 +1282,10 @@ mod tests {
             workspace_protocol: None,
             #[cfg(feature = "android-remote")]
             phone_preview: false,
+            #[cfg(feature = "android-remote")]
+            phone_pairing_status: None,
+            #[cfg(feature = "android-remote")]
+            phone_known: None,
         };
         assert!(unsupported.validate().is_err());
     }

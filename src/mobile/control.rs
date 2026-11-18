@@ -141,27 +141,46 @@ pub(super) async fn run(
     own: String,
     texts: mpsc::Sender<super::Text>,
     mut plan: tokio::sync::watch::Receiver<super::hub::Plan>,
-    routing: (bool, bool, PreviewRoute, super::screen::Provider),
+    routing: (
+        bool,
+        bool,
+        Option<String>,
+        PreviewRoute,
+        super::screen::Provider,
+    ),
     stop: tokio::sync::watch::Receiver<bool>,
 ) -> Result<()> {
     use super::{Destination, screen};
     use serde_json::json;
-    let (local, shared, (remote_request, mut remote_frames), provider) = routing;
+    let (local, shared, workspace, (remote_request, mut remote_frames), provider) = routing;
     let capable = peer.phone_preview;
     let (mut reader, writer) = Control::from_candidate(peer);
+    let authorized = |state: &super::hub::Plan| {
+        workspace.as_ref().is_none_or(|id| {
+            state
+                .routing
+                .workspace
+                .as_ref()
+                .is_some_and(|scope| &scope.id == id && scope.grants(&key))
+        })
+    };
+    let shared = |state: &super::hub::Plan| {
+        workspace.is_some() || state.sharing.get(&key).copied().unwrap_or(shared)
+    };
     let permit = |state: &super::hub::Plan| {
-        provider.available()
+        authorized(state)
+            && provider.available()
             && !matches!(state.routing.destination, Destination::Paused { .. })
             && if local {
                 matches!(state.routing.destination, Destination::Local)
             } else {
-                !state.sharing.get(&key).copied().unwrap_or(shared)
-                    || matches!(state.routing.destination, Destination::Local)
+                !shared(state) || matches!(state.routing.destination, Destination::Local)
             }
     };
     let remote_permit = |state: &super::hub::Plan| {
-        !local
-            && state.sharing.get(&key).copied().unwrap_or(shared)
+        authorized(state)
+            && !local
+            && shared(state)
             && matches!(state.routing.destination, Destination::Remote { .. })
     };
     let remote_options = |options: screen::Options, state: &super::hub::Plan| screen::Options {

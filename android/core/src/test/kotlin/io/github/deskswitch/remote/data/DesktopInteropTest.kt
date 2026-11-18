@@ -38,6 +38,14 @@ class DesktopInteropTest {
         session.preview(ScreenOptions(enabled = true, fps = 15))
         session.text("Привет, TV 👋")
         assertTrue("The synthetic cursor frame arrived alongside input", preview.await(3, TimeUnit.SECONDS))
+        // Exercise several native heartbeat intervals while adjusting preview
+        // settings and submitting motion faster than one input per frame.
+        repeat(18) { burst ->
+            session.preview(ScreenOptions(enabled = true, fps = if (burst % 2 == 0) 10 else 15))
+            repeat(24) { session.input(Input.Move(1, 0)) }
+            Thread.sleep(120)
+        }
+        assertEquals("Motion and preview traffic kept the session alive", 1L, closed.count)
         session.preview(ScreenOptions())
         session.input(Input.Key(14, true))
         session.input(Input.Key(14, false))

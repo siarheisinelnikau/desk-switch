@@ -20,7 +20,7 @@ def check(package, android_experiment=None):
         actual = subprocess.check_output(["dpkg-deb", "--field", str(package), field], text=True).strip()
         assert actual == expected, (field, actual)
     dependencies = subprocess.check_output(["dpkg-deb", "--field", str(package), "Depends"], text=True)
-    for required in ["ddcutil", "pipewire-bin", "pipewire-pulse", "pulseaudio-utils", "acl", "udev", "python3", "pkexec", "polkitd", "openssl", "libdbus-1-3", "zenity", "fuse3", "xwayland"]:
+    for required in ["ddcutil", "pipewire-bin", "pipewire-pulse", "pulseaudio-utils", "acl", "udev", "kmod", "python3", "pkexec", "polkitd", "openssl", "libdbus-1-3", "zenity", "fuse3", "xwayland"]:
         assert any(re.fullmatch(r"\s*" + re.escape(required) + r"(?:\s*\([^)]*\))?\s*", dependency)
                    for dependency in dependencies.split(",")), f"{required} must be a required runtime dependency"
     with tempfile.TemporaryDirectory(prefix="desk-switch-deb-check-") as temporary:
@@ -33,18 +33,19 @@ def check(package, android_experiment=None):
         assert helper.is_file() and os.access(helper, os.X_OK)
         rule = extracted / "usr/lib/udev/rules.d/99-desk-switch-input-access.rules"
         assert rule.is_file() and 'input-access --restore %k' in rule.read_text()
+        assert 'SUBSYSTEM=="misc", KERNEL=="uinput", RUN+="/usr/lib/desk-switch/native-input-access --restore"' in rule.read_text()
         control = work / "control"
         subprocess.run(["dpkg-deb", "--control", str(package), str(control)], check=True)
         postinst = control / "postinst"
         assert os.access(postinst, os.X_OK) and "--reload-rules" in postinst.read_text()
         assert "trigger" not in postinst.read_text(), "installation must not trigger real input devices"
         subprocess.run(["sh", "-n", str(postinst)], check=True)
-        for action, executable in [("input-access", "input-access"), ("update", "update-install")]:
+        for action, executable, active in [("input-access", "input-access", "yes"), ("native-input-access", "native-input-access", "auth_admin"), ("update", "update-install", "yes")]:
             helper_path = extracted / f"usr/lib/desk-switch/{executable}"
             assert helper_path.is_file() and os.access(helper_path, os.X_OK)
             assert helper_path.read_text().startswith("#!/usr/bin/python3 -I")
             policy = ET.parse(extracted / f"usr/share/polkit-1/actions/com.deskswitch.{action}.policy").getroot().find("action")
-            assert policy.findtext("defaults/allow_active") == "yes"
+            assert policy.findtext("defaults/allow_active") == active
             assert policy.findtext("defaults/allow_any") == policy.findtext("defaults/allow_inactive") == "no"
             assert policy.find("annotate[@key='org.freedesktop.policykit.exec.path']").text == f"/usr/lib/desk-switch/{executable}"
         assert (extracted / "usr/share/desk-switch/update-public-key.hex").read_bytes() == (ROOT / "release/update-public-key.hex").read_bytes()
@@ -65,7 +66,7 @@ def check(package, android_experiment=None):
         for notice in ["cap-std-LICENSE-MIT", "rfd-LICENSE", "rfd-window-identifier-LICENSE", "fuser-LICENSE-MIT", "nix-LICENSE-MIT", "page-size-LICENSE-MIT", "ref-cast-LICENSE-MIT"]:
             assert (extracted / "usr/share/doc/desk-switch" / notice).read_bytes() == (ROOT / "assets/third-party/file-transfer" / notice).read_bytes()
         assert (extracted / "usr/share/doc/desk-switch/THIRD-PARTY-NOTICES.md").read_bytes() == (ROOT / "THIRD-PARTY-NOTICES.md").read_bytes()
-        print("PASS: Debian metadata, required utilities, fixed password-free policies, pinned update key, menu icon, launcher, package-owned binary and third-party notices")
+        print("PASS: Debian metadata, required utilities, authorization policies, pinned update key, menu icon, launcher, package-owned binary and third-party notices")
 
 
 if __name__ == "__main__":

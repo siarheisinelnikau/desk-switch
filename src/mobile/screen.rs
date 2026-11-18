@@ -8,11 +8,12 @@ use std::{sync::Arc, time::Duration};
 use tokio::{
     sync::watch,
     task::JoinHandle,
-    time::{MissedTickBehavior, interval},
+    time::{MissedTickBehavior, interval, sleep},
 };
 
 pub const MIME: &str = "application/x-desk-switch-screen-options+json";
 pub const MAX_PNG: usize = 40 * 1024;
+const CAPTURE_RETRY_DELAY: Duration = Duration::from_secs(2);
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(default, deny_unknown_fields)]
@@ -136,19 +137,23 @@ pub(super) enum Provider {
     Native,
     #[cfg(test)]
     Synthetic,
+    #[cfg(test)]
+    Fixture(fn() -> Result<Option<Arc<Vec<u8>>>>),
 }
 impl Provider {
     pub(super) fn available(self) -> bool {
         match self {
             Self::Native => available(),
             #[cfg(test)]
-            Self::Synthetic => true,
+            Self::Synthetic | Self::Fixture(_) => true,
         }
     }
 
     fn frame(self) -> Result<Option<Arc<Vec<u8>>>> {
         match self {
             Self::Native => capture_shared(),
+            #[cfg(test)]
+            Self::Fixture(frame) => frame(),
             #[cfg(test)]
             Self::Synthetic => {
                 use image::ImageEncoder;
@@ -176,6 +181,7 @@ pub(super) fn start(
     let (send, frames) = watch::channel(None);
     let task = tokio::spawn(async move {
         let mut last_digest = None;
+        let mut last_failure = None;
         loop {
             if *stop.borrow() {
                 return;
@@ -185,6 +191,7 @@ pub(super) fn start(
             if !current.enabled || !permitted {
                 send.send_replace(None);
                 last_digest = None;
+                last_failure = None;
                 tokio::select! {
                     value = options.changed() => if value.is_err() { return },
                     value = allowed.changed() => if value.is_err() { return },
@@ -219,24 +226,34 @@ pub(super) fn start(
                 if *stop.borrow() || !*allowed.borrow() || *options.borrow() != current {
                     break;
                 }
-                match result {
+                let failure = match result {
                     Ok(Ok(Some(bytes))) => {
                         let digest = Sha256::digest(bytes.as_slice());
                         if last_digest.as_ref() != Some(&digest) {
                             last_digest = Some(digest);
+                            last_failure = None;
                             send.send_replace(Some(Frame::Png(bytes)));
                         }
+                        continue;
                     }
-                    Ok(Ok(None)) => {}
-                    _ => {
-                        send.send_replace(Some(Frame::Unavailable(
-                            "Cursor preview could not capture this desktop".into(),
-                        )));
-                        // An error waits for an explicit options/permission change.
-                        tokio::select! { _ = stop.changed() => {}, _ = options.changed() => {}, _ = allowed.changed() => {} }
-                        break;
-                    }
+                    Ok(Ok(None)) => continue,
+                    Ok(Err(error)) => crate::platform::screen::failure_status(&error),
+                    Err(_) => "Could not capture this desktop",
+                };
+                if last_failure != Some(failure) {
+                    last_failure = Some(failure);
+                    last_digest = None;
+                    send.send_replace(Some(Frame::Unavailable(failure.into())));
                 }
+                // GNOME can load its companion or unlock while the phone still
+                // requests preview. Keep retries independent of the frame rate.
+                tokio::select! {
+                    value = stop.changed() => if value.is_err() { return },
+                    value = options.changed() => if value.is_err() { return },
+                    value = allowed.changed() => if value.is_err() { return },
+                    _ = sleep(CAPTURE_RETRY_DELAY) => {},
+                }
+                break;
             }
         }
     });
@@ -342,5 +359,38 @@ mod tests {
             parse_frame(&Frame::Unavailable("Paused".into()).packet(&key).unwrap(), &key).unwrap(),
             Some(Frame::Unavailable(reason)) if reason == "Paused"
         ));
+    }
+
+    #[tokio::test]
+    async fn active_preview_recovers_from_capture_failure_with_the_same_pixels() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        static CAPTURES: AtomicUsize = AtomicUsize::new(0);
+        let provider = Provider::Fixture(|| {
+            if CAPTURES.fetch_add(1, Ordering::Relaxed) == 1 {
+                anyhow::bail!("Private backend detail");
+            }
+            Provider::Synthetic.frame()
+        });
+        let (options, requested) = watch::channel(Options {
+            enabled: true,
+            fps: 5,
+            ..Default::default()
+        });
+        let (_allow, allowed) = watch::channel(true);
+        let (cancel, stop) = watch::channel(false);
+        let (mut frames, worker) = start(provider, requested, allowed, stop);
+
+        tokio::time::timeout(Duration::from_secs(8), async {
+            frames.wait_for(|frame| matches!(frame, Some(Frame::Png(_)))).await.unwrap();
+            frames.wait_for(|frame| matches!(frame, Some(Frame::Unavailable(status)) if status == "Could not capture this desktop")).await.unwrap();
+            frames.wait_for(|frame| matches!(frame, Some(Frame::Png(_)))).await.unwrap();
+            options.send_replace(Options::default());
+            frames.wait_for(Option::is_none).await.unwrap();
+            cancel.send_replace(true);
+            worker.await.unwrap();
+        })
+        .await
+        .unwrap();
     }
 }

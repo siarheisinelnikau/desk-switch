@@ -113,4 +113,10 @@
     <string name="device_protocol_mismatch">Версии протокола устройства не совпадают. Приложение ожидает %1$d. Компьютер использует %2$d.</string>
     <string name="workspace_protocol_mismatch">Версии протокола рабочего пространства не совпадают. Приложение ожидает %1$d. Компьютер использует %2$d.</string>
     <string name="update_error_install_failed">Android не удалось установить обновление. Можно попробовать снова.</string>
+    <string name="workspace_name">Рабочее пространство Desk Switch</string>
+    <string name="choose_connection">Выберите рабочее пространство или компьютер в вашей сети Wi-Fi.</string>
+    <string name="saved_connections">ВАШИ ПОДКЛЮЧЕНИЯ</string>
+    <string name="saved_workspace">Сохранённое рабочее пространство</string>
+    <string name="workspace_via">Через %1$s</string>
+    <string name="workspace_forgotten">Рабочее пространство удалено</string>
 </resources>

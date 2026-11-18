@@ -11,11 +11,17 @@ from unittest.mock import Mock
 import unittest
 from unittest.mock import patch
 
-path = Path(__file__).resolve().parents[1] / 'packaging/linux/desk-switch-input-access'
-loader = importlib.machinery.SourceFileLoader('input_access', str(path))
-spec = importlib.util.spec_from_loader(loader.name, loader)
-helper = importlib.util.module_from_spec(spec)
-loader.exec_module(helper)
+def load(name):
+    path = Path(__file__).resolve().parents[1] / f'packaging/linux/desk-switch-{name}'
+    loader = importlib.machinery.SourceFileLoader(name, str(path))
+    spec = importlib.util.spec_from_loader(loader.name, loader)
+    module = importlib.util.module_from_spec(spec)
+    loader.exec_module(module)
+    return module
+
+
+helper = load('input-access')
+native = load('native-input-access')
 
 
 class InputAccessTests(unittest.TestCase):
@@ -149,6 +155,50 @@ class PersistentInputTests(unittest.TestCase):
                        dict(self.device, name='injected\nrule'), dict(self.device, mouse='true'),
                        dict(self.device, keyboard=False)]:
             with self.assertRaises(ValueError): self.store.save(self.uid, [device])
+
+
+class NativeInputAccessTests(unittest.TestCase):
+    def test_grant_and_revoke_target_only_the_authenticated_account_and_uinput(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            user = types.SimpleNamespace(pw_uid=1001, pw_name='fixture-user')
+            with patch.object(native, 'STATE', root), patch.object(native, 'MODULE', root / 'uinput.conf'), \
+                 patch.object(native, 'descriptor', return_value=71), patch.object(os, 'close'), \
+                 patch.object(native.subprocess, 'run') as run:
+                native.change_locked(user, True)
+                self.assertEqual((root / '1001').read_text(), '"fixture-user"')
+                self.assertEqual((root / 'uinput.conf').read_text(), 'uinput\n')
+                self.assertEqual(run.call_args.args[0],
+                                 ['/usr/bin/setfacl', '--modify', 'u:1001:rw', '/proc/self/fd/71'])
+                self.assertEqual(run.call_args.kwargs['pass_fds'], (71,))
+                native.change_locked(user, False)
+                self.assertFalse((root / '1001').exists())
+                self.assertFalse((root / 'uinput.conf').exists())
+                self.assertEqual(run.call_args.args[0],
+                                 ['/usr/bin/setfacl', '--remove', 'u:1001', '/proc/self/fd/71'])
+
+    def test_restore_never_grants_a_reassigned_uid(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / '1001').write_text('"fixture-user"')
+            (root / '1002').write_text('"former-user"')
+            (root / 'outside').write_text('"another-user"')
+            with patch.object(native, 'STATE', root), patch.object(native, 'trusted'), \
+                 patch.object(native, 'descriptor', return_value=71), patch.object(os, 'close'), \
+                 patch.object(native.pwd, 'getpwuid', side_effect=[
+                     types.SimpleNamespace(pw_uid=1001, pw_name='fixture-user'),
+                     types.SimpleNamespace(pw_uid=1002, pw_name='another-user')]), \
+                 patch.object(native, 'permission') as permission:
+                native.restore_locked()
+                permission.assert_called_once_with(1001, 71, True)
+
+    def test_virtual_access_cannot_be_redirected_to_a_physical_device(self):
+        metadata = types.SimpleNamespace(st_mode=stat.S_IFCHR, st_uid=0, st_rdev=os.makedev(13, 64))
+        with patch.object(os, 'open', return_value=71) as opened, \
+             patch.object(os, 'fstat', return_value=metadata), patch.object(os, 'close') as close:
+            with self.assertRaises(ValueError): native.descriptor()
+            self.assertEqual(opened.call_args.args[0], Path('/dev/uinput'))
+            close.assert_called_once_with(71)
 
 
 if __name__ == '__main__': unittest.main()

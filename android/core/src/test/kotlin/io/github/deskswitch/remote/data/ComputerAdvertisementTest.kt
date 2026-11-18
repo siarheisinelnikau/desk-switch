@@ -27,4 +27,14 @@ class ComputerAdvertisementTest {
             record() + ("app" to "other-app"),
         )) assertNull(ComputerAdvertisement.parse("fixture", "192.168.1.10", record))
     }
+
+    @Test fun workspaceAdvertisementIsAnOptionalCanonicalHint() {
+        val id = "1a".repeat(32)
+        val hinted = ComputerAdvertisement.parse("fixture", "192.168.1.10", record() + ("remote-workspace" to id))!!
+        assertEquals(id, hinted.advertisedWorkspaceId)
+        assertNull(hinted.workspace)
+        assertNull(hinted.key)
+        val malformed = ComputerAdvertisement.parse("fixture", "192.168.1.10", record() + ("remote-workspace" to id.uppercase()))!!
+        assertNull(malformed.advertisedWorkspaceId)
+    }
 }

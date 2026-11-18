@@ -1,6 +1,7 @@
 package io.github.deskswitch.remote.data
 
 import io.github.deskswitch.remote.domain.Computer
+import io.github.deskswitch.remote.domain.WorkspaceIdentity
 
 /** Capability hints from the original desktop announcement, never trust grants. */
 object ComputerAdvertisement {
@@ -18,6 +19,8 @@ object ComputerAdvertisement {
         require(host.isNotBlank() && host.length <= 253)
         val name = attributes["name"]?.trim()?.take(256)?.filterNot(Char::isISOControl)
             ?.takeIf { it.isNotBlank() } ?: serviceName.take(256)
-        Computer(name, host, port, inputPort, advertisedKey = key, previewSupported = attributes["screen-preview"] == "1")
+        val workspace = attributes["remote-workspace"]?.takeIf { WorkspaceIdentity.isCanonicalIdentity(it) }
+        Computer(name, host, port, inputPort, advertisedKey = key, previewSupported = attributes["screen-preview"] == "1",
+            advertisedWorkspaceId = workspace)
     }.getOrNull()
 }

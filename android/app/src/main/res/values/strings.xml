@@ -113,4 +113,10 @@
     <string name="device_protocol_mismatch">Device protocol mismatch. This app expects %1$d. The computer uses %2$d.</string>
     <string name="workspace_protocol_mismatch">Workspace protocol mismatch. This app expects %1$d. The computer uses %2$d.</string>
     <string name="update_error_install_failed">Android couldn’t install the update. You can try again.</string>
+    <string name="workspace_name">Desk Switch workspace</string>
+    <string name="choose_connection">Choose a workspace or computer on your Wi-Fi.</string>
+    <string name="saved_connections">YOUR CONNECTIONS</string>
+    <string name="saved_workspace">Saved workspace</string>
+    <string name="workspace_via">Via %1$s</string>
+    <string name="workspace_forgotten">Workspace forgotten</string>
 </resources>

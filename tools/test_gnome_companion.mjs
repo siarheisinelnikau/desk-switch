@@ -17,6 +17,7 @@ let holdPreviewEncode = false, previewEncodeError = null, previewPaintError = nu
 stage.paint_to_content = function (rectangle, scale, colorState, flags) {
     if (previewPaintError) throw previewPaintError;
     assert.equal(scale, 1);
+    assert.equal(arguments.length, Number.parseInt(Config.PACKAGE_VERSION, 10) >= 50 ? 4 : 3);
     if (arguments.length === 3) flags = colorState;
     else assert.equal(colorState, null);
     assert.equal(flags, 2);
@@ -565,7 +566,8 @@ assert.deepEqual(Array.from(previewCapability.result.data), [1]);
 assert.equal(previewPaints.length, 0, 'capability queries must not capture screen pixels');
 const deniedPreview = new Invocation(':1.6');
 await previewExtension.CaptureCursorRegionAsync([384, 256], deniedPreview);
-assert(deniedPreview.error); assert.equal(previewPaints.length, 0,
+assert.match(deniedPreview.error.name, /\.CursorPreviewAccessDenied$/);
+assert.equal(previewPaints.length, 0,
     'an input child or unrelated caller cannot capture through the GUI-only API');
 for (const size of [[0, 256], [127, 256], [641, 256], [384, 95], [384, 481], [384.5, 256]]) {
     const invalid = new Invocation(); await previewExtension.CaptureCursorRegionAsync(size, invalid);
@@ -574,12 +576,14 @@ for (const size of [[0, 256], [127, 256], [641, 256], [384, 95], [384, 481], [38
 for (const [owner, field] of [[Main.sessionMode, 'isLocked'], [Main.sessionMode, 'isGreeter'], [Main.screenShield, 'locked']]) {
     owner[field] = true;
     const locked = new Invocation(); await previewExtension.CaptureCursorRegionAsync([384, 256], locked);
-    assert(locked.error); assert.equal(previewPaints.length, 0);
+    assert.match(locked.error.name, /\.CursorPreviewLocked$/);
+    assert.equal(previewPaints.length, 0);
     owner[field] = false;
 }
 Main.sessionMode.allowScreencast = false;
 const restricted = new Invocation(); await previewExtension.CaptureCursorRegionAsync([384, 256], restricted);
-assert(restricted.error); assert.equal(previewPaints.length, 0);
+assert.match(restricted.error.name, /\.CursorPreviewUnsupported$/);
+assert.equal(previewPaints.length, 0);
 Main.sessionMode.allowScreencast = true;
 
 pointer[0] = -1915; pointer[1] = 4;

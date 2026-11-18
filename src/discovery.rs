@@ -51,6 +51,7 @@ impl Discovery {
         control_port: u16,
         ctx: eframe::egui::Context,
         #[cfg(feature = "android-remote")] phone_remote: bool,
+        #[cfg(feature = "android-remote")] phone_workspace: Option<&str>,
     ) -> Result<Self> {
         ensure!(
             control_port != 0 && public_key.len() == 64,
@@ -82,6 +83,9 @@ impl Discovery {
         let properties = {
             let mut properties = properties;
             if phone_remote {
+                if let Some(workspace) = phone_workspace {
+                    properties.insert("remote-workspace".into(), workspace.to_owned());
+                }
                 properties.insert("screen-preview".into(), "1".into());
                 properties.insert("screen-preview-allowed".into(), "1".into());
                 if crate::mobile::screen::available() {

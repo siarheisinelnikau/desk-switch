@@ -4,6 +4,8 @@ pub(crate) mod linux_geometry;
 #[cfg(target_os = "linux")]
 mod linux_host;
 #[cfg(target_os = "linux")]
+mod linux_input;
+#[cfg(target_os = "linux")]
 mod linux_monitor;
 #[cfg(target_os = "macos")]
 mod macos;
@@ -17,6 +19,8 @@ mod monitor_service;
 #[cfg(target_os = "linux")]
 pub mod portal;
 mod receiver;
+#[cfg(target_os = "linux")]
+mod uinput;
 #[cfg(target_os = "linux")]
 pub use linux_monitor::{discover, probe};
 #[cfg(target_os = "linux")]
@@ -147,6 +151,7 @@ pub fn run(
                 settings.edge,
                 settings.capture,
                 video,
+                settings.absolute_input,
             ));
             #[cfg(windows)]
             windows::run(
@@ -166,7 +171,8 @@ pub fn run(
             }
             #[cfg(target_os = "linux")]
             {
-                let mut sink = portal::Portal::open(settings.edge).await?;
+                let mut sink =
+                    linux_input::LinuxInput::open(settings.edge, settings.absolute_input).await?;
                 let result = receiver::run(address, identity, peer, &mut sink, video).await;
                 sink.close().await;
                 result

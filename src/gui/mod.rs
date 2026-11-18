@@ -77,6 +77,8 @@ enum QueryKind {
     Monitors,
     #[cfg(target_os = "linux")]
     InputAccess,
+    #[cfg(target_os = "linux")]
+    NativeInputAccess,
 }
 
 fn update_failure_status(preparing: bool, error: &anyhow::Error) -> String {
@@ -720,6 +722,8 @@ impl Desktop {
                 args.extend(self.input_permission_paths());
                 args
             }
+            #[cfg(target_os = "linux")]
+            QueryKind::NativeInputAccess => vec!["native-input-access".into()],
             QueryKind::Monitors => vec![
                 "monitor-read".into(),
                 self.prefs.workspace.monitor.id.clone(),
@@ -1039,6 +1043,18 @@ impl Desktop {
                         );
                         self.retry_devices();
                     }
+                    #[cfg(target_os = "linux")]
+                    QueryKind::NativeInputAccess => {
+                        anyhow::ensure!(
+                            value["native_input_access"] == true,
+                            "Native input permission was not granted"
+                        );
+                        self.group.data.restart_input();
+                        if let Some(worker) = &mut self.input {
+                            worker.stop();
+                        }
+                        self.retry_devices();
+                    }
                     QueryKind::Monitors => {
                         let monitor: MonitorInfo = serde_json::from_value(value)?;
                         anyhow::ensure!(
@@ -1071,6 +1087,10 @@ impl Desktop {
                     #[cfg(target_os = "linux")]
                     QueryKind::InputAccess => {
                         "Keyboard and mouse permission is saved, including after USB reconnection and restart."
+                    }
+                    #[cfg(target_os = "linux")]
+                    QueryKind::NativeInputAccess => {
+                        "Native keyboard and mouse permission is saved."
                     }
                     _ => "Список устройств обновлён.",
                 };
@@ -1319,7 +1339,8 @@ impl Desktop {
 
 #[cfg(target_os = "linux")]
 fn input_permission_error(line: &str) -> bool {
-    line.contains("Permission denied") || line.contains("os error 13")
+    !line.starts_with("Native input is unavailable.")
+        && (line.contains("Permission denied") || line.contains("os error 13"))
 }
 
 #[cfg(target_os = "linux")]

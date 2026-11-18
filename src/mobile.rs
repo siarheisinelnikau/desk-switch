@@ -20,7 +20,7 @@ use tokio::{
 mod control;
 mod routing;
 pub(crate) mod screen;
-pub use routing::{Destination, Device, Routing};
+pub use routing::{Destination, Device, Routing, WorkspaceAccess};
 pub(crate) mod hub;
 mod relay;
 
@@ -47,6 +47,12 @@ pub enum Event {
     Status(String),
     Trusted(BTreeMap<String, Trusted>),
     Devices(BTreeMap<String, Device>),
+    WorkspaceApproval {
+        workspace: String,
+        key: String,
+        name: String,
+        reapprove: bool,
+    },
 }
 pub struct Text {
     pub value: String,
@@ -303,6 +309,7 @@ struct Session {
     id: u64,
     relay: bool,
     admitted: bool,
+    workspace: Option<String>,
     stop: watch::Sender<bool>,
 }
 struct Server {
@@ -326,6 +333,8 @@ async fn serve(
     mut changing: watch::Receiver<hub::Plan>,
 ) -> Result<()> {
     let mut tasks = tokio::task::JoinSet::new();
+    let mut peers = saved(&server.dir)?;
+    let mut settings = changing.borrow().settings;
     server
         .notify
         .send(Event::Status("Ready for phone remotes".into()));
@@ -333,12 +342,37 @@ async fn serve(
         tokio::select! {
             _ = stopped(&mut stop) => break,
             _ = changing.changed() => {
-                let peers = saved(&server.dir)?;
-                let plan = changing.borrow().clone();
-                for (key, session) in server.sessions.borrow().iter() {
-                    if session.relay && !plan.routing.members.contains(key) || !session.relay && session.admitted && !peers.contains_key(key) { session.stop.send_replace(true); }
+                let (current_settings, workspace) = {
+                    let plan = changing.borrow();
+                    (plan.settings, plan.routing.workspace.clone())
+                };
+                let settings_changed = settings != current_settings;
+                if settings_changed {
+                    settings = current_settings;
+                    peers = saved(&server.dir)?;
                 }
-                server.notify.send(Event::Trusted(peers));
+                let pruned = if let Some(workspace) = &workspace {
+                    remove_local_duplicates(&server, workspace, &mut peers)?
+                } else {
+                    false
+                };
+                if settings_changed || pruned {
+                    server.notify.send(Event::Trusted(peers.clone()));
+                }
+                let plan = changing.borrow();
+                for (key, session) in server.sessions.borrow().iter() {
+                    let allowed = if session.relay {
+                        plan.routing.members.contains(key)
+                    } else if !session.admitted {
+                        true
+                    } else if let Some(workspace) = &session.workspace {
+                        plan.routing.workspace.as_ref().is_some_and(|current| &current.id == workspace && current.grants(key))
+                    } else {
+                        peers.contains_key(key)
+                            && !workspace.as_ref().is_some_and(|scope| scope.grants.contains_key(key))
+                    };
+                    if !allowed { session.stop.send_replace(true); }
+                }
             },
             stream = control.accept() => {
                 let (stream, _) = stream?;
@@ -372,6 +406,32 @@ async fn serve(
     tasks.abort_all();
     Ok(())
 }
+
+fn remove_local_duplicates(
+    server: &Server,
+    workspace: &WorkspaceAccess,
+    peers: &mut BTreeMap<String, Trusted>,
+) -> Result<bool> {
+    if !peers.keys().any(|key| workspace.grants.contains_key(key)) {
+        return Ok(false);
+    }
+    let _lock = server.trust_lock.lock().unwrap();
+    let mut current = saved(&server.dir)?;
+    current.retain(|key, _| !workspace.grants.contains_key(key));
+    config::write_atomic(
+        &server.dir.join("mobile-peers.json"),
+        &serde_json::to_string(&current)?,
+    )?;
+    server.state.send_if_modified(|plan| {
+        let len = plan.sharing.len();
+        plan.sharing
+            .retain(|key, _| !workspace.grants.contains_key(key));
+        plan.sharing.len() != len
+    });
+    *peers = current;
+    Ok(true)
+}
+
 fn control_port(_: &Server) -> u16 {
     CONTROL_PORT
 }
@@ -382,33 +442,24 @@ async fn session(server: Rc<Server>, peer: Candidate) -> Result<()> {
     server.sequence.set(id.wrapping_add(1));
     let relay = server.state.borrow().routing.members.contains(&key);
     let (stop, mut stopping) = watch::channel(false);
-    let admitted = relay || saved(&server.dir)?.contains_key(&key);
     if let Some(old) = server.sessions.borrow_mut().insert(
         key.clone(),
         Session {
             id,
             relay,
-            admitted,
+            admitted: relay,
+            workspace: None,
             stop,
         },
     ) {
         old.stop.send_replace(true);
     }
-    let mut plan = server.state.subscribe();
     let result = {
         let remote = remote(&server, peer, id, relay, stopping.clone());
         tokio::pin!(remote);
-        loop {
-            tokio::select! {
-                result = &mut remote => break result,
-                _ = stopped(&mut stopping) => break timeout(Duration::from_secs(3), &mut remote).await.unwrap_or_else(|_| Ok(())),
-                _ = plan.changed() => {
-                    let permitted = if relay { plan.borrow().routing.members.contains(&key) } else { saved(&server.dir)?.contains_key(&key) };
-                    // A new phone is awaiting explicit approval, so its absence
-                    // from the durable trust file is expected until Pinned.
-                    if relay && !permitted { break Ok(()); }
-                },
-            }
+        tokio::select! {
+            result = &mut remote => result,
+            _ = stopped(&mut stopping) => timeout(Duration::from_secs(3), &mut remote).await.unwrap_or_else(|_| Ok(())),
         }
     };
     if server
@@ -448,12 +499,42 @@ async fn remote(
     );
     let key = config::hex(&peer.key);
     let peers = saved(&server.dir)?;
-    let was_trusted = peers.contains_key(&key);
-    let decision = if !relay && !was_trusted {
-        ensure!(
-            peers.len() < 16,
-            "Forget a phone before adding another remote"
-        );
+    let local = peers.get(&key);
+    let workspace = (!relay)
+        .then(|| server.state.borrow().routing.workspace.clone())
+        .flatten()
+        .filter(|scope| scope.grants.contains_key(&key) || local.is_none_or(|phone| phone.shared));
+    let was_trusted = if let Some(scope) = &workspace {
+        scope.grants(&key)
+            || scope.can_enroll
+                && scope.may_migrate(&key)
+                && local.is_some_and(|phone| phone.shared)
+    } else {
+        local.is_some()
+    };
+    let error = if relay || was_trusted {
+        None
+    } else if workspace.as_ref().is_some_and(|scope| !scope.can_enroll) {
+        Some("Update Desk Switch on each workspace computer before adding a phone.")
+    } else if workspace
+        .as_ref()
+        .map_or(peers.len(), |scope| scope.grants.values().flatten().count())
+        >= crate::group::model::MAX_PHONE_REMOTES
+    {
+        Some("Forget a phone before adding another remote.")
+    } else {
+        None
+    };
+    let confirm = !relay && (!was_trusted || peer.phone_known == Some(false));
+    if peer.phone_known.is_some() {
+        let mut status = json!({"PhonePairing":{"confirm":confirm}});
+        if let Some(error) = error {
+            status["PhonePairing"]["error"] = json!(error);
+        }
+        peer.send_json(&status).await?;
+    }
+    ensure!(error.is_none(), "{}", error.unwrap_or_default());
+    let decision = if confirm {
         let (reply, decision) = oneshot::channel();
         server.notify.send(Event::Pair(Pending {
             key: key.clone(),
@@ -467,23 +548,31 @@ async fn remote(
     };
     let approved = timeout(Duration::from_secs(90), async {
         if let Some(mut decision) = decision {
+            {
+                let received = peer.receive_json();
+                tokio::pin!(received);
+                tokio::select! {
+                    approved = &mut decision => {
+                        if !approved? { return Ok::<_, anyhow::Error>(false); }
+                        ensure!(received.await? == json!({"Decision":true}), "Phone did not confirm pairing");
+                        return Ok(true);
+                    },
+                    value = &mut received => {
+                        ensure!(value? == json!({"Decision":true}), "Phone did not confirm pairing");
+                    },
+                }
+            }
             tokio::select! {
-                approved = &mut decision => {
-                    if !approved? { return Ok::<_, anyhow::Error>(false); }
-                    ensure!(peer.receive_json().await? == json!({"Decision":true}), "Phone did not confirm pairing");
-                    Ok(true)
-                },
-                value = peer.receive_json() => {
-                    ensure!(value? == json!({"Decision":true}), "Phone did not confirm pairing");
-                    tokio::select! {
-                        approved = decision => Ok(approved?),
-                        closed = peer.receive_json() => { let _ = closed?; anyhow::bail!("Unexpected phone record before consent") },
-                    }
-                },
+                approved = decision => Ok(approved?),
+                closed = peer.receive_json() => { let _ = closed?; anyhow::bail!("Unexpected phone record before consent") },
             }
         } else { ensure!(peer.receive_json().await? == json!({"Decision":true}), "Phone did not confirm pairing"); Ok(true) }
     }).await??;
-    peer.send_json(&json!({"Decision":approved})).await?;
+    let mut response = json!({"Decision":approved});
+    if approved && let Some(scope) = &workspace {
+        response["workspace"] = json!({"id": scope.id, "members": scope.peers});
+    }
+    peer.send_json(&response).await?;
     ensure!(approved, "Pairing declined");
     ensure!(
         timeout(Duration::from_secs(5), peer.receive_json()).await?? == json!("Pinned"),
@@ -495,9 +584,50 @@ async fn remote(
             "The relay computer left the workspace"
         );
         false
+    } else if let Some(scope) = &workspace {
+        let mut plan = server.state.subscribe();
+        if !scope.grants(&key) {
+            server.notify.send(Event::WorkspaceApproval {
+                reapprove: !scope.may_migrate(&key),
+                workspace: scope.id.clone(),
+                key: key.clone(),
+                name: peer.name.clone(),
+            });
+        }
+        timeout(Duration::from_secs(12), async {
+            loop {
+                let approved = {
+                    let state = plan.borrow();
+                    let current = state
+                        .routing
+                        .workspace
+                        .as_ref()
+                        .filter(|current| current.id == scope.id)
+                        .context("The workspace is unavailable")?;
+                    current.grants(&key)
+                };
+                if approved {
+                    return Ok::<_, anyhow::Error>(());
+                }
+                plan.changed().await?;
+            }
+        })
+        .await
+        .context("Waiting for workspace phone approval")??;
+        true
     } else {
         let current = {
             let _lock = server.trust_lock.lock().unwrap();
+            ensure!(
+                !server
+                    .state
+                    .borrow()
+                    .routing
+                    .workspace
+                    .as_ref()
+                    .is_some_and(|scope| scope.grants.contains_key(&key)),
+                "Workspace phone approval changed; connect again"
+            );
             let mut current = saved(&server.dir)?;
             ensure!(
                 !was_trusted || current.contains_key(&key),
@@ -522,11 +652,6 @@ async fn remote(
             current
         };
         let shared = current[&key].shared;
-        if let Some(session) = server.sessions.borrow_mut().get_mut(&key)
-            && session.id == id
-        {
-            session.admitted = true;
-        }
         server.state.send_modify(|state| {
             state.sharing.insert(key.clone(), shared);
             state.settings = state.settings.wrapping_add(1);
@@ -534,6 +659,16 @@ async fn remote(
         server.notify.send(Event::Trusted(current));
         shared
     };
+    let workspace_id = workspace.map(|scope| scope.id);
+    {
+        let mut sessions = server.sessions.borrow_mut();
+        let session = sessions
+            .get_mut(&key)
+            .filter(|session| session.id == id)
+            .context("Phone session was replaced")?;
+        session.admitted = true;
+        session.workspace = workspace_id.clone();
+    }
     let (send, native) = oneshot::channel();
     server.pending.borrow_mut().insert(
         peer.key,
@@ -547,7 +682,13 @@ async fn remote(
     let native = timeout(Duration::from_secs(10), native).await??;
     let source = server
         .hub
-        .register(key.clone(), peer.name.clone(), relay, shared)
+        .register(
+            key.clone(),
+            peer.name.clone(),
+            relay,
+            shared,
+            workspace_id.clone(),
+        )
         .await?;
     let (texts, receiver) = queue::channel(1);
     let (finished, finishing) = watch::channel(false);
@@ -557,7 +698,13 @@ async fn remote(
         config::hex(&server.identity.public),
         texts,
         server.state.subscribe(),
-        (relay, shared, source.remote_preview(), server.preview),
+        (
+            relay,
+            shared,
+            workspace_id,
+            source.remote_preview(),
+            server.preview,
+        ),
         finishing.clone(),
     );
     let receiving = crate::platform::mobile::run(native, receiver, finishing, source);

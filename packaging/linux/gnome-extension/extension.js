@@ -9,6 +9,13 @@ import {Extension} from 'resource:///org/gnome/shell/extensions/extension.js';
 import * as Config from 'resource:///org/gnome/shell/misc/config.js';
 import * as Main from 'resource:///org/gnome/shell/ui/main.js';
 
+class CursorPreviewError extends Error {
+    constructor(reason, message) {
+        super(message);
+        this.reason = reason;
+    }
+}
+
 const INDICATOR_ID = 'desk-switch';
 const CLIPBOARD_NAME = 'io.github.siarheisinelnikau.DeskSwitch.Clipboard';
 const CLIPBOARD_PATH = '/io/github/siarheisinelnikau/DeskSwitch/Clipboard';
@@ -428,22 +435,35 @@ export default class DeskSwitchTray extends Extension {
     _cursorPreviewSession() {
         if (!this._alive)
             throw new Error('The Desk Switch companion is disabled');
-        if (!Main.sessionMode?.allowScreencast || Main.sessionMode.isLocked ||
-            Main.sessionMode.isGreeter || Main.screenShield?.locked)
-            throw new Error('Cursor preview is unavailable while the desktop is locked');
-        if (typeof global.stage.paint_to_content !== 'function' ||
+        if (Main.sessionMode?.isLocked || Main.sessionMode?.isGreeter || Main.screenShield?.locked)
+            throw new CursorPreviewError('Locked', 'The desktop is locked');
+        if (!Main.sessionMode?.allowScreencast || typeof global.stage.paint_to_content !== 'function' ||
             typeof Shell.Screenshot.composite_to_stream !== 'function' ||
             !Number.isInteger(Clutter.PaintFlag?.FORCE_CURSORS))
-            throw new Error('This GNOME session does not support cursor preview');
+            throw new CursorPreviewError('Unsupported', 'This GNOME session does not support cursor preview');
+    }
+
+    async _authorizeCursorPreview(invocation) {
+        try {
+            // Managed input children may observe the pointer but cannot capture pixels.
+            await this._authorizeCaller(invocation);
+        } catch (error) {
+            throw new CursorPreviewError('AccessDenied', error.message);
+        }
+    }
+
+    _cursorPreviewError(invocation, error) {
+        const suffix = error instanceof CursorPreviewError ? error.reason : 'Unavailable';
+        invocation.return_dbus_error(`${CLIPBOARD_NAME}.CursorPreview${suffix}`, error.message);
     }
 
     async CursorPreviewVersionAsync(_parameters, invocation) {
         try {
-            await this._authorizeCaller(invocation);
+            await this._authorizeCursorPreview(invocation);
             this._cursorPreviewSession();
             invocation.return_value(new GLib.Variant('(u)', [1]));
         } catch (error) {
-            this._clipboardError(invocation, error);
+            this._cursorPreviewError(invocation, error);
         }
     }
 
@@ -455,7 +475,7 @@ export default class DeskSwitchTray extends Extension {
             const rectangle = await import('gi://Mtk').then(module => module.default.Rectangle)
                 .catch(() => Meta.Rectangle);
             if (typeof rectangle !== 'function')
-                throw new Error('This GNOME session has no capture rectangle API');
+                throw new CursorPreviewError('Unsupported', 'This GNOME session has no capture rectangle API');
             this._cursorPreviewRectangleType = rectangle;
         }
         return new this._cursorPreviewRectangleType(geometry);
@@ -492,9 +512,7 @@ export default class DeskSwitchTray extends Extension {
         let lease = null;
         let stream = null;
         try {
-            // Screen pixels keep the stricter exact-GUI-PID policy. Managed
-            // children may observe PointerState but cannot capture a screen.
-            await this._authorizeCaller(invocation);
+            await this._authorizeCursorPreview(invocation);
             this._cursorPreviewSession();
             const geometry = this._cursorPreviewGeometry(width, height);
             if (this._cursorPreviewLease !== null)
@@ -507,7 +525,7 @@ export default class DeskSwitchTray extends Extension {
                 throw new Error('Cursor preview was cancelled');
             const major = Number.parseInt(Config.PACKAGE_VERSION.split('.')[0], 10);
             if (!Number.isInteger(major) || major < 45)
-                throw new Error('This GNOME version does not support cursor preview');
+                throw new CursorPreviewError('Unsupported', 'This GNOME version does not support cursor preview');
             // Paint only the requested region at scale 1. Unlike capturing the
             // full stage then cropping, the backing texture is bounded here.
             const content = major >= 50
@@ -536,7 +554,7 @@ export default class DeskSwitchTray extends Extension {
                 throw new Error('Cursor preview exceeds its memory limit');
             invocation.return_value(new GLib.Variant('(ay)', [bytes]));
         } catch (error) {
-            this._clipboardError(invocation, error);
+            this._cursorPreviewError(invocation, error);
         } finally {
             if (stream && !stream.is_closed())
                 stream.close(null);

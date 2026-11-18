@@ -61,6 +61,7 @@ const USAGE: &str = "Desk Switch\n\
     internal-update-apply DIR  Apply a staged update\n\
     --apply-update         Apply an update from the shared installation\n\
     input-access PATH...   Grant selected input access (Linux)\n\
+    native-input-access [--revoke]  Change virtual input access (Linux)\n\
     macos-export-helper NAME DESTINATION  Export a helper (macOS)\n\
     gui-preview CASE --state-dir PATH  Render a preview (debug builds)";
 
@@ -202,6 +203,25 @@ fn run() -> Result<()> {
                     result = lifecycle::shutdown() => { result?; Ok::<_,anyhow::Error>(()) },
                     status = child.wait() => {
                         ensure!(status?.success(), "Input access was not granted. Reinstall the current .deb and retry in an active desktop session.");
+                        Ok(())
+                    }
+                }
+            })?;
+        }
+        #[cfg(target_os = "linux")]
+        ["native-input-access"] | ["native-input-access", "--revoke"] => {
+            lifecycle::install();
+            runtime()?.block_on(async {
+                let mut child = tokio::process::Command::new("pkexec")
+                    .arg("/usr/lib/desk-switch/native-input-access")
+                    .args(&args[1..])
+                    .kill_on_drop(true)
+                    .spawn()
+                    .context("requesting permission for the Linux virtual keyboard and mouse")?;
+                tokio::select! {
+                    result = lifecycle::shutdown() => { result?; Ok::<_, anyhow::Error>(()) },
+                    status = child.wait() => {
+                        ensure!(status?.success(), "Native input permission could not be changed. Use the current Debian package in an active desktop session.");
                         Ok(())
                     }
                 }

@@ -12,6 +12,8 @@ class ProtocolVersionMismatch(val kind: ProtocolKind, val expected: Int, val rec
 object NativeWire {
     const val PROTOCOL = 9
     const val WORKSPACE_PROTOCOL = 3
+    internal const val MAX_MOVE = 16384
+    internal const val MAX_SCROLL = 4096
     private const val MAX_VERSION_LENGTH = 48
     private val versionHeader = "DESKVER2".toByteArray(Charsets.US_ASCII)
 
@@ -65,13 +67,25 @@ object NativeWire {
         require(value > 0)
         return value
     }
-    fun event(event: Input): ByteArray = ByteArrayOutputStream().apply {
-        uint(10)
+    internal fun validateEvent(event: Input) {
         when (event) {
-            is Input.Key -> { require(event.code in 1..248); uint(0); uint(event.code.toLong()); write(if (event.down) 1 else 0) }
-            is Input.Button -> { require(event.code in 272..276); uint(1); uint(event.code.toLong()); write(if (event.down) 1 else 0) }
-            is Input.Move -> { require(event.dx in -16384..16384 && event.dy in -16384..16384); uint(2); signed(event.dx); signed(event.dy) }
-            is Input.Scroll -> { require(event.dx in -4096..4096 && event.dy in -4096..4096); uint(3); signed(event.dx); signed(event.dy) }
+            is Input.Key -> require(event.code in 1..248)
+            is Input.Button -> require(event.code in 272..276)
+            is Input.Move -> require(event.dx in -MAX_MOVE..MAX_MOVE && event.dy in -MAX_MOVE..MAX_MOVE)
+            is Input.Scroll -> require(event.dx in -MAX_SCROLL..MAX_SCROLL && event.dy in -MAX_SCROLL..MAX_SCROLL)
         }
-    }.toByteArray()
+    }
+
+    fun event(event: Input): ByteArray {
+        validateEvent(event)
+        return ByteArrayOutputStream().apply {
+            uint(10)
+            when (event) {
+                is Input.Key -> { uint(0); uint(event.code.toLong()); write(if (event.down) 1 else 0) }
+                is Input.Button -> { uint(1); uint(event.code.toLong()); write(if (event.down) 1 else 0) }
+                is Input.Move -> { uint(2); signed(event.dx); signed(event.dy) }
+                is Input.Scroll -> { uint(3); signed(event.dx); signed(event.dy) }
+            }
+        }.toByteArray()
+    }
 }

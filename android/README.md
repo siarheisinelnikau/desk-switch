@@ -1,6 +1,6 @@
 # Desk Switch phone remote
 
-Use an Android phone as a keyboard and pointing device for your Desk Switch workspace. Several phones can be paired at once. Check **Shared** beside a phone in **Sharing & volume** to let it follow the selected computer. Uncheck it to use that phone with its paired computer only.
+Use an Android phone as a keyboard and pointing device for your Desk Switch workspace. Several phones can be paired at once. Each approved workspace phone follows the active computer.
 
 ![Desk Switch workspace with connected and saved phones](../docs/android-desktop-workspace.png)
 
@@ -12,7 +12,7 @@ Use an Android phone as a keyboard and pointing device for your Desk Switch work
 </details>
 
 1. Open the experimental build of Desk Switch on the computer and the Android app on the phone. Join the same local network on both devices.
-2. Select the computer on the phone and confirm the matching code on both screens. Desk Switch remembers approved computers and phones.
+2. Select the workspace on the phone and confirm the matching code on the phone and the desktop that shows it. Open the saved workspace entry to reconnect. Standalone computers can also be paired directly.
 3. Tap the pointer mode icon beside **Controls** to switch between **Touchpad** and **Joystick**. Tap **Keyboard** to type in the computer's focused app. **Controls** saves the speed of each mode separately. Use the power icon in the top bar to disconnect.
 
 The pointing surface fades its hint when you use the remote. It brings the hint back after 15 seconds of inactivity.
@@ -40,11 +40,11 @@ Use two fingers to scroll, or tap once and drag on the second touch. A second qu
 </details>
 
 <details>
-<summary>Finding and pairing a computer</summary>
+<summary>Finding and pairing a workspace</summary>
 
 <p>
-  <img src="../docs/android-nearby.png" width="250" alt="Nearby Desk Switch computers discovered over Wi-Fi">
-  <img src="../docs/android-pairing.png" width="250" alt="Confirmation code for pairing an Android phone with a PC">
+  <img src="../docs/android-nearby.png" width="250" alt="Desk Switch workspace discovered over Wi-Fi">
+  <img src="../docs/android-pairing.png" width="250" alt="Confirmation code for joining a workspace from an Android phone">
 </p>
 </details>
 
@@ -52,7 +52,9 @@ Enable **Cursor preview** in the phone's **Controls** and set a rate from 1 to 3
 
 ![Phone remote and cursor preview settings in Desk Switch](../docs/android-desktop-settings.png)
 
-The Android app requires Android 8 or later. Install the experimental desktop build on each computer that should receive shared phone input. Choose the artifact for your Ubuntu version, such as `ubuntu-26.04-phone-remote-experiment`, and install its `.deb` named with `android-experiment`. The package updates the existing Desk Switch installation and keeps the workspace settings. After restarting Desk Switch, check for **Phone remotes · Experimental** in its settings. Connect to Ubuntu directly from the phone, or mark the phone **Shared** and select Ubuntu in the desktop workspace. Approve the Wayland remote desktop prompt when it appears. Typed text pastes through the target computer's clipboard, and preview on GNOME Wayland uses the companion bundled with the Ubuntu package. If automatic discovery is unavailable, enter the computer's local IP address in the Android app.
+The Android app requires Android 8 or later. Install the experimental desktop build on each workspace computer that should receive phone input. Choose the artifact for your Ubuntu version, such as `ubuntu-26.04-phone-remote-experiment`, and install its `.deb` named with `android-experiment`. The package updates the existing Desk Switch installation and keeps the workspace settings. After restarting Desk Switch, check for **Phone remotes · Experimental** in its settings. Select Ubuntu in the workspace to use the connected phone there. On Ubuntu, select **Enable native keyboard and mouse** under **Keyboard and mouse permissions** and approve the administrator prompt once. If native input is unavailable, approve the Wayland remote desktop prompt. Typed text pastes through the target computer's clipboard, and preview on GNOME Wayland uses the companion bundled with the Ubuntu package. If automatic discovery is unavailable, enter a workspace computer's local IP address in the Android app.
+
+If the phone reports that the GNOME companion is unavailable, enable **Desk Switch Tray** in GNOME Extensions on Ubuntu. If the extension is missing after installation or GNOME is still running an older copy after an update, sign out and sign back in to load the installed version. Cursor preview resumes after the companion becomes available and the Ubuntu desktop is unlocked, as long as the phone is still requesting it.
 
 ## Updates and compatibility
 

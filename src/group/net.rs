@@ -96,6 +96,13 @@ pub enum Action {
     RemoveMember {
         key: String,
     },
+    PhoneRemote {
+        workspace: String,
+        key: String,
+        name: Option<String>,
+        #[serde(default)]
+        reapprove: bool,
+    },
     MonitorResult {
         id: u64,
         error: Option<String>,
@@ -523,6 +530,7 @@ fn load(dir: &Path, local: Member) -> Result<Workspace> {
             revision: 0,
             settings: Settings::from(&local.node.shared),
             members: BTreeMap::new(),
+            phone_remotes: BTreeMap::new(),
             active_input: None,
             input_intent: None,
             input_request: 0,
@@ -1198,6 +1206,12 @@ fn apply(
         Action::ReturnInput => state.return_input()?,
         Action::EdgePause(paused) => state.pause_edges(paused)?,
         Action::RemoveMember { key } => state.remove_member(&key)?,
+        Action::PhoneRemote {
+            workspace,
+            key,
+            name,
+            reapprove,
+        } => state.set_phone_remote(&workspace, key, name, reapprove)?,
         Action::MonitorResult { id, error } => state.monitor_result(source, id, error)?,
         Action::MonitorPrepared { id, error } => state.monitor_prepared(source, id, error)?,
         Action::Invite { address, key } => {

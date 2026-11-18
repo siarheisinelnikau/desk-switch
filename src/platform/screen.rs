@@ -1,4 +1,4 @@
-//! Bounded cursor-region capture. Never called until both endpoints opt in.
+//! Bounded cursor-region capture on explicit request from a paired phone.
 #[cfg(any(windows, target_os = "linux", test))]
 use crate::mobile::screen::MAX_PNG;
 use crate::mobile::screen::Options;
@@ -9,6 +9,74 @@ use anyhow::Result;
 use anyhow::ensure;
 #[cfg(any(windows, target_os = "linux", test))]
 use image::{ImageEncoder, Rgb, RgbImage};
+
+/// Only application-defined text is safe to send back to a remote viewer.
+pub(crate) fn failure_status(error: &anyhow::Error) -> &'static str {
+    #[cfg(target_os = "linux")]
+    if let Some(error) = error.downcast_ref::<GnomeCaptureError>() {
+        return error.0;
+    }
+    let _ = error;
+    "Could not capture this desktop"
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Debug)]
+struct GnomeCaptureError(&'static str);
+
+#[cfg(target_os = "linux")]
+impl std::fmt::Display for GnomeCaptureError {
+    fn fmt(&self, output: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        output.write_str(self.0)
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl std::error::Error for GnomeCaptureError {}
+
+#[cfg(target_os = "linux")]
+fn gnome_capture_error(error: zbus::Error) -> anyhow::Error {
+    use zbus::DBusError;
+
+    let fdo_name;
+    let name = match &error {
+        zbus::Error::MethodError(name, _, _) => Some(name.as_str()),
+        zbus::Error::FDO(error) => {
+            fdo_name = error.name();
+            Some(fdo_name.as_str())
+        }
+        _ => None,
+    };
+    let status = match name {
+        Some(
+            "org.freedesktop.DBus.Error.ServiceUnknown"
+            | "org.freedesktop.DBus.Error.NameHasNoOwner",
+        ) => {
+            "Enable Desk Switch Tray in GNOME Extensions on the computer. If it is missing after installation, sign out and sign back in."
+        }
+        Some(
+            "org.freedesktop.DBus.Error.UnknownMethod"
+            | "org.freedesktop.DBus.Error.UnknownInterface"
+            | "org.freedesktop.DBus.Error.UnknownObject",
+        ) => {
+            "Install the current Desk Switch package on the computer, then sign out and sign back in to load the GNOME companion."
+        }
+        Some("io.github.siarheisinelnikau.DeskSwitch.Clipboard.CursorPreviewLocked") => {
+            "Unlock the computer to resume the preview."
+        }
+        Some("io.github.siarheisinelnikau.DeskSwitch.Clipboard.CursorPreviewUnsupported") => {
+            "This GNOME session does not support cursor preview."
+        }
+        Some(
+            "org.freedesktop.DBus.Error.AccessDenied"
+            | "io.github.siarheisinelnikau.DeskSwitch.Clipboard.CursorPreviewAccessDenied",
+        ) => {
+            "GNOME could not verify Desk Switch. Reopen the installed Desk Switch app on the computer."
+        }
+        _ => "GNOME could not capture the cursor area.",
+    };
+    anyhow::Error::new(error).context(GnomeCaptureError(status))
+}
 
 pub(crate) fn available() -> bool {
     #[cfg(windows)]
@@ -330,20 +398,21 @@ impl Capture {
                 Linux::X11(Box::new(connection), screen)
             });
         }
-        let result = match self.connection.as_ref().unwrap() {
+        let result = (|| match self.connection.as_ref().unwrap() {
             Linux::Gnome(connection) => {
                 let proxy = zbus::blocking::Proxy::new(
                     connection,
                     "io.github.siarheisinelnikau.DeskSwitch.Clipboard",
                     "/io/github/siarheisinelnikau/DeskSwitch/Clipboard",
                     "io.github.siarheisinelnikau.DeskSwitch.Clipboard",
-                )?;
+                )
+                .map_err(gnome_capture_error)?;
                 let bytes: Vec<u8> = proxy
                     .call(
                         "CaptureCursorRegion",
                         &(u32::from(options.width), u32::from(options.height)),
                     )
-                    .context("Enable or update the bundled GNOME companion for cursor preview")?;
+                    .map_err(gnome_capture_error)?;
                 ensure!(
                     bytes.len() <= 2 * 1024 * 1024,
                     "The GNOME preview exceeds its limit"
@@ -449,7 +518,7 @@ impl Capture {
                 crosshair(&mut image, area);
                 Ok(image)
             }
-        };
+        })();
         if result.is_err() {
             self.connection = None;
         }
@@ -460,6 +529,22 @@ impl Capture {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn gnome_capture_errors_are_actionable_and_hide_dbus_details() {
+        let missing = gnome_capture_error(zbus::Error::FDO(Box::new(
+            zbus::fdo::Error::ServiceUnknown("private D-Bus details".into()),
+        )));
+        assert!(failure_status(&missing).contains("Enable Desk Switch Tray"));
+        assert!(!failure_status(&missing).contains("private D-Bus details"));
+
+        let stale = gnome_capture_error(zbus::Error::FDO(Box::new(
+            zbus::fdo::Error::UnknownMethod("private D-Bus details".into()),
+        )));
+        assert!(failure_status(&stale).contains("Install the current Desk Switch package"));
+    }
+
     #[test]
     fn cursor_region_clamps_to_negative_monitor_edges_and_small_displays() {
         let options = Options::default();

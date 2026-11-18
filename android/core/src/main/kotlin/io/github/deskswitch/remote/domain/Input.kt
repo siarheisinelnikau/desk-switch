@@ -12,6 +12,8 @@ data class Computer(
     val inputPort: Int = 45883, val key: String? = null,
     val advertisedKey: String? = null,
     val previewSupported: Boolean = false,
+    val advertisedWorkspaceId: String? = null,
+    val workspace: WorkspaceIdentity? = null,
 ) {
     companion object {
         const val DEFAULT_CONTROL_PORT = 45884
@@ -31,7 +33,7 @@ interface RemoteStore {
     fun identity(): Identity
     fun computers(): List<Computer>
     fun save(computer: Computer)
-    fun forget(key: String?)
+    fun forget(computer: Computer)
 }
 
 interface SessionFactory : AutoCloseable {

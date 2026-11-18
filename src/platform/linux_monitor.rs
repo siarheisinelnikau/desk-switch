@@ -219,10 +219,17 @@ pub fn prepare(id: &str) -> Result<()> {
     // Reject only a connected output that remains disabled after waking.
     if let Some(display) = displays()?.into_iter().find(|display| display.id == id) {
         let connector = std::path::Path::new("/sys/class/drm").join(&display.connector);
-        let status = fs::read_to_string(connector.join("status")).ok();
-        let enabled = fs::read_to_string(connector.join("enabled")).ok();
+        let status_path = connector.join("status");
+        let enabled_path = connector.join("enabled");
         ensure!(
-            !disabled_connected_output(status.as_deref(), enabled.as_deref()),
+            wait_for_wake(|| {
+                let status = fs::read_to_string(&status_path).ok();
+                let enabled = fs::read_to_string(&enabled_path).ok();
+                Ok(!disabled_connected_output(
+                    status.as_deref(),
+                    enabled.as_deref(),
+                ))
+            })?,
             "The destination video output is disabled. Enable it in Displays before switching."
         );
     }
@@ -234,6 +241,20 @@ fn disabled_connected_output(status: Option<&str>, enabled: Option<&str>) -> boo
         && enabled.is_some_and(|value| value.trim() == "disabled")
 }
 
+fn wait_for_wake(mut ready: impl FnMut() -> Result<bool>) -> Result<bool> {
+    let deadline = Instant::now() + Duration::from_millis(600);
+    loop {
+        if ready()? {
+            return Ok(true);
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Ok(false);
+        }
+        thread::sleep(remaining.min(Duration::from_millis(100)));
+    }
+}
+
 fn prepare_gnome(connection: &zbus::blocking::Connection) -> Result<()> {
     let display: zbus::blocking::Proxy<'_> = zbus::blocking::proxy::Builder::new(connection)
         .destination("org.gnome.Mutter.DisplayConfig")?
@@ -243,15 +264,23 @@ fn prepare_gnome(connection: &zbus::blocking::Connection) -> Result<()> {
         // PropertiesChanged reaches this connection. Confirm against the server.
         .cache_properties(zbus::proxy::CacheProperties::No)
         .build()?;
-    let mode: i32 = display.get_property("PowerSaveMode")?;
-    if mode > 0 {
-        display.set_property("PowerSaveMode", 0i32)?;
-        ensure!(
-            display.get_property::<i32>("PowerSaveMode")? == 0,
-            "GNOME did not wake the destination display"
-        );
+    let mut mode: i32 = display.get_property("PowerSaveMode")?;
+    if mode <= 0 {
+        return Ok(());
     }
-    Ok(())
+    // A compositor can report the previous mode while applying a wake. Give
+    // it time to converge, then retry only if it still reports power saving.
+    for _ in 0..2 {
+        display.set_property("PowerSaveMode", 0i32)?;
+        if wait_for_wake(|| {
+            mode = display.get_property("PowerSaveMode")?;
+            Ok(mode == 0)
+        })? {
+            return Ok(());
+        }
+        ensure!(mode > 0, "GNOME cannot confirm destination display power");
+    }
+    bail!("GNOME did not wake the destination display after two requests")
 }
 
 impl Monitor for Ddc {
@@ -487,11 +516,18 @@ mod tests {
         struct Mutter {
             mode: Arc<AtomicI32>,
             wakes: Arc<AtomicU32>,
+            wake_on: Arc<AtomicU32>,
+            reads_since_wake: AtomicU32,
         }
         #[zbus::interface(name = "org.gnome.Mutter.DisplayConfig")]
         impl Mutter {
             #[zbus(property)]
             fn power_save_mode(&self) -> i32 {
+                if self.wakes.load(SeqCst) >= self.wake_on.load(SeqCst)
+                    && self.reads_since_wake.fetch_add(1, SeqCst) >= 2
+                {
+                    self.mode.store(0, SeqCst);
+                }
                 self.mode.load(SeqCst)
             }
             #[zbus(property)]
@@ -501,11 +537,12 @@ mod tests {
                     "A handoff must never blank the destination display"
                 );
                 self.wakes.fetch_add(1, SeqCst);
-                self.mode.store(mode, SeqCst);
+                self.reads_since_wake.store(0, SeqCst);
             }
         }
         let mode = Arc::new(AtomicI32::new(3));
         let wakes = Arc::new(AtomicU32::new(0));
+        let wake_on = Arc::new(AtomicU32::new(1));
         let _server = zbus::blocking::connection::Builder::session()
             .unwrap()
             .name("org.gnome.Mutter.DisplayConfig")
@@ -515,6 +552,8 @@ mod tests {
                 Mutter {
                     mode: mode.clone(),
                     wakes: wakes.clone(),
+                    wake_on: wake_on.clone(),
+                    reads_since_wake: AtomicU32::new(0),
                 },
             )
             .unwrap()
@@ -534,6 +573,20 @@ mod tests {
             1,
             "An already active signal needs no power write"
         );
+
+        mode.store(3, SeqCst);
+        wakes.store(0, SeqCst);
+        wake_on.store(2, SeqCst);
+        prepare_gnome(&client).unwrap();
+        assert_eq!(mode.load(SeqCst), 0);
+        assert_eq!(wakes.load(SeqCst), 2, "Retry only a still sleeping display");
+
+        mode.store(3, SeqCst);
+        wakes.store(0, SeqCst);
+        wake_on.store(3, SeqCst);
+        assert!(prepare_gnome(&client).is_err());
+        assert_eq!(mode.load(SeqCst), 3);
+        assert_eq!(wakes.load(SeqCst), 2, "Stop after one retry");
     }
 
     #[test]

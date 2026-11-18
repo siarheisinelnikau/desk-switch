@@ -1,8 +1,11 @@
 //! Phone sources inside the original workspace, without adding workspace voters.
 use super::topology::{PHONE_RELAY_CAPABILITY, PhoneState, phone_id};
 use crate::{
-    group::model::Workspace,
-    mobile::{Destination, Device, Event, Pending, Routing, Service, Trusted},
+    group::{
+        model::{PHONE_WORKSPACE_CAPABILITY, Workspace},
+        net::{Action, Service as WorkspaceService},
+    },
+    mobile::{Destination, Device, Event, Pending, Routing, Service, Trusted, WorkspaceAccess},
     workspace::{Node, devices::Inventory},
 };
 use eframe::egui;
@@ -18,6 +21,8 @@ pub(super) struct Panel {
     trusted: BTreeMap<String, Trusted>,
     devices: BTreeMap<String, Device>,
     status: String,
+    workspace: Option<WorkspaceAccess>,
+    workspace_actions: VecDeque<Action>,
 }
 impl Panel {
     #[cfg(debug_assertions)]
@@ -49,6 +54,12 @@ impl Panel {
         self.service.is_some()
     }
 
+    pub fn advertised_workspace(&self) -> Option<&str> {
+        self.workspace
+            .as_ref()
+            .map(|workspace| workspace.id.as_str())
+    }
+
     pub fn enable(&mut self, dir: &std::path::Path, name: String, ctx: &egui::Context) {
         match Service::start(dir.into(), name, ctx.clone()) {
             Ok(service) => {
@@ -66,6 +77,7 @@ impl Panel {
             self.service = None;
             self.pending.clear();
             self.devices.clear();
+            self.workspace_actions.clear();
             return false;
         }
         let mut show = false;
@@ -83,6 +95,19 @@ impl Panel {
                     Event::Status(status) => self.status = status,
                     Event::Trusted(peers) => self.trusted = peers,
                     Event::Devices(devices) => self.devices = devices,
+                    Event::WorkspaceApproval {
+                        workspace,
+                        key,
+                        name,
+                        reapprove,
+                    } => {
+                        self.workspace_actions.push_back(Action::PhoneRemote {
+                            workspace,
+                            key,
+                            name: Some(name),
+                            reapprove,
+                        });
+                    }
                 }
             }
         }
@@ -124,13 +149,17 @@ impl Panel {
         self.inventory(&mut node.devices);
         let logs = &mut node.diagnostics.logs;
         logs.retain(|line| {
-            line != PHONE_RELAY_CAPABILITY && !line.starts_with(CONTROL_PORT_PREFIX)
+            line != PHONE_RELAY_CAPABILITY
+                && line != PHONE_WORKSPACE_CAPABILITY
+                && !line.starts_with(CONTROL_PORT_PREFIX)
         });
+        let reserved = if self.available() { 3 } else { 1 };
+        let overflow = logs
+            .len()
+            .saturating_sub(crate::workspace::diagnostics::LINES - reserved);
+        logs.drain(..overflow);
+        logs.push(PHONE_WORKSPACE_CAPABILITY.into());
         if self.available() {
-            let overflow = logs
-                .len()
-                .saturating_sub(crate::workspace::diagnostics::LINES - 2);
-            logs.drain(..overflow);
             logs.push(PHONE_RELAY_CAPABILITY.into());
             logs.push(format!(
                 "{CONTROL_PORT_PREFIX}{}",
@@ -158,21 +187,64 @@ impl Panel {
             }
         }
     }
-    pub fn route(&self, state: Option<&Workspace>, own: &str, paused: bool) {
-        let Some(service) = &self.service else { return };
-        let members = state
-            .into_iter()
-            .flat_map(|state| state.members.values())
-            .filter(|member| member.compatible())
-            .map(|member| member.node.key.clone())
-            .collect();
-        let generation = state.map_or(0, |state| state.activation);
-        let destination = destination(state, own, paused);
-        service.set_routing(Routing {
-            generation,
-            destination,
-            members,
-        });
+    pub fn route(
+        &mut self,
+        state: Option<&Workspace>,
+        own: &str,
+        paused: bool,
+        group: Option<&WorkspaceService>,
+    ) -> bool {
+        let workspace = state
+            .filter(|state| state.phone_workspace_enabled() || !state.phone_remotes.is_empty())
+            .map(|state| {
+                let peers = state
+                    .members
+                    .values()
+                    .filter(|member| {
+                        member.node.key != own
+                            && member
+                                .node
+                                .diagnostics
+                                .logs
+                                .iter()
+                                .any(|line| line == PHONE_RELAY_CAPABILITY)
+                    })
+                    .take(31)
+                    .map(|member| member.node.key.clone())
+                    .chain(std::iter::once(own.to_owned()))
+                    .collect();
+                WorkspaceAccess {
+                    id: state.workspace_id().to_owned(),
+                    peers,
+                    grants: state.phone_remotes.clone(),
+                    can_enroll: state.phone_workspace_enabled(),
+                }
+            });
+        let changed =
+            self.advertised_workspace() != workspace.as_ref().map(|value| value.id.as_str());
+        self.workspace = workspace;
+        while let Some(action) = self.workspace_actions.pop_front() {
+            if let Some(group) = group
+                && let Err(error) = group.action(action)
+            {
+                self.status = format!("Could not change workspace phone access: {error:#}");
+            }
+        }
+        if let Some(service) = &self.service {
+            let members = state
+                .into_iter()
+                .flat_map(|state| state.members.values())
+                .filter(|member| member.compatible())
+                .map(|member| member.node.key.clone())
+                .collect();
+            service.set_routing(Routing {
+                generation: state.map_or(0, |state| state.activation),
+                destination: destination(state, own, paused),
+                members,
+                workspace: self.workspace.clone(),
+            });
+        }
+        changed
     }
     pub fn shared_devices(&mut self, ui: &mut egui::Ui, state: &Workspace, own: &str) {
         let mut rows = Vec::new();
@@ -190,6 +262,7 @@ impl Panel {
         ui.strong("Phone remotes");
         for (host, key, status, name) in rows {
             let connected = host.compatible() && status != PhoneState::Offline;
+            let workspace_phone = state.phone_remotes.get(key).is_some_and(Option::is_some);
             let local = host.node.key == own && self.service.is_some();
             let mut shared = if local {
                 self.devices.get(key).is_some_and(|device| device.shared)
@@ -205,10 +278,11 @@ impl Panel {
                 } else {
                     ui.weak("Offline");
                 }
-                if ui
-                    .add_enabled(local, egui::Checkbox::new(&mut shared, "Shared"))
-                    .on_disabled_hover_text("Manage this phone on its paired computer")
-                    .changed()
+                if !workspace_phone
+                    && ui
+                        .add_enabled(local, egui::Checkbox::new(&mut shared, "Shared"))
+                        .on_disabled_hover_text("Manage this phone on its paired computer")
+                        .changed()
                     && let Some(service) = &self.service
                     && let Err(error) = service.set_shared(key, shared)
                 {
@@ -245,19 +319,33 @@ impl Panel {
                 }
             }
             if !self.status.is_empty() { ui.label(&self.status); }
-            ui.weak("Open Desk Switch on your phone on the same Wi-Fi. Confirm matching codes once; saved devices reconnect without another code.");
+            ui.weak("Open Desk Switch on your phone on the same Wi-Fi. Confirm matching codes to add it to the workspace.");
             let mut forget = None;
-            for (key, peer) in &self.trusted {
+            let mut phones = self.trusted.iter().map(|(key, peer)| (key.as_str(), peer.name.as_str()))
+                .collect::<BTreeMap<_, _>>();
+            if let Some(workspace) = &self.workspace {
+                for (key, name) in &workspace.grants {
+                    if let Some(name) = name { phones.insert(key, name); } else { phones.remove(key.as_str()); }
+                }
+            }
+            for (key, name) in phones {
                 ui.horizontal_wrapped(|ui| {
                     let connected = self.devices.get(key).is_some_and(|device| device.connected);
                     phone_icon(ui, connected);
-                    ui.label(&peer.name);
-                    ui.weak(if connected { "Connected" } else { "Offline" });
-                    if ui.button("Forget phone").clicked() { forget = Some(key.clone()); }
+                    ui.label(name);
+                    ui.weak(if connected { "Connected" } else if self.workspace.as_ref().is_some_and(|value| value.grants(key)) {
+                        "Approved for this workspace"
+                    } else { "Offline" });
+                    if ui.button("Forget phone").clicked() { forget = Some(key.to_owned()); }
                 });
             }
-            if let Some(key) = forget && let Some(service) = &self.service {
-                if service.forget(&key).is_ok() {
+            if let Some(key) = forget {
+                if let Some(workspace) = &self.workspace && workspace.grants(&key) {
+                    self.workspace_actions.push_back(Action::PhoneRemote {
+                        workspace: workspace.id.clone(), key, name: None, reapprove: false,
+                    });
+                    ui.ctx().request_repaint();
+                } else if self.service.as_ref().is_some_and(|service| service.forget(&key).is_ok()) {
                     self.trusted.remove(&key); self.devices.remove(&key);
                     self.status = "Phone forgotten".into();
                 } else { self.status = "Could not forget the phone".into(); }
