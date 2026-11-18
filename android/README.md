@@ -11,7 +11,7 @@ Use an Android phone as a keyboard and pointing device for your Desk Switch work
 
 </details>
 
-1. Open the experimental build of Desk Switch on the computer and the Android app on the phone. Join the same local network on both devices.
+1. Open Desk Switch 0.11.4 or later on the computer and the Android app on the phone. Join the same local network on both devices.
 2. Select the workspace on the phone and confirm the matching code on the phone and the desktop that shows it. Open the saved workspace entry to reconnect. Standalone computers can also be paired directly.
 3. Tap the pointer mode icon beside **Controls** to switch between **Touchpad** and **Joystick**. Tap **Keyboard** to type in the computer's focused app. **Controls** saves the speed of each mode separately. Use the power icon in the top bar to disconnect.
 
@@ -52,7 +52,7 @@ Enable **Cursor preview** in the phone's **Controls** and set a rate from 1 to 3
 
 ![Phone remote and cursor preview settings in Desk Switch](../docs/android-desktop-settings.png)
 
-The Android app requires Android 8 or later. Install the experimental desktop build on each workspace computer that should receive phone input. Choose the artifact for your Ubuntu version, such as `ubuntu-26.04-phone-remote-experiment`, and install its `.deb` named with `android-experiment`. The package updates the existing Desk Switch installation and keeps the workspace settings. After restarting Desk Switch, check for **Phone remotes · Experimental** in its settings. Select Ubuntu in the workspace to use the connected phone there. On Ubuntu, select **Enable native keyboard and mouse** under **Keyboard and mouse permissions** and approve the administrator prompt once. If native input is unavailable, approve the Wayland remote desktop prompt. Typed text pastes through the target computer's clipboard, and preview on GNOME Wayland uses the companion bundled with the Ubuntu package. If automatic discovery is unavailable, enter a workspace computer's local IP address in the Android app.
+The Android app requires Android 8 or later. Use **Settings → Updates** in Desk Switch to install 0.11.4 or later on each Windows or Ubuntu workspace computer. The update keeps the workspace settings and pairings. After restarting Desk Switch, look for **Phone remotes · Experimental** in its settings. On Ubuntu, select **Enable native keyboard and mouse** under **Keyboard and mouse permissions** and approve the administrator prompt once. If native input is unavailable, approve the Wayland remote desktop prompt. Typed text pastes through the target computer's clipboard, and preview on GNOME Wayland uses the companion bundled with the Ubuntu package. If automatic discovery is unavailable, enter a workspace computer's local IP address in the Android app.
 
 If the phone reports that the GNOME companion is unavailable, enable **Desk Switch Tray** in GNOME Extensions on Ubuntu. If the extension is missing after installation or GNOME is still running an older copy after an update, sign out and sign back in to load the installed version. Cursor preview resumes after the companion becomes available and the Ubuntu desktop is unlocked, as long as the phone is still requesting it.
 
@@ -71,7 +71,7 @@ Signed updates use the same certificate across releases. A local debug APK can u
 Use the repository's Rust toolchain, JDK 23, Android SDK Platform 35, Android Build Tools 35.0.0, and Android NDK r28c (`28.2.13676358`). Experimental APK, Windows, and Ubuntu build artifacts are available from [GitHub Actions](https://github.com/siarheisinelnikau/desk-switch/actions/workflows/checks.yml?query=branch%3Aexperiment%2Fandroid-remote).
 
 ```sh
-cargo build --locked --release --features android-remote
+cargo build --locked --release
 rustup target add aarch64-linux-android armv7-linux-androideabi x86_64-linux-android i686-linux-android
 cd android
 ./gradlew :core:test :app:testDebugUnitTest :app:lintDebug :app:assembleDebug --max-workers=2
@@ -83,4 +83,4 @@ On Windows use `gradlew.bat`. The APK is at `android/app/build/outputs/apk/debug
 
 Android uses one Activity and a ViewModel with `StateFlow` for connection and controls state. Gesture rules are Android-independent, preferences are stored by the data adapter, and the Noise handshake uses the same Rust `snow` protocol implementation as the desktop. Existing phone keys and paired computers carry over.
 
-The desktop build uses the existing profile and Wi-Fi announcement. For a temporary Windows test, `DeskSwitch-v0.11.3-android-experiment.exe gui --experimental-mobile` opens the ordinary interface and preserves the previous login startup command. The desktop device and workspace protocols remain 9 and 3. Cursor preview negotiates optional records in the encrypted control stream.
+The desktop build uses the existing profile and Wi-Fi announcement. The desktop device and workspace protocols remain 9 and 3. Cursor preview negotiates optional records in the encrypted control stream.
